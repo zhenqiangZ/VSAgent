@@ -1,0 +1,509 @@
+/* 全局 */
+Screen {
+    background: #000000;
+}
+
+/* 弹窗类屏幕：弹窗本体在屏幕内水平垂直居中，遮罩半透明以透出下一层界面 */
+ModalScreen {
+    align: center middle;
+    background: #000000 60%;
+}
+
+/* Home 屏幕：内容水平居中、垂直大致居中，底部状态栏贴在最下方 */
+#home-frame {
+    width: 100%;
+    height: 100%;
+    background: #000000;
+}
+
+#home-center {
+    width: 100%;
+    height: 1fr;
+    align: center middle;
+}
+
+#home-logo {
+    width: 82;
+    max-width: 100%;
+    color: #FFFFFF;
+    text-align: center;
+    height: auto;
+}
+
+#home-box {
+    width: 82;
+    max-width: 100%;
+    height: auto;
+    background: #1A1A1A;
+    margin-top: 2;
+}
+
+/* 文本框自身也加一条聚焦规则，让 Textual 在焦点变化时重算整块子树 */
+#home-box:focus-within {
+    background: #1F1F1F;
+}
+
+/* 左侧竖条：聚焦时点亮成蓝线，未聚焦时接近框底色 */
+#home-accent-bar {
+    width: 1;
+    height: 100%;
+    background: #2A2A2A;
+}
+
+#home-box:focus-within #home-accent-bar {
+    background: #4A9EFF;
+}
+
+#home-box-main {
+    width: 1fr;
+    height: auto;
+    padding: 1 2;
+}
+
+#home-prompt-row {
+    width: 100%;
+    height: auto;
+    align-vertical: top;
+}
+
+#home-prompt-mark {
+    width: auto;
+    height: 1;
+    color: #888888;
+}
+
+/* 输入框随内容换行增高，到高度上界后由自身滚动掩盖最早的内容 */
+#home-input {
+    width: 1fr;
+    height: auto;
+    max-height: 6;
+    padding: 0 1;
+    border: none;
+    background: #1A1A1A;
+    color: #E0E0E0;
+    scrollbar-size-vertical: 0;
+}
+
+#home-input .text-area--placeholder {
+    color: #777777;
+}
+
+/* 输入区跟着区块一起在聚焦时提亮。`#home-box:focus-within` 把区块底色抬到 #1F1F1F，
+   而输入区自己写的是 #1A1A1A，不提亮的话焦点一进到输入框，输入区就比周围暗出一档 */
+#home-box:focus-within #home-input {
+    background: #1F1F1F;
+}
+
+#home-info {
+    width: 100%;
+    height: 1;
+    margin-top: 1;
+}
+
+#home-help {
+    width: 82;
+    max-width: 100%;
+    height: 1;
+    padding: 0 2;
+    text-align: right;
+    color: #666666;
+}
+
+#home-footer {
+    width: 100%;
+    height: 2;
+    padding: 0 2 1 2;
+    color: #666666;
+    background: #000000;
+}
+
+#home-footer-left {
+    width: 1fr;
+    height: 1;
+}
+
+#home-footer-right {
+    width: auto;
+    height: 1;
+}
+
+/* Chat 屏幕 */
+#chat-body {
+    height: 1fr;
+}
+
+#messages-pane {
+    width: 1fr;
+    height: 100%;
+    padding: 0 1;
+}
+
+/* 上下文侧栏：默认隐藏，leader b 打开后占 30 列，消息区让出这块宽度 */
+#side-panel {
+    width: 30;
+    height: 100%;
+    border-left: solid #333333;
+    background: #0A0A0A;
+    padding: 0 1;
+    display: none;
+}
+
+#side-panel.-visible {
+    display: block;
+}
+
+#side-panel .side-title {
+    height: 1;
+    color: #E0E0E0;
+    text-style: bold;
+}
+
+#side-panel .side-section {
+    height: 1;
+    margin-top: 1;
+    color: #4A9EFF;
+}
+
+#side-panel .side-line {
+    height: auto;
+    color: #AAAAAA;
+}
+
+#side-panel .side-body {
+    height: auto;
+    color: #888888;
+}
+
+/* 输入框区块：深灰底、带左右内边距，最左侧那条竖线在聚焦时点亮成亮蓝。
+   区块高度取 auto 即可：里面的输入区高度固定，区块总高于是也不随输入变化 */
+#editor-pane {
+    height: auto;
+    border-top: solid #333333;
+    background: #1A1A1A;
+    /* 上下不留内边距：竖线的首行要与上界线下面第一行、也就是输入文字那一行同一行。
+       区块自己的上下留白会夹在竖线与上界线之间，看着像输入行上方还空着一行 */
+    padding: 0 2;
+}
+
+#editor-pane.mode-command {
+    border-top: solid #4A9EFF;
+}
+
+#editor-pane.mode-bash {
+    border-top: solid #EF6C00;
+}
+
+#editor-pane.-leader {
+    border-top: solid #C62828;
+}
+
+#editor-body {
+    width: 100%;
+    height: auto;
+    layout: horizontal;
+    /* 不留内边距：竖线取 100% 高度，量的是这一块的内容区，上下都不留空白时，
+       竖线占的行数与这一块的内容区完全重合，它的首行就是输入行、末行就是状态行，
+       与区块上下边界之间也没有夹着空白 */
+}
+
+#editor-accent {
+    width: 1;
+    height: 100%;
+    background: #2A2A2A;
+}
+
+/* 指示线由 EditorPane 在焦点进出时自己添加类。走 :focus-within 的话，
+   规则命中的是 `#editor-pane` 自己，区块连同输入区与状态行一起重算样式再重绘，
+   焦点每进出一次就闪一下。 */
+#editor-accent.-focused {
+    background: #4A9EFF;
+}
+
+#editor-main {
+    width: 1fr;
+    height: auto;
+}
+
+/* 输入区显式铺区块那层底色。不写的话会用到 TextArea 自带的 `background: $surface`，
+   主题换成 gruvbox 之后 `$surface` 是 #3C3836，比区块的 #1A1A1A 亮出一档，
+   输入区看起来像单独铺了一块灰。
+
+   高度固定成 8 行，输入再多也不增高，多出来的行由输入框自己滚动。
+   写成 `height: auto` 的话，输入每跨过一次换行边界，输入区就多占一行，
+   区块高度从 auto 跟着长高，上边缘往上退一行，上面的消息区被压短一行，
+   提交清空之后整块又退回来。区块固定多少行，就由这里的这个数决定：
+   上界线 1 行 + 输入区 8 行 + 状态行上方 1 行间距 + 状态行 1 行 = 11 行。 */
+#editor-input {
+    height: 8;
+    padding: 0 1;
+    border: none;
+    background: #1A1A1A;
+    color: #E0E0E0;
+    scrollbar-size-vertical: 0;
+}
+
+/* 方块光标：亮蓝底、深色字 */
+#editor-input .text-area--cursor {
+    color: #0A0A0A;
+    background: #4A9EFF;
+}
+
+#editor-input .text-area--placeholder {
+    color: #5A5A5A;
+}
+
+/* 状态行：Agent、模型、推理强度靠左，输入模式靠右；左侧内边距与输入区一致，
+   让状态行与上面输入的文字从同一列开始 */
+#editor-status {
+    width: 100%;
+    height: 1;
+    margin-top: 1;
+    padding: 0 1;
+    layout: horizontal;
+}
+
+#editor-agent {
+    width: auto;
+    height: 1;
+    color: #4A9EFF;
+}
+
+#editor-model {
+    width: auto;
+    height: 1;
+    padding-left: 1;
+    color: #C9D1D9;
+}
+
+#editor-effort {
+    width: auto;
+    height: 1;
+    padding-left: 1;
+    color: #E3B341;
+}
+
+#editor-hint {
+    width: 1fr;
+    height: 1;
+    text-align: right;
+    color: #5A5A5A;
+}
+
+/* 消息区顶端那条"上方还有多少条"的提示：占一行、灰字居中，滚到它附近就开始补更早的消息 */
+#history-hint {
+    height: 1;
+    color: #5A5A5A;
+    text-align: center;
+}
+
+/* 消息样式 */
+.message-user {
+    color: #E0E0E0;
+    margin-bottom: 1;
+}
+
+/* 气泡自己已经留了一行顶部内边距，正文那段的后边距不要再叠一层：
+   叠上去之后单行提问的气泡是"上 1 行、下 2 行"，上下不对称 */
+.message-user .part-text {
+    margin-bottom: 0;
+}
+
+.message-assistant {
+    color: #CCCCCC;
+    margin-bottom: 1;
+}
+
+.part-text {
+    margin-bottom: 1;
+}
+
+.part-file {
+    color: #4A9EFF;
+}
+
+.part-agent {
+    color: #AB47BC;
+}
+
+.part-step_start,
+.part-step_finish {
+    color: #555555;
+}
+
+.part-patch {
+    color: #66BB6A;
+}
+
+.part-subtask {
+    color: #FFA726;
+}
+
+.part-retry {
+    color: #EF6C00;
+}
+
+.part-compaction {
+    color: #78909C;
+}
+
+.part-reasoning.-hidden {
+    display: none;
+}
+
+/* 状态栏：贴在最底部，左端项目路径，右端用量与快捷键提示 */
+#status-bar {
+    height: 1;
+    background: #0A0A0A;
+    color: #5A5A5A;
+    layout: horizontal;
+    padding: 0 1;
+}
+
+#status-left {
+    width: 1fr;
+    height: 1;
+    text-align: left;
+    text-overflow: ellipsis;
+    color: #5A5A5A;
+}
+
+#status-usage {
+    width: auto;
+    height: 1;
+    color: #5A5A5A;
+}
+
+#status-keys {
+    width: auto;
+    height: 1;
+    padding-left: 2;
+    color: #4A4A4A;
+}
+
+/* 命令面板 */
+#command-palette {
+    align: center middle;
+    width: 60%;
+    max-width: 80;
+    height: auto;
+    max-height: 20;
+    background: #1A1A1A 85%;
+    border: tall #4A9EFF;
+    padding: 0 1;
+}
+
+#palette-title {
+    color: #4A9EFF;
+    height: 1;
+}
+
+#palette-list {
+    height: auto;
+    max-height: 12;
+}
+
+#palette-hint {
+    color: #666666;
+    height: 1;
+}
+
+/* 会话选择器、模型、主题、帮助、Diff */
+#session-picker,
+#model-selector,
+#theme-selector,
+#help-screen,
+#diff-overlay,
+#confirm-dialog,
+#rename-dialog {
+    align: center middle;
+    width: 70%;
+    max-width: 90;
+    height: auto;
+    max-height: 26;
+    background: #101010 85%;
+    border: tall #4A9EFF;
+    padding: 0 1;
+}
+
+#picker-title,
+#model-title,
+#theme-title,
+#diff-title {
+    color: #4A9EFF;
+    height: 1;
+    text-style: bold;
+}
+
+#picker-hint,
+#model-hint,
+#theme-hint,
+#diff-hint,
+#confirm-hint,
+#rename-hint {
+    color: #666666;
+    height: 1;
+}
+
+#session-list,
+#model-list,
+#theme-list {
+    height: auto;
+    max-height: 16;
+}
+
+#confirm-text,
+#rename-title {
+    height: 2;
+}
+
+/* 帮助界面 */
+.help-section {
+    color: #4A9EFF;
+    text-style: bold;
+    margin-top: 1;
+    height: 1;
+}
+
+#help-keys,
+#help-commands {
+    color: #CCCCCC;
+    height: auto;
+}
+
+#help-hint {
+    color: #666666;
+    height: 1;
+}
+
+/* Diff 覆盖层 */
+#diff-body {
+    height: auto;
+    padding: 0 1;
+}
+
+/* Toast 通知 */
+.toast {
+    height: auto;
+    margin: 0 1 1 0;
+    padding: 0 1;
+}
+
+.toast.info {
+    background: #1565C0;
+    color: #FFFFFF;
+}
+
+.toast.success {
+    background: #2E7D32;
+    color: #FFFFFF;
+}
+
+.toast.warning {
+    background: #EF6C00;
+    color: #FFFFFF;
+}
+
+.toast.error {
+    background: #C62828;
+    color: #FFFFFF;
+}

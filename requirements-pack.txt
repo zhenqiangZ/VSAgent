@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# 打包
+pyinstaller==6.22.3
+
+# 打包产物的验证：在无真实终端的环境里起伪终端抓屏幕
+pywinpty==3.0.5
+pyte==0.8.2

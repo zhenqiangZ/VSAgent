@@ -1,0 +1,16 @@
+{
+  "name": "default",
+  "textual_theme": "textual-dark",
+  "palette": {
+    "background": "#000000",
+    "surface": "#0A0A0A",
+    "panel": "#101010",
+    "accent": "#4A9EFF",
+    "success": "#2E7D32",
+    "warning": "#EF6C00",
+    "error": "#C62828",
+    "text": "#E0E0E0",
+    "text_muted": "#666666"
+  },
+  "logo_color": "#E0E0E0"
+}

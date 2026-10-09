@@ -55,18 +55,27 @@ def usage_chunk(
     prompt_tokens: int,
     completion_tokens: int,
     model: str = DEFAULT_MODEL,
+    cached_tokens: int = 0,
 ) -> dict[str, Any]:
-    """造收尾那一条只带用量的分片，它的 choices 是空数组。"""
+    """造收尾那一条只带用量的分片，它的 choices 是空数组。
+
+    cached_tokens 非零时按 DeepSeek 的字段名给出缓存命中与未命中两个数，
+    用来验证循环层把两类输入分开计价。
+    """
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if cached_tokens:
+        usage["prompt_cache_hit_tokens"] = cached_tokens
+        usage["prompt_cache_miss_tokens"] = prompt_tokens - cached_tokens
     return {
         "id": "chatcmpl-fake",
         "object": "chat.completion.chunk",
         "model": model,
         "choices": [],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        "usage": usage,
     }
 
 

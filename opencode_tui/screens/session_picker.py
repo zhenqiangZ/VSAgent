@@ -27,7 +27,7 @@ class ConfirmDialog(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
-            yield Static(self._question, id="confirm-text")
+            yield Static(self._question, id="confirm-text", markup=False)
             yield Static("y 确认    n 取消", id="confirm-hint")
 
     def action_confirm(self) -> None:
@@ -104,7 +104,7 @@ class SessionPickerScreen(ModalScreen[str | None]):
         for session in self.sessions:
             stamp = time.strftime("%m-%d %H:%M", time.localtime(session.updated_at))
             label = f"{session.title}   {len(session.messages)} 条   {stamp}"
-            view.append(ListItem(Label(label)))
+            view.append(ListItem(Label(label, markup=False)))
             self._ids.append(session.id)
         if self._ids:
             view.index = 0

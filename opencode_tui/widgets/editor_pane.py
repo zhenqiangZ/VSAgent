@@ -13,17 +13,20 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 
 from .agent_autocomplete import AgentAutocomplete
+from .command_autocomplete import CommandAutocomplete
 from .file_autocomplete import AutocompletePopup, FileAutocomplete
 
-# 状态行最右端显示当前输入模式；前导键等待第二击时改显示等待提示。
+# 状态行最右端显示当前输入模式。
 MODE_LABEL = {
     "chat": "chat",
     "command": "命令",
     "bash": "bash",
 }
-LEADER_LABEL = "ctrl+x 等待第二击"
 
 FILE_TOKEN = re.compile(r"@([^\s@]*)$")
+# 斜杠命令只认第一段的那个词：整段输入以 / 开头、且后面没有空格，才把它当命令名去补全。
+# 一出现空格就说明命令名已经打完（或者这根本不是命令），弹窗该收起来。
+COMMAND_TOKEN = re.compile(r"^/(\S*)$")
 
 IGNORED_DIRS = {
     ".git",
@@ -106,11 +109,7 @@ class ScrollingTextArea(TextArea):
 
 
 class PromptInput(ScrollingTextArea):
-    """输入框：前导键等待第二击时不吞掉按键，让外层绑定能收到。"""
-
-    def _leader_waiting(self) -> bool:
-        """屏幕是否在等前导键的第二击。"""
-        return bool(getattr(self.screen, "_leader_pending", False))
+    """输入框：焦点进出时不重画整块，滚动跟着光标走。"""
 
     def _on_focus(self, event: events.Focus) -> None:
         """获得焦点时不重画整块输入区。
@@ -136,12 +135,6 @@ class PromptInput(ScrollingTextArea):
         if self.parent is not None:
             self.parent.post_message(events.DescendantBlur(self))
 
-    def check_consume_key(self, key: str, character: str | None) -> bool:
-        """返回是否由输入框独占该按键。"""
-        if self._leader_waiting():
-            return False
-        return super().check_consume_key(key, character)
-
     def focus(self, scroll_visible: bool = True) -> PromptInput:
         """把焦点交给输入框，不先重画整块。
 
@@ -152,17 +145,6 @@ class PromptInput(ScrollingTextArea):
         """
         self.screen.set_focus(self, scroll_visible=scroll_visible)
         return self
-
-    async def _on_key(self, event: events.Key) -> None:
-        """等待第二击期间，没命中命令的按键丢掉，不要当普通字符写进输入框。
-
-        命中的第二击由屏幕的优先绑定先一步接走，走到这里的都是没登记过的按键。
-        """
-        if self._leader_waiting() and event.is_printable:
-            event.stop()
-            event.prevent_default()
-            return
-        await super()._on_key(event)
 
 
 class EditorPane(Container):
@@ -204,9 +186,12 @@ class EditorPane(Container):
         self._model = ""
         self._effort = "low"
         self._written: dict[str, str] = {}
+        # esc 关掉命令补全之后，这一次输入不再弹窗，直到输入不再是命令前缀。
+        self._command_dismissed = False
 
     def compose(self) -> ComposeResult:
         yield FileAutocomplete()
+        yield CommandAutocomplete()
         yield AgentAutocomplete()
         with Horizontal(id="editor-body"):
             yield Static("", id="editor-accent")
@@ -217,10 +202,12 @@ class EditorPane(Container):
                 # 键里不含这个字段，也没有清缓存的钩子。只能在构造时传。
                 yield PromptInput(id="editor-input", highlight_cursor_line=False)
                 with Horizontal(id="editor-status"):
-                    yield Static(self._agent, id="editor-agent")
-                    yield Static(self._model, id="editor-model")
-                    yield Static(self._effort, id="editor-effort")
-                    yield Static(self._hint_text(), id="editor-hint")
+                    # 这四个标签画的是 Agent 名称、模型名称与提示语，取值来自 `.env`，
+                    # 关掉标签解析，模型名里带方括号时不会被当成标签吞掉。
+                    yield Static(self._agent, id="editor-agent", markup=False)
+                    yield Static(self._model, id="editor-model", markup=False)
+                    yield Static(self._effort, id="editor-effort", markup=False)
+                    yield Static(self._hint_text(), id="editor-hint", markup=False)
 
     def on_mount(self) -> None:
         """挂载后把焦点交给输入框。"""
@@ -292,9 +279,10 @@ class EditorPane(Container):
         return True
 
     def on_text_area_changed(self) -> None:
-        """输入变化时更新模式与文件补全候选。"""
+        """输入变化时更新模式与补全候选。"""
         self._update_mode()
         self._update_file_popup()
+        self._update_command_popup()
 
     def action_submit(self) -> None:
         """提交输入，弹窗打开时改为接受候选项。"""
@@ -329,15 +317,25 @@ class EditorPane(Container):
             popup.move(1)
 
     def action_agent_popup(self) -> None:
-        """打开 Agent 补全弹窗。"""
+        """tab：命令补全开着时采纳当前候选，否则打开 Agent 补全弹窗。"""
+        if self.command_popup.is_open:
+            self._accept(self.command_popup)
+            return
         self.file_popup.hide()
         self.agent_popup.open_list()
 
     def action_close_popup(self) -> None:
-        """关闭当前补全弹窗。"""
+        """关闭当前补全弹窗。
+
+        关掉命令补全之后，这一次输入就不再弹了：只收起一个的话，接着打下一个字母
+        又会去匹配一次，esc 等于没按。
+        """
         popup = self._active_popup()
-        if popup is not None:
-            popup.hide()
+        if popup is None:
+            return
+        if popup is self.command_popup:
+            self._command_dismissed = True
+        popup.hide()
 
     def action_history_prev(self) -> None:
         """翻阅上一条历史输入。"""
@@ -371,9 +369,14 @@ class EditorPane(Container):
         """Agent 补全弹窗。"""
         return self.query_one("#agent-autocomplete", AgentAutocomplete)
 
+    @property
+    def command_popup(self) -> CommandAutocomplete:
+        """斜杠命令补全弹窗。"""
+        return self.query_one("#command-autocomplete", CommandAutocomplete)
+
     def _active_popup(self) -> AutocompletePopup | None:
         """返回当前打开的弹窗。"""
-        for popup in (self.file_popup, self.agent_popup):
+        for popup in (self.file_popup, self.command_popup, self.agent_popup):
             if popup.is_open:
                 return popup
         return None
@@ -387,6 +390,17 @@ class EditorPane(Container):
         if popup is self.agent_popup:
             popup.hide()
             self.set_agent(choice)
+            return
+        if popup is self.command_popup:
+            command = self.command_popup.current_command()
+            if command is None:
+                popup.hide()
+                return
+            # 只填命令名，末尾不带空格：带空格会让下一次输入变化又去匹配一次，
+            # 弹窗刚收起来就又弹开。名字打全之后弹窗本来也要收（见 `_update_command_popup`）。
+            popup.hide()
+            self.input.text = f"/{command.name}"
+            self._update_mode()
             return
         token = FILE_TOKEN.search(self.input.text)
         if token is None:
@@ -425,7 +439,29 @@ class EditorPane(Container):
             return
         self.file_popup.set_items(search_files(self.root, token.group(1)))
 
+    def _update_command_popup(self) -> None:
+        """输入 / 时按已经打出来的那一段列出命令候选。
+
+        打一个 / 就把全部命令列出来，这是命令唯一的一份清单；接着打字按名字、
+        别名与说明筛。名字打全之后收起：留着只会挡住下面那行输入。
+        """
+        token = COMMAND_TOKEN.match(self.input.text.strip())
+        if token is None:
+            # 不再是个命令前缀（清空、加了空格、或多打了一个 /），esc 的抑制到这里为止。
+            self._command_dismissed = False
+            if self.command_popup.is_open:
+                self.command_popup.hide()
+            return
+        if self._command_dismissed:
+            return
+        query = token.group(1)
+        registry = self.app.command_registry
+        # 名字或别名打全了就收起：留着弹窗会把回车截走，命令执行不了。
+        if registry.is_exact(query):
+            if self.command_popup.is_open:
+                self.command_popup.hide()
+            return
+        self.command_popup.set_commands(registry.complete(query))
+
     def _hint_text(self) -> str:
-        if self.has_class("-leader"):
-            return LEADER_LABEL
         return MODE_LABEL[self.mode]

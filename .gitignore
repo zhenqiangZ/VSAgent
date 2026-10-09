@@ -1,10 +1,16 @@
 # 运行与打包产物
 .probe/
+runs/
 tests/output/
 build/
 dist/
 __pycache__/
 *.pyc
+
+# 前端依赖与打包产物（viz/ 是唯一装 npm 包的地方）
+node_modules/
+viz/build/
+web/vendor/
 
 # 凭据
 .env
@@ -14,6 +20,7 @@ opencode-export-*.md
 
 # 内部工作文档：调试记录、设计讨论与编码规范，不进公开分支
 AGENTS.md
+HARNESS.md
 ISSUES.md
 LOOP.md
 PLAN.md
@@ -21,3 +28,20 @@ PLAN.md
 .workbuddy/
 .workbuddy-ai/
 .VSCodeCounter/
+
+# 本机运行状态与编辑器配置
+.opencode_tui/
+.vscode/
+.vsmemory/
+
+# 一次性探针与临时脚本
+probe_*.py
+state_check.py
+tmp_*.py
+ligandset2_stats.py
+ligandset2_stats.txt
+egfr_vs/
+
+# 误入的第三方缓存目录
+Microsoft/
+pip/

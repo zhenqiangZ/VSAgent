@@ -47,7 +47,8 @@ async def main() -> None:
         await pilot.pause()
         (OUTPUT_DIR / "home.txt").write_text(dump(app, "HomeScreen"), encoding="utf-8")
 
-        await pilot.press("ctrl+n")
+        await pilot.press(*list("/new"))
+        await pilot.press("enter")
         await pilot.pause()
         await pilot.press(*list("explain this repo"))
         await pilot.press("enter")

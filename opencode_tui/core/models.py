@@ -62,12 +62,15 @@ class PartType(Enum):
     SUBTASK = "subtask"
     RETRY = "retry"
     COMPACTION = "compaction"
+    ERROR = "error"
+    SUMMARY = "summary"
 
 
 class ToolStatus(Enum):
     """工具执行状态。"""
 
     PENDING = "pending"
+    AWAITING = "awaiting"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -91,6 +94,8 @@ class Part:
     tool_output: str = ""
     file_path: str = ""
     agent_name: str = ""
+    # 这次调用是按哪一条规则放行的，或为什么被拒绝
+    permission: str = ""
     # 补丁的增删行数。放在数据里，渲染层只负责显示；接上真后端之后这里会被真实数字填上。
     patch_added: int = 0
     patch_removed: int = 0
@@ -109,6 +114,7 @@ class Part:
             "tool_output": self.tool_output,
             "file_path": self.file_path,
             "agent_name": self.agent_name,
+            "permission": self.permission,
             "patch_added": self.patch_added,
             "patch_removed": self.patch_removed,
             "timestamp": self.timestamp,
@@ -129,6 +135,7 @@ class Part:
             tool_output=data.get("tool_output", ""),
             file_path=data.get("file_path", ""),
             agent_name=data.get("agent_name", ""),
+            permission=data.get("permission", ""),
             patch_added=int(data.get("patch_added") or 0),
             patch_removed=int(data.get("patch_removed") or 0),
             timestamp=float(data.get("timestamp", time.time())),
@@ -198,6 +205,170 @@ class Message:
         return message
 
 
+# 任务状态有五个字段。命令里可以打的别名 -> 数据里的字段名。
+# 单数的写法也认，因为命令是手打的，多一个 s 少一个 s 不该是错。
+TASK_FIELD_ALIASES: dict[str, str] = {
+    "goal": "goal",
+    "constraint": "constraints",
+    "constraints": "constraints",
+    "done": "done",
+    "todo": "todo",
+    "blocker": "blockers",
+    "blockers": "blockers",
+}
+
+# 列表型字段，顺序即渲染顺序。goal 是单值，不在这里。
+TASK_LIST_FIELDS: tuple[str, ...] = ("constraints", "done", "todo", "blockers")
+
+
+@dataclass
+class TaskState:
+    """结构化的任务状态，独立于聊天记录。
+
+    它是「用户约束不能因为丢弃就没了」这条要求的归处：约束存在这里，
+    而不是靠摘要的某一段兜住。装配时它整块进 `TASK` 层、**不参与淘汰**，
+    所以聊到多长，用户当初提的要求都还在。
+
+    与聊天记录的分工：聊天记录是过程，这里是结论——目标是什么、答应了什么、
+    做到哪一步、卡在哪。要改结论就改这里，不必回头翻聊天记录。
+    """
+
+    goal: str = ""
+    constraints: list[str] = field(default_factory=list)  # 用户明确给出的要求
+    done: list[str] = field(default_factory=list)
+    todo: list[str] = field(default_factory=list)
+    blockers: list[str] = field(default_factory=list)
+    version: int = 0  # 每次真的改了才 +1，供 trace 与判据比对
+
+    def is_empty(self) -> bool:
+        """五个字段全空时返回 True。空的就不必往上下文里塞一段废话。"""
+        return not (
+            self.goal or self.constraints or self.done
+            or self.todo or self.blockers
+        )
+
+    def render(self) -> str:
+        """渲染成给模型看的一段文字。空字段整段不出现。"""
+        blocks = ["（本会话的任务状态，随进度更新）"]
+        if self.goal:
+            blocks.append(f"目标：{self.goal}")
+        if self.constraints:
+            blocks.append(
+                "用户约束（每一步都生效）：\n"
+                + "\n".join(f"- {item}" for item in self.constraints)
+            )
+        if self.done:
+            blocks.append("已完成：\n" + "\n".join(f"- {item}" for item in self.done))
+        if self.todo:
+            blocks.append("待办：\n" + "\n".join(f"- {item}" for item in self.todo))
+        if self.blockers:
+            blocks.append("阻塞：\n" + "\n".join(f"- {item}" for item in self.blockers))
+        return "\n".join(blocks)
+
+    def apply(
+        self,
+        *,
+        goal: str | None = None,
+        add_constraints: Iterable[str] | None = None,
+        done: Iterable[str] | None = None,
+        todo: Iterable[str] | None = None,
+        blockers: Iterable[str] | None = None,
+    ) -> bool:
+        """按字段更新，返回是否真的变了。变了才把 `version` 加一。
+
+        两类字段的语义**刻意不同**：
+
+        - `add_constraints` 是**追加**。约束是用户提的要求，模型每轮重写一遍的话，
+          漏抄一条就等于把它删了——而这正是本模块要防的那件事。要删只能由用户来。
+        - `done` / `todo` / `blockers` 是**整段替换**。这三类是模型自己的进度记录，
+          随进度重写才是对的；传空列表就是清掉这一类。
+
+        `None` 表示「这次不动这一类」，与传空列表不是一回事。
+        """
+        changed = False
+
+        if goal is not None:
+            text = goal.strip()
+            if text and text != self.goal:
+                self.goal = text
+                changed = True
+
+        for raw in add_constraints or ():
+            text = str(raw).strip()
+            if text and text not in self.constraints:
+                self.constraints.append(text)
+                changed = True
+
+        for name, values in (("done", done), ("todo", todo), ("blockers", blockers)):
+            if values is None:
+                continue
+            items = [str(item).strip() for item in values if str(item).strip()]
+            if items != getattr(self, name):
+                setattr(self, name, items)
+                changed = True
+
+        if changed:
+            self.version += 1
+        return changed
+
+    def add(self, field: str, text: str) -> bool:
+        """往某一类里加一条。`goal` 是单值，等同于覆盖。
+
+        命令那条路走这里：用户打的是一句话，不该为了加一条待办而把整张表重写一遍。
+        """
+        name = TASK_FIELD_ALIASES.get(field.strip().lower())
+        if name is None:
+            raise ValueError(f"不认识的字段：{field}")
+        text = text.strip()
+        if not text:
+            raise ValueError("内容不能为空")
+        if name == "goal":
+            return self.apply(goal=text)
+        if name == "constraints":
+            return self.apply(add_constraints=[text])
+        return self.apply(**{name: [*getattr(self, name), text]})
+
+    def clear(self) -> bool:
+        """清空全部字段。已经空的返回 False，不必白写一次盘。"""
+        if self.is_empty():
+            return False
+        self.goal = ""
+        for name in TASK_LIST_FIELDS:
+            getattr(self, name).clear()
+        self.version += 1
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为可写入 TOML 的字典。"""
+        return {
+            "goal": self.goal,
+            "constraints": list(self.constraints),
+            "done": list(self.done),
+            "todo": list(self.todo),
+            "blockers": list(self.blockers),
+            "version": self.version,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TaskState:
+        """从字典还原。老状态文件里没有这一段，缺字段时按空处理。"""
+
+        def strings(key: str) -> list[str]:
+            raw = data.get(key)
+            if not isinstance(raw, list):
+                return []
+            return [str(item).strip() for item in raw if str(item).strip()]
+
+        return cls(
+            goal=str(data.get("goal") or ""),
+            constraints=strings("constraints"),
+            done=strings("done"),
+            todo=strings("todo"),
+            blockers=strings("blockers"),
+            version=int(data.get("version") or 0),
+        )
+
+
 @dataclass
 class Session:
     """一个会话，持有消息列表与元信息。"""
@@ -210,6 +381,13 @@ class Session:
     model_id: str = ""
     agent_name: str = "Build"
     effort: str = EFFORTS[0]
+    # 手动压缩留下的位置：这个序号之前的消息不发出去，会话里的消息一条不少
+    compact_upto: int = 0
+    # 摘要正文，以及它覆盖到第几条消息。两者随会话写进状态文件
+    summary: str = ""
+    summary_upto: int = 0
+    # 结构化的任务状态：目标、用户约束、进度、阻塞。整块进上下文的 TASK 层，不参与淘汰
+    task_state: TaskState = field(default_factory=TaskState)
 
     def add_message(self, message: Message) -> Message:
         """追加消息并刷新更新时间。"""
@@ -226,6 +404,14 @@ class Session:
         """返回会话内累计 token 数。"""
         return sum(message.total_tokens() for message in self.messages)
 
+    def total_cached(self) -> int:
+        """返回会话内累计的缓存命中输入 token 数。"""
+        return sum(int(message.tokens.get("cached", 0)) for message in self.messages)
+
+    def total_uncached(self) -> int:
+        """返回会话内累计的缓存未命中输入 token 数。"""
+        return sum(int(message.tokens.get("uncached", 0)) for message in self.messages)
+
     def total_cost(self) -> float:
         """返回会话内累计成本。"""
         return sum(message.cost for message in self.messages)
@@ -241,6 +427,10 @@ class Session:
             "model_id": self.model_id,
             "agent_name": self.agent_name,
             "effort": self.effort,
+            "compact_upto": self.compact_upto,
+            "summary": self.summary,
+            "summary_upto": self.summary_upto,
+            "task_state": self.task_state.to_dict(),
         }
 
     @classmethod
@@ -254,6 +444,12 @@ class Session:
             model_id=data.get("model_id", ""),
             agent_name=data.get("agent_name", "Build"),
             effort=data.get("effort") or EFFORTS[0],
+            compact_upto=int(data.get("compact_upto") or 0),
+            summary=data.get("summary", ""),
+            summary_upto=int(data.get("summary_upto") or 0),
+            task_state=TaskState.from_dict(
+                data.get("task_state") if isinstance(data.get("task_state"), dict) else {}
+            ),
         )
         for raw in data.get("messages") or []:
             session.messages.append(Message.from_dict(raw))

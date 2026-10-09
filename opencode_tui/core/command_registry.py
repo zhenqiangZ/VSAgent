@@ -3,28 +3,34 @@ from __future__ import annotations
 import difflib
 from dataclasses import dataclass, field
 
-# keybind 为 None 表示该命令只能通过命令面板触发。
-# connect 与 compact 在原规格里都写成了 ctrl+x c，这里把 connect 改到 ctrl+x o，避免前导键冲突。
+# 命令只有一种入口：在输入框里打 /命令，或者 ctrl+p 打开命令面板再把名字敲进去。
+# 键位不挂在命令上：快捷键那一层由 `KeybindManager` 单独维护，两边各管各的。
+# 这么分是因为成熟的做法就是这样——快捷键只留最常按的那几个，其余全靠 /命令 记。
 COMMANDS: dict[str, dict[str, object]] = {
-    "compact": {"keybind": "ctrl+x c", "desc": "压缩当前会话", "aliases": ["summarize"]},
-    "connect": {"keybind": "ctrl+x o", "desc": "添加提供商", "aliases": []},
-    "details": {"keybind": "ctrl+x d", "desc": "切换工具执行详情", "aliases": []},
-    "editor": {"keybind": "ctrl+x e", "desc": "打开外部编辑器", "aliases": []},
-    "effort": {"keybind": None, "desc": "轮换推理强度", "aliases": []},
-    "exit": {"keybind": "ctrl+x q", "desc": "退出", "aliases": ["quit", "q"]},
-    "export": {"keybind": "ctrl+x x", "desc": "导出对话为 Markdown", "aliases": []},
-    "help": {"keybind": "ctrl+x h", "desc": "显示帮助", "aliases": []},
-    "init": {"keybind": "ctrl+x i", "desc": "创建或更新 AGENTS.md", "aliases": []},
-    "models": {"keybind": "ctrl+x m", "desc": "列出可用模型", "aliases": []},
-    "new": {"keybind": "ctrl+x n", "desc": "新会话", "aliases": ["clear"]},
-    "redo": {"keybind": "ctrl+x r", "desc": "重做撤销的消息", "aliases": []},
-    "sessions": {"keybind": "ctrl+x l", "desc": "列出会话", "aliases": ["resume", "continue"]},
-    "share": {"keybind": "ctrl+x s", "desc": "分享会话", "aliases": []},
-    "sidebar": {"keybind": "ctrl+x b", "desc": "切换上下文侧栏", "aliases": []},
-    "themes": {"keybind": "ctrl+x t", "desc": "列出主题", "aliases": []},
-    "thinking": {"keybind": None, "desc": "切换思考块可见性", "aliases": []},
-    "undo": {"keybind": "ctrl+x u", "desc": "撤销最后一条消息", "aliases": []},
-    "unshare": {"keybind": None, "desc": "取消分享", "aliases": []},
+    "compact": {"desc": "压缩当前会话", "aliases": ["summarize"]},
+    "connect": {"desc": "添加提供商", "aliases": []},
+    "details": {"desc": "切换工具执行详情", "aliases": []},
+    "editor": {"desc": "打开外部编辑器", "aliases": []},
+    "effort": {"desc": "轮换推理强度", "aliases": []},
+    "exit": {"desc": "退出", "aliases": ["quit", "q"]},
+    "export": {"desc": "导出对话为 Markdown", "aliases": []},
+    "forget": {"desc": "删除一条记忆", "aliases": []},
+    "help": {"desc": "显示帮助", "aliases": []},
+    "init": {"desc": "创建或更新 AGENTS.md", "aliases": []},
+    "log": {"desc": "显示事件日志路径", "aliases": []},
+    "memory": {"desc": "列出项目记忆", "aliases": []},
+    "models": {"desc": "列出可用模型", "aliases": []},
+    "new": {"desc": "新会话", "aliases": ["clear"]},
+    "redo": {"desc": "重做撤销的消息", "aliases": []},
+    "remember": {"desc": "记住一条项目事实", "aliases": []},
+    "sessions": {"desc": "列出会话", "aliases": ["resume", "continue"]},
+    "share": {"desc": "分享会话", "aliases": []},
+    "sidebar": {"desc": "切换上下文侧栏", "aliases": []},
+    "task": {"desc": "查看或更新任务状态", "aliases": []},
+    "themes": {"desc": "列出主题", "aliases": []},
+    "thinking": {"desc": "切换思考块可见性", "aliases": []},
+    "undo": {"desc": "撤销最后一条消息", "aliases": []},
+    "unshare": {"desc": "取消分享", "aliases": []},
 }
 
 
@@ -34,13 +40,15 @@ class Command:
 
     name: str
     desc: str
-    keybind: str | None = None
     aliases: list[str] = field(default_factory=list)
 
     def display(self) -> str:
-        """命令面板中的展示文本。"""
-        keybind = self.keybind or "-"
-        return f"/{self.name}  [{keybind}]  {self.desc}"
+        """命令面板与补全弹窗中的展示文本。
+
+        名字那一段定宽：名字长短差一半（`/exit` 到 `/thinking`），只留两个空格的话
+        说明列会参差不齐，二十条排下来看不出哪条对哪条。
+        """
+        return f"/{self.name:<9}{self.desc}"
 
     def search_text(self) -> str:
         """参与模糊匹配的文本。"""
@@ -57,7 +65,6 @@ class CommandRegistry:
             self._commands[name] = Command(
                 name=name,
                 desc=str(meta.get("desc", "")),
-                keybind=meta.get("keybind") or None,  # type: ignore[arg-type]
                 aliases=list(meta.get("aliases") or []),  # type: ignore[arg-type]
             )
 
@@ -75,27 +82,48 @@ class CommandRegistry:
                 return command
         return None
 
-    def by_keybind(self, keybind: str) -> Command | None:
-        """按完整 keybind 字符串反查命令，例如 ctrl+x n。"""
-        for command in self._commands.values():
-            if command.keybind == keybind:
-                return command
-        return None
+    def is_exact(self, name: str) -> bool:
+        """这一段输入已经是某条命令的完整名字或完整别名。
 
-    def by_leader_key(self, second_key: str) -> Command | None:
-        """按前导键之后的第二击反查命令，例如 n。"""
-        return self.by_keybind(f"ctrl+x {second_key}")
+        补全弹窗靠这个判断"还有没有补全的必要"：名字打全之后弹窗该收起来，
+        否则回车会被弹窗截走变成"采纳候选"，命令反而执行不了。别名同样算打全——
+        `/clear` 就是 `/new`，打全了按回车就该去执行，不该被改写成 `/new` 停在那里。
+        """
+        cleaned = name.lstrip("/").strip()
+        command = self.get(cleaned)
+        if command is None:
+            return False
+        return command.name == cleaned or cleaned in command.aliases
 
-    def leader_keys(self) -> dict[str, Command]:
-        """返回第二击到命令的映射。"""
-        mapping: dict[str, Command] = {}
-        for command in self._commands.values():
-            if command.keybind and command.keybind.startswith("ctrl+x "):
-                mapping[command.keybind.split(" ", 1)[1]] = command
-        return mapping
+    def complete(self, query: str) -> list[Command]:
+        """命令补全用的候选：名字前缀 > 名字里含 > 别名或说明里含，同档内按名字排。
+
+        补全与命令面板要的不是同一种排序。面板里敲的是"大概是这么个意思"，模糊匹配
+        能把说明里带那个词的命令一起捞出来；补全里敲的是命令名的开头几个字母，
+        打 hel 却列出十几条（模糊匹配的实测结果）只会把人挡在外面。
+        """
+        cleaned = query.lstrip("/").strip().lower()
+        if not cleaned:
+            return self.all()
+        prefix: list[Command] = []
+        inside: list[Command] = []
+        loose: list[Command] = []
+        for command in self.all():
+            name = command.name.lower()
+            if name.startswith(cleaned):
+                prefix.append(command)
+            elif cleaned in name:
+                inside.append(command)
+            elif any(cleaned in alias for alias in command.aliases) or cleaned in command.desc.lower():
+                loose.append(command)
+        return prefix + inside + loose
 
     def fuzzy_match(self, query: str, limit: int = 12) -> list[Command]:
-        """对命令做模糊匹配，返回按相关度降序的结果。"""
+        """对命令做模糊匹配，返回按相关度降序的结果。
+
+        limit 默认 12 是命令面板那一屏放得下的条数；补全弹窗要列出全部命令时
+        自己传一个更大的上限进来。
+        """
         cleaned = query.lstrip("/").strip().lower()
         if not cleaned:
             return self.all()[:limit]

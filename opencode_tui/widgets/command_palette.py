@@ -73,6 +73,6 @@ class CommandPalette(ModalScreen[str | None]):
         view = self.query_one("#palette-list", ListView)
         view.clear()
         for command in self._results:
-            view.append(ListItem(Label(command.display())))
+            view.append(ListItem(Label(command.display(), markup=False)))
         if self._results:
             view.index = 0

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 STATUS_ICON = {
     ToolStatus.PENDING: "○",
+    ToolStatus.AWAITING: "◐",
     ToolStatus.RUNNING: "●",
     ToolStatus.COMPLETED: "◆",
     ToolStatus.FAILED: "✕",
@@ -23,6 +24,7 @@ STATUS_ICON = {
 
 STATUS_TEXT = {
     ToolStatus.PENDING: "等待",
+    ToolStatus.AWAITING: "询问",
     ToolStatus.RUNNING: "执行中",
     ToolStatus.COMPLETED: "完成",
     ToolStatus.FAILED: "失败",
@@ -113,8 +115,8 @@ class FoldBlock(Container):
         self._title = title
         self._expanded = False
         self._body_text = ""
-        self._header = Static(self._header_text(), classes="fold-header")
-        self._body = Static("", classes="fold-body -hidden")
+        self._header = Static(self._header_text(), classes="fold-header", markup=False)
+        self._body = Static("", classes="fold-body -hidden", markup=False)
 
     def compose(self) -> ComposeResult:
         yield self._header
@@ -160,10 +162,12 @@ class ToolCard(Container):
         margin: 0 0 1 0;
     }
     ToolCard.-running { border-left: thick #4A9EFF; }
+    ToolCard.-awaiting { border-left: thick #FFB300; }
     ToolCard.-completed { border-left: thick #2E7D32; }
     ToolCard.-failed { border-left: thick #C62828; }
     ToolCard .tool-header { color: #9AA0A6; }
     ToolCard.-running .tool-header { color: #4A9EFF; }
+    ToolCard.-awaiting .tool-header { color: #FFB300; }
     ToolCard.-completed .tool-header { color: #66BB6A; }
     ToolCard.-failed .tool-header { color: #EF5350; }
     ToolCard .tool-output { color: #6E7681; }
@@ -175,8 +179,8 @@ class ToolCard(Container):
         self.part_id = part.id
         self._part = part
         self._show_output = True
-        self._header = Static(self._header_text(), classes="tool-header")
-        self._output = Static(part.tool_output, classes="tool-output")
+        self._header = Static(self._header_text(), classes="tool-header", markup=False)
+        self._output = Static(part.tool_output, classes="tool-output", markup=False)
 
     def compose(self) -> ComposeResult:
         yield self._header
@@ -186,8 +190,23 @@ class ToolCard(Container):
         status = self._part.tool_status or ToolStatus.PENDING
         icon = STATUS_ICON.get(status, "○")
         mark = "▾" if self._show_output else "▸"
-        detail = self._detail_text()
-        return f"{mark} {icon} {self._part.tool_name or 'tool'} · {STATUS_TEXT[status]}{detail}"
+        return (
+            f"{mark} {icon} {self._part.tool_name or 'tool'} · {STATUS_TEXT[status]}"
+            f"{self._permission_text()}{self._detail_text()}"
+        )
+
+    def _permission_text(self) -> str:
+        """判定那一层留下的说明。
+
+        只有按规则放行、用户点过允许、或正在等答复时才有内容，
+        默认放行的调用这里是空的，卡片上不多出一段。
+        """
+        note = self._part.permission
+        if not note:
+            return ""
+        if len(note) > 40:
+            note = note[:37] + "..."
+        return f"  {note}"
 
     def _detail_text(self) -> str:
         if not self._part.tool_input:
@@ -222,6 +241,7 @@ class ToolCard(Container):
         self._part = part
         status = part.tool_status or ToolStatus.PENDING
         self.set_class(status is ToolStatus.RUNNING, "-running")
+        self.set_class(status is ToolStatus.AWAITING, "-awaiting")
         self.set_class(status is ToolStatus.COMPLETED, "-completed")
         self.set_class(status is ToolStatus.FAILED, "-failed")
         self._header.update(self._header_text())
@@ -252,7 +272,11 @@ class SimplePartView(Static):
     """
 
     def __init__(self, part: Part) -> None:
-        super().__init__(self.render_part_text(part), classes=f"part part-{part.type.value}")
+        super().__init__(
+            self.render_part_text(part),
+            classes=f"part part-{part.type.value}",
+            markup=False,
+        )
         self.part_id = part.id
 
     def sync(self, part: Part) -> None:
@@ -283,6 +307,10 @@ class SimplePartView(Static):
             return f"⟳ 重试 {part.text}"
         if part.type is PartType.COMPACTION:
             return f"░ 上下文已压缩 {part.text}"
+        if part.type is PartType.ERROR:
+            return f"■ {part.text}"
+        if part.type is PartType.SUMMARY:
+            return f"◆ 收尾总结\n{part.text}"
         return part.text
 
 
@@ -475,7 +503,9 @@ class MessagesPane(ScrollableContainer):
         self._mounted_end = total
         widgets: list[Widget] = []
         if self._mounted_start:
-            self._history_hint = Static(self._history_hint_text(), id="history-hint")
+            self._history_hint = Static(
+                self._history_hint_text(), id="history-hint", markup=False
+            )
             widgets.append(self._history_hint)
         widgets.extend(self._build_views(self._mounted_start, self._mounted_end))
         if widgets:
@@ -742,7 +772,7 @@ class MessagesPane(ScrollableContainer):
                 self._history_hint = None
             return
         if hint is None:
-            hint = Static(self._history_hint_text(), id="history-hint")
+            hint = Static(self._history_hint_text(), id="history-hint", markup=False)
             self._history_hint = hint
             self.mount(hint, before=0)
         else:

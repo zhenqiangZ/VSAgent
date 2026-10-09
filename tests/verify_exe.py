@@ -7,8 +7,11 @@
     python tests/verify_exe.py <exe 路径>   验证指定的可执行文件
     python tests/verify_exe.py --source     验证源码直接运行（用于与打包产物对照）
 
-最后一步会按前导键 ctrl+x e 打开外部编辑器，子进程的 EDITOR 指向
+最后一步会打 /editor 打开外部编辑器，子进程的 EDITOR 指向
 tests/fixtures/marker_editor.cmd，用它判断挂起、外部进程、恢复这条链路是否走通。
+
+中间那几步（/sidebar、/help）排在外部编辑器之前：/editor 回来之后输入框里是编辑器
+写进去的那行内容，再往下打命令会接在它后面，就不是一条命令了。
 
 子进程的 HOME 与 USERPROFILE 指到 .probe/verify-home，每轮都从空状态启动，
 这样两轮抓到的画面才是同一个会话长度。
@@ -19,7 +22,7 @@ tests/fixtures/marker_editor.cmd，用它判断挂起、外部进程、恢复这
 跑一次约 25 秒，画面写入 tests/output/。
 
 pyte 与 pywinpty 装在打包环境里（requirements-pack.txt），.venv 里没有，所以要用
-`C:/Users/Administrator/.workbuddy/binaries/python/envs/opencode_tui_pack/Scripts/python.exe`
+`C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/opencode_tui_pack/Scripts/python.exe`
 来跑这个脚本。
 """
 
@@ -74,11 +77,12 @@ STEPS = [
     (None, 5.0, "home", LOGO_MARK, False),
     ([(0.0, "从启动界面进入"), (0.6, "\r")], 8.0, "chat", REPLY_MARK, True),
     ([(0.0, "解释一下这个仓库"), (0.6, "\r")], 8.0, "reply", REPLY_MARK, True),
-    ([(0.0, "\x18"), (0.6, "e")], 6.0, "editor", EDITOR_MARK, False),
-    ([(0.0, "\x18"), (0.6, "b")], 6.0, "sidebar", SIDEBAR_MARK, False),
+    ([(0.0, "/sidebar"), (0.6, "\r")], 6.0, "sidebar", SIDEBAR_MARK, False),
     # 帮助界面按注册表渲染全部命令。拿它当 connect 登记的凭证，因为 toast 三秒就消失，
     # 等画面静止的抓帧逻辑等不到它。
-    ([(0.0, "\x18"), (0.6, "h")], 6.0, "help", HELP_MARK, False),
+    ([(0.0, "/help"), (0.6, "\r")], 6.0, "help", HELP_MARK, False),
+    # 外部编辑器放在最后：这一步回来之后输入框里是编辑器写进去的那行内容。
+    ([(0.0, "\x1b"), (0.6, "/editor"), (1.2, "\r")], 6.0, "editor", EDITOR_MARK, False),
 ]
 
 # 冻结产物与源码运行的启动速度不同，固定等待会假失败；标记出现后最多再等这么久
@@ -206,8 +210,12 @@ def main() -> int:
                     time.sleep(delay)
                 process.write(text)
         wait_for(recorder, mark, minimum, minimum + MAX_EXTRA_WAIT)
-        # 源码与冻结产物的自动滚动会稳定差一行：抓帧前按 End 让消息区统一滚到底
-        process.write("\x1b[F")
+        # 源码与冻结产物的自动滚动会稳定差一行：抓帧前按 End 让消息区统一滚到底。
+        # 但 /help 那一步焦点在对话框的滚动容器里，End 会被它吃掉、把对话框滚到底，
+        # 顶部的快捷键表与「斜杠命令」标题于是被挤出可视区。那一帧要的是对话框本身，
+        # 这个键只对消息区有意义，所以那一帧不按。
+        if name != "help":
+            process.write("\x1b[F")
         time.sleep(2.0)
         shots[name] = recorder.snapshot()
 

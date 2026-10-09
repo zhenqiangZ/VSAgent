@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import pkgutil
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,9 @@ from textual.widget import Widget  # noqa: E402
 from textual.widgets import ListView  # noqa: E402
 
 from opencode_tui.app import OpenCodeApp  # noqa: E402
+from opencode_tui.core.agent.memory import MemoryStore  # noqa: E402
+from opencode_tui.core.agent.permission import PermissionPolicy, Verdict  # noqa: E402
+from opencode_tui.core.agent.prompt import KEEP_MESSAGES  # noqa: E402
 from opencode_tui.core.command_registry import CommandRegistry  # noqa: E402
 from opencode_tui.core.event_bus import EventBus  # noqa: E402
 from opencode_tui.core.exporter import export_filename, render_session_markdown  # noqa: E402
@@ -31,11 +35,14 @@ from opencode_tui.core.external_editor import (  # noqa: E402
 )
 from opencode_tui.core.file_refs import resolve_file_refs  # noqa: E402
 from opencode_tui.core.models import EFFORTS, Message, Part, PartType, ToolStatus  # noqa: E402
+from opencode_tui.core.project_scan import BEGIN_MARK, END_MARK  # noqa: E402
 from opencode_tui.core.session_manager import SessionManager  # noqa: E402
-from opencode_tui.screens.chat import LEADER_KEYS, ChatScreen, SidePanel  # noqa: E402
+from opencode_tui.screens.chat import ChatScreen, SidePanel  # noqa: E402
 from opencode_tui.screens.help import HelpScreen  # noqa: E402
 from opencode_tui.screens.home import HomeInput, HomeScreen  # noqa: E402
+from opencode_tui.screens.message import MessageScreen  # noqa: E402
 from opencode_tui.screens.model_selector import ModelSelectorScreen  # noqa: E402
+from opencode_tui.screens.permission import PermissionDialog  # noqa: E402
 from opencode_tui.screens.session_picker import (  # noqa: E402
     ConfirmDialog,
     RenameDialog,
@@ -100,6 +107,21 @@ TOOL_OUTPUT = "hi"
 CHUNK_DELAY = 0.004
 
 CHECKS: list[str] = []
+
+
+def build_app(state_path: Path, **options: object) -> OpenCodeApp:
+    """冒烟测试用的应用：判定层不拦任何工具。
+
+    这一组断言验的是界面。默认策略会让 bash 停下来等答复，而这里排的应答脚本
+    带一个 bash 工具调用，界面上没有东西去答复它。判定那一条链由 test_agent.py 验，
+    弹窗自己那几条断言在第 4 步单独开，那一条自己传 policy。
+    """
+    return OpenCodeApp(
+        root=ROOT,
+        state_path=state_path,
+        policy=PermissionPolicy(default_ask=frozenset()),
+        **options,  # type: ignore[arg-type]
+    )
 
 
 def script_reply(server: FakeModelServer) -> None:
@@ -206,7 +228,7 @@ def shape_of(manager: SessionManager) -> list[tuple[str, str, int]]:
 def declared_bindings() -> list[tuple[type, str, str]]:
     """列出包里每条按键绑定声明的（类, 按键, 动作）。
 
-    `Binding("ctrl+x o", "leader_o", ...)` 这类绑定如果找不到对应的动作方法，
+    `Binding("ctrl+d", "quit_app", ...)` 这类绑定如果找不到对应的动作方法，
     Textual 不会报错，按下去也没有任何反应，所以要把这个对应关系静态查一遍。
     """
     found: list[tuple[type, str, str]] = []
@@ -236,6 +258,9 @@ def action_exists(cls: type, action: str) -> bool:
     return hasattr(cls, f"action_{name}") or hasattr(OpenCodeApp, f"action_{name}")
 
 
+# 只在某个弹窗开着时才生效的按键，不算快捷键表里的一行。
+CONTEXTUAL_KEYS = {"up", "down", "escape"}
+
 # 走 SimplePartView 的 Part 类型。其余四种各自有专门的组件（正文、思考折叠块、工具卡片、补丁）。
 SIMPLE_PART_TYPES = [
     PartType.FILE,
@@ -246,6 +271,7 @@ SIMPLE_PART_TYPES = [
     PartType.SUBTASK,
     PartType.RETRY,
     PartType.COMPACTION,
+    PartType.SUMMARY,
 ]
 
 # 循环层只产出 TEXT / REASONING / TOOL / STEP_START / STEP_FINISH，剩下的类型靠这里的样本过一遍渲染分支。
@@ -258,6 +284,8 @@ PART_SAMPLES: dict[PartType, Part] = {
     PartType.SUBTASK: Part(type=PartType.SUBTASK, agent_name="explore", text="找一下入口"),
     PartType.RETRY: Part(type=PartType.RETRY, text="第 2 次"),
     PartType.COMPACTION: Part(type=PartType.COMPACTION, text="省略了 3 条"),
+    PartType.ERROR: Part(type=PartType.ERROR, text="请求没有成功：服务暂时不可用"),
+    PartType.SUMMARY: Part(type=PartType.SUMMARY, text="一、这一轮停下了"),
 }
 
 
@@ -276,10 +304,137 @@ async def run() -> None:
         server.stop()
 
 
+PERMISSION_STATE_PATH = ROOT / ".probe" / "state_permission.toml"
+
+# 询问弹窗上四个按键各自的期望：工具最终状态，以及卡片上留下的输出。
+# escape 与 n 是同一个动作，两条都排进来是为了让"随手按一下不会放过去"这一条有据可查。
+PERMISSION_CASES: list[tuple[str, ToolStatus, str]] = [
+    ("y", ToolStatus.COMPLETED, TOOL_OUTPUT),
+    ("n", ToolStatus.FAILED, "用户拒绝"),
+    ("a", ToolStatus.COMPLETED, TOOL_OUTPUT),
+    ("escape", ToolStatus.FAILED, "用户拒绝"),
+]
+
+
+async def wait_for_screen(app: OpenCodeApp, pilot, kind: type, timeout: float = 8.0) -> object:
+    """等某一类屏幕成为最上面那一层，并且已经铺好内容。
+
+    `App._push_screen` 先把屏幕同步放进 `_screen_stack`，再等挂载完成
+    （`textual/app.py:3022` 是那一次放进，`await await_mount()` 在它后面）。
+    所以 `app.screen` 变成弹窗的那一刻，弹窗里的组件还没建出来，
+    这时候去 `query_one("#permission-title")` 会抛 `NoMatches`。
+    要连组件建出来一起等，只看 `isinstance` 会偶发失败。
+    """
+    waited = 0.0
+    while waited < timeout:
+        screen = app.screen
+        if isinstance(screen, kind) and screen.is_mounted and len(screen.children) > 0:
+            return screen
+        await pilot.pause(0.1)
+        waited += 0.1
+    raise AssertionError(
+        f"等待 {kind.__name__} 出现超时，当前最上面是 {type(app.screen).__name__}"
+    )
+
+
+def dialog_text(dialog: PermissionDialog) -> str:
+    """把弹窗上三行文字拼成一段，便于断言。"""
+    return " ".join(
+        str(dialog.query_one(selector).render())
+        for selector in ("#permission-title", "#permission-detail", "#permission-hint")
+    )
+
+
+def last_tool_part(app: OpenCodeApp) -> Part:
+    """当前会话里最后一张工具卡片对应的 Part。"""
+    for message in reversed(app.session_manager.current.messages):
+        for part in reversed(message.parts):
+            if part.type is PartType.TOOL:
+                return part
+    raise AssertionError("这一轮没有产生工具 Part")
+
+
+async def run_permission_round(server: FakeModelServer, key: str) -> tuple[ToolStatus, str]:
+    """按一个按键走完一轮生成，返回工具最终状态与卡片上的输出。"""
+    server.clear()
+    script_reply(server)
+    PERMISSION_STATE_PATH.unlink(missing_ok=True)
+    app = OpenCodeApp(root=ROOT, state_path=PERMISSION_STATE_PATH)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await type_text(pilot, "run it")
+        await pilot.press("enter")
+        dialog = await wait_for_screen(app, pilot, PermissionDialog)
+        assert isinstance(dialog, PermissionDialog)
+        shown = dialog_text(dialog)
+        check("bash" in shown, f"弹窗里写着要调用哪个工具：{shown}")
+        check(TOOL_MARK in shown, f"弹窗里写着这次调用的参数：{shown}")
+        check("原因" in shown, f"弹窗里写着被拦下来的原因：{shown}")
+        hint = str(dialog.query_one("#permission-hint").render())
+        # a 键放行的是**本会话的所有工具**，提示行要如实写出来。
+        # 同时点明它管不到工作目录之外，否则用户会以为 a 是一张通吃整个磁盘的许可证。
+        check(
+            "放行所有工具" in hint and "工作目录之外" in hint,
+            f"提示行写明 a 键的真实范围（所有工具，且管不到工作目录之外）：{hint}",
+        )
+        await pilot.press(key)
+        await wait_idle(app, pilot)
+        check(isinstance(app.screen, ChatScreen), f"按 {key} 之后弹窗关掉，回到聊天界面")
+        part = last_tool_part(app)
+        if key == "a":
+            tool = app.agent.registry.get("bash")
+            assert tool is not None
+            decision = app.agent.policy.check(tool, {"command": TOOL_MARK}, "Build")
+            check(
+                decision.verdict is Verdict.ALLOW and "本会话" in decision.rule,
+                f"按 a 之后同样的调用不再问：{decision.note()}",
+            )
+            # 换一条**内容完全不同**的命令也放行：这是「本会话全放行」的关键，
+            # 按命令原文记的时候这一条会失败。
+            other = app.agent.policy.check(tool, {"command": "echo 完全不同的命令"}, "Build")
+            check(
+                other.verdict is Verdict.ALLOW,
+                f"按 a 之后同工具的另一条命令也放行：{other.note()}",
+            )
+            # 别的默认要问的工具也一起放行——这就是「所有工具」的含义。
+            write = app.agent.registry.get("write")
+            assert write is not None
+            crossed = app.agent.policy.check(write, {"path": "a.txt", "content": "x"}, "Build")
+            check(
+                crossed.verdict is Verdict.ALLOW,
+                f"按 a 之后别的工具也放行：{crossed.note()}",
+            )
+            # 但工作目录之外仍然要问：放行的是工具，不是磁盘。
+            # 这一条是「范围扩大之后边界还在」的证据，不是可选项。
+            outside = app.agent.policy.check(
+                write, {"path": r"D:\Elsewhere\a.txt", "content": "x"}, "Build"
+            )
+            check(
+                outside.verdict is Verdict.ASK,
+                f"按 a 之后工作目录之外仍要问：{outside.note()}",
+            )
+        return part.tool_status, part.tool_output
+
+
+async def run_permission_checks(server: FakeModelServer) -> None:
+    """权限弹窗：四个按键各走一轮完整生成。"""
+    for key, want_status, want_output in PERMISSION_CASES:
+        status, output = await run_permission_round(server, key)
+        check(
+            status is want_status,
+            f"按 {key} 之后工具状态是 {want_status.value}：实际 {status}",
+        )
+        check(
+            output == want_output,
+            f"按 {key} 之后卡片上的输出是「{want_output}」：实际「{output}」",
+        )
+    PERMISSION_STATE_PATH.unlink(missing_ok=True)
+
+
 async def run_interface_checks(server: FakeModelServer) -> None:
     STATE_PATH.unlink(missing_ok=True)
     script_reply(server)
-    app = OpenCodeApp(root=ROOT, state_path=STATE_PATH)
+    app = build_app(STATE_PATH)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
 
@@ -370,9 +525,10 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(isinstance(app.screen, HomeScreen), "esc 关闭命令面板回到启动界面")
 
-        await pilot.press("ctrl+m")
+        await type_text(pilot, "/models")
+        await pilot.press("enter")
         await pilot.pause()
-        check(isinstance(app.screen, ModelSelectorScreen), "ctrl+m 打开模型选择器")
+        check(isinstance(app.screen, ModelSelectorScreen), "启动界面上 /models 打开模型选择器")
         check(
             len(app.screen.query_one("#model-list").children) == len(app.available_models),
             "模型选择器列出全部可选模型",
@@ -674,6 +830,10 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             )
 
             # 用户消息画成一条对话框：浅灰底 + 最左侧一条蓝线，不再写"你"这样的角色标签。
+            # 先等这一轮跑完再看尺寸：回复还在流的时候消息区的高度正在长，
+            # 纵向滚动条出现的那一帧与子视图重新排布的那一帧不是同一帧，
+            # 中间读到的宽度会差滚动条的那两列。
+            await wait_idle(app, pilot)
             user_view = pane.query(".message-user").first()
             check(
                 user_view.styles.background.hex.lower() == "#1e1e1e",
@@ -687,7 +847,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             # 滚动条占掉的那两列不算气泡该铺的范围。
             check(
                 user_view.region.width == pane.scrollable_content_region.width,
-                "用户消息横贯消息区的整行",
+                f"用户消息横贯消息区的整行：气泡 {user_view.region.width} 列，"
+                f"可滚动内容区 {pane.scrollable_content_region.width} 列，"
+                f"消息区 {pane.region.width} 列",
             )
             check(len(user_view.query(".message-header")) == 0, "用户消息不画角色标签")
             user_text = user_view.query(".part-text").first()
@@ -971,17 +1133,22 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.press("enter")
         await pilot.pause()
         check(isinstance(app.screen, HelpScreen), "/help 打开帮助界面")
+        keys_help = str(app.screen.query_one("#help-keys").content)
         check(
-            "ctrl+x b" in str(app.screen.query_one("#help-keys").content),
-            "帮助界面列出前导键的第二击",
+            "ctrl+p" in keys_help and "ctrl+c" in keys_help and "ctrl+d" in keys_help,
+            f"帮助界面列出聊天界面的快捷键：{keys_help.splitlines()[:5]}",
+        )
+        check(
+            "ctrl+x" not in keys_help,
+            f"帮助界面不再列出前导键：{keys_help.splitlines()[:5]}",
         )
         check(
             "/sidebar" in str(app.screen.query_one("#help-commands").content),
             "帮助界面列出全部斜杠命令",
         )
         home_help = str(app.screen.query_one("#help-home").content)
-        check("ctrl+n" in home_help and "ctrl+t" in home_help, "帮助界面单列启动界面的快捷键")
-        check("ctrl+q" in home_help, "启动界面的退出键也在这一列")
+        check("ctrl+p" in home_help and "tab" in home_help, "帮助界面单列启动界面的快捷键")
+        check("ctrl+d" in home_help, "启动界面的退出键也在这一列")
         check(
             app.screen.query_one("#help-keys").region.y
             < app.screen.query_one("#help-home").region.y,
@@ -1078,18 +1245,23 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             "把思考块开关恢复成原样，后面几条检查不受影响",
         )
 
-        await pilot.press("ctrl+x", "t")
+        await type_text(pilot, "/themes")
+        await pilot.press("enter")
         await pilot.pause()
-        check(isinstance(app.screen, ThemeSelectorScreen), "前导键 ctrl+x t 打开主题选择器")
+        check(isinstance(app.screen, ThemeSelectorScreen), "/themes 打开主题选择器")
         await pilot.press("escape")
         await pilot.pause()
         check(isinstance(app.screen, ChatScreen), "escape 关闭主题选择器")
-        check(editor.text == "", "前导键序列不会把按键写进编辑器")
+        check(editor.text == "", "提交命令之后输入框清空")
 
         await type_text(pilot, "@app")
         await pilot.pause()
         check(editor.file_popup.is_open, "输入 @ 触发文件补全")
         check(bool(editor.file_popup.visible_items), "文件补全给出候选")
+        # 候选按匹配程度排，头一个是谁随仓库里有什么文件而变，这里不假定某一个路径，
+        # 记下真的采纳了哪一个，后面按它断言。
+        accepted = editor.file_popup.current()
+        check(bool(accepted), f"补全弹窗上有高亮候选：{accepted}")
         await pilot.press("enter")
         await pilot.pause()
         check("@" in editor.text, "enter 采纳文件补全候选")
@@ -1104,6 +1276,10 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             if part.type is PartType.FILE
         ]
         check(bool(user_parts), "引用的文件写入 File Part")
+        check(
+            any(str(part.file_path).endswith(str(accepted)) for part in user_parts),
+            f"引用的是采纳的那一个：{accepted}，实际 {[part.file_path for part in user_parts]}",
+        )
 
         await type_text(pilot, "@app")
         await pilot.pause()
@@ -1168,71 +1344,72 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(not editor.agent_popup.is_open, "焦点回到编辑器后 escape 关掉 Agent 补全")
 
-        await pilot.press("ctrl+z")
-        await pilot.pause()
-        check("不支持挂起" in latest_toast(app), f"ctrl+z 说明这个终端不支持挂起：{latest_toast(app)}")
-
         check(editor.styles.border_top[1].hex.lower() == "#333333", "普通输入时编辑器上边框是灰色")
-        await pilot.press("ctrl+x")
-        await pilot.pause()
-        check("-leader" in editor.classes, "按下前导键后编辑器进入等待第二击的状态")
-        check(editor.styles.border_top[1].hex.lower() == "#c62828", "前导键等待期间编辑器上边框变红")
-        await pilot.press("escape")
-        await pilot.pause()
-        check("-leader" not in editor.classes, "escape 退出前导键等待状态")
-        check(editor.styles.border_top[1].hex.lower() == "#333333", "退出等待后编辑器上边框恢复灰色")
 
-        # 等待第二击有时限，超时自己收回去。
-        # 这里还守着另一个坑：到点的回调是排在消息队列里的，取消定时器取消不掉它，
-        # 事件循环被堵住（同步的活干久了、界面卡一下）时，它可能在又一次按下前导键之后才跑，
-        # 把刚设好的等待状态清掉，第二击就掉进输入框变成一个普通字符。
-        await pilot.press("ctrl+x")
+        # 斜杠命令补全：打一个 / 就把全部命令列出来，接着打字按名字筛，上下键挪高亮，
+        # 回车采纳。这份清单原先只有 ctrl+p 命令面板与帮助界面里有，输入框里看不到。
+        await type_text(pilot, "/")
         await pilot.pause()
-        token_now = chat._leader_token
-        chat._expire_leader(token_now - 1)
+        popup = editor.command_popup
+        check(popup.is_open, "输入 / 打开命令补全")
+        listed = len(popup.commands)
+        total = len(app.command_registry.all())
+        check(listed == total, f"打一个 / 列出全部命令：列了 {listed} 条，注册表 {total} 条")
+        check(
+            bool(popup.visible_items) and popup.visible_items[0].startswith("/compact"),
+            f"候选按命令名排序，头一条是 /compact：{popup.visible_items[:2]}",
+        )
+        await type_text(pilot, "hel")
+        await pilot.pause()
+        names = [command.name for command in popup.commands]
+        check(bool(names) and names[0] == "help", f"接着打字只留下匹配的命令：{names}")
+        check(len(names) < total, f"筛完之后少于全部：{len(names)} / {total}")
+        first_index = popup.index
+        await pilot.press("down")
         await pilot.pause()
         check(
-            chat._leader_pending and "-leader" in editor.classes,
-            "过期的那次超时回调不会清掉新按下的等待状态",
+            popup.index == (first_index + 1) % len(names),
+            f"down 把高亮往后挪一格：{first_index} -> {popup.index}",
         )
-        await pilot.pause(ChatScreen.LEADER_SECONDS + 0.3)
+        await pilot.press("up")
         await pilot.pause()
-        check(not chat._leader_pending, "等待超过时限后自己收回等待状态")
-        check("-leader" not in editor.classes, "超时后编辑器不再显示等待状态")
-        check(editor.text == "", "超时收回状态的过程没往输入框里写东西")
-
-        # 等待第二击期间，没登记过的按键丢在门外：它写进输入框的话，会跟着下一条消息一起发出去。
-        for stray in ("z", "5", "?"):
-            await pilot.press("ctrl+x")
-            await pilot.pause()
-            await pilot.press(stray)
-            await pilot.pause()
-            check(editor.text == "", f"未登记的第二击 {stray} 不写进输入框")
-            check(chat._leader_pending, f"丢掉未登记的 {stray} 之后仍在等待第二击")
-            await pilot.press("escape")
-            await pilot.pause()
-
-        # 丢掉的按键不能顺手把等待状态也带走：换个登记的键应当照常执行。
-        # 顺手端到端复现一次"界面卡一下"：按一次前导键之后把事件循环堵住，让那次超时回调排进队列，
-        # 再按一次前导键紧跟第二击。排进队列的是上一次的号，不该动这一次的等待状态。
-        await pilot.press("ctrl+x", "o")
+        check(popup.index == first_index, "up 把高亮挪回原来那一格")
+        await pilot.press("enter")
         await pilot.pause()
-        time.sleep(ChatScreen.LEADER_SECONDS + 0.2)
+        check(editor.text == "/help", f"回车采纳高亮的命令名：{editor.text!r}")
+        check(not popup.is_open, "命令名打全之后补全收起（不然回车永远只采纳候选）")
+        await pilot.press("enter")
+        await pilot.pause()
+        check(isinstance(app.screen, HelpScreen), "再按一次回车执行补出来的命令")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, ChatScreen), "escape 关闭帮助界面")
+
+        await type_text(pilot, "/")
+        await pilot.pause()
+        check(popup.is_open, "再次输入 / 重新打开命令补全")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(not popup.is_open, "escape 关闭命令补全")
+        editor.text = ""
+        await pilot.pause()
+
+        # /details：切换工具详情。原先是前导键第二击，现在只有斜杠命令这一条路。
         details_before = app.session_manager.show_details
-        await pilot.press("ctrl+x", "d")
+        await type_text(pilot, "/details")
+        await pilot.press("enter")
         await pilot.pause()
-        check(app.session_manager.show_details is not details_before, "leader d 切换工具详情")
+        check(app.session_manager.show_details is not details_before, "/details 切换工具详情")
         card_output = pane.query(ToolCard)[0].query_one(".tool-output")
         expected = "block" if app.session_manager.show_details else "none"
         check(
             str(card_output.styles.display) == expected,
             f"工具详情开关作用到画面上：开关 {app.session_manager.show_details}，输出 display={card_output.styles.display}",
         )
-        await pilot.press("ctrl+x", "d")
+        await type_text(pilot, "/details")
+        await pilot.press("enter")
         await pilot.pause()
-        check(str(card_output.styles.display) == "block", "再按一次工具输出回到画面")
-        check(editor.text == "", "事件循环被堵住之后第二击不会掉进输入框")
-        check("-leader" not in editor.classes, "第二击执行后清除等待状态")
+        check(str(card_output.styles.display) == "block", "再执行一次工具输出回到画面")
 
         panel = chat.query_one(SidePanel)
         pane_width = pane.region.width
@@ -1273,12 +1450,13 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         )
         check("◆ bash" in str(chat.query_one("#side-tools").content), "侧栏列出调用过的工具与状态")
         check(
-            "opencode_tui/app.py" in str(chat.query_one("#side-files").content),
-            "侧栏列出引用过的文件",
+            str(accepted) in str(chat.query_one("#side-files").content),
+            f"侧栏列出引用过的文件：{accepted}",
         )
-        await pilot.press("ctrl+x", "b")
+        await type_text(pilot, "/sidebar")
+        await pilot.press("enter")
         await pilot.pause()
-        check(not panel.has_class("-visible"), "leader b 关闭上下文侧栏")
+        check(not panel.has_class("-visible"), "/sidebar 关闭上下文侧栏")
         check(pane.region.width == pane_width, "关闭侧栏后消息区恢复原宽")
         check(
             "上下文侧栏：隐藏" in latest_toast(app),
@@ -1287,25 +1465,209 @@ async def run_interface_checks(server: FakeModelServer) -> None:
 
         app.execute_command("compact")
         await pilot.pause()
-        check(bool(app.screen.query(".toast")), "未接入的命令给出提示")
+        check(bool(app.screen.query(".toast")), "压缩命令给出提示")
+        check("尚未接入" not in latest_toast(app), f"压缩已经接上：{latest_toast(app)}")
 
-        second_keys = {
-            name[len("action_leader_") :]
-            for name in dir(ChatScreen)
-            if name.startswith("action_leader_")
-        }
-        second_keys = {key for key in second_keys if len(key) == 1}
+        # 快捷键那一层不再挂着命令：包里不该再有按键去触发某一条命令，
+        # 命令全靠 /名字 与 ctrl+p 面板这两条路。
         check(
-            second_keys <= set(LEADER_KEYS),
-            f"每个 leader 第二击都有登记的命令：{sorted(second_keys - set(LEADER_KEYS))}",
+            not [name for name in dir(ChatScreen) if name.startswith("action_leader_")],
+            f"聊天界面上不再有前导键动作：{[name for name in dir(ChatScreen) if name.startswith('action_leader_')]}",
         )
-        check(app.command_registry.by_leader_key("o") is not None, "ctrl+x o 反查到已登记的命令")
-        await pilot.press("ctrl+x", "o")
+        chat_keys = {entry.key for entry in ChatScreen.BINDINGS}
+        check(
+            chat_keys == {"ctrl+p", "ctrl+c", "ctrl+d", "tab"},
+            f"聊天界面只留四个快捷键：{sorted(chat_keys)}",
+        )
+
+        await type_text(pilot, "/connect")
+        await pilot.press("enter")
+        await pilot.pause()
+        check(isinstance(app.screen, MessageScreen), "/connect 打开提供商信息弹窗")
+        shown = " ".join(
+            str(getattr(node, "renderable", node.render()))
+            for node in app.screen.query(".message-line")
+        )
+        check(app.agent.config.base_url in shown, f"弹窗里写着当前接口地址：{shown[:80]}")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, ChatScreen), "关掉提供商信息弹窗后回到聊天界面")
+
+        log_path = app.trace.current_path()
+        app.execute_command("log")
+        await pilot.pause()
+        check(isinstance(app.screen, MessageScreen), "/log 打开事件日志弹窗")
+        shown_log = " ".join(
+            str(getattr(node, "renderable", node.render()))
+            for node in app.screen.query(".message-line")
+        )
+        check(str(log_path) in shown_log, f"弹窗里写着日志文件路径：{shown_log[:90]}")
+        check(log_path.is_file(), "日志文件已经存在")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, ChatScreen), "关掉事件日志弹窗后回到聊天界面")
+
+        # 记忆命令：/remember 写、/forget 删、/memory 列。
+        # 三条都往项目根下的 .vsmemory 写，这里把记忆目录换到 .probe 下，
+        # 免得跑一次测试就把仓库根写脏；跑完删掉。
+        mem_fixture = ROOT / ".probe" / "smoke_memory"
+        shutil.rmtree(mem_fixture, ignore_errors=True)
+        mem_fixture.mkdir(parents=True, exist_ok=True)
+        app._memory = MemoryStore(mem_fixture)
+
+        app.execute_command("memory")
         await pilot.pause()
         check(
-            any("connect" in str(toast.content) for toast in app.screen.query(".toast-body")),
-            "leader o 命中的命令给出可见提示",
+            "还是空的" in latest_toast(app),
+            f"没有记忆时 /memory 给一句提示：{latest_toast(app)}",
         )
+
+        app.execute_command("remember 受体结构在 receptor.pdb")
+        await pilot.pause()
+        check("已记住" in latest_toast(app), f"/remember 写入一条：{latest_toast(app)}")
+        check(app._memory.entries_path.is_file(), "/remember 之后条目文件已写出")
+        check(
+            app._memory.memory_path.is_file()
+            and "受体结构在 receptor.pdb" in app._memory.memory_path.read_text(encoding="utf-8"),
+            "给人看的 memory.md 也写出来，正文在里面",
+        )
+
+        app.execute_command("remember")
+        await pilot.pause()
+        check(
+            "用法" in latest_toast(app),
+            f"/remember 不带参数给用法提示：{latest_toast(app)}",
+        )
+
+        app.execute_command("memory")
+        await pilot.pause()
+        check(isinstance(app.screen, MessageScreen), "/memory 打开记忆弹窗")
+        listed = " ".join(
+            str(getattr(node, "renderable", node.render()))
+            for node in app.screen.query(".message-line")
+        )
+        check("受体结构在 receptor.pdb" in listed, f"弹窗里列出这条记忆：{listed[:90]}")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, ChatScreen), "关掉记忆弹窗后回到聊天界面")
+
+        # 关键词只命中一条时直接删掉。
+        app.execute_command("remember 配体库在 ligands.sdf")
+        await pilot.pause()
+        app.execute_command("forget 配体")
+        await pilot.pause()
+        check("已删除" in latest_toast(app), f"/forget 用关键词删一条：{latest_toast(app)}")
+
+        app.execute_command("forget 查无此物")
+        await pilot.pause()
+        check(
+            "没有匹配" in latest_toast(app),
+            f"/forget 没命中时给提示：{latest_toast(app)}",
+        )
+
+        app.execute_command("forget")
+        await pilot.pause()
+        check("用法" in latest_toast(app), f"/forget 不带参数给用法提示：{latest_toast(app)}")
+
+        # 清到零，后面数「多条命中」才数得准。
+        for entry_id in list(app._memory.entries):
+            app.execute_command(f"forget {entry_id}")
+            await pilot.pause()
+        app.execute_command("memory")
+        await pilot.pause()
+        check("还是空的" in latest_toast(app), f"删完 /memory 又空了：{latest_toast(app)}")
+
+        # 关键词命中多条时不猜，列出来让人用编号指定，不擅自删。
+        app.execute_command("remember 甲受体在 a.pdb")
+        await pilot.pause()
+        app.execute_command("remember 乙受体在 b.pdb")
+        await pilot.pause()
+        before = len(app._memory.entries)
+        check(before == 2, f"这时有两条记忆：{before}")
+        app.execute_command("forget 受体")
+        await pilot.pause()
+        check(
+            isinstance(app.screen, MessageScreen),
+            "关键词命中多条时列出候选，而不是随便删一条",
+        )
+        check(len(app._memory.entries) == before, "列出候选时一条都没删")
+        await pilot.press("escape")
+        await pilot.pause()
+
+        # 用编号删：编号就是 /memory 里那一行开头的那个。
+        numbered = list(app._memory.entries)
+        app.execute_command(f"forget {numbered[0]}")
+        await pilot.pause()
+        check("已删除" in latest_toast(app), f"/forget 用编号删：{latest_toast(app)}")
+        check(
+            numbered[0] not in app._memory.entries and len(app._memory.entries) == 1,
+            "编号删除只删掉指定的那一条",
+        )
+
+        shutil.rmtree(mem_fixture, ignore_errors=True)
+
+        # 任务状态命令：/task 看、/task <字段> <内容> 加、/task clear 清。
+        # 写的是当前会话的 task_state，随状态文件写盘，所以这里只看内存与提示。
+        state = app.session_manager.current.task_state
+        app.execute_command("task")
+        await pilot.pause()
+        check(
+            "还没有任务状态" in latest_toast(app),
+            f"没有任务状态时 /task 给一句提示：{latest_toast(app)}",
+        )
+
+        app.execute_command("task goal 对 EGFR 做一轮虚拟筛选")
+        await pilot.pause()
+        check("已更新" in latest_toast(app), f"/task 设目标：{latest_toast(app)}")
+        check(state.goal == "对 EGFR 做一轮虚拟筛选", "目标写进了当前会话的任务状态")
+
+        app.execute_command("task constraint 受体必须用 4.2 的晶体结构")
+        await pilot.pause()
+        app.execute_command("task constraint 打分用 Vina，不要用 Vinardo")
+        await pilot.pause()
+        check(len(state.constraints) == 2, f"约束逐条追加：{state.constraints}")
+        app.execute_command("task constraint 打分用 Vina，不要用 Vinardo")
+        await pilot.pause()
+        check(
+            len(state.constraints) == 2 and "没有变化" in latest_toast(app),
+            f"同一条约束不重复加：{state.constraints} / {latest_toast(app)}",
+        )
+
+        app.execute_command("task todo 生成配体库并粗筛")
+        await pilot.pause()
+        check(state.todo == ["生成配体库并粗筛"], "待办也加得进去")
+
+        # 查看：非空时开弹窗，内容在里面。
+        app.execute_command("task")
+        await pilot.pause()
+        check(isinstance(app.screen, MessageScreen), "/task 非空时打开任务状态弹窗")
+        shown = " ".join(
+            str(getattr(node, "renderable", node.render()))
+            for node in app.screen.query(".message-line")
+        )
+        check("对 EGFR 做一轮虚拟筛选" in shown, f"弹窗里列出目标：{shown[:90]}")
+        check("受体必须用 4.2 的晶体结构" in shown, "弹窗里列出约束")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, ChatScreen), "关掉任务状态弹窗后回到聊天界面")
+
+        # 字段名写错与内容为空都不改东西，只给提示。
+        snapshot = state.to_dict()
+        app.execute_command("task goalx 随便写点")
+        await pilot.pause()
+        check("可用字段" in latest_toast(app), f"/task 字段名写错时列出可用字段：{latest_toast(app)}")
+        app.execute_command("task goal")
+        await pilot.pause()
+        check("内容不能为空" in latest_toast(app), f"/task 内容为空时给提示：{latest_toast(app)}")
+        check(state.to_dict() == snapshot, "这两种情况都没有改到任务状态")
+
+        app.execute_command("task clear")
+        await pilot.pause()
+        check("已清空" in latest_toast(app), f"/task clear 清空：{latest_toast(app)}")
+        check(state.is_empty(), "清空之后任务状态是空的")
+        app.execute_command("task clear")
+        await pilot.pause()
+        check("本来就是空的" in latest_toast(app), f"再清一次给另一句提示：{latest_toast(app)}")
 
         unresolved = [
             f"{cls.__name__}.{key} -> action_{action}"
@@ -1321,8 +1683,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             (HomeScreen, app.keybind_manager.home_bindings, "启动界面"),
         ]:
             real = {(entry[0] if isinstance(entry, tuple) else entry.key) for entry in cls.BINDINGS}
-            real.discard(app.keybind_manager.LEADER_KEY)
-            real -= set(app.keybind_manager.leader_bindings)
+            # 上下键与 esc 只在命令补全弹窗开着时才归弹窗，不进帮助界面那张快捷键表。
+            real -= CONTEXTUAL_KEYS
             check(
                 real == set(table),
                 f"帮助界面为{label}列出的按键与真实绑定一致，差异：{sorted(set(table) ^ real)}",
@@ -1334,6 +1696,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             PartType.REASONING,
             PartType.TOOL,
             PartType.PATCH,
+            PartType.ERROR,
+            PartType.SUMMARY,
         }
         unrouted = sorted(item.value for item in set(PartType) - routed)
         check(not unrouted, f"每种 Part 都归入了渲染路径，未归入的：{unrouted}")
@@ -1385,12 +1749,13 @@ async def run_interface_checks(server: FakeModelServer) -> None:
 
         before = len(app.session_manager.current.messages)
         check(before > 0, f"要撤销就得先有消息：{before} 条")
-        await pilot.press("ctrl+x", "u")
+        await type_text(pilot, "/undo")
+        await pilot.press("enter")
         await pilot.pause()
         undone = len(app.session_manager.current.messages)
         check(
             undone == before - 1,
-            f"leader u 撤销最后一条消息：撤销前 {before} 条，撤销后 {undone} 条，"
+            f"/undo 撤销最后一条消息：撤销前 {before} 条，撤销后 {undone} 条，"
             f"最近的提示是{latest_toast(app)}",
         )
         # 撤销只改内存里的消息表，要当场写盘，否则退出前磁盘那一份还是旧的。
@@ -1400,12 +1765,13 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"撤销立刻写进状态文件：磁盘 {shape_of(state_on_disk())}，"
             f"内存 {shape_of(app.session_manager)}",
         )
-        await pilot.press("ctrl+x", "r")
+        await type_text(pilot, "/redo")
+        await pilot.press("enter")
         await pilot.pause()
         redone = len(app.session_manager.current.messages)
         check(
             redone == before,
-            f"leader r 恢复被撤销的消息：恢复前 {undone} 条，恢复后 {redone} 条，"
+            f"/redo 恢复被撤销的消息：恢复前 {undone} 条，恢复后 {redone} 条，"
             f"最近的提示是{latest_toast(app)}",
         )
         check(
@@ -1645,16 +2011,12 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(registry.get("/help") is not None and registry.get("/help").name == "help", "get 去掉前导斜杠")
         check(registry.get("quit") is not None and registry.get("quit").name == "exit", "get 认别名")
         check(registry.get("no-such-command") is None, "get 查不到时返回 None")
-        check(
-            registry.by_keybind("ctrl+x n") is not None and registry.by_keybind("ctrl+x n").name == "new",
-            "by_keybind 按完整按键反查到命令",
-        )
-        check(registry.by_keybind("ctrl+alt+nope") is None, "by_keybind 查不到时返回 None")
-        check(
-            registry.by_leader_key("x") is not None and registry.by_leader_key("x").name == "export",
-            "by_leader_key 用第二击反查到命令",
-        )
+        check(registry.get("clear") is not None and registry.get("clear").name == "new", "get 认另一个别名")
         every_command = registry.all()
+        check(
+            all(command.display().startswith(f"/{command.name}") for command in every_command),
+            "每条命令的展示文本以 /名字 开头（补全弹窗靠它回名字）",
+        )
         check(
             len(registry.fuzzy_match("")) == min(12, len(every_command)),
             f"空查询按上限列出全部命令：{len(registry.fuzzy_match(''))}",
@@ -1709,6 +2071,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             PartType.SUBTASK: "子任务 `explore` 找一下入口",
             PartType.RETRY: "重试 第 2 次",
             PartType.COMPACTION: "上下文已压缩 省略了 3 条",
+            PartType.ERROR: "请求没有成功：服务暂时不可用",
+            PartType.SUMMARY: "## 收尾总结",
         }
         for part_type, marker in exported_markers.items():
             check(marker in exported_text, f"{part_type.value} 这一类 Part 也导出了内容：{marker!r}")
@@ -1819,37 +2183,78 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         editor.text = ""
         await pilot.pause()
 
-        # 另外九个前导键第二击在别处都没按过。m/l/h 打开各自的界面，x 写出导出文件，
-        # c/i/s 是还没接入的命令。e 走外部编辑器，测试环境不支持挂起，不在这一轮里按。
-        for key, screen_type, label in [
-            ("m", ModelSelectorScreen, "模型选择器"),
-            ("l", SessionPickerScreen, "会话选择器"),
-            ("h", HelpScreen, "帮助界面"),
+        # 另外几条命令在别处都没走过。models/sessions 打开各自的界面，export 写出导出文件，
+        # compact 与 init 会真改东西，share 是还没接入的命令。
+        # editor 走外部编辑器，测试环境不支持挂起，不在这一轮里按。
+        for name, screen_type, label in [
+            ("models", ModelSelectorScreen, "模型选择器"),
+            ("sessions", SessionPickerScreen, "会话选择器"),
+            ("help", HelpScreen, "帮助界面"),
         ]:
-            await pilot.press("ctrl+x", key)
+            await type_text(pilot, f"/{name}")
+            await pilot.press("enter")
             await pilot.pause()
-            check(isinstance(app.screen, screen_type), f"leader {key} 打开{label}")
+            check(isinstance(app.screen, screen_type), f"/{name} 打开{label}")
             await pilot.press("escape")
             await pilot.pause()
             check(isinstance(app.screen, ChatScreen), f"关闭{label}后回到聊天界面")
 
         export_target = ROOT / f"opencode-export-{app.session_manager.current_session_id}.md"
         export_target.unlink(missing_ok=True)
-        await pilot.press("ctrl+x", "x")
+        await type_text(pilot, "/export")
+        await pilot.press("enter")
         await pilot.pause()
-        check(export_target.exists(), "leader x 导出 Markdown 文件")
+        check(export_target.exists(), "/export 导出 Markdown 文件")
         export_target.unlink()
 
-        for key in ("c", "i", "s", "o"):
-            await pilot.press("ctrl+x", key)
+        # /compact：消息够多时压掉前面一段，位置记在会话上。
+        session = app.session_manager.current
+        while len(session.messages) <= KEEP_MESSAGES:
+            filler = session.add_message(Message(role="user", session_id=session.id))
+            filler.add_part(Part(type=PartType.TEXT, text=f"凑第 {len(session.messages)} 条"))
+        await type_text(pilot, "/compact")
+        await pilot.press("enter")
+        await pilot.pause()
+        check(session.compact_upto > 0, f"/compact 把压缩位置往前推：{session.compact_upto}")
+        kept_now = len(session.messages) - session.compact_upto
+        check(kept_now == KEEP_MESSAGES, f"压完之后留下的条数：{kept_now}")
+
+        # /init：往项目根写一份 AGENTS.md，已有内容一个字都不动。
+        # 项目里本来就有一份，先备份再恢复，测试跑完那一个字节也不能变。
+        agents_target = ROOT / "AGENTS.md"
+        agents_backup = agents_target.read_bytes() if agents_target.is_file() else None
+        try:
+            if agents_target.is_file():
+                agents_target.unlink()
+            await type_text(pilot, "/init")
+            await pilot.press("enter")
+            await pilot.pause()
+            check(agents_target.is_file(), "/init 在项目根写出 AGENTS.md")
+            written = agents_target.read_text(encoding="utf-8")
+            check(BEGIN_MARK in written and END_MARK in written, "写出来的文件里带着那两个标记")
+            check("Python" in written, "写出来的文件里认出了项目用的语言")
+            await type_text(pilot, "/init")
+            await pilot.press("enter")
+            await pilot.pause()
+            again = agents_target.read_text(encoding="utf-8")
+            check(again.count(BEGIN_MARK) == 1, "再按一次不会把这一段写两遍")
+        finally:
+            if agents_backup is None:
+                agents_target.unlink(missing_ok=True)
+            else:
+                agents_target.write_bytes(agents_backup)
+
+        for name in ("share",):
+            await type_text(pilot, f"/{name}")
+            await pilot.press("enter")
             await pilot.pause()
             check(
                 "尚未接入" in latest_toast(app),
-                f"leader {key} 是未接入的命令，给出提示：{latest_toast(app)}",
+                f"/{name} 是未接入的命令，给出提示：{latest_toast(app)}",
             )
-            check(isinstance(app.screen, ChatScreen), f"leader {key} 之后仍停在聊天界面")
+            check(isinstance(app.screen, ChatScreen), f"/{name} 之后仍停在聊天界面")
 
-        # unshare 没有键位，只能走斜杠命令。它与上面几条走同一个分支，
+        # unshare 也只能走斜杠命令。它与上面几条走同一个分支，
         # 但没有任何用例走过它（`.probe/check_command_coverage.py` 点名列出来的）。
         app.execute_command("unshare")
         await pilot.pause()
@@ -1933,14 +2338,15 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"删掉的是 {doomed}",
         )
 
-        # 聊天界面用前导键新建会话；启动界面那次 ctrl+n 在文件末尾单独开的会话里验。
+        # 聊天界面用 /new 新建会话；启动界面那一次在文件末尾单独开的会话里验。
         # 这一步放在最后：新建会话会清空消息区，前面几条按历史长度断言的检查会受影响。
         session_before_new = app.session_manager.current_session_id
-        await pilot.press("ctrl+x", "n")
+        await type_text(pilot, "/new")
+        await pilot.press("enter")
         await pilot.pause()
         check(
             app.session_manager.current_session_id != session_before_new,
-            "leader n 在聊天界面新建会话",
+            "/new 在聊天界面新建会话",
         )
         check(isinstance(app.screen, ChatScreen), "新建会话后仍停在聊天界面")
         check(len(app.session_manager.current.messages) == 0, "新会话没有历史消息")
@@ -1951,13 +2357,15 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         )
 
         # 空会话上三条命令的提示分支。空手撤销与重做要先被拦住，导出要有东西可导。
-        await pilot.press("ctrl+x", "u")
+        await type_text(pilot, "/undo")
+        await pilot.press("enter")
         await pilot.pause()
         check(
             "没有可撤销的消息" in latest_toast(app),
             f"空会话上撤销被拦住：{latest_toast(app)}",
         )
-        await pilot.press("ctrl+x", "r")
+        await type_text(pilot, "/redo")
+        await pilot.press("enter")
         await pilot.pause()
         check(
             "没有可重做的消息" in latest_toast(app),
@@ -1974,24 +2382,45 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(app.return_code == 0, "ctrl+d 退出应用")
 
-    # 启动界面还有六个按键（ctrl+n/l/m/t/h/q）写成不带优先级的元组形式，靠聚焦输入框之外
-    # 的那一层接住。焦点就在输入框里，被输入框抢走就会静默失效，所以单独开一个会话逐个按。
-    # 其中 ctrl+n 会新建会话并进入聊天界面，清空消息区，没法塞进上面那条主线。
+    # 启动界面上那几条命令原先各有各的按键（ctrl+n/l/m/t/h/q），现在统一走 /命令。
+    # 单独开一个会话逐个走一遍：焦点在输入框里，按键都被输入框先接住。
     STATE_PATH.unlink(missing_ok=True)
-    second = OpenCodeApp(root=ROOT, state_path=STATE_PATH)
+    second = build_app(STATE_PATH)
     async with second.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         check(isinstance(second.screen, HomeScreen), "新会话从启动界面开始")
-        for key, screen_type, opened, closed in [
-            ("ctrl+h", HelpScreen, "ctrl+h 打开帮助界面", "帮助界面"),
-            ("ctrl+t", ThemeSelectorScreen, "ctrl+t 打开主题选择器", "主题选择器"),
-            ("ctrl+l", SessionPickerScreen, "ctrl+l 打开会话选择器", "会话选择器"),
-            ("ctrl+m", ModelSelectorScreen, "ctrl+m 打开模型选择器", "模型选择器"),
+
+        # 启动界面上也打 / 列出全部命令，并且能上下选、回车执行。
+        await type_text(pilot, "/")
+        await pilot.pause()
+        home_popup = second.screen.command_popup
+        check(home_popup.is_open, "启动界面上输入 / 打开命令补全")
+        check(
+            len(home_popup.commands) == len(second.command_registry.all()),
+            f"启动界面上列出全部命令：{len(home_popup.commands)} 条",
+        )
+        await type_text(pilot, "the")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        check(second.screen.input.text == "/themes", f"回车采纳命令名：{second.screen.input.text!r}")
+        await pilot.press("enter")
+        await pilot.pause()
+        check(isinstance(second.screen, ThemeSelectorScreen), "启动界面上 /themes 打开主题选择器")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(second.screen, HomeScreen), "关闭主题选择器后回到启动界面")
+
+        for name, screen_type, opened, closed in [
+            ("help", HelpScreen, "/help 打开帮助界面", "帮助界面"),
+            ("sessions", SessionPickerScreen, "/sessions 打开会话选择器", "会话选择器"),
+            ("models", ModelSelectorScreen, "/models 打开模型选择器", "模型选择器"),
         ]:
-            await pilot.press(key)
+            await type_text(pilot, f"/{name}")
+            await pilot.press("enter")
             await pilot.pause()
             check(isinstance(second.screen, screen_type), opened)
-            if key == "ctrl+h":
+            if name == "help":
                 check(
                     second.screen.query_one("#help-home").region.y
                     < second.screen.query_one("#help-keys").region.y,
@@ -2063,23 +2492,24 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(isinstance(second.screen, HomeScreen), "关掉帮助界面回到启动界面")
 
         session_before = second.session_manager.current_session_id
-        await pilot.press("ctrl+n")
+        await type_text(pilot, "/new")
+        await pilot.press("enter")
         await pilot.pause()
-        check(isinstance(second.screen, ChatScreen), "启动界面按 ctrl+n 进入聊天界面")
+        check(isinstance(second.screen, ChatScreen), "启动界面上 /new 进入聊天界面")
         check(
             second.session_manager.current_session_id != session_before,
-            "ctrl+n 在启动界面新建了会话",
+            "/new 在启动界面新建了会话",
         )
 
-    # 启动界面的 ctrl+q 退出单独跑：按下去应用就结束了，同一会话里后面几步没法再走。
+    # 启动界面的 ctrl+d 退出单独跑：按下去应用就结束了，同一会话里后面几步没法再走。
     STATE_PATH.unlink(missing_ok=True)
-    fourth = OpenCodeApp(root=ROOT, state_path=STATE_PATH)
+    fourth = build_app(STATE_PATH)
     async with fourth.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         check(isinstance(fourth.screen, HomeScreen), "又一次从启动界面开始")
-        await pilot.press("ctrl+q")
+        await pilot.press("ctrl+d")
         await pilot.pause()
-        check(fourth.return_code == 0, "启动界面 ctrl+q 退出应用")
+        check(fourth.return_code == 0, "启动界面 ctrl+d 退出应用")
         STATE_PATH.unlink(missing_ok=True)
 
     # 界面开始收拾自己的时候要立刻断掉后端事件。Textual 卸载一棵子树时先把消息区摘掉、
@@ -2088,7 +2518,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
     # 中途退出，四十轮里两次）。消息区自己卸载时通知界面断订阅，这件事就断在它离开的那一刻。
     STATE_PATH.unlink(missing_ok=True)
     script_reply(server)
-    fifth = OpenCodeApp(root=ROOT, state_path=STATE_PATH)
+    fifth = build_app(STATE_PATH)
     async with fifth.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         await pilot.press(*list("退出时的事件"))
@@ -2100,6 +2530,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause(0.3)
         bus = fifth.event_bus
         payload = {"message_id": "msg_不存在", "part_id": "prt_不存在"}
+        # 事件日志订的是通配事件，每一发都会打到它一次。这里量的是消息区那一份订阅，
+        # 先把日志停掉，读到的数字才只反映消息区。
+        fifth.trace.stop()
         before = bus.publish("part.update", payload)
         check(before == 1, f"消息区还在的时候，界面接得住后端事件：{before} 个处理函数")
         await fifth.screen.query_one(MessagesPane).remove()
@@ -2110,7 +2543,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
     # 上次选的主题与 Agent 记在状态文件里，启动时要读回来。
     restore_path = ROOT / ".probe" / "state_restore.toml"
     restore_path.unlink(missing_ok=True)
-    restored = OpenCodeApp(root=ROOT, state_path=restore_path)
+    restored = build_app(restore_path)
     last_theme = sorted(restored.available_themes)[-1]
     last_agent = AGENTS[-1]
     prepared = SessionManager(state_path=restore_path)
@@ -2164,7 +2597,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             ]
         )
     )
-    third = OpenCodeApp(root=ROOT, state_path=STATE_PATH)
+    third = build_app(STATE_PATH)
     async with third.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         await pilot.press(*list("第一轮"))
@@ -2242,10 +2675,11 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"内存 {shape_of(third.session_manager)}",
         )
 
-        # 聊天界面的 ctrl+x q 退出：与 ctrl+d 走的是同一条命令，都要真的结束应用。
-        await pilot.press("ctrl+x", "q")
+        # 聊天界面的 /exit 退出：与 ctrl+d 走的是同一条命令，都要真的结束应用。
+        await type_text(pilot, "/exit")
+        await pilot.press("enter")
         await pilot.pause()
-        check(third.return_code == 0, "聊天界面 leader q 退出应用")
+        check(third.return_code == 0, "聊天界面 /exit 退出应用")
 
     # 一段几百条消息的会话不能在打开时把几千个组件一次建出来：建完还要等布局算完，
     # 这几秒里界面是停住的。打开时只建最后一批，更早的等滚到顶端再补，补的时候
@@ -2253,10 +2687,11 @@ async def run_interface_checks(server: FakeModelServer) -> None:
     # 那一端会被裁掉（数据仍在内存），挂载条数有上界，滚动成本于是不随历史长度增长。
     STATE_PATH.unlink(missing_ok=True)
     script_reply(server)
-    paging = OpenCodeApp(root=ROOT, state_path=STATE_PATH)
+    paging = build_app(STATE_PATH)
     async with paging.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        await pilot.press("ctrl+n")
+        await type_text(pilot, "/new")
+        await pilot.press("enter")
         for _ in range(80):
             if isinstance(paging.screen, ChatScreen):
                 break
@@ -2361,6 +2796,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         )
 
         STATE_PATH.unlink(missing_ok=True)
+
+    # 判定层要问一次，所以这几轮各自开一个应用，界面上按不同的键答复。
+    await run_permission_checks(server)
 
     # 循环层与 provider 的断言放在最后：它们会造出不少 Message 与 Part，
     # 把 ID 序号推上去，前面那些按编号断言的检查会跟着变。

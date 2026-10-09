@@ -45,7 +45,9 @@ class ModelSelectorScreen(ModalScreen[str | None]):
         view = self.query_one("#model-list", ListView)
         for model in self.models:
             context = f"{model.context_window // 1000}k"
-            view.append(ListItem(Label(f"{model.name}   {model.provider}   {context}")))
+            view.append(
+                ListItem(Label(f"{model.name}   {model.provider}   {context}", markup=False))
+            )
         if self.models:
             view.index = 0
         view.focus()

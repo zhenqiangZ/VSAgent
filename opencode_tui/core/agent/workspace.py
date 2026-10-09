@@ -7,15 +7,16 @@ from ..models import Session
 
 
 def workspace_root() -> Path:
-    """会话工作目录的根。"""
+    """会话工作目录的默认根。只在没有指定根时用到。"""
     return Path.home() / ".opencode_tui" / "workspaces"
 
 
 class Workspace:
     """一个会话的工作目录，以及它可以向模型描述的当前状态。
 
-    受体文件、预处理产物、每一批的结果表都放在这个目录里，模型通过工具读写它们。
-    这一轮只给出目录与会话的几项基本信息，受体与批次由后续工具层往描述里加。
+    `app.py` 装配时把项目目录交给循环层，因此 `root` 就是项目目录：模型在系统提示里
+    读到的路径与 `BashTool` 执行命令的位置是同一个。没有指定根时退回用户目录下按会话
+    编号分开的一块地方，测试与单独调用走这一条。
     """
 
     def __init__(self, session_id: str, root: Path | None = None) -> None:

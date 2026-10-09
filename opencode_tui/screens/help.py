@@ -38,9 +38,9 @@ class HelpScreen(ModalScreen[None]):
             )
             for title, rows, element_id in (first, second):
                 yield Static(title, classes="help-section")
-                yield Static(self._rows_text(rows), id=element_id)
+                yield Static(self._rows_text(rows), id=element_id, markup=False)
             yield Static("斜杠命令", classes="help-section")
-            yield Static(self._commands_text(), id="help-commands")
+            yield Static(self._commands_text(), id="help-commands", markup=False)
             yield Static("esc 关闭", id="help-hint")
 
     @staticmethod
@@ -52,10 +52,10 @@ class HelpScreen(ModalScreen[None]):
         return "\n".join(lines)
 
     def _commands_text(self) -> str:
-        rows = ["命令              快捷键          说明"]
+        # 与补全弹窗、命令面板同一份 `display()`，三处不必各写一种排法。
+        rows = ["命令      说明（输入框打 / 会列出这一份）"]
         for command in self.registry.all():
-            keybind = command.keybind or "-"
-            rows.append(f"/{command.name:<16}{keybind:<16}{command.desc}")
+            rows.append(command.display())
         return "\n".join(rows)
 
     def action_dismiss(self) -> None:

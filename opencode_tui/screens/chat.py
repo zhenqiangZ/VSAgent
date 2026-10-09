@@ -8,24 +8,22 @@ from textual.containers import Horizontal, Vertical
 from textual.reactive import Reactive
 from textual.screen import Screen
 from textual.selection import SelectState
-from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Static
 from textual.worker import Worker
 
-from ..core.command_registry import CommandRegistry
+from ..core.agent.permission import Verdict, argument_value
 from ..core.file_refs import resolve_file_refs
 from ..core.models import Message, Part, PartType, Session, ToolStatus
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import EditorPane
 from ..widgets.messages_pane import STATUS_ICON, MessagesPane
 from ..widgets.status_bar import StatusBar, format_tokens
-
-LEADER_KEYS = sorted(CommandRegistry().leader_keys())
+from .permission import PermissionAnswer, PermissionDialog
 
 
 class SidePanel(Vertical):
-    """会话上下文侧栏，默认隐藏，由 leader b 切换。
+    """会话上下文侧栏，默认隐藏，由 /sidebar 切换。
 
     只放消息区里看不到的东西：会话标题、消息条数与 token 用量、引用文件、工具清单。
     模型名与 Agent 名不在这里出现，那一对已经在输入框下方的状态行上。
@@ -37,12 +35,12 @@ class SidePanel(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static("上下文", classes="side-title")
-        yield Static("", id="side-session", classes="side-line")
-        yield Static("", id="side-stats", classes="side-line")
+        yield Static("", id="side-session", classes="side-line", markup=False)
+        yield Static("", id="side-stats", classes="side-line", markup=False)
         yield Static("引用文件", classes="side-section")
-        yield Static("", id="side-files", classes="side-body")
+        yield Static("", id="side-files", classes="side-body", markup=False)
         yield Static("工具调用", classes="side-section")
-        yield Static("", id="side-tools", classes="side-body")
+        yield Static("", id="side-tools", classes="side-body", markup=False)
 
     def update_context(self, session: Session) -> None:
         """按当前会话刷新标题、用量、引用文件与工具清单。
@@ -54,6 +52,10 @@ class SidePanel(Vertical):
             return
         self._write("#side-session", session.title)
         stats = f"{len(session.messages)} 条消息 · {format_tokens(session.total_tokens())} tokens"
+        cached = session.total_cached()
+        uncached = session.total_uncached()
+        if cached and cached + uncached:
+            stats += f" · 缓存命中 {round(cached / (cached + uncached) * 100)}%"
         self._write("#side-stats", stats)
         self._write("#side-files", self._files_text(session))
         self._write("#side-tools", self._tools_text(session))
@@ -104,30 +106,19 @@ class ChatScreen(Screen):
     focused: Reactive[Widget | None] = Reactive(None, repaint=False)
     _select_state: Reactive[SelectState | None] = Reactive(None, repaint=False)
 
-    # 按下前导键后等第二击的时间。超时就把等待状态收回去。
-    LEADER_SECONDS = 1.5
-
+    # 快捷键只留最常按的这四个：命令面板、中断、退出、切 Agent。
+    # 其余操作一律走 /命令（输入框里打 / 会列出全部）或 ctrl+p 命令面板。
     BINDINGS = [
-        Binding("ctrl+x", "leader_key", "Leader", priority=True),
         Binding("ctrl+p", "command_palette", "Commands", priority=True),
         Binding("ctrl+c", "interrupt", "Interrupt", priority=True),
         Binding("ctrl+d", "quit_app", "Quit", priority=True),
-        Binding("ctrl+z", "suspend", "Suspend", priority=True),
-        Binding("escape", "close_modal", "Close"),
         Binding("tab", "switch_agent", "Agent"),
-        *[
-            Binding(key, f"leader_{key}", f"leader {key}", priority=True)
-            for key in LEADER_KEYS
-        ],
     ]
 
     def __init__(self, root: Path | None = None, initial_prompt: str = "") -> None:
         super().__init__()
         self.root = root or Path.cwd()
         self._initial_prompt = initial_prompt
-        self._leader_pending = False
-        self._leader_timer: Timer | None = None
-        self._leader_token = 0
         self._worker: Worker[object] | None = None
         self._busy = False
         self._unsubscribes: list[object] = []
@@ -147,6 +138,7 @@ class ChatScreen(Screen):
             bus.subscribe("message.add", self._on_message_add),
             bus.subscribe("part.add", self._on_part_add),
             bus.subscribe("part.update", self._on_part_update),
+            bus.subscribe("permission.ask", self._on_permission_ask),
             bus.subscribe("turn.done", self._on_turn_done),
             bus.subscribe("status.update", self._on_status_update),
         ]
@@ -188,12 +180,6 @@ class ChatScreen(Screen):
             self._selecting = False
             return
         super()._watch__select_state(select_state)
-
-    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
-        """前导键之后的第二击只有在前导键按下后才启用。"""
-        if action.startswith("leader_") and action != "leader_key":
-            return self._leader_pending
-        return True
 
     @property
     def messages(self) -> MessagesPane:
@@ -269,6 +255,7 @@ class ChatScreen(Screen):
     def _submit_prompt(self, text: str) -> None:
         """把一段普通文本作为用户消息发出，并启动流式回复。"""
         session = self.app.session_manager.current
+        self.app._sync_ledger()
         clean_text, file_parts = resolve_file_refs(text, self.root)
         message = session.add_message(
             Message(role="user", session_id=session.id, model_id=session.model_id)
@@ -288,7 +275,13 @@ class ChatScreen(Screen):
         self.app.show_toast(f"已切换 Agent：{event.agent}", "success")
 
     def action_command_palette(self) -> None:
-        """打开命令面板。"""
+        """打开命令面板，先把补全弹窗收掉。
+
+        不收的话面板叠在上面、下面那个弹窗还开着，等面板退回来它仍在。
+        这里只收弹窗、不算"用户按了 esc"：`_command_dismissed` 留着 false，
+        面板选完命令之后补全照旧可用。
+        """
+        self.editor.command_popup.hide()
         self.app.push_screen(CommandPalette(self.app.command_registry), self._on_palette_result)
 
     def action_interrupt(self) -> None:
@@ -308,135 +301,26 @@ class ChatScreen(Screen):
         self.app.show_toast("已中断当前生成", "warning")
 
     def _unfinished_tools(self) -> list[Part]:
-        """当前会话里还停在 pending 或 running 的工具 Part。"""
+        """当前会话里还停在等待、询问或执行中的工具 Part。
+
+        询问中的也要算进来：中断时循环层自己会去拒掉那个 future，
+        但 worker 在下一个 await 点就被摘掉了，那一段走不到，卡片会一直停在询问上。
+        """
         return [
             part
             for message in self.app.session_manager.current.messages
             for part in message.parts
             if part.type is PartType.TOOL
-            and part.tool_status in (ToolStatus.PENDING, ToolStatus.RUNNING)
+            and part.tool_status in (ToolStatus.PENDING, ToolStatus.AWAITING, ToolStatus.RUNNING)
         ]
 
     def action_quit_app(self) -> None:
         """退出应用。"""
         self.app.execute_command("exit")
 
-    def action_suspend(self) -> None:
-        """挂起提示：Windows 上不支持挂起。"""
-        self.app.show_toast("Windows 终端不支持挂起（ctrl+z）", "warning")
-
-    def action_close_modal(self) -> None:
-        """退出前导键等待状态。"""
-        self._clear_leader()
-
     def action_switch_agent(self) -> None:
         """用 tab 打开 Agent 列表。"""
         self.editor.action_agent_popup()
-
-    def action_leader_key(self) -> None:
-        """按下前导键，进入等待第二击的状态。"""
-        self._leader_pending = True
-        self.editor.add_class("-leader")
-        self.editor.refresh_status_line()
-        self._arm_leader_timer()
-
-    def _arm_leader_timer(self) -> None:
-        """给这一次等待重新计时。
-
-        只停掉旧的定时器不够：到点的回调已经排在消息队列里，取消不掉，
-        它可能在又一次按下前导键之后才轮到自己跑。每次等待发一个号，
-        回调带着号回来，只认自己那一次。
-        """
-        self._leader_token += 1
-        token = self._leader_token
-        if self._leader_timer is not None:
-            self._leader_timer.stop()
-        self._leader_timer = self.set_timer(
-            self.LEADER_SECONDS, lambda: self._expire_leader(token)
-        )
-
-    def _expire_leader(self, token: int) -> None:
-        """等待超时回调。只有当前这一次到点才收回等待状态。"""
-        if token == self._leader_token:
-            self._clear_leader()
-
-    def action_leader_b(self) -> None:
-        """leader b：切换上下文侧栏。"""
-        self._run_leader("b")
-
-    def action_leader_c(self) -> None:
-        """leader c：压缩会话。"""
-        self._run_leader("c")
-
-    def action_leader_o(self) -> None:
-        """leader o：添加提供商。"""
-        self._run_leader("o")
-
-    def action_leader_d(self) -> None:
-        """leader d：切换工具详情。"""
-        self._run_leader("d")
-
-    def action_leader_e(self) -> None:
-        """leader e：外部编辑器。"""
-        self._run_leader("e")
-
-    def action_leader_q(self) -> None:
-        """leader q：退出。"""
-        self._run_leader("q")
-
-    def action_leader_x(self) -> None:
-        """leader x：导出对话。"""
-        self._run_leader("x")
-
-    def action_leader_h(self) -> None:
-        """leader h：帮助。"""
-        self._run_leader("h")
-
-    def action_leader_i(self) -> None:
-        """leader i：初始化 AGENTS.md。"""
-        self._run_leader("i")
-
-    def action_leader_m(self) -> None:
-        """leader m：模型列表。"""
-        self._run_leader("m")
-
-    def action_leader_n(self) -> None:
-        """leader n：新会话。"""
-        self._run_leader("n")
-
-    def action_leader_r(self) -> None:
-        """leader r：重做。"""
-        self._run_leader("r")
-
-    def action_leader_l(self) -> None:
-        """leader l：会话列表。"""
-        self._run_leader("l")
-
-    def action_leader_s(self) -> None:
-        """leader s：分享会话。"""
-        self._run_leader("s")
-
-    def action_leader_t(self) -> None:
-        """leader t：主题列表。"""
-        self._run_leader("t")
-
-    def action_leader_u(self) -> None:
-        """leader u：撤销。"""
-        self._run_leader("u")
-
-    def _run_leader(self, key: str) -> None:
-        """按第二击执行对应命令。"""
-        self._clear_leader()
-        command = self.app.command_registry.by_leader_key(key)
-        if command is None:
-            return
-        self.app.execute_command(command.name)
-
-    def _clear_leader(self) -> None:
-        """清除前导键等待状态。"""
-        self._leader_pending = False
-        self.editor.remove_class("-leader")
-        self.editor.refresh_status_line()
 
     def _on_palette_result(self, command_name: str | None) -> None:
         """命令面板选中的命令。"""
@@ -483,6 +367,36 @@ class ChatScreen(Screen):
         part = message.part_by_id(str(data.get("part_id", "")))
         if part is not None:
             self.messages.update_part(part)
+
+    def _on_permission_ask(self, data: dict[str, object]) -> None:
+        """事件总线：工具调用需要用户答复。
+
+        循环层停在这个 Part 的 future 上，答复由弹窗的回调交回去。
+        弹窗在没有给出答复的情况下被关掉（应用正在退出、会话被换掉）时按拒绝处理，
+        否则这一轮的 worker 会一直停在等待上。
+        """
+        message = self._find_message(str(data.get("message_id", "")))
+        if message is None:
+            return
+        part = message.part_by_id(str(data.get("part_id", "")))
+        if part is None:
+            return
+        tool = self.app.agent.registry.get(part.tool_name)
+        argument = argument_value(tool, part.tool_input) if tool is not None else ""
+        dialog = PermissionDialog(
+            part.tool_name,
+            argument,
+            self.app.session_manager.current.agent_name,
+            part.permission,
+        )
+        self.app.push_screen(dialog, lambda answer: self._answer_permission(part.id, answer))
+
+    def _answer_permission(self, part_id: str, answer: PermissionAnswer | None) -> None:
+        """把弹窗的答复交给循环层。"""
+        if answer is None:
+            self.app.agent.resolve_permission(part_id, Verdict.DENY)
+            return
+        self.app.agent.resolve_permission(part_id, answer.verdict, answer.remember)
 
     def _on_turn_done(self, data: dict[str, object]) -> None:
         """事件总线：一轮生成结束。"""

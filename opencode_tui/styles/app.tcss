@@ -138,7 +138,7 @@ ModalScreen {
     padding: 0 1;
 }
 
-/* 上下文侧栏：默认隐藏，leader b 打开后占 30 列，消息区让出这块宽度 */
+/* 上下文侧栏：默认隐藏，/sidebar 打开后占 30 列，消息区让出这块宽度 */
 #side-panel {
     width: 30;
     height: 100%;
@@ -191,10 +191,6 @@ ModalScreen {
 
 #editor-pane.mode-bash {
     border-top: solid #EF6C00;
-}
-
-#editor-pane.-leader {
-    border-top: solid #C62828;
 }
 
 #editor-body {
@@ -346,6 +342,15 @@ ModalScreen {
     color: #78909C;
 }
 
+.part-error {
+    color: #E53935;
+}
+
+/* 收尾总结：一轮停下时给的那份交代，与压缩摘要同一档视觉重量 */
+.part-summary {
+    color: #4a9eff;
+}
+
 .part-reasoning.-hidden {
     display: none;
 }
@@ -414,7 +419,9 @@ ModalScreen {
 #help-screen,
 #diff-overlay,
 #confirm-dialog,
-#rename-dialog {
+#rename-dialog,
+#permission-dialog,
+#message-dialog {
     align: center middle;
     width: 70%;
     max-width: 90;
@@ -428,7 +435,8 @@ ModalScreen {
 #picker-title,
 #model-title,
 #theme-title,
-#diff-title {
+#diff-title,
+#message-title {
     color: #4A9EFF;
     height: 1;
     text-style: bold;
@@ -439,9 +447,21 @@ ModalScreen {
 #theme-hint,
 #diff-hint,
 #confirm-hint,
-#rename-hint {
+#rename-hint,
+#permission-hint,
+#message-hint {
     color: #666666;
     height: 1;
+}
+
+#message-body {
+    height: auto;
+    max-height: 18;
+}
+
+.message-line {
+    color: #CCCCCC;
+    height: auto;
 }
 
 #session-list,
@@ -454,6 +474,22 @@ ModalScreen {
 #confirm-text,
 #rename-title {
     height: 2;
+}
+
+/* 询问弹窗：与消息区里"询问"状态的工具卡片同一个颜色，一眼能对上 */
+#permission-dialog {
+    border: tall #FFB300;
+}
+
+#permission-title {
+    color: #FFB300;
+    height: 1;
+    text-style: bold;
+}
+
+#permission-detail {
+    color: #CCCCCC;
+    height: auto;
 }
 
 /* 帮助界面 */

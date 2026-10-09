@@ -16,7 +16,7 @@
 地址通过 `VSA_LLM_*` 交给子进程，回复内容固定，弹窗打开前后的两屏才对得上。
 
 pyte 与 pywinpty 装在打包环境里（requirements-pack.txt），.venv 里没有，所以要用
-`C:/Users/Administrator/.workbuddy/binaries/python/envs/opencode_tui_pack/Scripts/python.exe`
+`C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/opencode_tui_pack/Scripts/python.exe`
 来跑这个脚本，verify_exe.py 同理。
 """
 

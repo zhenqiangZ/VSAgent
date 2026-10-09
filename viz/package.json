@@ -1,0 +1,18 @@
+{
+  "name": "vsagent-viz",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把 Mol* 与 Markdown 渲染打成静态库，供网页端直接引用",
+  "scripts": {
+    "build": "npm run build:viewer && npm run build:markdown",
+    "build:viewer": "esbuild src/viewer.ts --bundle --minify --format=iife --global-name=vsViewer --outfile=build/viewer/molstar-lib.js",
+    "build:markdown": "esbuild src/markdown.ts --bundle --minify --format=iife --global-name=vsMarkdown --outfile=build/viewer/markdown-lib.js",
+    "dev": "esbuild src/viewer.ts --bundle --format=iife --global-name=vsViewer --outfile=build/viewer/molstar-lib.js --watch"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.16",
+    "esbuild": "^0.28.2",
+    "marked": "^18.0.14",
+    "molstar": "^5.12.0"
+  }
+}

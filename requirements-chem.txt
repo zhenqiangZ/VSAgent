@@ -1,0 +1,23 @@
+# 可选化学依赖：准备受体要用。
+#
+# 不装它也能用整个程序——检索靶点、查已知活性、取结构、会话与界面全都不受影响，
+# 只有 prepare_receptor 会返回一条带这份文件路径的安装指令。
+#
+#   pip install -r requirements-chem.txt
+#
+# 装完重启会话（依赖探测只在进程启动后第一次调用时做一遍）。
+
+# 按残基做模板匹配 → 指派 AutoDock 原子类型与部分电荷 → 出 PDBQT。
+meeko
+
+# 指纹与形状计算，Meeko 与 RDKit 的公开接口都用它。
+rdkit
+
+# meeko 内部 import 它（meeko/__init__.py → polymer → chemtempgen），
+# 而上游**不声明**这条依赖，所以必须显式列出来：少了它 import meeko 直接抛
+# ModuleNotFoundError: No module named 'gemmi'。
+gemmi
+
+# 同上：meeko 不声明依赖，这两个是它实际用到的数值库。
+numpy
+scipy

@@ -40,7 +40,7 @@ class ToastNotification(Widget):
 
     def compose(self) -> ComposeResult:
         icon = KIND_ICON.get(self._kind, "●")
-        yield Static(f"{icon} {self._text}", classes="toast-body")
+        yield Static(f"{icon} {self._text}", classes="toast-body", markup=False)
 
     @property
     def kind(self) -> str:

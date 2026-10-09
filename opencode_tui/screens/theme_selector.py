@@ -29,7 +29,7 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         """填充主题列表并聚焦。"""
         view = self.query_one("#theme-list", ListView)
         for name in self.themes:
-            view.append(ListItem(Label(name)))
+            view.append(ListItem(Label(name, markup=False)))
         if self.themes:
             view.index = 0
         view.focus()

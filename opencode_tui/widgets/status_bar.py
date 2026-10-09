@@ -56,7 +56,8 @@ class StatusBar(Container):
         self._written: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="status-left")
+        # 左端画的是项目路径与 git 分支，路径里可能出现方括号，关掉标签解析。
+        yield Static("", id="status-left", markup=False)
         yield Static("", id="status-usage")
         yield Static(self.KEYS_HINT, id="status-keys")
 

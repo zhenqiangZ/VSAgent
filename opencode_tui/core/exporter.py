@@ -92,4 +92,8 @@ def _render_part(part: Part) -> list[str]:
         return [f"重试 {part.text}", ""]
     if part.type is PartType.COMPACTION:
         return [f"上下文已压缩 {part.text}", ""]
+    if part.type is PartType.SUMMARY:
+        return ["## 收尾总结", "", *part.text.splitlines(), ""]
+    if part.type is PartType.ERROR:
+        return [f"> 请求没有成功：{part.text}", ""]
     return [part.text, ""]

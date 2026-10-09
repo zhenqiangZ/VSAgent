@@ -4,9 +4,36 @@ from pathlib import Path
 
 from textual.app import App
 
-from .core.agent.loop import AgentLoop
-from .core.agent.provider import OpenAICompatProvider, ProviderConfig
-from .core.agent.tools import BashTool, ToolRegistry
+from .core.agent.domain.all_tools import domain_tools
+from .core.agent.domain.export import runs_dir
+from .core.web.service import WebService, web_root
+from .core.agent.hooks import HookRunner, default_hooks_paths, load_hooks
+from .core.agent.ledger import SessionLedger
+from .core.agent.loop import AgentLoop, max_steps_from_env
+from .core.agent.memory import MemoryStore, RecallTool, RememberTool
+from .core.agent.task import TaskTool
+from .core.agent.permission import (
+    PermissionPolicy,
+    default_permission_paths,
+    load_permissions,
+)
+from .core.agent.prompt import KEEP_MESSAGES
+from .core.agent.provider import (
+    BUILTIN_MODELS,
+    OpenAICompatProvider,
+    ProviderConfig,
+    model_names,
+)
+from .core.agent.tools import (
+    BASH_TIMEOUT,
+    BashTool,
+    GrepTool,
+    PatchTool,
+    ReadTool,
+    ToolRegistry,
+    WriteTool,
+)
+from .core.agent.trace import TraceWriter, log_directory_for
 from .core.command_registry import CommandRegistry
 from .core.event_bus import EventBus
 from .core.exporter import export_filename, render_session_markdown
@@ -19,16 +46,21 @@ from .core.external_editor import (
 )
 from .core.keybind_manager import KeybindManager
 from .core.models import EFFORTS, Message
+from .core.project_scan import merge_agents_md, scan_project
 from .core.session_manager import SessionManager
-from .env import load_env
+from .env import env_file, load_env
 from .screens.chat import ChatScreen
 from .screens.diff_overlay import DiffOverlayScreen
 from .screens.help import HelpScreen
 from .screens.home import HomeScreen
+from .screens.message import MessageScreen
 from .screens.model_selector import ModelInfo, ModelSelectorScreen
 from .screens.session_picker import SessionPickerScreen
 from .screens.theme_selector import ThemeSelectorScreen
 from .widgets.toast import ToastNotification
+
+# 需要参数的命令：命令名之后那一段交给处理函数，其余命令不吃参数。
+ARGUMENT_COMMANDS = frozenset({"remember", "forget", "task"})
 
 
 class OpenCodeApp(App[None]):
@@ -44,6 +76,9 @@ class OpenCodeApp(App[None]):
         self,
         root: Path | None = None,
         state_path: Path | None = None,
+        log_directory: Path | None = None,
+        policy: PermissionPolicy | None = None,
+        hooks: HookRunner | None = None,
     ) -> None:
         super().__init__()
         self.root = root or Path.cwd()
@@ -51,54 +86,213 @@ class OpenCodeApp(App[None]):
         self.command_registry = CommandRegistry()
         self.keybind_manager = KeybindManager(self.command_registry)
         self.event_bus = EventBus()
+        self.trace = TraceWriter(
+            self.event_bus,
+            lambda: self.session_manager.current_session_id,
+            log_directory or log_directory_for(self.session_manager.state_path),
+        )
+        self._policy = policy
+        self._hooks = hooks
+        self._ledger: SessionLedger | None = None
+        self._memory: MemoryStore | None = None
+        self.web_service = self._build_web_service()
         self.agent = self._build_agent()
         self._removed_message: Message | None = None
         self._removed_session_id = ""
 
+    def _build_web_service(self) -> WebService:
+        """本地结构页的服务。
+
+        **随应用启停，不交给模型**：起、复用、关这三件事让模型各错一次，
+        而它是环境的一部分，不是某一步动作。这里只装配，真正的 `start()`
+        放在 `on_mount`——构造期就监听的话，`--help` 这类只跑一下就退的
+        路径也会占一瞬端口。
+        """
+        return WebService(
+            state_path=self.session_manager.state_path,
+            runs_dir=runs_dir(),
+            web_root=web_root(),
+        )
+
     def _build_agent(self) -> AgentLoop:
         """装配循环层。
 
-        连接参数、单价与上下文窗口都取自项目根目录的 `.env`。
+        连接参数、单价与上下文窗口都取自项目根目录的 `.env`。工作目录是项目目录：
+        系统提示里写的路径与 BashTool 实际执行的位置是同一个，模型按提示读到的目录
+        就是它在工具里操作的那一个。
         """
         load_env()
         config = ProviderConfig.from_env()
-        registry = ToolRegistry()
-        registry.register(BashTool(cwd=self.root))
+        memory = self._build_memory()
+        registry = self._build_registry(memory)
         return AgentLoop(
             self.event_bus,
             OpenAICompatProvider(config),
             registry,
             config,
             context_window=config.context_window,
+            workspace_root=self.root,
+            policy=self._build_policy(),
+            hooks=self._build_hooks(),
+            ledger=self._build_ledger(),
+            memory=memory,
+            viewer=self.web_service,
+            max_steps=max_steps_from_env(),
         )
 
+    def _build_ledger(self) -> SessionLedger:
+        """装配登记表。
+
+        会话级状态，按当前会话编号写盘到 `~/.opencode_tui/ledgers/`，
+        与状态文件同处。会话换掉时由 `_sync_ledger` 重新载入。
+        """
+        if self._ledger is not None:
+            return self._ledger
+        self._ledger = SessionLedger(session_id=self.session_manager.current_session_id)
+        self._ledger.load()
+        return self._ledger
+
+    def _sync_ledger(self) -> None:
+        """把登记表切到当前会话。
+
+        会话切换发生在界面里（新建、选中），循环层只拿得到登记表对象本身，
+        所以在每一次发问之前校准一次——比在每个切换动作上都埋一次调用稳。
+        """
+        manager = self.session_manager
+        if self._ledger is None:
+            self._ledger = self._build_ledger()
+            self.agent.ledger = self._ledger
+            return
+        if self._ledger.session_id == manager.current_session_id:
+            return
+        self._ledger = SessionLedger(session_id=manager.current_session_id)
+        self._ledger.load()
+        self.agent.ledger = self._ledger
+
+    def _build_policy(self) -> PermissionPolicy:
+        """装配判定层。
+
+        两份配置在这里各读一次，改配置要重启应用。规则文件与状态文件不同：
+        `AGENTS.md` 是每次发问之前重新读，那一个改完立刻生效。
+        """
+        if self._policy is not None:
+            return self._policy
+        project_path, user_path = default_permission_paths(self.root)
+        return PermissionPolicy(
+            project_rules=load_permissions(project_path, "项目配置"),
+            user_rules=load_permissions(user_path, "用户配置"),
+            # 工作目录交给判定层，它据此判「这一步是不是踩到了外面」。
+            # 与 BashTool / ReadTool 拿到的 cwd 是同一个目录，边界因此只有一处说法。
+            workspace_root=self.root,
+        )
+
+    def _build_hooks(self) -> HookRunner:
+        """装配钩子层。
+
+        钩子的工作基准与工具一致，都是项目目录：钩子脚本里的相对路径、
+        它读到的那个文件，与模型在工具里操作的是同一个。
+        """
+        if self._hooks is not None:
+            return self._hooks
+        project_path, user_path = default_hooks_paths(self.root)
+        return HookRunner(
+            load_hooks(project_path, "项目配置") + load_hooks(user_path, "用户配置"),
+            self.root,
+        )
+
+    def _build_memory(self) -> MemoryStore:
+        """装配项目级记忆。
+
+        记忆是**跨会话**的，与当前会话无关，所以只建一次、切换会话时不重建。
+        载入之后先对一次账：引用的文件在磁盘上可能早就变了，标出来之后
+        注入时才会带上提醒。
+        """
+        if self._memory is not None:
+            return self._memory
+        self._memory = MemoryStore(self.root)
+        self._memory.load()
+        self._memory.revalidate()
+        return self._memory
+
+    def _build_registry(self, memory: MemoryStore) -> ToolRegistry:
+        """装配全部工具。每个工具的工作基准都是项目目录，
+        与系统提示里写出来的路径是同一个。
+
+        领域工具由 `domain.all_tools` 一次给全：这个文件的本职是管屏幕与状态，
+        每加一个领域模块都回来改一次装配，漏掉一处的结果就是「工具写了但模型看不见」。
+        记忆工具与任务状态工具同属内核，排在领域工具之前。
+        """
+        registry = ToolRegistry()
+        # 超时显式传进来，而不是靠 BashTool 的默认值：改这一个数字就能看见装配处跟着动，
+        # 不必翻回 tools.py 猜当前生效的是哪一个。
+        registry.register(BashTool(cwd=self.root, timeout=BASH_TIMEOUT))
+        registry.register(ReadTool(cwd=self.root))
+        registry.register(WriteTool(cwd=self.root))
+        registry.register(PatchTool(cwd=self.root))
+        registry.register(GrepTool(cwd=self.root))
+        registry.register(RememberTool(memory))
+        registry.register(RecallTool(memory))
+        # 任务状态不用传东西进来：它挂在会话上，由循环层每次调用现取。
+        registry.register(TaskTool())
+        for tool in domain_tools():
+            registry.register(tool)
+        return registry
+
     def on_mount(self) -> None:
-        """启动时载入状态并进入启动界面。"""
+        """启动时载入状态、起本地结构页的服务，并进入启动界面。"""
         loaded = self.session_manager.load_from_toml()
         if loaded:
             self.theme = self.session_manager.theme
         if not self.session_manager.sessions:
             self.session_manager.new_session()
+        self.trace.start()
+        self.web_service.start()
         self.event_bus.subscribe("turn.done", self._on_turn_done)
         self.push_screen(HomeScreen())
 
+    def on_unmount(self) -> None:
+        """退出时把服务停掉、日志文件关掉。
+
+        服务要显式停：`daemon=True` 只保证进程结束时它跟着结束，
+        端口要等进程真正退出才释放。不显式停的话，下一次启动会归到
+        「上次没退干净」那条路上（靠端口避让兜着，但那是兜底不是常态）。
+        """
+        self.web_service.stop()
+        self.trace.stop()
+
     @property
     def available_models(self) -> list[ModelInfo]:
-        """可选的模型。只有 `.env` 里给出的那一个。"""
+        """可选的模型。
+
+        内置清单里的全部模型都在选择界面上；
+        `.env` 里给出的那一个如果不在清单里也照旧列在最前面。
+        """
         config = self.agent.config
-        return [
-            ModelInfo(
-                config.model,
-                config.model,
-                config.provider,
-                config.context_window,
+        models = []
+        for name in model_names():
+            spec = BUILTIN_MODELS[name]
+            models.append(ModelInfo(spec.name, spec.name, spec.provider, spec.context_window))
+        if self.current_model_label not in BUILTIN_MODELS:
+            models.insert(
+                0,
+                ModelInfo(
+                    self.current_model_label,
+                    self.current_model_label,
+                    config.provider,
+                    config.context_window,
+                ),
             )
-        ]
+        return models
 
     @property
     def current_model_label(self) -> str:
-        """当前模型的展示名。"""
-        return self.agent.config.model
+        """当前模型的展示名。
+
+        会话里选过模型就以会话为准：界面上显示的那一个，
+        与下一次请求体里 `model` 字段是同一个。
+        """
+        session = self.session_manager.current
+        return session.model_id or self.agent.config.model
 
     @property
     def current_model_provider(self) -> str:
@@ -136,8 +330,14 @@ class OpenCodeApp(App[None]):
             toast.remove()
 
     def execute_command(self, name: str) -> None:
-        """按名字执行斜杠命令。"""
-        command = self.command_registry.get(name)
+        """按名字执行斜杠命令。
+
+        命令名之后的那一段是参数。只有 `ARGUMENT_COMMANDS` 里的命令吃参数，
+        其余命令后面的内容忽略——这样 `/new` 后面多打一个词不会变成「未知命令」。
+        """
+        raw = name.lstrip("/").strip()
+        head, _, rest = raw.partition(" ")
+        command = self.command_registry.get(head)
         if command is None:
             self.show_toast(f"未知命令：{name}", "error")
             return
@@ -145,7 +345,10 @@ class OpenCodeApp(App[None]):
         if handler is None:
             self.show_toast(f"/{command.name} 尚未接入", "warning")
             return
-        handler()
+        if command.name in ARGUMENT_COMMANDS:
+            handler(rest.strip())
+        else:
+            handler()
 
     def _command_new(self) -> None:
         """新建会话。"""
@@ -198,6 +401,86 @@ class OpenCodeApp(App[None]):
         target = self.root / export_filename(session)
         target.write_text(render_session_markdown(session), encoding="utf-8")
         self.show_toast(f"已导出到 {target}", "success")
+
+    def _command_memory(self) -> None:
+        """列出项目记忆。"""
+        store = self._build_memory()
+        entries = store.recall("")
+        if not entries:
+            self.show_toast("项目记忆还是空的", "info")
+            return
+        lines = [store.render_line(entry) for entry in entries]
+        self.push_screen(MessageScreen("项目记忆", lines))
+
+    def _command_remember(self, arguments: str) -> None:
+        """把一段文字写进项目记忆。"""
+        text = arguments.strip()
+        if not text:
+            self.show_toast("用法：/remember 一段事实", "warning")
+            return
+        entry = self._build_memory().remember(text, source="user")
+        self.show_toast(f"已记住（{entry.id}）", "success")
+
+    def _command_forget(self, arguments: str) -> None:
+        """按编号或关键词删掉一条记忆。"""
+        query = arguments.strip()
+        if not query:
+            self.show_toast("用法：/forget 编号或关键词", "warning")
+            return
+        store = self._build_memory()
+        if query in store.entries:
+            store.forget(query)
+            self.show_toast(f"已删除 {query}", "success")
+            return
+        hits = store.recall(query)
+        if not hits:
+            self.show_toast(f"没有匹配「{query}」的记忆", "warning")
+            return
+        if len(hits) > 1:
+            lines = [store.render_line(entry) for entry in hits]
+            self.push_screen(MessageScreen("匹配到多条，请用编号 /forget", lines))
+            return
+        store.forget(hits[0].id)
+        self.show_toast(f"已删除 {hits[0].id}", "success")
+
+    def _command_task(self, arguments: str) -> None:
+        """查看或更新本会话的任务状态。
+
+        三种形式：`/task` 查看、`/task clear` 清空、
+        `/task <字段> <内容>` 追加一条（`goal` 是单值，等同于覆盖）。
+
+        写的是当前会话的 `task_state`，与模型调 `task` 工具改的是同一份东西；
+        两者都随状态文件写盘，重启之后还在。
+        """
+        state = self.session_manager.current.task_state
+        text = arguments.strip()
+        if not text:
+            if state.is_empty():
+                self.show_toast("本会话还没有任务状态", "info")
+                return
+            self.push_screen(MessageScreen("任务状态", state.render().splitlines()))
+            return
+        head, _, rest = text.partition(" ")
+        if head.strip().lower() == "clear":
+            if state.clear():
+                self.save_state()
+                self.show_toast("任务状态已清空", "success")
+            else:
+                self.show_toast("任务状态本来就是空的", "info")
+            return
+        try:
+            changed = state.add(head, rest)
+        except ValueError as error:
+            self.show_toast(
+                f"{error}。可用字段：goal / constraint / done / todo / blocker",
+                "warning",
+            )
+            return
+        if not changed:
+            self.show_toast("与已有内容相同，没有变化", "info")
+            return
+        self.save_state()
+        self.show_toast(f"任务状态已更新（v{state.version}）", "success")
 
     def _command_editor(self) -> None:
         """用外部编辑器撰写当前输入。"""
@@ -273,26 +556,93 @@ class OpenCodeApp(App[None]):
         self.save_state()
         self.show_toast("已恢复被撤销的消息", "success")
 
+    def _command_compact(self) -> None:
+        """把当前会话前面的一段压掉。"""
+        session = self.session_manager.current
+        if len(session.messages) <= KEEP_MESSAGES:
+            self.show_toast(f"消息不足 {KEEP_MESSAGES} 条，不用压缩", "info")
+            return
+        before = session.compact_upto
+        left = self.agent.compact_session(session)
+        self.save_state()
+        if session.compact_upto == before:
+            self.show_toast("这一段已经压过了", "info")
+            return
+        self.refresh_chat()
+        self.show_toast(f"已压缩，之后这一轮只带最近 {left} 条发给模型", "success")
+
+    def _command_connect(self) -> None:
+        """显示当前连的是哪一家，以及密钥从哪里读。"""
+        config = self.agent.config
+        path = env_file()
+        lines = [
+            f"提供商　{config.provider or '（没写）'}",
+            f"接口　　{config.base_url}",
+            f"模型　　{config.model}",
+            f"密钥　　{'已设置' if config.api_key else '没有'}（只从环境变量读，不写进状态文件）",
+            f"配置文件{path}",
+            f"　　　　{'存在' if path.is_file() else '还没有，建一份就能换到别的提供商'}",
+        ]
+        self.push_screen(MessageScreen("当前提供商", lines))
+
+    def _command_init(self) -> None:
+        """扫描项目，写一份或更新一份 AGENTS.md。"""
+        summary = scan_project(self.root)
+        target = self.root / "AGENTS.md"
+        existed = target.is_file()
+        try:
+            text = merge_agents_md(target.read_text(encoding="utf-8") if existed else "", summary)
+            target.write_text(text, encoding="utf-8")
+        except OSError as error:
+            self.show_toast(f"写 {target} 出错：{error}", "error")
+            return
+        action = "更新" if existed else "创建"
+        self.show_toast(f"已{action} {target.name}，扫到 {summary.file_count} 个文件", "success")
+
     def _on_turn_done(self, data: dict[str, object]) -> None:
         """一轮生成结束后持久化状态。"""
         self.save_state()
+
+    def _command_log(self) -> None:
+        """显示当前会话的事件日志路径。"""
+        path = self.trace.current_path()
+        if path.is_file():
+            with path.open("r", encoding="utf-8") as handle:
+                state = f"已有 {sum(1 for _ in handle)} 行"
+        else:
+            state = "还没有内容，发起一轮生成就会出现"
+        self.push_screen(MessageScreen("事件日志", [f"日志文件　{path}", f"状态　　　{state}"]))
 
     def _on_session_picked(self, session_id: str | None) -> None:
         """切换会话。"""
         if not session_id:
             return
         self.session_manager.switch_session(session_id)
+        self.agent.policy.clear_session()
         self._ensure_chat_screen()
         session = self.session_manager.get_session(session_id)
         self.show_toast(f"已切换到 {session.title if session else session_id}", "success")
 
     def _on_model_picked(self, model_id: str | None) -> None:
-        """切换模型。只有 `.env` 里给出的那一个可选，选中它就是再确认一次。"""
+        """切换模型。
+
+        会话上记下选的是哪一个，循环层跟着换配置：
+        窗口、单价、采样参数与推理能力都按新模型重取，下一次请求体的 `model` 就是它。
+        """
         if not model_id:
             return
-        self.session_manager.current.model_id = model_id
+        session = self.session_manager.current
+        if session.model_id == model_id:
+            self.show_toast(f"当前已经在用 {model_id}", "info")
+            return
+        session.model_id = model_id
+        config = self.agent.switch_model(model_id)
         self.refresh_chat()
-        self.show_toast(f"模型已切换为 {self.current_model_label}", "success")
+        self.save_state()
+        if config.known:
+            self.show_toast(f"模型已切换为 {config.model}", "success")
+        else:
+            self.show_toast(f"模型已切换为 {config.model}，窗口与单价按兜底值算", "warning")
 
     def _on_theme_picked(self, theme: str | None) -> None:
         """切换主题。"""

@@ -3,6 +3,7 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from textual.markup import escape
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
@@ -59,15 +60,20 @@ class DiffOverlayScreen(ModalScreen[None]):
         self.dismiss(None)
 
     def _colorize(self) -> str:
-        """按行着色的 diff 文本。"""
+        """按行着色的 diff 文本。
+
+        每一行先转义再套颜色标签：diff 里出现方括号（改的是列表、下标、正则）时，
+        原文会被当成标签解析，轻则少几个字，重则整屏渲染不出来。
+        """
         lines = []
         for line in self._diff_text.splitlines():
+            body = escape(line)
             if line.startswith("+") and not line.startswith("+++"):
-                lines.append(f"[green]{line}[/green]")
+                lines.append(f"[green]{body}[/green]")
             elif line.startswith("-") and not line.startswith("---"):
-                lines.append(f"[red]{line}[/red]")
+                lines.append(f"[red]{body}[/red]")
             elif line.startswith("@@"):
-                lines.append(f"[cyan]{line}[/cyan]")
+                lines.append(f"[cyan]{body}[/cyan]")
             else:
-                lines.append(line)
+                lines.append(body)
         return "\n".join(lines)

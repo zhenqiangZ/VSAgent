@@ -114,6 +114,7 @@ from opencode_tui.core.agent.tools import (  # noqa: E402
     argument_error,
     change_counts,
     decode_output,
+    decode_text,
     number_lines,
     resolve_path,
 )
@@ -143,6 +144,7 @@ from opencode_tui.core.agent.domain import export as export_module  # noqa: E402
 from opencode_tui.core.agent.domain import complexes as complexes_module  # noqa: E402
 from opencode_tui.core.agent.domain import prankweb as prankweb_module  # noqa: E402
 from opencode_tui.core.agent.domain import pockets as pockets_module  # noqa: E402
+from opencode_tui.core.agent.domain import align as align_module  # noqa: E402
 from opencode_tui.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
 from opencode_tui.core.agent.trace import TraceWriter, log_directory_for  # noqa: E402
 from opencode_tui.core.event_bus import EventBus  # noqa: E402
@@ -614,6 +616,18 @@ async def check_file_tools() -> None:
     binary.write_bytes(b"\xff\xfe\x00\x01\xff")
     unreadable = await read.run({"path": "blob.bin"})
     check(unreadable.failed and "不是文本文件" in unreadable.output, "二进制文件读不出来时说明原因")
+
+    # Windows 上 `cmd` 的 `>` 重定向写出的是**带标记的 UTF-16**。模型自己重定向出来的
+    # 文件读不了，只好改用 bash 一段段打印——现场 `ses_0037` 第 16~22 步，七步里六步
+    # 耗在这上面。所以「读得出来」这件事要单独盯住。
+    utf16 = root / "out.txt"
+    utf16.write_bytes("甲\n乙\n丙\n".encode("utf-16"))
+    wide = await read.run({"path": "out.txt"})
+    check(not wide.failed, f"带标记的 UTF-16 要读得出来：{wide.output[:80]}")
+    check("     1 | 甲" in wide.output and wide.output.endswith("丙"), "UTF-16 的内容按行读出来")
+    patched = await patch.run({"path": "out.txt", "old": "乙", "new": "改过的"})
+    check(not patched.failed, f"UTF-16 的文件也改得了：{patched.output[:80]}")
+    check("改过的" in utf16.read_text(encoding="utf-8"), "改完写回盘上的是改后的内容")
 
     oneline = root / "one.txt"
     oneline.write_text("就这一行", encoding="utf-8")
@@ -1815,6 +1829,24 @@ async def check_bash_tool() -> None:
     check(
         decode_output(b"\x00\x01\xff\xfe") != "",
         "两种编码都解不通时退回替换字符，而不是抛异常把整条输出抹掉",
+    )
+    # 文件那一侧的解码（`decode_text`）：先认字节序标记，再按同一串编码严格试，
+    # 全试不通才判成不是文本。与 `decode_output` 的差别只有两处：认标记、能返回 None。
+    check(decode_text("甲".encode("utf-8")) == "甲", "decode_text 认 UTF-8")
+    check(decode_text("甲".encode("gbk")) == "甲", "decode_text 认 GBK")
+    check(decode_text("甲\n乙".encode("utf-16")) == "甲\n乙", "decode_text 认带标记的 UTF-16")
+    check(decode_text("甲".encode("utf-8-sig")) == "甲", "decode_text 认带标记的 UTF-8")
+    check(decode_text(b"\x7fELF\x00\x00\x00\x00") is None, "夹着 NUL 的二进制不当文本")
+    check(decode_text(bytes(range(256))) is None, "随机字节不当文本")
+    # 换行归一：`Path.read_text` 默认做通用换行翻译，改用 `read_bytes` 之后要自己补回来。
+    # 少了这一条，Windows 上 `write_text` 写出的 `\r\n` 会留下 `\r`，行尾判断全部失配。
+    check(
+        decode_text("甲\r\n乙\r\n".encode("utf-8")) == "甲\n乙\n",
+        "decode_text 把 CRLF 归一成 LF",
+    )
+    check(
+        decode_text("甲\r乙".encode("utf-16")) == "甲\n乙",
+        "UTF-16 里的换行同样归一",
     )
     # 真机取一条会吐中文的命令，读它实际回来的字节，逐字检查没有替换字符。
     # 编码对不对不能只靠自造的字节：这里跑的是真命令，回来的是真代码页。
@@ -4773,6 +4805,143 @@ def check_pockets() -> None:
     check(no_id.origin == "none" and "没查成" in no_id.note, f"没有编号时说明白：{no_id.note}")
 
 
+def check_align_and_prior() -> None:
+    """`align` + `pockets.prior_pockets`：序列核对、叠合、按先验清单算口袋。
+
+    三件必须成立的事：
+      · 同一个蛋白的两份结构比对得上，另一个蛋白的比对不上（门槛真的在起作用）；
+      · 核对不通过的编号**拿不到变换**，也就进不了口袋；
+      · 逐条结论里「编号不存在」与「没查成」分得开。
+    """
+    real_1iep = PROBE / "1iep.pdb"
+    if not real_1iep.is_file():
+        check(True, "（跳过 align：.probe/1iep.pdb 不在）")
+        return
+    abl_text = real_1iep.read_text(encoding="utf-8")
+
+    # ---- 一、取序列 ----
+    seqs = align_module.sequences(abl_text)
+    check(set(seqs) == {"A", "B"}, f"读出两条聚合物链：{sorted(seqs)}")
+    check(len(seqs["A"]) == 274, f"链 A 的序列长度：{len(seqs['A'])}")
+    check(align_module.identity(seqs["A"], seqs["A"]) == 1.0, "同一条序列的同一性为 1")
+    reversed_seq = seqs["A"][::-1]
+    low = align_module.identity(seqs["A"], reversed_seq)
+    check(low < align_module.IDENTITY_FLOOR, f"与无关序列的同一性低于门槛：{low:.3f}")
+
+    pair = align_module.best_pair(seqs, {"X": seqs["B"]})
+    check(pair is not None and pair[2] == 1.0, f"配对取同一性最高的一对：{pair}")
+
+    # ---- 二、核对与门槛 ----
+    verdict, transform = align_module.align_candidate(abl_text, abl_text, "SELF")
+    check(verdict.ok and transform is not None, f"自己跟自己核对通过：{verdict.reason}")
+    check(
+        verdict.rmsd is not None and verdict.rmsd < 0.01,
+        f"自己跟自己叠合 rmsd≈0：{verdict.rmsd}",
+    )
+    check("→" in verdict.pair, f"结论里报出配的是哪两条链：{verdict.pair}")
+
+    strict, no_transform = align_module.align_candidate(
+        abl_text, abl_text, "SELF", floor=1.01
+    )
+    check(
+        not strict.ok and no_transform is None,
+        "门槛抬高之后同一个结构也被拒——说明门槛不是在空转",
+    )
+
+    # 另一个蛋白：本机有 1M17（EGFR）就用它，没有就跳过这一小段。
+    egfr_path = ROOT / "runs" / "1M17" / "receptor.pdb"
+    egfr_text = egfr_path.read_text(encoding="utf-8") if egfr_path.is_file() else ""
+    if egfr_text:
+        cross, cross_transform = align_module.align_candidate(egfr_text, abl_text, "1IEP")
+        check(
+            not cross.ok and cross_transform is None,
+            f"另一个蛋白被剔除、且拿不到变换：{cross.state}",
+        )
+        check(
+            cross.identity is not None and cross.identity < align_module.IDENTITY_FLOOR,
+            f"跨蛋白同一性低于门槛：{cross.identity}",
+        )
+
+    # ---- 三、搬坐标：返回新的组，不动原来那一份 ----
+    doc = pdbtext.parse(abl_text)
+    filtered = export_module.ligand_groups(doc)
+    check(len(filtered.kept) >= 2, f"1IEP 里有两个配体组：{len(filtered.kept)}")
+    moved_transform, moved_rmsd = align_module.superpose(abl_text, abl_text, "A", "B")
+    moved = align_module.moved_groups(filtered.kept, moved_transform)
+    check(moved[0] is not filtered.kept[0], "返回的是新的组，不是改原来那一份")
+    check(
+        moved[0].atoms[0].coord != filtered.kept[0].atoms[0].coord,
+        "坐标真的被搬动了（两条链的构象不同，变换不是恒等）",
+    )
+    check(moved_rmsd >= 0.0, f"叠合给出了 rmsd：{moved_rmsd:.3f}")
+
+    # ---- 四、先验清单：通过 / 剔除 / 去重 / 两种「没有」 ----
+    texts = {"1IEP": abl_text}
+
+    def download(pdb_id, **_kwargs):
+        if pdb_id in texts:
+            return texts[pdb_id]
+        raise complexes_module.ComplexError(f"下载 {pdb_id} 没成：假的失败")
+
+    bundle, verdicts = pockets_module.prior_pockets(
+        receptor_text=abl_text,
+        candidates=["1iep", "1IEP", "9ZZZ"],
+        download=download,
+        probe=lambda _url, **_kw: 404,
+    )
+    states = {item.pdb_id: item.state for item in verdicts}
+    check(len(verdicts) == 2, f"重复的编号只留一条：{[i.pdb_id for i in verdicts]}")
+    check(states.get("1IEP") == "ok", f"通过的编号：{states}")
+    check(states.get("9ZZZ") == "missing", f"不存在的编号标 missing：{states}")
+    check(bundle.origin == "aligned", f"来源标成 aligned：{bundle.origin}")
+    check(bundle.total == 2 and bundle.used == 1, f"报了 total/used：{bundle.total}/{bundle.used}")
+    check(len(bundle.pockets) >= 1, f"算出了口袋：{len(bundle.pockets)}")
+    check(
+        bundle.pockets[0]["source"] == "ligand",
+        f"先验这一侧也是实测事实，source=ligand：{bundle.pockets[0]['source']}",
+    )
+    check("score" not in bundle.pockets[0], "先验这一侧不写 score")
+    check(
+        bundle.pockets[0]["complexes"][0].get("rmsd") == 0.0,
+        f"来源里带上 rmsd：{bundle.pockets[0]['complexes'][0]}",
+    )
+    check(
+        bundle.pockets[0]["residues"] and "min_distance" in bundle.pockets[0]["residues"][0],
+        "残基带着现算的最短距离",
+    )
+
+    # 探编号时回 200：编号存在，这一次是没取下来 —— 与「不存在」分开说
+    _bundle2, verdicts2 = pockets_module.prior_pockets(
+        receptor_text=abl_text,
+        candidates=["9ZZZ"],
+        download=download,
+        probe=lambda _url, **_kw: 200,
+    )
+    check(verdicts2[0].state == "unreachable", f"取不下来标 unreachable：{verdicts2[0].state}")
+    check(
+        verdicts2[0].state != states.get("9ZZZ"),
+        "「编号不存在」与「没查成」是两种状态，不混成一个",
+    )
+
+    # 一个都没通过：留空，且说明是「查了确实没有」而不是「没查成」
+    empty_bundle, empty_verdicts = pockets_module.prior_pockets(
+        receptor_text=abl_text,
+        candidates=["9ZZZ", "8YYY"],
+        download=download,
+        probe=lambda _url, **_kw: 404,
+    )
+    check(empty_bundle.origin == "none", f"一个都没通过时 origin=none：{empty_bundle.origin}")
+    check(empty_bundle.pockets == [], "口袋留空，不编条目")
+    check(empty_bundle.reason == "checked", f"reason 标 checked：{empty_bundle.reason}")
+    check(len(empty_verdicts) == 2, "两个编号都留了结论")
+
+    # 清单本身是空的：与「查了没有」又不是一回事
+    none_bundle, none_verdicts = pockets_module.prior_pockets(
+        receptor_text=abl_text, candidates=[], download=download
+    )
+    check(none_bundle.origin == "none" and not none_verdicts, "空清单不产出结论")
+
+
 async def check_write_run() -> None:
     """`write_run`：装配点。优先级、三态、meta 形状、登记成 artifact、不编字段。"""
     import json as _json
@@ -5021,6 +5190,119 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
         # ---- write_run 的文件里没有 contacts / 没有编造的 score ----
         raw = (runs_root / "p0-check" / export_module.RUN_META).read_text(encoding="utf-8")
         check('"contacts"' not in raw, "meta.json 全文不含 contacts 字段")
+
+        # ---- 给了 candidates 就走先验这一侧，不再按 UniProt 检索复合物 ----
+        seen_calls: list[dict] = []
+
+        def stub_prior(**kwargs):
+            seen_calls.append(kwargs)
+            return (
+                pockets_module.PocketBundle(
+                    pockets=[
+                        {
+                            "center": (1.0, 2.0, 3.0),
+                            "radius": 5.0,
+                            "source": "ligand",
+                            "residues": [
+                                {
+                                    "chain": "A",
+                                    "number": "10",
+                                    "icode": "",
+                                    "resname": "LEU",
+                                    "min_distance": 3.0,
+                                }
+                            ],
+                            "complexes": [
+                                {
+                                    "pdb_id": "1IEP",
+                                    "ligand": "STI",
+                                    "resolution": 2.1,
+                                    "rmsd": 0.4,
+                                }
+                            ],
+                        }
+                    ],
+                    origin="aligned",
+                    note="从先验清单里 1 个通过核对的复合物结构、按叠合后的共晶配体圈出来",
+                    total=3,
+                    used=1,
+                ),
+                (
+                    align_module.Verdict(
+                        "1IEP", "ok", "同一性 1.000（A→A）", pair="A→A", identity=1.0, rmsd=0.4
+                    ),
+                    align_module.Verdict(
+                        "1M17", "mismatch", "链序列与受体对不上", pair="A→A", identity=0.356
+                    ),
+                    align_module.Verdict("9ZZZ", "missing", "RCSB 上没有这个编号"),
+                ),
+            )
+
+        uniprot_calls: list[str] = []
+
+        def spy_complex(**kwargs):
+            uniprot_calls.append(kwargs.get("uniprot", ""))
+            raise AssertionError("给了 candidates 就不该按 UniProt 检索复合物")
+
+        original_prior = getattr(pockets_module, "prior_pockets", None)
+        pockets_module.prior_pockets = stub_prior
+        pockets_module.complex_pockets = spy_complex
+        try:
+            wired = await _run_tool(
+                tool,
+                {
+                    "receptor": str(entry3.handle),
+                    "run_id": "prior-check",
+                    "uniprot": "P00519",
+                    "candidates": "1IEP, 1M17;9ZZZ",
+                },
+            )
+            check(not wired.failed, f"给了 candidates 能跑通：{wired.output[:200]}")
+            check(not uniprot_calls, "给了 candidates 时一次都没按 UniProt 检索复合物")
+            got = seen_calls[0].get("candidates") if seen_calls else None
+            check(
+                got == ("1IEP", "1M17", "9ZZZ"),
+                f"清单按逗号/分号/空格分开并去重：{got}",
+            )
+            check(wired.meta.get("origin") == "aligned", f"origin=aligned：{wired.meta.get('origin')}")
+            check(
+                "通过 1IEP" in wired.output
+                and "剔除 1M17" in wired.output
+                and "剔除 9ZZZ" in wired.output,
+                f"逐条结论都念出来了：{wired.output[:400]}",
+            )
+            prior_meta = _json.loads(
+                (runs_root / "prior-check" / export_module.RUN_META).read_text(encoding="utf-8")
+            )
+            check(
+                prior_meta["pockets"][0]["source"] == "ligand",
+                "先验这一侧的口袋 source=ligand（实测事实，不是预测）",
+            )
+            check(
+                prior_meta["pockets"][0]["complexes"][0]["rmsd"] == 0.4,
+                "来源里留着 rmsd",
+            )
+            check(
+                prior_meta["pockets"][0].get("id") and prior_meta["pockets"][0].get("label"),
+                f"口袋补上了 id 与 label：{prior_meta['pockets'][0].get('id')}"
+                f" / {prior_meta['pockets'][0].get('label')}",
+            )
+            stored = prior_meta["provenance"]["pockets"].get("prior")
+            check(
+                isinstance(stored, list) and len(stored) == 3,
+                f"取证结论进了 meta（挂在已有的 provenance 下，不加顶层键）：{stored}",
+            )
+            check(stored[1]["state"] == "mismatch", "meta 里带着每一条的状态")
+            check(
+                set(prior_meta) == set(_json.loads(
+                    (PROBE.parent / "runs" / "1iep-molstar" / "meta.json").read_text(encoding="utf-8")
+                )) - {"contacts"},
+                "先验这一侧也没有多出顶层键",
+            )
+        finally:
+            pockets_module.complex_pockets = stub_complex
+            if original_prior is not None:
+                pockets_module.prior_pockets = original_prior
     finally:
         pockets_module.complex_pockets = original_complex
         pockets_module.p2rank_pockets = original_p2rank
@@ -8372,6 +8654,7 @@ async def run_agent_checks() -> None:
     check_complexes()
     check_prankweb()
     check_pockets()
+    check_align_and_prior()
     await check_write_run()
     await check_rsearch()
     await check_literature()

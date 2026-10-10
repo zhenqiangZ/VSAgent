@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import re
 import subprocess
 import sys
@@ -485,6 +486,55 @@ def decode_output(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+# 字节序标记与它对应的编码。顺序**从长到短**：UTF-32 的标记前两个字节与 UTF-16 一样，
+# 短的排在前面会把 UTF-32 认成 UTF-16，解出来满屏 NUL。
+_BOMS = (
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+
+def decode_text(raw: bytes) -> str | None:
+    """把文件字节解成文本；确实不是文本时返回 None。
+
+    为什么要先看字节序标记：Windows 上 `cmd` 的 `>` 重定向写出的是**带标记的 UTF-16**，
+    按 UTF-8 解必然失败——而那种文件恰恰是模型自己刚重定向出来的，于是它拿到
+    「不是文本文件」之后只好改用 bash 一段段打印，白花好几步
+    （现场：`ses_0037` 第 16~22 步，七步里六步耗在这上面）。
+
+    标记认不出来时，再按 `OUTPUT_ENCODINGS` 逐种**严格**试。试之前先挡掉二进制：
+    没有标记又夹着 NUL 字节的直接判成不是文本，免得 GBK 那种宽松编码把二进制
+    解成一片乱码交出去——那比说一句「读不出来」更误导。
+
+    **换行要归一成 `\\n`**：这是 `Path.read_text` 的通用换行语义，改用 `read_bytes`
+    之后必须自己补回来。Windows 上 `write_text` 会把 `\\n` 写成 `\\r\\n`，不归一的话
+    `\\r` 就留在每行末尾——`endswith("丙")` 这类判断会莫名其妙地失配
+    （改这一处时踩到过：`check_file_tools` 里「文件里的三行都读出来」当场报出来）。
+    """
+    for mark, encoding in _BOMS:
+        if raw.startswith(mark):
+            try:
+                return _normalize_newlines(raw.decode(encoding))
+            except UnicodeDecodeError:
+                return None
+    if b"\x00" in raw[:8192]:
+        return None
+    for encoding in OUTPUT_ENCODINGS:
+        try:
+            return _normalize_newlines(raw.decode(encoding))
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _normalize_newlines(text: str) -> str:
+    """三种换行都归一成 `\\n`，与 `Path.read_text` 的通用换行一致。"""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 class BashTool(Tool):
     """执行一条 shell 命令，把标准输出与标准错误合并作为结果。
 
@@ -599,11 +649,12 @@ class ReadTool(Tool):
         if limit is None:
             limit = self.limit
         try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return ToolResult(output=f"{path} 不是文本文件，读不出来", failed=True)
+            blob = path.read_bytes()
         except OSError as error:
             return ToolResult(output=f"读 {path} 出错：{error}", failed=True)
+        text = decode_text(blob)
+        if text is None:
+            return ToolResult(output=f"{path} 不是文本文件，读不出来", failed=True)
         lines = text.split("\n")
         if lines and lines[-1] == "":
             lines.pop()
@@ -728,11 +779,12 @@ class PatchTool(Tool):
         if path.is_dir():
             return ToolResult(output=f"{path} 是目录，改不了", failed=True)
         try:
-            before = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return ToolResult(output=f"{path} 不是文本文件，改不了", failed=True)
+            blob = path.read_bytes()
         except OSError as error:
             return ToolResult(output=f"读 {path} 出错：{error}", failed=True)
+        before = decode_text(blob)
+        if before is None:
+            return ToolResult(output=f"{path} 不是文本文件，改不了", failed=True)
         occurrences = before.count(old)
         if occurrences == 0:
             return ToolResult(

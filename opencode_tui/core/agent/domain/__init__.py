@@ -40,7 +40,8 @@
 | `export.py` | 从坐标算口袋的纯几何（第 1 步）+ `write_run` / `open_viewer` 两个工具（第 4 步） |
 | `complexes.py` | P0 主来源：搜该蛋白所有复合物 → 排序 → 下载坐标（不登记工具） |
 | `prankweb.py` | P1 副选：prankweb.cz 的 p2rank 预测（状态轮询 + 缓存，不登记工具） |
-| `pockets.py` | 三层口袋来源的装配点，产出 `meta.json` 的 `pockets[]`（不登记工具） |
+| `pockets.py` | 四层口袋来源的装配点，产出 `meta.json` 的 `pockets[]`（不登记工具） |
+| `align.py` | 先验清单的取证与叠合：核序列、按 CA 把配体搬进受体参考系（不登记工具） |
 | `rsearch.py` | 搜索工具（一）：RCSB 文本/属性搜 + GraphQL 批量取配体（1 个工具） |
 | `literature.py` | 搜索工具（二）：PubMed E-utilities 文献检索（1 个工具） |
 | `receptor.py` | 准备受体（1 个工具） |
@@ -54,6 +55,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "align",
     "chembl",
     "chemistry",
     "complexes",

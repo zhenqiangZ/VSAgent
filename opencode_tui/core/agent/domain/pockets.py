@@ -1,34 +1,41 @@
-"""三层口袋来源的装配点：P0 复合物配体 → P1 预测 → 留空。
+"""四层口袋来源的装配点：P0 复合物配体 → P1 预测 → 留空，另有 P2 先验清单。
 
-这一层**不自己算几何**——几何在 `export.py`，网络在 `complexes.py` / `prankweb.py`。
-它只做一件事：按优先级把两侧的结果装配成 `meta.json` 里 `pockets[]` 那一种形状，
-并把「这个数是从哪来的」标清楚。
+这一层**不自己算几何**——几何在 `export.py`，网络在 `complexes.py` / `prankweb.py`，
+叠合在 `align.py`。它只做一件事：按优先级把各侧的结果装配成 `meta.json` 里
+`pockets[]` 那一种形状，并把「这个数是从哪来的」标清楚。
 
 **每个数标来源**（方案稿 §2.1 / §2.3.8）：
 
-| 字段 | P0（复合物） | P1（预测） |
-|---|---|---|
-| `residues[]` | 从共晶配体圈 5 埃 | prankweb 直接给 |
-| `center` / `radius` | 配体聚类算，半径固定 5.0 | prankweb 给 center，半径同 5.0 |
-| `score` | **不出现**（实验定位没有打分这回事） | prankweb 的 `score` 与 `probability` |
-| `source` | `"ligand"` | `"p2rank"` |
-| `complexes[]` | **有**（跨哪几个复合物、各哪个配体、分辨率） | 无 |
+| 字段 | P0（复合物） | P1（预测） | P2（先验清单） |
+|---|---|---|---|
+| `residues[]` | 从共晶配体圈 5 埃 | prankweb 直接给 | 从叠合后的配体圈 5 埃 |
+| `center` / `radius` | 配体聚类算，半径固定 5.0 | prankweb 给 center，半径同 5.0 | 同 P0 |
+| `score` | **不出现**（实验定位没有打分这回事） | prankweb 的 `score` 与 `probability` | **不出现** |
+| `source` | `"ligand"` | `"p2rank"` | `"ligand"` |
+| `complexes[]` | **有**（跨哪几个复合物、各哪个配体、分辨率） | 无 | **有**，另带 `rmsd` |
 
-**没有来源就留空。** 三态 `origin = "complex" | "predicted" | "none"` 里，
+P2 与 P0 的分工在**清单从哪来**：P0 拿 UniProt 编号去检索，返回的是「带配体的
+已发布复合物」，覆盖到的口袋窄；P2 拿模型凭先验知识给出的编号清单，覆盖面宽，
+代价是清单本身不可信——所以 P2 先做两道核对（编号存在、序列是受体序列），
+核对不通过的一律剔除并逐条报出来。
+
+**没有来源就留空。** 四态 `origin = "complex" | "aligned" | "predicted" | "none"` 里，
 `none` 还要再分「查了没有」与「没查成」——这两者对用户的含义完全不同（§2.3.9）。
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
-from . import complexes, export, pdbtext, prankweb, structure
+from . import align, complexes, export, http, pdbtext, prankweb, structure
 
 __all__ = [
     "PocketBundle",
     "complex_pockets",
     "p2rank_pockets",
+    "prior_pockets",
 ]
 
 POCKET_RADIUS = export.POCKET_RADIUS
@@ -305,19 +312,196 @@ def _merge(clusters: dict, *, radius: float) -> list[dict[str, Any]]:
                 # 实验定位本来就没有打分这回事（§2.1）。
                 "source": "ligand",
                 "residues": [r.as_dict() for r in ordered],
-                "complexes": [
-                    {
-                        "pdb_id": o.get("pdb_id", ""),
-                        "ligand": o.get("ligand", ""),
-                        "resolution": o.get("resolution"),
-                    }
-                    for o in origins
-                ],
+                "complexes": [_complex_entry(o) for o in origins],
             }
         )
 
     pockets.sort(key=lambda p: (-len(p["complexes"]), p["center"]))
     return pockets
+
+
+def _complex_entry(origin: dict[str, Any]) -> dict[str, Any]:
+    """一条来源记录。`rmsd` **只在有值时出现**——P0 那一侧没有叠合这回事，
+    补一个 `null` 会让「没做叠合」与「叠合出来是空」看起来一样。"""
+    entry: dict[str, Any] = {
+        "pdb_id": origin.get("pdb_id", ""),
+        "ligand": origin.get("ligand", ""),
+        "resolution": origin.get("resolution"),
+    }
+    if origin.get("rmsd") is not None:
+        entry["rmsd"] = origin["rmsd"]
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# P2：先验清单（模型给出的编号）+ 叠合
+# ---------------------------------------------------------------------------
+def prior_pockets(
+    *,
+    receptor_text: str,
+    candidates: Sequence[str],
+    receptor_chains: tuple[str, ...] = (),
+    radius: float = POCKET_RADIUS,
+    timeout: float | None = None,
+    download=None,
+    probe=None,
+) -> tuple[PocketBundle, tuple[align.Verdict, ...]]:
+    """P2：按模型给出的编号清单取证，再把叠合后的配体聚成口袋。
+
+    四段：取 → 核 → 叠 → 圈。**核对不通过的编号一律剔除并留在结论里**，
+    不静默丢掉——「这个编号不是这个蛋白」正是用户要看的那句话。
+
+    与 P0 一样，回来的是 `(PocketBundle, 逐条结论)`；空 `PocketBundle` 不代表出错，
+    它正是「清单里没有一个能用的」这一态，是转 P1 的入口之一。
+
+    `download` / `probe` 是给判据打桩留的注入点（默认走 `complexes.py` 与 `http.py`）。
+    打桩的调用方**不改算法**，只是把网络那一段换掉。
+    """
+    download = download or _default_download
+    probe = probe or http.probe
+
+    receptor_doc = pdbtext.parse(receptor_text)
+    # 受体这一份文件里的聚合物链就是受体自己，所以留空时按它来。
+    chains = receptor_chains or tuple(align.sequences(receptor_text))
+
+    clusters: dict = {}
+    verdicts: list[align.Verdict] = []
+    excluded: dict[str, int] = {}
+    sources: list[dict[str, Any]] = []
+    index = 0
+    seen: set[str] = set()
+
+    for raw in candidates:
+        pdb_id = (raw or "").strip().upper()
+        if not pdb_id or pdb_id in seen:
+            continue
+        seen.add(pdb_id)
+
+        try:
+            text = download(pdb_id, timeout=timeout)
+        except complexes.ComplexError as error:
+            state, reason = _classify_failure(pdb_id, error, probe, timeout)
+            verdicts.append(align.Verdict(pdb_id, state, reason))
+            continue
+
+        verdict, transform = align.align_candidate(receptor_text, text, pdb_id)
+        if transform is None:
+            verdicts.append(verdict)
+            continue
+
+        facts = structure.parse_pdb(text, pdb_id=pdb_id)
+        doc = pdbtext.parse(text)
+        filtered = export.ligand_groups(
+            doc, modified_names=[name for name, _count in facts.modified]
+        )
+        for reason, count in filtered.counts.items():
+            excluded[reason] = excluded.get(reason, 0) + count
+
+        moved = align.moved_groups(filtered.kept, transform)
+        for cluster in export.cluster_ligands(moved):
+            residues = export.pocket_residues(
+                receptor_doc, cluster.coords, radius, chains=chains
+            )
+            if not residues:
+                # 配体搬到受体上之后周围没有受体残基——多半是叠合到了别处。
+                # 留空并让这一条进结论，**不编一个空口袋**。
+                continue
+            clusters[index] = _Cluster3D(
+                center=cluster.center,
+                coords=cluster.coords,
+                residues=residues,
+                origin={
+                    "pdb_id": pdb_id,
+                    "ligand": "+".join(cluster.resnames),
+                    "resolution": facts.resolution,
+                    "rmsd": round(verdict.rmsd, 3) if verdict.rmsd is not None else None,
+                },
+            )
+            index += 1
+
+        ligands = tuple(name for name, _count in facts.ligands)
+        verdicts.append(dataclasses.replace(verdict, ligands=ligands))
+        sources.append(
+            {
+                "pdb_id": pdb_id,
+                "resolution": facts.resolution,
+                "rmsd": round(verdict.rmsd, 3) if verdict.rmsd is not None else None,
+                "ligands": list(ligands),
+            }
+        )
+
+    merged = _merge(clusters, radius=radius)
+    if not merged:
+        return (
+            PocketBundle(
+                origin="none",
+                reason="checked",
+                total=len(seen),
+                used=sum(1 for item in verdicts if item.ok),
+                excluded=excluded,
+                sources=sources,
+                note=_empty_note(verdicts, len(seen)),
+            ),
+            tuple(verdicts),
+        )
+
+    passed = sum(1 for item in verdicts if item.ok)
+    note = (
+        f"从先验清单里 {passed} 个通过核对的复合物结构、按叠合后的共晶配体圈出来"
+    )
+    if len(seen) > passed:
+        note += f"；清单里另有 {len(seen) - passed} 个被剔除"
+    return (
+        PocketBundle(
+            pockets=merged,
+            origin="aligned",
+            note=note,
+            total=len(seen),
+            used=passed,
+            excluded=excluded,
+            sources=sources,
+        ),
+        tuple(verdicts),
+    )
+
+
+def _empty_note(verdicts: Sequence[align.Verdict], total: int) -> str:
+    """一个都没能用时，把「查了确实没有」与「没查成」分开说。"""
+    if not total:
+        return "清单是空的，没有编号可取（没查成）"
+    if not any(item.ok for item in verdicts):
+        return f"清单里 {total} 个编号一个都没通过核对（查了，确实没有）"
+    return f"清单里 {total} 个编号通过了核对，但叠合后的配体在受体上圈不到残基（查了，确实没有）"
+
+
+def _default_download(pdb_id: str, **kwargs):
+    return complexes.download_entry(pdb_id, **kwargs)
+
+
+def _classify_failure(
+    pdb_id: str, error: Exception, probe, timeout: float | None
+) -> tuple[str, str]:
+    """下载没成时，用一次 HEAD 把「编号不存在」与「没查成」分开。
+
+    分这两档是有代价的（多一次请求），但不说清的话模型只会看到「下载失败」，
+    然后对着一个编错的编号反复重试——而真实原因是那个编号压根不存在。
+
+    404 的话还要留半句余地：RCSB 对超出 PDB 格式上限的条目只提供 mmCIF，
+    那也是 404，与「没有这个编号」同码（`http.probe` 的注释记过这件事）。
+    """
+    url = f"{complexes.RCSB_DOWNLOAD_URL}/{pdb_id}.pdb"
+    try:
+        status = probe(url, timeout=timeout or http.DEFAULT_TIMEOUT)
+    except Exception:  # 探一下也失败：连编号在不在都答不出来
+        return "unreachable", f"{error}；编号在不在也没探出来（没查成）"
+    if status == 404:
+        return (
+            "missing",
+            "RCSB 上没有这个编号，或它只提供 mmCIF 而取不到 .pdb（查了，确实没有）",
+        )
+    if status == 200:
+        return "unreachable", f"{error}；编号是存在的，这一次没取下来（没查成）"
+    return "unreachable", f"{error}；探编号时回的是 HTTP {status}（没查成）"
 
 
 # ---------------------------------------------------------------------------

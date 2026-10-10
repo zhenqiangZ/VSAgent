@@ -36,6 +36,8 @@ PLAN.md
 
 # 一次性探针与临时脚本
 probe_*.py
+probe_*.txt
+_probe_*.py
 state_check.py
 tmp_*.py
 ligandset2_stats.py

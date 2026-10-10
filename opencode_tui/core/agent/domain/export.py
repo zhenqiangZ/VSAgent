@@ -754,9 +754,15 @@ class WriteRunTool(Tool):
             "把一个受体（与可选的配体集合）写成一个**运行目录**：`meta.json` 记目标与口袋来源、"
             "`receptor.pdb` 是坐标、`ligands/` 放配体位姿。产出的目录登记成 artifact，"
             "网页端据此渲染结构页。\n\n"
-            "**口袋来源按优先级自动选**：先查该蛋白在 RCSB 里所有带配体的复合物"
-            "（实验事实，`source=ligand`），一个都没有才转 prankweb 的 p2rank 预测"
-            "（算出来的，`source=p2rank`），两者都拿不到就写空口袋数组并说明原因。\n\n"
+            "**口袋来源按优先级自动选，两条路二选一**：\n"
+            "  · 给了 candidates（你自己给出的 PDB 编号清单）就走**先验这一侧**："
+            "逐个取回来核对（编号是否存在、链序列是不是受体序列），通过的按 CA 原子"
+            "叠合到受体上，再用叠合后的共晶配体圈口袋（`source=ligand`，带 `rmsd`）。"
+            "**这一侧不再按 UniProt 检索复合物**——检索只返回带配体的已发布复合物，"
+            "覆盖到的口袋窄。核对不通过的编号逐条列在返回里。\n"
+            "  · 没给 candidates 就按老路：先查该蛋白在 RCSB 里所有带配体的复合物，"
+            "一个都没有才转 prankweb 的 p2rank 预测（`source=p2rank`）。\n"
+            "两条路都拿不到就写空口袋数组并说明原因。\n\n"
             "**uniprot 与 pdb_id 不是一回事**：uniprot 是一个蛋白（如 P00519），"
             "它名下可能对应几十上百个 PDB 条目——只给 pdb_id 会让主来源退化成"
             "「只看手上这一份结构」。给出 uniprot 才能让工具去搜全部复合物。\n\n"
@@ -791,6 +797,15 @@ class WriteRunTool(Tool):
                     ),
                 },
                 "name": {"type": "string", "description": "运行显示名，进了界面标题"},
+                "candidates": {
+                    "type": "string",
+                    "description": (
+                        "先验清单：你自己给出的 PDB 编号，逗号或空格分隔"
+                        "（如 \"1M17,2ITY,4HJO\"）。给了它就走先验这一侧，"
+                        "不再按 UniProt 检索复合物。每个编号都会核对编号是否存在、"
+                        "链序列是不是受体序列，不通过的逐条列在返回里"
+                    ),
+                },
             },
             "required": ["receptor"],
         },
@@ -851,7 +866,7 @@ class WriteRunTool(Tool):
                 output=f"读受体文件失败（{type(error).__name__}：{error}）", failed=True
             )
 
-        # ---- 口袋：P0 优先，为空才 P1（延迟导入避免成环）----
+        # ---- 口袋：先验清单优先，其次 P0，为空才 P1（延迟导入避免成环）----
         from . import pockets as pockets_module
 
         note_parts: list[str] = []
@@ -859,8 +874,20 @@ class WriteRunTool(Tool):
         p0_total = 0
         p0_used = 0
         p1_state = "absent"
+        verdicts: tuple = ()
 
-        if uniprot:
+        candidates = _candidates_of(arguments.get("candidates"))
+        if candidates:
+            # 给了先验清单就走这一侧，**不再按 UniProt 检索复合物**：那种检索只返回
+            # 「带配体的已发布复合物」，覆盖到的口袋窄。清单覆盖面宽，代价是清单本身
+            # 不可信，所以逐个核对编号与序列，逐条把结论报回去。
+            bundle, verdicts = pockets_module.prior_pockets(
+                receptor_text=text,
+                candidates=candidates,
+                receptor_chains=chains,
+            )
+            p0_total, p0_used = bundle.total, bundle.used
+        elif uniprot:
             bundle = pockets_module.complex_pockets(
                 uniprot=uniprot, receptor_chains=chains
             )
@@ -923,6 +950,7 @@ class WriteRunTool(Tool):
                 reference=reference,
                 bundle=bundle,
                 ligands=written_ligands,
+                prior=verdicts,
             )
             _write_json(target / RUN_META, payload)
         except OSError as error:
@@ -952,6 +980,7 @@ class WriteRunTool(Tool):
                 pdb_id=pdb_id,
                 reference=reference,
                 note_parts=note_parts,
+                prior=verdicts,
             ),
             meta={
                 "handle": str(artifact.handle),
@@ -1131,13 +1160,17 @@ def _build_meta(
     reference: str,
     bundle: Any,
     ligands: list[dict[str, Any]],
+    prior: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """装配 `meta.json`。
 
     顶层键与 `runs/1iep-molstar/meta.json` 一致：
     `run_id` / `target` / `structure` / `reference_ligand` / `pockets` / `molecules` / `provenance`。
+    **不要加新的顶层键**——判据按「与演示数据同键」核对，多一个键就会报出来。
+    先验清单的取证结论因此挂在 `provenance.pockets.prior` 里，那是已有键的内层。
     """
     pockets = [dict(pocket) for pocket in bundle.pockets]
+    _label_pockets(pockets)
     payload: dict[str, Any] = {
         "run_id": run_id,
         "target": {
@@ -1165,12 +1198,71 @@ def _build_meta(
             }
         },
     }
+    if prior:
+        payload["provenance"]["pockets"]["prior"] = [
+            {
+                "pdb_id": item.pdb_id,
+                "state": item.state,
+                "reason": item.reason,
+                "pair": item.pair,
+                "identity": item.identity,
+                "rmsd": item.rmsd,
+                "ligands": list(item.ligands),
+            }
+            for item in prior
+        ]
     return payload
+
+
+def _label_pockets(pockets: list[dict[str, Any]]) -> None:
+    """给缺 `id` / `label` 的口袋补上。
+
+    页面按 `pocket.id` 与 `pocket.label` 渲染口袋列表，缺了会显示成 `undefined`
+    ——而复合物与先验清单这两侧出来的口袋本来就没有这两个字段（预测那一侧有，
+    编号就是预测给的排名）。补在这里而不是在各自的来源里，因为「第几个」只有
+    排完序才知道，而排序发生在装配 `meta.json` 之前。
+    """
+    for index, pocket in enumerate(pockets, start=1):
+        pocket.setdefault("id", f"P{index}")
+        if pocket.get("label"):
+            continue
+        names = _pocket_ligand_names(pocket)
+        pocket["label"] = f"{names} 位点" if names else f"口袋 {index}"
+
+
+def _pocket_ligand_names(pocket: dict[str, Any]) -> str:
+    """这个口袋是从哪些配体代号圈出来的，按出现顺序去重。"""
+    complexes = pocket.get("complexes")
+    if not isinstance(complexes, list):
+        return ""
+    names: list[str] = []
+    for item in complexes:
+        if not isinstance(item, dict):
+            continue
+        for code in str(item.get("ligand") or "").split("+"):
+            code = code.strip()
+            if code and code not in names:
+                names.append(code)
+    return "+".join(names)
+
+
+def _candidates_of(explicit: Any) -> tuple[str, ...]:
+    """把先验清单那段文字切成编号，按出现顺序去重。空串与重复项都丢掉。"""
+    text = str(explicit or "").strip()
+    if not text:
+        return ()
+    out: list[str] = []
+    for token in re.split(r"[\s,;、]+", text):
+        code = token.strip().upper()
+        if code and code not in out:
+            out.append(code)
+    return tuple(out)
 
 
 def _origin_method(origin: str) -> str:
     return {
         "complex": "rcsb-complex",
+        "aligned": "prior-aligned",
         "predicted": "p2rank",
         "none": "",
     }.get(origin, "")
@@ -1188,13 +1280,22 @@ def _run_report(
     pdb_id: str,
     reference: str,
     note_parts: list[str],
+    prior: Sequence[Any] = (),
 ) -> str:
+    # 延迟导入：`align` 与 `pockets` 都不在模块顶层引，避免绕回成环。
+    from . import align as align_module
+
     lines = [f"已写出运行目录 {target}，登记为 {artifact.handle}。"]
     lines.append(
         f"  口袋来源：{bundle.origin}（{_origin_label(bundle.origin)}）"
         f"，共 {len(bundle.pockets)} 个口袋。"
     )
-    if bundle.origin == "complex":
+    if bundle.origin == "aligned":
+        lines.append(
+            f"  先验清单：共 {p0_total} 个编号，通过核对并使用 **{p0_used} 个**"
+            "（逐个核对了编号是否存在、链序列是不是受体序列，再按 CA 原子叠合）。"
+        )
+    elif bundle.origin == "complex":
         lines.append(
             f"  主来源：UniProt {uniprot} 名下**搜到 {p0_total} 个**带配体复合物，"
             f"本次下载并使用 **{p0_used} 个**（只报 used 会让人以为这个蛋白只有这么多）。"
@@ -1213,6 +1314,13 @@ def _run_report(
     elif bundle.note:
         lines.append("  说明：" + bundle.note)
 
+    if prior:
+        lines.extend(align_module.describe(prior))
+        lines.append(
+            "  提示：剔除的编号不要直接拿去用；要换清单就再调一次本工具，"
+            "把新的编号写进 candidates。"
+        )
+
     excluded = dict(bundle.excluded or {})
     if excluded:
         detail = "、".join(f"{reason} {count} 个" for reason, count in sorted(excluded.items()))
@@ -1228,6 +1336,7 @@ def _run_report(
 def _origin_label(origin: str) -> str:
     return {
         "complex": "实验复合物共晶配体，实测事实",
+        "aligned": "先验清单取证后叠合的共晶配体，实测事实",
         "predicted": "p2rank 预测，算出来的位置",
         "none": "没有可用来源，口袋留空",
     }.get(origin, origin)

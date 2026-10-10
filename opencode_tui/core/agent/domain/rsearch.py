@@ -13,6 +13,8 @@
 1. **文本搜与属性搜分工明确**：文本搜是「按猜测找」，结果随输入变；属性搜是「按条件筛」，
    结果可复现。所以「按 UniProt 列结构」走属性搜，其余走文本搜——内部自己决定。
 2. **失败返回结果，不抛异常**：网络不可达 / 4xx / 5xx 都回一句「这次没搜成」并带原因。
+   **命中 0 条不算失败**，那是「查了、确实没有」——正文措辞与 `meta.reason` 都要分开写。
+   混成一句的话，模型会当成工具出错，换个说法反复重试。
 3. **只解出需要的字段**：多解一项，就多一种把响应形状的偶然当成约定的可能。
 """
 
@@ -161,10 +163,17 @@ def text_query(text: str, *, rows: int = DEFAULT_LIMIT) -> dict[str, Any]:
 
 _ATTRIBUTES = {
     "uniprot": "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
-    "ligand": "rcsb_nonpolymer_entity_container_identifiers.comp_id",
+    "ligand": "rcsb_nonpolymer_entity_container_identifiers.nonpolymer_comp_id",
     "method": "exptl.method",
 }
-"""属性搜认的三个条件各自对应的 RCSB 字段名。"""
+"""属性搜认的三个条件各自对应的 RCSB 字段名。
+
+配体那一项**不能**写成 `...container_identifiers.comp_id`：那个名字看着更直白，
+但 RCSB 明确拒绝按它检索——HTTP 400，`search is not enabled on [ ...comp_id ] attribute`，
+一用整条查询就作废。可搜的名字是 `nonpolymer_comp_id`，`exact_match` 配 `EPJ`
+实测命中 15 条（现场：`ses_0037` 第 6 步拿 `ligand=NCT` 搜，撞的就是这个 400）。
+改这里之前先拿真实接口打一次，别照着名字猜。
+"""
 
 
 def attribute_query(
@@ -229,6 +238,13 @@ def search_entries(
 
     try:
         body = http.post_json(RCSB_SEARCH_URL, query, timeout=timeout)
+    except http.EmptyResult:
+        # **零命中不是失败。** RCSB 在零命中时回 204、不带响应体，`http` 那一层
+        # 已经为这个场景单独造了 `EmptyResult`。这里原先用 `except Exception`
+        # 把它一起吞了，于是「查了、确实没有」被写成「这次没搜成」——模型读到之后
+        # 以为工具坏了，换个说法反复重试（现场：`ses_0037` 第 5~9 步连试四种说法，
+        # 步数就是这么烧掉的）。当成空结果往下走，正文与 `meta.reason` 会分开说。
+        body = {}
     except Exception as error:  # ToolError / RetryableToolError 都归为「这次没搜成」
         raise SearchError(f"RCSB 检索没成：{error}") from error
 
@@ -470,12 +486,24 @@ class SearchPdbTool(Tool):
             ids, total, _raw = search_entries(body)
         except SearchError as error:
             # 网络不可达 / 4xx / 5xx 都走这里：返回一句可读的失败，**不抛异常、不重试到底**。
-            return ToolResult(output=f"这次没搜成（{how} {condition}）：{error}", failed=True)
+            return ToolResult(
+                output=f"这次没搜成（{how} {condition}）：{error}",
+                failed=True,
+                meta=_empty_meta("failed", total=0),
+            )
 
         if not ids:
+            # **命中 0 条不是失败。** 这里原先也写「这次没搜成」，模型读到之后以为工具
+            # 出了问题，换条件反复重试——现场 `ses_0037` 第 5~9 步连着试了四种说法，
+            # 步数就是这么烧掉的。它与「没查成」对用户的含义相反：
+            # 一个是「这个条件下确实没有」，一个是「这次没拿到答案」。
             return ToolResult(
-                output=f"这次没搜成（{how} {condition}）：命中 0 条，没有可列的条目。",
-                meta={"count": 0, "total": total, "ids": [], "entries": []},
+                output=(
+                    f"{how} {condition}：查了，确实没有（命中 0 条）。\n"
+                    "（这是「查了没有」，不是「没查成」——换个条件或换个说法可以再试，"
+                    "但不必当成工具出错。）"
+                ),
+                meta=_empty_meta("checked", total=total),
             )
 
         # ---- 批量取配体：拿不到就只给 id，别把整次检索判失败 ----
@@ -498,6 +526,15 @@ class SearchPdbTool(Tool):
                 "entries": [hit.as_dict() for hit in entries],
             },
         )
+
+
+def _empty_meta(reason: str, *, total: int) -> dict[str, Any]:
+    """空结果的 meta。**`reason` 是结构化字段**，不让调用方去正文里搜那几个字。
+
+    `"checked"` = 查了、确实没有；`"failed"` = 没查成（网络或接口不可用）。
+    与 `pockets.py` 的 `reason` 是同一套分档，措辞也照它那一份。
+    """
+    return {"count": 0, "total": total, "ids": [], "entries": [], "reason": reason}
 
 
 def _describe_condition(*, uniprot: str, ligand: str, method: str) -> str:

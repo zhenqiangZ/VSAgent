@@ -321,7 +321,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 > 压缩过的正文带 `OMISSION_MARK` / `DEEP_MARK`，与 `_cut_middle` 的省略说明
 > **刻意用词不同**：同词的话翻译层裁过的输出会被装配器当成「已经压过」，再也压不动。
 
-### 3.3 `permission.py`（198 行 / 4 个类 / 12 个函数）
+### 3.3 `permission.py`（工具准入判定 + 工具开关）
 
 工具调用的准入判定。
 
@@ -339,11 +339,27 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 | `check(tool, arguments)`             | 查规则给出判定；**取最严的那条**（层级：DENY > ASK > ALLOW）                          |                      |
 | `remember(tool, arguments, verdict)` | 记住这次选择（「本次会话都允许」）                                                  |                      |
 | `clear_session()`                    | 清掉本会话记住的选择                                                         |                      |
-| 模块级                                  | `argument_value` / `load_permissions` / `default_permission_paths` |                      |
-| 常量                                   | `DEFAULT_ASK` / `PLAN_DENY`                                        | 默认要问；Plan 模式下默认拒绝写操作 |
+| 模块级                                  | `argument_value` / `load_permissions` / `default_permission_paths` / `project_config_directory` / **`load_disabled`** |                      |
+| 常量                                   | `DEFAULT_ASK` / `PLAN_DENY` / **`TOOLS_FILE`**                     | 默认要问；Plan 模式下默认拒绝写操作 |
 
 > **值得注意**：多档判定要取**最严**。若按「第一条命中」来判，规则表的顺序就定义了  
 > 安全语义——那是没人会去维护的一处隐式依赖。层级化之后，加一条 DENY 无论如何都生效。
+
+**两件事别混**（这是本模块最容易搞错的地方）：
+
+| | `permissions.toml`（`load_permissions`） | `tools.toml`（`load_disabled`） |
+| --- | --- | --- |
+| 管什么 | 调用时放不放行 | **装配时装不装** |
+| 工具在不在 `tools` 数组里 | **在**，模型看得见 | **不在**，模型不知道有它 |
+| 模型被拒后 | 会一直重试，上下文里攒一串失败 | 不会去想它 |
+| 配置写错 | **抛 `ValueError`**（静默失效更难查） | 按「没关」处理（不让应用起不来） |
+
+要「彻底不让模型用某个工具」用 `tools.toml`，不要用 `deny`。
+
+**配置放哪儿**：项目侧那份跟着**可执行文件**走——打包后读 `exe 同目录/.opencode_tui/tools.toml`，
+源码运行时读 `<启动目录>/.opencode_tui/tools.toml`（`project_config_directory()`，与 `env.env_file()` 同一套判断）。
+用户侧始终是 `~/.opencode_tui/tools.toml`，两份都读、任一处说关就关。
+这样 exe 挪到哪、从哪个目录启动，开关都读得到。
 
 
 ### 3.4 `hooks.py`（207 行 / 4 个类 / 9 个函数）

@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import sys
 import tomllib
 from dataclasses import dataclass
 from enum import Enum
@@ -13,6 +14,9 @@ from .tools import Tool
 # 项目配置所在目录，与状态文件的位置惯例一致
 CONFIG_DIRECTORY = ".opencode_tui"
 PERMISSIONS_FILE = "permissions.toml"
+# 工具开关所在的文件。与权限规则分开放：权限管「调用时放不放行」，
+# 开关管「装配时装不装进来」——后者决定工具在不在请求体的 tools 数组里。
+TOOLS_FILE = "tools.toml"
 # 默认策略下要问一次的工具：会改动文件或运行命令的那些
 DEFAULT_ASK = frozenset({"write", "patch", "bash"})
 # Plan 方式下一律拒绝的工具。一条命令会不会改动看不出来，所以 bash 也算在里面
@@ -356,6 +360,68 @@ def _verdict_of(key: str) -> Verdict | None:
 def default_permission_paths(root: Path) -> tuple[Path, Path]:
     """项目配置与用户配置的位置。"""
     return (
-        root / CONFIG_DIRECTORY / PERMISSIONS_FILE,
+        project_config_directory(root) / PERMISSIONS_FILE,
         Path.home() / CONFIG_DIRECTORY / PERMISSIONS_FILE,
     )
+
+
+def project_config_directory(root: Path) -> Path:
+    """项目侧配置目录：打包后跟着可执行文件走，否则跟着启动目录走。
+
+    与 `env.env_file()` 同一套判断。不这样处理的话，配置只在「从仓库根目录启动」
+    时才找得到——换个目录、或者把 exe 挪到别处双击，禁用清单就读不到了。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent / CONFIG_DIRECTORY
+    return root / CONFIG_DIRECTORY
+
+
+def load_disabled(root: Path) -> tuple[frozenset[str], Path | None]:
+    """读工具开关，返回「装配时不要装进来的工具名」与它的来源文件。
+
+    与权限规则是两件事，这是本函数存在的全部理由：
+
+    - **权限规则管调用**：工具照旧装进注册表、照旧出现在模型看到的工具清单里，
+      只是模型真去调的时候被拦下来。模型会一直重试，上下文里会攒下一串失败记录。
+    - **开关管装配**：工具根本不进注册表，也就不在请求体的 `tools` 数组里。
+      模型看不到它，不会去想它，连失败的机会都没有。
+
+    要彻底不让模型用某个工具时用这个，不要用 `permissions.toml` 里的 `deny`。
+
+    读法（TOML 里一张 `[tools]` 表，键是工具名、值是真假值）：
+
+        [tools]
+        bash = false        # 不装 bash
+        list_workspace = false
+
+    值为真或键写错都不报错——**这份文件的语义是「关」，不是「配」**：
+    没有把握的键按「没关」处理，比让整个应用起不来强。这与 `load_permissions`
+    刻意相反，那边写错一个字母会让规则静默失效、更难查，所以选择启动即报错。
+
+    项目配置与用户配置都读，按 set 收：**任一处说了关就关**。
+    项目侧那份跟着可执行文件走（见 `project_config_directory`），
+    所以 exe 挪到哪、从哪个目录启动都一样生效。
+    返回的来源文件用于启动时打一行日志，让用户知道这条是哪儿来的。
+    """
+    names: set[str] = set()
+    sources: list[Path] = []
+    for path in (
+        project_config_directory(root) / TOOLS_FILE,
+        Path.home() / CONFIG_DIRECTORY / TOOLS_FILE,
+    ):
+        if not path.is_file():
+            continue
+        try:
+            with path.open("rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            # 配置文件坏了不应连累启动：当作没读到，继续走。
+            continue
+        table = data.get("tools")
+        if not isinstance(table, dict):
+            continue
+        found = [name for name, value in table.items() if value is False]
+        if found:
+            sources.append(path)
+            names.update(found)
+    return frozenset(names), (sources[0] if sources else None)

@@ -15,6 +15,7 @@ from .core.agent.task import TaskTool
 from .core.agent.permission import (
     PermissionPolicy,
     default_permission_paths,
+    load_disabled,
     load_permissions,
 )
 from .core.agent.prompt import KEEP_MESSAGES
@@ -93,6 +94,7 @@ class OpenCodeApp(App[None]):
         )
         self._policy = policy
         self._hooks = hooks
+        self._disabled: frozenset[str] | None = None
         self._ledger: SessionLedger | None = None
         self._memory: MemoryStore | None = None
         self.web_service = self._build_web_service()
@@ -221,8 +223,12 @@ class OpenCodeApp(App[None]):
         领域工具由 `domain.all_tools` 一次给全：这个文件的本职是管屏幕与状态，
         每加一个领域模块都回来改一次装配，漏掉一处的结果就是「工具写了但模型看不见」。
         记忆工具与任务状态工具同属内核，排在领域工具之前。
+
+        `.opencode_tui/tools.toml` 里标了关的工具**根本不装进来**：不装进注册表就
+        不会出现在请求体的 `tools` 数组里，模型连它存在都不知道。这与权限层的
+        `deny` 是两件事——那一层工具照旧可见，只是调用时被拦。
         """
-        registry = ToolRegistry()
+        registry = ToolRegistry(disabled=self._disabled_tools())
         # 超时显式传进来，而不是靠 BashTool 的默认值：改这一个数字就能看见装配处跟着动，
         # 不必翻回 tools.py 猜当前生效的是哪一个。
         registry.register(BashTool(cwd=self.root, timeout=BASH_TIMEOUT))
@@ -237,6 +243,15 @@ class OpenCodeApp(App[None]):
         for tool in domain_tools():
             registry.register(tool)
         return registry
+
+    def _disabled_tools(self) -> frozenset[str]:
+        """`.opencode_tui/tools.toml` 里关掉的工具名。
+
+        与权限配置一样只在启动时读一次，改完要重启应用。
+        """
+        if self._disabled is None:
+            self._disabled = load_disabled(self.root)[0]
+        return self._disabled
 
     def on_mount(self) -> None:
         """启动时载入状态、起本地结构页的服务，并进入启动界面。"""

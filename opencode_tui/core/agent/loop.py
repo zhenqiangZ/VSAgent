@@ -81,6 +81,29 @@ EXIT_LABELS: dict[str, str] = {
     EXIT_TOOL_FAILED: "工具没能完成",
 }
 
+
+def missing_tool_reason(registry: ToolRegistry, name: str) -> str:
+    """模型叫了一个不在注册表里的工具时，回给它的一句话。
+
+    两种情形要说成两种话，因为模型该做的事不同：
+
+    - 在禁用清单里 → 这个工具是被人为关掉的，**重试无用**，也不该换个方式绕。
+    - 真的没有 → 报名字，让它自己改。
+
+    分开还有个用处：模型偶尔会凭训练印象叫一个我们从来没有的工具
+    （历史现场：`unknown tool: read`，当时注册表里确实只有 bash），
+    那句话与「被你关掉了」混在一起会让用户以为是自己配错了。
+
+    模块级函数而不是循环层的方法：它只看注册表上的禁用清单，是纯的，
+    测试直接调它验这一句话即可，不必为此起一整层循环、配总线与模型。
+    """
+    if name in registry.disabled:
+        return (
+            f"{name} 已被禁用（配置在 .opencode_tui/tools.toml 里），"
+            "本次会话不会提供这个工具，重试无用，请改用别的办法或告诉用户。"
+        )
+    return f"unknown tool: {name}"
+
 # 让模型写收尾总结时给的指令。
 #
 # 四段固定，与压缩摘要的四段刻意用同一套骨架：用户读到的两份总结因此形状一致，
@@ -748,7 +771,7 @@ class AgentLoop:
         """
         tool = self.registry.get(part.tool_name)
         if tool is None:
-            self._fail_tool(message, part, f"unknown tool: {part.tool_name}")
+            self._fail_tool(message, part, missing_tool_reason(self.registry, part.tool_name))
             return
         error = argument_error(tool.spec, part.tool_input)
         if error:

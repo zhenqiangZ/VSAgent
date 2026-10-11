@@ -315,14 +315,26 @@ class Tool(ABC):
 
 
 class ToolRegistry:
-    """工具登记表，按名字查找。"""
+    """工具登记表，按名字查找。
 
-    def __init__(self) -> None:
+    `disabled` 里的工具**根本不进来**：不装进注册表，也就不在 `specs()` 给出的
+    工具清单里，模型看不到它。这与「装进来但调用时拒绝」是两件事——
+    后者模型会一直重试，上下文里攒下一串失败记录；前者它连这个工具存在都不知道。
+
+    禁用清单的读法见 `permission.load_disabled`，配置在 `.opencode_tui/tools.toml`。
+    这里只负责一件事：把清单里那些名字挡在门外。放在注册表而不是装配处，
+    是因为装配处有八次 `register` 调用，逐个加判断会漏；一个入口收口最省事。
+    """
+
+    def __init__(self, disabled: frozenset[str] | set[str] | None = None) -> None:
         self._tools: dict[str, Tool] = {}
+        self.disabled: frozenset[str] = frozenset(disabled or ())
 
     def register(self, tool: Tool) -> None:
-        """登记一个工具，名字重复时直接抛错。"""
+        """登记一个工具；它在禁用清单里时不登记，名字重复时直接抛错。"""
         name = tool.spec.name
+        if name in self.disabled:
+            return
         if name in self._tools:
             raise ValueError(f"工具名字重复：{name}")
         self._tools[name] = tool
@@ -330,6 +342,10 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         """按名字取工具，没有登记时返回 None。"""
         return self._tools.get(name)
+
+    def names(self) -> list[str]:
+        """已装工具的名字，按装配顺序。"""
+        return list(self._tools)
 
     def specs(self) -> list[dict[str, Any]]:
         """全部工具的参数模式，直接作为请求体的 tools 字段。"""

@@ -28,13 +28,18 @@ from opencode_tui.core.agent.loop import (  # noqa: E402
     STOP_NOTICE,
     TOOL_HOOK_NOTICE,
     AgentLoop,
+    missing_tool_reason,
 )
 from opencode_tui.core.agent.permission import (  # noqa: E402
+    CONFIG_DIRECTORY,
     PLAN_DENY,
+    TOOLS_FILE,
     PermissionPolicy,
     PermissionRule,
     Verdict,
+    load_disabled,
     load_permissions,
+    project_config_directory,
 )
 from opencode_tui.core.agent.memory import (  # noqa: E402
     MEMORY_DIR_NAME,
@@ -830,14 +835,18 @@ def check_rules() -> None:
     path.unlink(missing_ok=True)
 
 
-def build_permission_registry() -> ToolRegistry:
-    """判定那一组断言用的工具表，五个工具都用真的。"""
-    registry = ToolRegistry()
+def build_permission_registry(disabled: frozenset[str] | None = None) -> ToolRegistry:
+    """判定那一组断言用的工具表，五个工具都用真的。
+
+    `disabled` 交给注册表：被关的工具连 `register` 都不该进去。
+    """
+    registry = ToolRegistry(disabled=disabled)
     registry.register(BashTool(cwd=WORKSPACE_FIXTURE))
     registry.register(ReadTool(cwd=WORKSPACE_FIXTURE))
     registry.register(WriteTool(cwd=WORKSPACE_FIXTURE))
     registry.register(PatchTool(cwd=WORKSPACE_FIXTURE))
     registry.register(GrepTool(cwd=WORKSPACE_FIXTURE))
+    registry.register(TaskTool())
     return registry
 
 
@@ -1124,6 +1133,153 @@ def check_permission() -> None:
         raised = str(error)
     check("denny" in raised, f"判定写错一个字母时直接报错：{raised}")
     path.unlink(missing_ok=True)
+
+    check_disabled_tools()
+
+
+def check_disabled_tools() -> None:
+    """工具开关：标了关的工具根本不装进注册表。
+
+    这一组与 `check_permission` 刻意分开立题：那边验的是「调用时放不放行」，
+    这边验的是「装不装进来」。两者看起来都像「不让用某个工具」，实际差得很远——
+    权限层拦下来之后那个工具**照旧在请求体的 tools 数组里**，模型会一直重试；
+    开关关掉之后它不在数组里，模型连它存在都不知道。
+    """
+    root = ROOT / ".probe" / "tools_fixture"
+    config = root / ".opencode_tui"
+    config.mkdir(parents=True, exist_ok=True)
+    path = config / "tools.toml"
+    path.unlink(missing_ok=True)
+
+    check(load_disabled(root)[0] == frozenset(), "开关文件不存在时读出空清单")
+    check(len(load_disabled(root)) == 2, "开关读出来是「清单 + 来源」两样")
+
+    path.write_text('[tools]\nbash = false\nlist_workspace = false\n', encoding="utf-8")
+    disabled, source = load_disabled(root)
+    check(
+        disabled == frozenset({"bash", "list_workspace"}),
+        f"标了 false 的工具都读了出来：{sorted(disabled)}",
+    )
+    check(source == path, f"来源指向那份配置文件：{source}")
+
+    registry = build_permission_registry(disabled=disabled)
+    names = registry.names()
+    check("bash" not in names, "被关的工具不进注册表")
+    check("list_workspace" not in names, "领域工具一样能被关掉")
+    check("read" in names, "没在清单里的工具照旧装上")
+    sent = {item["function"]["name"] for item in registry.specs()}
+    check(
+        "bash" not in sent and "list_workspace" not in sent,
+        "被关的工具不在请求体的 tools 数组里（这才叫「不出现在上下文中」）",
+    )
+    check(
+        len(sent) == len(names),
+        "工具数组与注册表一致，没有哪个被漏掉或多出来",
+    )
+
+    # 只认 false。写别的值等于没关：这一层的语义是「关」，不是「配」，
+    # 认不出的键按「没关」处理，比让整个应用起不来强。
+    path.write_text('[tools]\nbash = "no"\nwrite = true\n', encoding="utf-8")
+    check(load_disabled(root)[0] == frozenset(), "只有 false 才算关，别的值都不算")
+    path.write_text("这不是 TOML [[[\n", encoding="utf-8")
+    check(load_disabled(root)[0] == frozenset(), "配置文件坏掉时当作没读到，不连累启动")
+
+    # 关掉的工具真被模型叫到时，回给它的话要与「压根没这个工具」分得开：
+    # 前者重试无用、也不该换个方式绕，后者让它自己改名字。
+    #
+    # 这里直接调判定函数，不起整个循环层：它是纯函数（只看注册表的禁用清单），
+    # 起一层要配事件总线、模型配置、工作目录，为验一句话不值当。
+    path.write_text("[tools]\nbash = false\n", encoding="utf-8")
+    disabled, _ = load_disabled(root)
+    registry = build_permission_registry(disabled=disabled)
+    reason = missing_tool_reason(registry, "bash")
+    check("禁用" in reason and "重试无用" in reason, f"被关的工具给出的是「已被禁用」：{reason}")
+    check(
+        "unknown tool" in missing_tool_reason(registry, "nonexistent_thing"),
+        "真没有的工具照旧报 unknown tool",
+    )
+    check(
+        "unknown tool" in missing_tool_reason(registry, "list_workspace"),
+        "没被关的工具即使不在这一份注册表里也报 unknown tool，不误报成禁用",
+    )
+
+    # 用户配置那一侧同样生效，且「任一处说了关就关」。
+    path.unlink(missing_ok=True)
+    user_dir = Path.home() / CONFIG_DIRECTORY
+    user_file = user_dir / TOOLS_FILE
+    existed = user_file.is_file()
+    backup = user_file.read_text(encoding="utf-8") if existed else ""
+    try:
+        user_dir.mkdir(parents=True, exist_ok=True)
+        user_file.write_text("[tools]\ngrep = false\n", encoding="utf-8")
+        check(
+            load_disabled(root)[0] == frozenset({"grep"}),
+            "用户配置里的开关读得到（对所有项目生效）",
+        )
+        path.write_text("[tools]\nbash = false\ngrep = true\n", encoding="utf-8")
+        check(
+            load_disabled(root)[0] == frozenset({"bash", "grep"}),
+            "用户说关、项目说开时仍然是关（任一处说了关就关）",
+        )
+    finally:
+        path.unlink(missing_ok=True)
+        if existed:
+            user_file.write_text(backup, encoding="utf-8")
+        else:
+            user_file.unlink(missing_ok=True)
+
+    # 这一条是整组的要害：把配置读出来的清单真的拿去装配，断言被关的工具确实少了。
+    # 上面那几条都只验了「清单读出来了」，清单读出来却没用上一样是白读。
+    config.mkdir(parents=True, exist_ok=True)
+    path.write_text("[tools]\nsearch_pdb = false\n", encoding="utf-8")
+    disabled, _ = load_disabled(root)
+    live = ToolRegistry(disabled=disabled)
+    for tool in all_domain_tools():
+        live.register(tool)
+    check(live.get("search_pdb") is None, "配置里关掉的领域工具，装配时真没进来")
+    check(
+        live.get("search_literature") is not None and live.get("write_run") is not None,
+        "没在配置里点名的工具照旧装上",
+    )
+    check(
+        "search_pdb" not in {spec["function"]["name"] for spec in live.specs()},
+        "被关的工具不在请求体的 tools 数组里（模型看不到它）",
+    )
+    check(
+        set(DOMAIN_TOOL_NAMES) - set(live.names()) == {"search_pdb"},
+        "少的正好是那一个，没有连带别的",
+    )
+    path.unlink(missing_ok=True)
+
+    # 打包之后项目侧配置跟着**可执行文件**走，不跟着启动目录走：换个目录启动、
+    # 或把 exe 挪到别处，禁用清单照样读得到。这里直接改 `sys.frozen` 与
+    # `sys.executable` 模拟打包环境（不真起 exe）。
+    exe_dir = ROOT / ".probe" / "frozen_fixture"
+    (exe_dir / CONFIG_DIRECTORY).mkdir(parents=True, exist_ok=True)
+    (exe_dir / CONFIG_DIRECTORY / TOOLS_FILE).write_text(
+        "[tools]\nsearch_pdb = false\n", encoding="utf-8"
+    )
+    frozen, executable = getattr(sys, "frozen", None), sys.executable
+    try:
+        sys.frozen = True
+        sys.executable = str(exe_dir / "opencode-tui.exe")
+        check(
+            project_config_directory(Path("/nowhere")) == exe_dir / CONFIG_DIRECTORY,
+            "打包后配置目录取自可执行文件所在处，与启动目录无关",
+        )
+        disabled, source = load_disabled(Path("/nowhere"))
+        check(
+            disabled == frozenset({"search_pdb"}),
+            f"换个启动目录仍读得到 exe 旁边的开关：{sorted(disabled)}",
+        )
+        check(source == exe_dir / CONFIG_DIRECTORY / TOOLS_FILE, f"来源指向 exe 旁那份：{source}")
+    finally:
+        if frozen is None:
+            del sys.frozen
+        else:
+            sys.frozen = frozen
+        sys.executable = executable
+        (exe_dir / CONFIG_DIRECTORY / TOOLS_FILE).unlink(missing_ok=True)
 
 
 # 钩子夹具脚本。测试自己写出来，内容里不能出现用字规则禁用的那些字：
@@ -3301,8 +3457,16 @@ def tool_parts_of(app: OpenCodeApp) -> list[Part]:
 
 
 async def check_live_app(server: FakeModelServer) -> None:
-    """从界面提交一句话到消息区出现完整回复。"""
+    """从界面提交一句话到消息区出现完整回复。
+
+    **根目录要用隔离的那一个**（不是 `ROOT`）：`.opencode_tui/tools.toml` 是
+    用户自己会改的本地配置，拿仓库根当 root 的话，本机把某个工具关掉之后
+    这一组断言会当场响——那是配置生效，不是产品坏了。这里要验的是
+    「没人配置时全装」，所以给一个空目录当 root。
+    """
     state = ROOT / ".probe" / "state_live.toml"
+    bare_root = ROOT / ".probe" / "live_root"
+    bare_root.mkdir(parents=True, exist_ok=True)
     os.environ["VSA_LLM_BASE_URL"] = server.base_url
     os.environ["VSA_LLM_API_KEY"] = "secret"
     os.environ["VSA_LLM_MODEL"] = "fake-model"
@@ -3325,7 +3489,7 @@ async def check_live_app(server: FakeModelServer) -> None:
             ]
         )
     )
-    app = OpenCodeApp(root=ROOT, state_path=state)
+    app = OpenCodeApp(root=bare_root, state_path=state)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         await pilot.press(*list("hello"))
@@ -3394,6 +3558,10 @@ async def check_live_app(server: FakeModelServer) -> None:
             [spec["function"]["name"] for spec in app.agent.registry.specs()][:3]
             == ["bash", "read", "write"],
             "文件工具排在前面，领域工具跟在后面（装配顺序就是请求体里的顺序）",
+        )
+        check(
+            not app.agent.registry.disabled,
+            "没配 tools.toml 时禁用清单是空的，一个工具都不少",
         )
         check(
             abs(assistant.cost - 0.000021) < 1e-9,

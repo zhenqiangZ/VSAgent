@@ -74,6 +74,7 @@ from opencode_tui.core.agent.prompt import (  # noqa: E402
     MODEL_OUTPUT_LIMIT,
     OMISSION_MARK,
     REASONING_PLACEHOLDER,
+    RULES_DIR_ENV,
     RULES_LIMIT,
     SUMMARY_INSTRUCTION,
     SUMMARY_NOTICE,
@@ -82,6 +83,7 @@ from opencode_tui.core.agent.prompt import (  # noqa: E402
     estimate_tokens,
     is_key_line,
     project_rules,
+    rules_directory,
     stable_prefix,
     summary_messages,
     translate_message,
@@ -822,15 +824,29 @@ def check_rules() -> None:
 
     session = Session(id="ses_rules", title="规则")
     path.write_text("# 只许读，不许写\n", encoding="utf-8")
-    with_rules = build_system_prompt(Workspace(session.id, root=RULES_FIXTURE), session)
-    check("只许读，不许写" in with_rules, "系统提示里带上项目规则")
+
+    # 规则的位置由代码定，不由工作目录定：传进去的工作目录是别处，
+    # 读到的仍是 rules_directory() 指的那一份。
     check(
-        with_rules.index("只许读，不许写") < with_rules.index("工作目录："),
-        "规则排在工作目录之前",
+        rules_directory(WORKSPACE_FIXTURE) == ROOT,
+        "没设 VSA_RULES_DIR 时，规则目录固定是开发项目根，与工作目录无关",
     )
 
-    without = build_system_prompt(Workspace("ses_rules_none", root=RULES_FIXTURE / "empty"), session)
-    check("这个项目的规则" not in without, "没有规则文件时系统提示里没有那一段")
+    os.environ[RULES_DIR_ENV] = str(RULES_FIXTURE)
+    try:
+        check(rules_directory(WORKSPACE_FIXTURE) == RULES_FIXTURE, "VSA_RULES_DIR 能顶掉规则目录")
+        with_rules = build_system_prompt(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
+        check("只许读，不许写" in with_rules, "系统提示里带上规则文件的内容")
+        check(
+            with_rules.index("只许读，不许写") < with_rules.index("工作目录："),
+            "规则排在工作目录之前",
+        )
+
+        os.environ[RULES_DIR_ENV] = str(RULES_FIXTURE / "empty")
+        without = build_system_prompt(Workspace("ses_rules_none", root=WORKSPACE_FIXTURE), session)
+        check("这个项目的规则" not in without, "规则文件不存在时系统提示里没有那一段")
+    finally:
+        os.environ.pop(RULES_DIR_ENV, None)
 
     path.unlink(missing_ok=True)
 
@@ -8188,6 +8204,48 @@ async def check_task_state() -> None:
     check(
         unassigned.failed and "内核装配问题" in unassigned.output,
         f"该注入却没注入时报装配问题：{unassigned.output[:40]}",
+    )
+
+    # 参数名必须与模型看得到的那一处一致。说明文字、渲染出来的标题、`/task` 的别名表
+    # 用的都是 `constraints`，而参数模式原来是 `add_constraints`——模型照着说明写，
+    # 被 `additionalProperties: False` 挡下，白烧一步（现场 4 个会话各撞过一次）。
+    properties = tool.spec.parameters["properties"]
+    check("constraints" in properties, "参数模式里有 constraints（模型看得到的就是这个名字）")
+    check("add_constraints" in properties, "旧名字也留着，老会话历史里的调用照旧认")
+
+    by_new_name = TaskState()
+    added = await tool.execute({"constraints": ["约束甲", "约束乙"]}, task_state=by_new_name)
+    check(not added.failed, f"用 constraints 追加不再被挡：{added.output[:60]}")
+    check(
+        by_new_name.constraints == ["约束甲", "约束乙"],
+        f"constraints 收进了状态：{by_new_name.constraints}",
+    )
+
+    by_old_name = TaskState()
+    legacy = await tool.execute({"add_constraints": ["旧写法"]}, task_state=by_old_name)
+    check(not legacy.failed and by_old_name.constraints == ["旧写法"], "旧名字 add_constraints 仍然生效")
+
+    both = TaskState()
+    merged = await tool.execute(
+        {"constraints": ["新写法"], "add_constraints": ["旧写法"]}, task_state=both
+    )
+    check(
+        not merged.failed and both.constraints == ["新写法", "旧写法"],
+        f"两个名字都给就都追加：{both.constraints}",
+    )
+
+    # 参数模式这一层也要放行新名字（内核在 execute 之前先过它）。
+    check(
+        argument_error(tool.spec, {"constraints": ["一条"]}) == "",
+        "constraints 能过参数模式这一道",
+    )
+    check(
+        argument_error(tool.spec, {"add_constraints": ["一条"]}) == "",
+        "add_constraints 也仍能过参数模式这一道",
+    )
+    check(
+        "不在允许的范围内" in argument_error(tool.spec, {"constraint": ["一条"]}),
+        "真写错的名字（单数 constraint）照旧被挡下",
     )
 
     for label, arguments in (("一个字段都没给", {}), ("todo 不是数组", {"todo": "不是数组"})):

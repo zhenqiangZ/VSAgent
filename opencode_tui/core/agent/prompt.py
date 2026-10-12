@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,8 @@ EMPTY_REASONING = "（本步没有推理输出）"
 REASONING_PLACEHOLDER = "（本步的中间推理已压缩，结论见正文）"
 # 项目规则文件，每次发问之前重新读
 RULES_FILE = "AGENTS.md"
+# 规则文件所在的目录，可以用这个环境变量顶掉（调试与断言换一份规则用）
+RULES_DIR_ENV = "VSA_RULES_DIR"
 # 规则文件注入系统提示的上限，按字节数算
 RULES_LIMIT = 32 * 1024
 # 摘要那一条插在系统提示之后
@@ -185,11 +189,35 @@ def truncate_for_model(text: str) -> str:
     return _cut_middle(text, MODEL_OUTPUT_HALF)
 
 
+def rules_directory(root: Path) -> Path:
+    """规则文件所在的目录。
+
+    默认取**这份代码所属的项目**——源码运行时是包的上级目录（开发项目根），
+    打包之后是可执行文件所在目录。两支都**不看启动目录**，所以不管从哪个目录
+    启动，读到的都是同一份规则文件。
+
+    这与 `env.env_file()` / `permission.project_config_directory` 是同一套判断，
+    只有源码运行那一支不同：那两个跟着启动目录走（用户在哪就认哪），
+    这一份跟着代码走——规则是写给这个项目本身的，换目录不该把它甩掉。
+
+    `VSA_RULES_DIR` 指到哪儿就取哪儿，调试与断言用它换一份规则文件。
+    """
+    override = os.environ.get(RULES_DIR_ENV)
+    if override:
+        return Path(override)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parents[3]
+
+
 def project_rules(root: Path) -> str:
-    """读项目规则文件，每次调用都重新读磁盘。
+    """读 `root` 下的规则文件，每次调用都重新读磁盘。
 
     每次发问之前都重新读一遍，所以在会话中途改动这个文件之后，
     下一个 step 就按新内容发出去，不用重开会话。
+
+    这里收的是**目录**，不是工作目录：给它的通常是 `rules_directory()`
+    算出来的那个，与模型当前在哪个目录里干活无关。
 
     文件不存在时返回空字符串，系统提示里那一段就不出现。
     超过上限时在最后一个完整行处断开，末尾写明省略了多少字节。
@@ -251,6 +279,9 @@ def stable_prefix(workspace: Workspace, session: Session) -> str:
 
     这一段在同一会话内只随 `AGENTS.md` 变化，**不放时间、不放进度**——
     放了的话每一步都会击穿 prompt cache，前缀缓存永远命中不了。
+
+    规则取 `rules_directory()` 那一份，与 `workspace.root`（模型干活的目录）
+    无关：换工作目录不该换掉项目规则。
     """
     blocks = [
         _identity(session.agent_name),
@@ -259,7 +290,7 @@ def stable_prefix(workspace: Workspace, session: Session) -> str:
         LEDGER_DISCIPLINE,
         MEMORY_DISCIPLINE,
     ]
-    rules = project_rules(workspace.root)
+    rules = project_rules(rules_directory(workspace.root))
     if rules:
         blocks.append(f"这个项目的规则，每一条都必须遵守：\n\n{rules}")
     return "\n\n".join(blocks)

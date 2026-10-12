@@ -289,7 +289,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 > 模态帧里能读到 `deepseek-chat` / `deepseek-flash` / `deepseek-reasoner`，  
 > 说明 `BUILTIN_MODELS` 真的进了冻结产物——这是抓帧时确认「新代码进包了」的读数。
 
-### 3.2 `prompt.py`（435 行 / 18 个函数）
+### 3.2 `prompt.py`（466 行 / 18 个函数）
 
 **稳定前缀**、翻译层、token 估算与**选择性压缩**。装配（分层与预算）已搬到 `context.py`。
 
@@ -300,7 +300,8 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 | `is_key_line(line)`                                               | 这一行是不是关键行：报错原文按「行里含」判、结论行按「行首是」判            |
 | `compress_tool_output(text, deep)`                                | **按内容挑着留**：保关键行与首尾，丢掉成片过程输出；返回 None 表示压不动   |
 | `truncate_for_model(text)`                                        | 给模型的那一份：先按内容挑，挑完仍超长才按位置兜底                  |
-| `project_rules(root)`                                             | 读项目规则文件 `AGENTS.md`，超 32KB 时按行截断           |
+| `rules_directory(root)`                                           | 规则文件在哪个目录：源码运行取包的上级目录、打包后取 exe 所在目录，**都不看启动目录**；`VSA_RULES_DIR` 可顶掉 |
+| `project_rules(root)`                                             | 读该目录下的 `AGENTS.md`，超 32KB 时按行截断           |
 | `stable_prefix(workspace, session)`                               | 稳定前缀（`PREFIX` 层）：身份 / 纪律 / 规则，**不含时间与进度**   |
 | `build_system_prompt()`                                           | 稳定前缀 + 工作目录的当前状态（保留的兼容入口）                  |
 | `summary_messages()`                                              | 压缩时用的「请总结以下对话」请求                           |
@@ -313,6 +314,13 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 
 > `stable_prefix` 与 `build_system_prompt` 的差别就是「前缀稳定」这条不变式：前者只随
 > `AGENTS.md` 变化，后者多带一段含当前时间的 `state_text`。装配器只用前者。
+
+> **规则的位置不跟工作目录走**：`stable_prefix` 取 `rules_directory(workspace.root)`，
+> 而不是 `workspace.root` 本身。`rules_directory` 与 `env.env_file()` /
+> `permission.project_config_directory` 是同一套判断，只有源码运行那一支不同——
+> 那两个跟着启动目录走（用户在哪就认哪），规则这一份跟着代码走，因为规则是写给
+> 这个项目本身的。所以从任何目录启动，读到的都是开发中那份 `AGENTS.md`。
+> 打包后读 exe 旁边那份，**要记得把它放在 exe 旁边**（与 `.env`、`.opencode_tui/` 同一批）。
 
 > **压缩原语为什么在这一层**：`context.py` 从 `prompt.py` 导入，反过来不行，所以
 > 两处都要用的东西只能放这里。而这两处**必须**共用一套——翻译层给模型的那一份
@@ -654,7 +662,7 @@ JSONL 事件日志。
 > 一条 `Part` 的最终状态，所以它必须排在 POST_TOOL_USE 钩子之后——钩子可能把这一条
 > 改成失败，那时它更该进证据层。
 
-### 3.12 `task.py`（102 行 / 1 个类 / 1 个方法）
+### 3.12 `task.py`（116 行 / 1 个类 / 1 个方法）
 
 本会话的任务状态**更新入口**（模型那条路）。数据在 `core/models.py`（`Session` 持有它），
 这里只有工具——数据在数据层，工具在工具层。用户那条路是 `/task` 命令，在 `app.py`。
@@ -663,8 +671,14 @@ JSONL 事件日志。
 | ----------------- | -------------------------------------------------------- |
 | `TaskTool`        | 工具名 `task`；`task_argument = "state"`，内核按它把 `session.task_state` 塞进来 |
 | 参数 `goal`         | 覆盖目标                                                     |
-| 参数 `add_constraints` | **追加**约束（去重）；已有约束不会被这次调用删掉                             |
+| 参数 `constraints`  | **追加**约束（去重）；已有约束不会被这次调用删掉                             |
 | 参数 `done` / `todo` / `blockers` | **整段替换**；传空数组即清空这一类                        |
+
+> **参数名要和状态字段一致**：这个参数原来叫 `add_constraints`，而说明文字、渲染出来的
+> 标题、`/task` 的别名表用的都是 `constraints`——模型照着说明写 `constraints`，
+> 被 `additionalProperties: False` 挡下，白烧一步（4 个会话里各撞过一次）。
+> 现以 `constraints` 为准，`add_constraints` 作为旧写法继续收（老会话的历史里
+> 还有那些调用，模型会学）。**加新工具时，参数名要照模型看得到的那个名字取。**
 
 > **值得注意**：这是全仓唯一声明 `task_argument` 的工具。它与 `context_argument`
 > 是两个通道，因为内核从不同地方取：`context` 是循环层持有的登记表、会话切换时整体换掉；

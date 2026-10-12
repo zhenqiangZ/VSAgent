@@ -917,6 +917,7 @@ class PrepareReceptorTool(Tool):
     spec = ToolSpec(
         name="prepare_receptor",
         description=(
+            "在用户没有充分了解受体以及确认结构前，不可调用。"
             "把一套实验坐标准备成**可以直接对接的受体**：选链、去水去杂、取出共晶配体、"
             "算盒子，再做按残基的模板匹配与 PDBQT 参数化。产物是一个目录（规整后的 "
             "receptor.pdb、受体 receptor.pdbqt、共晶配体 ligand.pdb、盒子 box.txt、"
@@ -928,22 +929,6 @@ class PrepareReceptorTool(Tool):
             "也不生成 3D 坐标、不指派质子化态——它做的是模板匹配。"
             "上游要先用 fetch_structure 或 import_structure 拿到状态为原始结构的受体。"
             f"{CHEM_TOOL_DESCRIPTION_NOTE}"
-            "\n\n参数：\n"
-            "  structure: 原始结构（状态 raw 的受体），例如 receptor#1，不要传路径\n"
-            "  chain: 留哪条链。一条写一个字母，多条用逗号分隔，全要写 all；"
-            "结构里只有一条聚合物链时可以留空，有多条时留空会被拒绝并列出清单\n"
-            "  ligand: 共晶配体，它同时也是盒子的依据。留空 = 自动取那一组非水杂原子残基；"
-            "给残基名（如 AQ4）指定，同名多组时写 残基名:链；给 whole 表示用整份受体"
-            "算盒子（盲对接）；给 none 表示不取配体（那时盒子必须显式给）\n"
-            "  box_center / box_size: 盒子中心与边长，形如 \"21.7, 0.3, 52.1\" 与 "
-            "\"24, 13, 15\"，必须成对给，给了就覆盖「由配体算盒子」\n"
-            "  padding: 由配体算盒子时四周各留多少埃，默认 4\n"
-            "  altloc: 交替构象取哪一个（通常是 A）。留空时若文件里有交替构象会被拒绝"
-            "并列出是哪些残基——这是有意的，构象由你选\n"
-            "  keep_hetero: 要保留的杂原子残基名，逗号分隔（金属离子、糖基化位点）。"
-            "MODRES 登记过的修饰残基一律保留，不用写在这里\n"
-            "  relax: true 时允许丢掉模板匹配不上的残基，默认 false（拒绝并报告）\n"
-            "  confirm: 必须是 true 才真正写盘与登记，默认 false 只做预演"
         ),
         parameters={
             "type": "object",

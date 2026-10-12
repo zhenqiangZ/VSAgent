@@ -19,7 +19,7 @@ web/vendor/
 opencode-export-*.md
 
 # 内部工作文档：调试记录、设计讨论与编码规范，不进公开分支
-AGENTS.md
+# （AGENTS.md 例外：它是给协作模型读的项目约定，跟着代码走，见 prompt.rules_directory）
 HARNESS.md
 ISSUES.md
 LOOP.md

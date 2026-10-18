@@ -1,0 +1,674 @@
+{
+  "run_id": "1iep-demo",
+  "target": {
+    "name": "ABL kinase domain",
+    "pdb_id": "1IEP",
+    "chains": [
+      "A",
+      "B"
+    ],
+    "reference_chain": "A",
+    "ligand": "STI"
+  },
+  "structure": "receptor.pdb",
+  "reference_ligand": "ligands/crystal-sti.pdb",
+  "pockets": [
+    {
+      "id": "P1",
+      "label": "ATP 结合位点",
+      "score": 0.91,
+      "rank": 1,
+      "is_reference": true,
+      "center": [
+        15.614,
+        53.38,
+        15.455
+      ],
+      "radius": 5.0,
+      "residues": [
+        {
+          "chain": "A",
+          "resseq": 360,
+          "resname": "ILE",
+          "min_distance": 2.67
+        },
+        {
+          "chain": "A",
+          "resseq": 315,
+          "resname": "THR",
+          "min_distance": 2.88
+        },
+        {
+          "chain": "A",
+          "resseq": 318,
+          "resname": "MET",
+          "min_distance": 2.9
+        },
+        {
+          "chain": "A",
+          "resseq": 381,
+          "resname": "ASP",
+          "min_distance": 2.9
+        },
+        {
+          "chain": "A",
+          "resseq": 286,
+          "resname": "GLU",
+          "min_distance": 3.0
+        },
+        {
+          "chain": "A",
+          "resseq": 361,
+          "resname": "HIS",
+          "min_distance": 3.16
+        },
+        {
+          "chain": "A",
+          "resseq": 299,
+          "resname": "VAL",
+          "min_distance": 3.25
+        },
+        {
+          "chain": "A",
+          "resseq": 290,
+          "resname": "MET",
+          "min_distance": 3.31
+        },
+        {
+          "chain": "A",
+          "resseq": 317,
+          "resname": "PHE",
+          "min_distance": 3.33
+        },
+        {
+          "chain": "A",
+          "resseq": 380,
+          "resname": "ALA",
+          "min_distance": 3.33
+        },
+        {
+          "chain": "A",
+          "resseq": 271,
+          "resname": "LYS",
+          "min_distance": 3.35
+        },
+        {
+          "chain": "A",
+          "resseq": 382,
+          "resname": "PHE",
+          "min_distance": 3.4
+        },
+        {
+          "chain": "A",
+          "resseq": 313,
+          "resname": "ILE",
+          "min_distance": 3.45
+        },
+        {
+          "chain": "A",
+          "resseq": 269,
+          "resname": "ALA",
+          "min_distance": 3.55
+        },
+        {
+          "chain": "A",
+          "resseq": 253,
+          "resname": "TYR",
+          "min_distance": 3.56
+        },
+        {
+          "chain": "A",
+          "resseq": 248,
+          "resname": "LEU",
+          "min_distance": 3.63
+        },
+        {
+          "chain": "A",
+          "resseq": 362,
+          "resname": "ARG",
+          "min_distance": 3.66
+        },
+        {
+          "chain": "A",
+          "resseq": 256,
+          "resname": "VAL",
+          "min_distance": 3.73
+        },
+        {
+          "chain": "A",
+          "resseq": 370,
+          "resname": "LEU",
+          "min_distance": 3.8
+        },
+        {
+          "chain": "A",
+          "resseq": 321,
+          "resname": "GLY",
+          "min_distance": 3.81
+        },
+        {
+          "chain": "A",
+          "resseq": 289,
+          "resname": "VAL",
+          "min_distance": 3.84
+        },
+        {
+          "chain": "A",
+          "resseq": 293,
+          "resname": "ILE",
+          "min_distance": 4.02
+        },
+        {
+          "chain": "A",
+          "resseq": 270,
+          "resname": "VAL",
+          "min_distance": 4.05
+        },
+        {
+          "chain": "A",
+          "resseq": 359,
+          "resname": "PHE",
+          "min_distance": 4.08
+        },
+        {
+          "chain": "A",
+          "resseq": 316,
+          "resname": "GLU",
+          "min_distance": 4.26
+        },
+        {
+          "chain": "A",
+          "resseq": 379,
+          "resname": "VAL",
+          "min_distance": 4.76
+        },
+        {
+          "chain": "A",
+          "resseq": 322,
+          "resname": "ASN",
+          "min_distance": 4.82
+        },
+        {
+          "chain": "A",
+          "resseq": 314,
+          "resname": "ILE",
+          "min_distance": 4.96
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "label": "变构位点候选",
+      "score": 0.74,
+      "rank": 2,
+      "is_reference": false,
+      "center": [
+        0.853,
+        65.049,
+        37.422
+      ],
+      "radius": 5.0,
+      "residues": [
+        {
+          "chain": "A",
+          "resseq": 461,
+          "resname": "PRO",
+          "min_distance": 0.0
+        },
+        {
+          "chain": "A",
+          "resseq": 462,
+          "resname": "GLU",
+          "min_distance": 2.42
+        },
+        {
+          "chain": "A",
+          "resseq": 460,
+          "resname": "ARG",
+          "min_distance": 2.45
+        },
+        {
+          "chain": "A",
+          "resseq": 459,
+          "resname": "GLU",
+          "min_distance": 4.2
+        },
+        {
+          "chain": "A",
+          "resseq": 464,
+          "resname": "CYS",
+          "min_distance": 4.31
+        },
+        {
+          "chain": "A",
+          "resseq": 434,
+          "resname": "THR",
+          "min_distance": 4.77
+        },
+        {
+          "chain": "A",
+          "resseq": 430,
+          "resname": "TRP",
+          "min_distance": 4.91
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "label": "表面浅槽",
+      "score": 0.63,
+      "rank": 3,
+      "is_reference": false,
+      "center": [
+        10.051,
+        41.228,
+        40.317
+      ],
+      "radius": 5.0,
+      "residues": [
+        {
+          "chain": "A",
+          "resseq": 481,
+          "resname": "SER",
+          "min_distance": 0.0
+        },
+        {
+          "chain": "A",
+          "resseq": 480,
+          "resname": "PRO",
+          "min_distance": 2.42
+        },
+        {
+          "chain": "A",
+          "resseq": 482,
+          "resname": "ASP",
+          "min_distance": 2.44
+        },
+        {
+          "chain": "A",
+          "resseq": 479,
+          "resname": "ASN",
+          "min_distance": 4.23
+        },
+        {
+          "chain": "A",
+          "resseq": 483,
+          "resname": "ARG",
+          "min_distance": 4.36
+        },
+        {
+          "chain": "A",
+          "resseq": 419,
+          "resname": "LYS",
+          "min_distance": 4.66
+        }
+      ]
+    },
+    {
+      "id": "P4",
+      "label": "二聚界面附近",
+      "score": 0.52,
+      "rank": 4,
+      "is_reference": false,
+      "center": [
+        21.178,
+        63.505,
+        39.636
+      ],
+      "radius": 5.0,
+      "residues": [
+        {
+          "chain": "A",
+          "resseq": 445,
+          "resname": "LEU",
+          "min_distance": 0.0
+        },
+        {
+          "chain": "A",
+          "resseq": 446,
+          "resname": "SER",
+          "min_distance": 2.43
+        },
+        {
+          "chain": "A",
+          "resseq": 444,
+          "resname": "ASP",
+          "min_distance": 2.46
+        },
+        {
+          "chain": "A",
+          "resseq": 448,
+          "resname": "VAL",
+          "min_distance": 3.92
+        },
+        {
+          "chain": "A",
+          "resseq": 404,
+          "resname": "LYS",
+          "min_distance": 4.18
+        },
+        {
+          "chain": "A",
+          "resseq": 447,
+          "resname": "GLN",
+          "min_distance": 4.27
+        },
+        {
+          "chain": "A",
+          "resseq": 443,
+          "resname": "ILE",
+          "min_distance": 4.71
+        },
+        {
+          "chain": "A",
+          "resseq": 403,
+          "resname": "ILE",
+          "min_distance": 4.8
+        }
+      ]
+    }
+  ],
+  "molecules": [
+    {
+      "id": "L01",
+      "name": "candidate-01",
+      "score": 9.34,
+      "pose": "ligands/pose-01.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L02",
+      "name": "candidate-02",
+      "score": 9.04,
+      "pose": "ligands/pose-02.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L03",
+      "name": "candidate-03",
+      "score": 8.86,
+      "pose": "ligands/pose-03.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L04",
+      "name": "candidate-04",
+      "score": 8.44,
+      "pose": "ligands/pose-04.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L05",
+      "name": "candidate-05",
+      "score": 8.19,
+      "pose": "ligands/pose-05.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L06",
+      "name": "candidate-06",
+      "score": 7.8,
+      "pose": "ligands/pose-06.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L07",
+      "name": "candidate-07",
+      "score": 7.54,
+      "pose": "ligands/pose-07.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L08",
+      "name": "candidate-08",
+      "score": 7.22,
+      "pose": "ligands/pose-08.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L09",
+      "name": "candidate-09",
+      "score": 6.99,
+      "pose": "ligands/pose-09.pdb",
+      "chain": "A"
+    },
+    {
+      "id": "L10",
+      "name": "candidate-10",
+      "score": 6.68,
+      "pose": "ligands/pose-10.pdb",
+      "chain": "A"
+    }
+  ],
+  "contacts": [
+    {
+      "residue": "ILE360",
+      "resname": "ILE",
+      "resseq": 360,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 2.67
+    },
+    {
+      "residue": "THR315",
+      "resname": "THR",
+      "resseq": 315,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 2.88
+    },
+    {
+      "residue": "MET318",
+      "resname": "MET",
+      "resseq": 318,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 2.9
+    },
+    {
+      "residue": "ASP381",
+      "resname": "ASP",
+      "resseq": 381,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 2.9
+    },
+    {
+      "residue": "GLU286",
+      "resname": "GLU",
+      "resseq": 286,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.0
+    },
+    {
+      "residue": "HIS361",
+      "resname": "HIS",
+      "resseq": 361,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.16
+    },
+    {
+      "residue": "VAL299",
+      "resname": "VAL",
+      "resseq": 299,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.25
+    },
+    {
+      "residue": "MET290",
+      "resname": "MET",
+      "resseq": 290,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.31
+    },
+    {
+      "residue": "PHE317",
+      "resname": "PHE",
+      "resseq": 317,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.33
+    },
+    {
+      "residue": "ALA380",
+      "resname": "ALA",
+      "resseq": 380,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.33
+    },
+    {
+      "residue": "LYS271",
+      "resname": "LYS",
+      "resseq": 271,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.35
+    },
+    {
+      "residue": "PHE382",
+      "resname": "PHE",
+      "resseq": 382,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.4
+    },
+    {
+      "residue": "ILE313",
+      "resname": "ILE",
+      "resseq": 313,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.45
+    },
+    {
+      "residue": "ALA269",
+      "resname": "ALA",
+      "resseq": 269,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.55
+    },
+    {
+      "residue": "TYR253",
+      "resname": "TYR",
+      "resseq": 253,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.56
+    },
+    {
+      "residue": "LEU248",
+      "resname": "LEU",
+      "resseq": 248,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.63
+    },
+    {
+      "residue": "ARG362",
+      "resname": "ARG",
+      "resseq": 362,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.66
+    },
+    {
+      "residue": "VAL256",
+      "resname": "VAL",
+      "resseq": 256,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.73
+    },
+    {
+      "residue": "LEU370",
+      "resname": "LEU",
+      "resseq": 370,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.8
+    },
+    {
+      "residue": "GLY321",
+      "resname": "GLY",
+      "resseq": 321,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.81
+    },
+    {
+      "residue": "VAL289",
+      "resname": "VAL",
+      "resseq": 289,
+      "chain": "A",
+      "kind": "疏水接触",
+      "distance": 3.84
+    },
+    {
+      "residue": "ILE293",
+      "resname": "ILE",
+      "resseq": 293,
+      "chain": "A",
+      "kind": "范德华接触",
+      "distance": 4.02
+    },
+    {
+      "residue": "VAL270",
+      "resname": "VAL",
+      "resseq": 270,
+      "chain": "A",
+      "kind": "范德华接触",
+      "distance": 4.05
+    },
+    {
+      "residue": "PHE359",
+      "resname": "PHE",
+      "resseq": 359,
+      "chain": "A",
+      "kind": "范德华接触",
+      "distance": 4.08
+    },
+    {
+      "residue": "GLU316",
+      "resname": "GLU",
+      "resseq": 316,
+      "chain": "A",
+      "kind": "范德华接触",
+      "distance": 4.26
+    },
+    {
+      "residue": "VAL379",
+      "resname": "VAL",
+      "resseq": 379,
+      "chain": "A",
+      "kind": "范德华接触",
+      "distance": 4.76
+    },
+    {
+      "residue": "ASN322",
+      "resname": "ASN",
+      "resseq": 322,
+      "chain": "A",
+      "kind": "范德华接触",
+      "distance": 4.82
+    },
+    {
+      "residue": "ILE314",
+      "resname": "ILE",
+      "resseq": 314,
+      "chain": "A",
+      "kind": "范德华接触",
+      "distance": 4.96
+    }
+  ],
+  "provenance": {
+    "structure_source": "RCSB PDB 1IEP",
+    "pockets": "合成的演示数据",
+    "poses": "合成的演示数据"
+  }
+}

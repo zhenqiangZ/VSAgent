@@ -191,6 +191,19 @@ HOOK_FIXTURE = ROOT / ".probe" / "hook_fixture"
 OUTSIDE_PATH = r"D:\Elsewhere\secrets.txt" if os.name == "nt" else "/etc/passwd"
 OUTSIDE_TRAVERSAL = r"..\..\Elsewhere\x.txt" if os.name == "nt" else "../../Elsewhere/x.txt"
 
+# 真实坐标夹具：1IEP（ABL1 激酶域 + STI-571）。P0 口袋、叠合、write_run 三块都靠它。
+# 原先读 `.probe/1iep.pdb`——那是 gitignore 的本地文件，干净 checkout 上不存在，
+# 于是这三块在任何新克隆上都以 `check(True, "跳过…")` 收场，看着全绿实际没跑。
+# 这里放 RCSB 的原样文件（两条链、STI、CL、水都在）：残基编号 360/315/318 与
+# 最短距离 2.67 那几条断言是对着这份原始坐标写死的，裁掉任何原子数字都会变。
+IEP_FIXTURE = ROOT / "tests" / "fixtures" / "1iep.pdb"
+
+# 演示数据的 meta.json 形状（`tools/build_demo_data.py` 的产出，原样提交）。
+# 原来是读 `runs/1iep-molstar/meta.json`——那是 gitignore 的本地产物，新克隆上没有，
+# 于是 write_run 里「顶层键与演示数据一致」那两条一起被跳过。改 demo 的顶层形状时
+# 要重新生成这份文件，否则这两条会红；那正是它们该做的事。
+DEMO_META_FIXTURE = ROOT / "tests" / "fixtures" / "demo-meta.json"
+
 # 压缩那几条断言用的上下文窗口。要明显大于系统提示的用量，否则量出来的超支
 # 来自系统提示本身（它是固定开销，压缩机制缩不动），而不是压缩没起作用。
 COMPACT_WINDOW = 16_000
@@ -4963,11 +4976,7 @@ def check_prankweb() -> None:
 
 def check_pockets() -> None:
     """两层来源的装配：优先级、三态、complexes 表、不编条目。"""
-    real_1iep = PROBE / "1iep.pdb"
-    if not real_1iep.is_file():
-        check(True, "（跳过 P0 全链路：.probe/1iep.pdb 不在，用打桩覆盖其余部分）")
-        return
-    text = real_1iep.read_text(encoding="utf-8")
+    text = IEP_FIXTURE.read_text(encoding="utf-8")
 
     class _Outcome:
         def __init__(self, texts, failed=()):
@@ -5101,10 +5110,7 @@ def check_align_and_prior() -> None:
       · 核对不通过的编号**拿不到变换**，也就进不了口袋；
       · 逐条结论里「编号不存在」与「没查成」分得开。
     """
-    real_1iep = PROBE / "1iep.pdb"
-    if not real_1iep.is_file():
-        check(True, "（跳过 align：.probe/1iep.pdb 不在）")
-        return
+    real_1iep = IEP_FIXTURE
     abl_text = real_1iep.read_text(encoding="utf-8")
 
     # ---- 一、取序列 ----
@@ -5239,10 +5245,7 @@ async def check_write_run() -> None:
 
     from opencode_tui.core.agent.ledger import SessionLedger
 
-    real_1iep = PROBE / "1iep.pdb"
-    if not real_1iep.is_file():
-        check(True, "（跳过 write_run：.probe/1iep.pdb 不在）")
-        return
+    real_1iep = IEP_FIXTURE
     text = real_1iep.read_text(encoding="utf-8")
 
     # 运行目录写到临时处，别污染仓库根的 runs/。
@@ -5325,7 +5328,7 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
 
         # meta.json 键集合与演示数据一致。**`contacts` 是刻意的例外**：
         # 本轮没有真实位姿，接触距离不可信，字段本身不出（方案稿 §2.1 第 78 行）。
-        demo = _json.loads((PROBE.parent / "runs" / "1iep-molstar" / "meta.json").read_text(encoding="utf-8"))
+        demo = _json.loads(DEMO_META_FIXTURE.read_text(encoding="utf-8"))
         expected = set(demo) - {"contacts"}
         check(
             set(meta) == expected,
@@ -5583,7 +5586,7 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
             check(stored[1]["state"] == "mismatch", "meta 里带着每一条的状态")
             check(
                 set(prior_meta) == set(_json.loads(
-                    (PROBE.parent / "runs" / "1iep-molstar" / "meta.json").read_text(encoding="utf-8")
+                    DEMO_META_FIXTURE.read_text(encoding="utf-8")
                 )) - {"contacts"},
                 "先验这一侧也没有多出顶层键",
             )

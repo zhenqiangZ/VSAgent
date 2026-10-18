@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,12 +142,14 @@ class HookRunner:
             {"event": event, "tool": tool, "input": tool_input, "cwd": str(self.cwd)},
             ensure_ascii=False,
         )
+        extra: dict[str, Any] = {} if sys.platform == "win32" else {"start_new_session": True}
         process = await asyncio.create_subprocess_shell(
             hook.command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.cwd),
+            **extra,
         )
         collect = asyncio.ensure_future(
             process.communicate(payload.encode("utf-8") + b"\n")

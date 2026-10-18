@@ -406,8 +406,10 @@ async def run_permission_round(server: FakeModelServer, key: str) -> tuple[ToolS
             )
             # 但工作目录之外仍然要问：放行的是工具，不是磁盘。
             # 这一条是「范围扩大之后边界还在」的证据，不是可选项。
+            # 越界路径按平台取：POSIX 上反斜杠不是分隔符，`D:\x` 只是站内的文件名。
+            outside_path = r"D:\Elsewhere\a.txt" if os.name == "nt" else "/etc/passwd"
             outside = app.agent.policy.check(
-                write, {"path": r"D:\Elsewhere\a.txt", "content": "x"}, "Build"
+                write, {"path": outside_path, "content": "x"}, "Build"
             )
             check(
                 outside.verdict is Verdict.ASK,
@@ -1986,7 +1988,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         else:
             check(fallback == expected_fallback, f"两个环境变量都没设时按平台找一个：{fallback}")
 
-        plain_path = ROOT
+        # 用固定长度的路径，不用 ROOT：这条断言验的是「没超上界就原样返回」，
+        # 拿 ROOT 会让它顺带断言 checkout 路径的长度，换个目录深一点就假失败。
+        plain_path = Path("proj")
         check(
             shorten_path(plain_path) == str(plain_path),
             f"路径没超过上界时原样返回：{shorten_path(plain_path)}",

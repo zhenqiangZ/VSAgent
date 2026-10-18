@@ -10,7 +10,11 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 
 没有 README，没有 pyproject / setup.py / pytest / ruff / mypy 配置，也没有 Makefile。
 依赖手工装，测试是**直接跑的脚本**。详细逐文件导览见 `docs/source-map.md`（很长但准确，
-注意其中「56 个文件 / 17669 行」的统计已过期，实际约 67 文件 / 22.6k 行，且不含 `web/` `viz/`）。
+注意其中「56 个文件 / 17669 行」的统计已过期，实际 67 文件 / 22,883 行，且不含 `web/` `viz/`）。
+
+CI 只有一个 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，**两份依赖都装**
+（叠合与先验口袋那几条断言要 gemmi，缺了会直接抛 ToolError，不是跳过）。
+没有 Windows job——`verify_exe` 要 pywinpty，还没人验过那条路。
 
 代码注释与 docstring 一律用中文写，解释「为什么这么写」而不是复述代码。新增代码跟随这一惯例。
 

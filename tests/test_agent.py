@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 import json
 import os
 import shutil
 import sys
+import tempfile
+import time
 from pathlib import Path
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -181,6 +185,12 @@ WORKSPACE_FIXTURE = ROOT / ".probe" / "workspace_fixture"
 RULES_FIXTURE = ROOT / ".probe" / "rules_fixture"
 HOOK_FIXTURE = ROOT / ".probe" / "hook_fixture"
 
+# 「确定在工作目录之外」的两条样例路径，按平台取。
+# 反斜杠在 POSIX 上只是文件名里的普通字符，`D:\x` 会被拼成站内的合法文件名，
+# 也确实逃不出工作目录——那一边不算越界，不是缺陷，所以夹具要跟着平台换。
+OUTSIDE_PATH = r"D:\Elsewhere\secrets.txt" if os.name == "nt" else "/etc/passwd"
+OUTSIDE_TRAVERSAL = r"..\..\Elsewhere\x.txt" if os.name == "nt" else "../../Elsewhere/x.txt"
+
 # 压缩那几条断言用的上下文窗口。要明显大于系统提示的用量，否则量出来的超支
 # 来自系统提示本身（它是固定开销，压缩机制缩不动），而不是压缩没起作用。
 COMPACT_WINDOW = 16_000
@@ -214,6 +224,25 @@ class EchoTool(Tool):
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         return ToolResult(output=str(arguments["text"]))
+
+
+class SlowTool(Tool):
+    """睡一会儿再返回，专门给「在工具执行期间按中断」留一个稳定的窗口。
+
+    `EchoTool` 是瞬时的：测试看到 TOOL 那条 Part 再调 `cancel()` 时，循环往往
+    已经走到下一步、甚至已经问完了模型，于是中断落在步与步之间而不是工具执行期间，
+    这条断言就变成看机器速度。工具自己慢下来，窗口才是确定的。
+    """
+
+    spec = ToolSpec(
+        name="slow",
+        description="等一小会儿再返回",
+        parameters={"type": "object", "properties": {}, "required": []},
+    )
+
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
+        await asyncio.sleep(0.3)
+        return ToolResult(output="慢完了")
 
 
 class FailTool(Tool):
@@ -1020,7 +1049,7 @@ def check_permission() -> None:
     # 工作目录之外的访问：单独一级判定，排在两级「本会话放行」之前。
     # 这一级的存在意义就是让「按 a 全放行」不等于「整个磁盘随便动」。
     bounded = PermissionPolicy(workspace_root=WORKSPACE_FIXTURE)
-    outside = r"D:\Elsewhere\secrets.txt"
+    outside = OUTSIDE_PATH
     check(
         judge(bounded, "read", {"path": "notes.md"}).verdict is Verdict.ALLOW,
         "工作目录内的读照旧放行",
@@ -1067,9 +1096,9 @@ def check_permission() -> None:
     bounded.clear_session()
 
     # 判定用的路径要先补成绝对路径：`..\..\x` 看字符串是相对的，
-    # 补全之后才知道跑到了外面。
+    # 补全之后才知道跑到了外面。分隔符跟着平台走——POSIX 上反斜杠不是分隔符。
     check(
-        judge(bounded, "read", {"path": r"..\..\Elsewhere\x.txt"}).verdict is Verdict.ASK,
+        judge(bounded, "read", {"path": OUTSIDE_TRAVERSAL}).verdict is Verdict.ASK,
         "相对路径补全之后跑到外面的，也要问",
     )
     check(
@@ -1083,14 +1112,16 @@ def check_permission() -> None:
     )
 
     # 命令行的开关不是路径：`dir /T:W` 里的 /T 和 `/S` 都被当成过越界。
+    # 这条只在 Windows 成立——POSIX 上 `/T` 就是一个根下的普通路径，本来就该拦。
     check(
         judge(bounded, "bash", {"command": "dir /T:W"}).verdict is Verdict.ASK,
         "带斜杠开关的命令按 bash 那一档处理，不因开关误报越界",
     )
-    check(
-        not bounded.outside_paths(registry.get("bash"), {"command": "dir /T:W /S"}),
-        "斜杠开关不被当成绝对路径",
-    )
+    if os.name == "nt":
+        check(
+            not bounded.outside_paths(registry.get("bash"), {"command": "dir /T:W /S"}),
+            "斜杠开关不被当成绝对路径",
+        )
     # URL 里有 `//`，不剔掉的话每条打接口的命令都会被判越界。
     check(
         not bounded.outside_paths(
@@ -1103,6 +1134,55 @@ def check_permission() -> None:
         not bounded.outside_paths(registry.get("bash"), {"command": "echo hello"}),
         "普通命令没有越界路径",
     )
+    # 临时目录与标准流转接必须放行，否则这两类每天都在写的命令会次次弹窗，
+    # 用户很快就会条件反射按 y，越界询问整体失效。
+    check(
+        not bounded.outside_paths(
+            registry.get("bash"),
+            {"command": f"ls {tempfile.gettempdir()}"},
+        ),
+        "平台临时目录不算越界",
+    )
+    if os.name != "nt":
+        check(
+            not bounded.outside_paths(registry.get("bash"), {"command": "echo hi > /dev/null"}),
+            "POSIX 上重定向到 /dev/null 不算越界",
+        )
+
+    # 根与顶层目录：以前只认两级以上的路径，`rm -rf /usr`、`rm -rf /` 都判成
+    # 「没有越界」——按过 a（本会话全放行）之后就直接执行了。这是这一组最该守的。
+    for risky in ("rm -rf /", "rm -rf /usr", "cat /etc", "rm -rf ~", "rm -rf ~/data"):
+        check(
+            bool(bounded.outside_paths(registry.get("bash"), {"command": risky})),
+            f"顶层目录与家目录要判成越界：{risky}",
+        )
+    check(
+        not bounded.outside_paths(
+            registry.get("bash"),
+            {"command": f"cat {Path.home() / '.opencode_tui' / 'state.toml'}"},
+        ),
+        "程序自己的数据目录仍然放行（`~` 展开之后要落回放行前缀）",
+    )
+
+    # 长路径不能把判定卡住。这不是性能基准，是挂起防护：判断「在不在前缀之内」
+    # 原先走 `item in target.parents`，深度两万时要把每一级父目录都造一遍，
+    # 实测 9 秒；而命令内容由模型给。上限给得很宽，只挡平方级那种实现。
+    started = time.monotonic()
+    deep = "/" + "a/" * 20000
+    check(
+        bool(bounded.outside_paths(registry.get("bash"), {"command": deep})),
+        "两万级的深路径仍然判出越界",
+    )
+    elapsed = time.monotonic() - started
+    check(elapsed < 3.0, f"深路径不把判定卡住：{elapsed:.2f}s")
+
+    # 反过来：相对路径不能被摘出「斜杠开头的片段」。误报比漏判更伤——
+    # 用户被无意义地拦几次之后，就会对越界询问条件反射地按 y。
+    for harmless in ("ls a/b/c", "./scripts/run.sh", "python src/main.py", "sed 's/a/b/'"):
+        check(
+            not bounded.outside_paths(registry.get("bash"), {"command": harmless}),
+            f"相对路径不算越界：{harmless}",
+        )
 
     check(
         judge(plain, "bash", {"command": "rm -rf /"}, explicit=True).verdict is Verdict.ALLOW,
@@ -1692,6 +1772,14 @@ async def check_hooks_in_loop(server: FakeModelServer) -> None:
     )
     check(bool(recorder.names("turn.done")), "用满重试次数之后照常收尾")
 
+    # 用字规则这一段接的是本机的判据脚本 `.probe/check_banned_chars.py`——它被
+    # gitignore，不在仓库里，干净 checkout 上从来就没有。缺了它整段跳过并**明说**：
+    # 「Stop 钩子能把一轮拦下来」这件事上面用 once.py 已经验过，这里只是把本地
+    # 那把尺子接上去再走一遍；不能因为本机没放这个文件就让整个套件红着。
+    if not (ROOT / ".probe" / "check_banned_chars.py").is_file():
+        print("  （跳过用字规则那一段：本机没有 .probe/check_banned_chars.py）")
+        return
+
     # 用字规则检查接成 Stop 钩子：故意写一个禁用字，这一轮不结束并给出原因
     probe = ROOT / ".probe" / "banned_probe.md"
     server.clear()
@@ -2022,18 +2110,29 @@ async def check_bash_tool() -> None:
     )
     # 真机取一条会吐中文的命令，读它实际回来的字节，逐字检查没有替换字符。
     # 编码对不对不能只靠自造的字节：这里跑的是真命令，回来的是真代码页。
-    certutil = await tool.run(
-        {"command": f'certutil -hashfile "{ROOT / "requirements.txt"}" SHA256'}
-    )
-    check(
-        "\ufffd" not in certutil.output,
-        f"certutil 的中文提示不能被解坏：{certutil.output[-90:]!r}",
-    )
-    check(
-        "CertUtil" in certutil.output
-        and ("成功完成" in certutil.output or "哈希" in certutil.output),
-        f"certutil 的中文提示要还原成原字：{certutil.output[-90:]!r}",
-    )
+    #
+    # Windows 专门用 certutil：它是让「代码页 936 → GBK 字节 → 解成 U+FFFD」
+    # 这条真实故障路径走一遍的现成命令。POSIX 没有代码页这回事（默认 UTF-8），
+    # 那一段换成 echo，验的是「真命令的中文原样回来」，不假装在验 GBK。
+    if os.name == "nt":
+        certutil = await tool.run(
+            {"command": f'certutil -hashfile "{ROOT / "requirements.txt"}" SHA256'}
+        )
+        check(
+            "\ufffd" not in certutil.output,
+            f"certutil 的中文提示不能被解坏：{certutil.output[-90:]!r}",
+        )
+        check(
+            "CertUtil" in certutil.output
+            and ("成功完成" in certutil.output or "哈希" in certutil.output),
+            f"certutil 的中文提示要还原成原字：{certutil.output[-90:]!r}",
+        )
+    else:
+        echoed = await tool.run({"command": "echo 中文测试"})
+        check(
+            echoed.output == "中文测试",
+            f"真命令输出的中文原样回来：{echoed.output!r}",
+        )
 
     raised = ""
     try:
@@ -3055,6 +3154,7 @@ async def check_wrap_up_fallbacks(server: FakeModelServer) -> None:
     bus = EventBus()
     registry = ToolRegistry()
     registry.register(EchoTool())
+    registry.register(SlowTool())
     loop = build_loop(server, bus, registry)
 
     # 一、收尾请求失败 -> 本地按已有 Part 汇编，不能空手收场。
@@ -3106,8 +3206,8 @@ async def check_wrap_up_fallbacks(server: FakeModelServer) -> None:
                 delta_chunk(
                     tool_calls=[
                         tool_call_delta(
-                            0, call_id="c1", name="echo",
-                            arguments=json.dumps({"text": "慢一点"}),
+                            0, call_id="c1", name="slow",
+                            arguments=json.dumps({}),
                         )
                     ]
                 ),
@@ -3124,7 +3224,11 @@ async def check_wrap_up_fallbacks(server: FakeModelServer) -> None:
     message = await asyncio.wait_for(running, timeout=5)
     assert message is not None
     summaries = [part.text for part in message.parts if part.type is PartType.SUMMARY]
-    check(len(summaries) == 1, "被中断时也留下收尾总结")
+    check(
+        len(summaries) == 1,
+        f"被中断时也留下收尾总结：{len(summaries)} 份（"
+        f"{[part.type.value for part in message.parts]}）",
+    )
     check(
         "被中断" in summaries[0],
         f"中断那一份写明是中断：{summaries[0][:160]}",
@@ -3368,7 +3472,7 @@ async def check_permission_in_loop(server: FakeModelServer) -> None:
                             0,
                             call_id="c5",
                             name="read",
-                            arguments=json.dumps({"path": r"D:\Elsewhere\secrets.txt"}),
+                            arguments=json.dumps({"path": OUTSIDE_PATH}),
                         )
                     ]
                 ),
@@ -6062,7 +6166,13 @@ async def check_structure_tools() -> None:
 
         # ---- import_structure ----
         imported = work / "model.pdb"
-        imported.write_text(_pdb_fixture(), encoding="utf-8")
+        # 刻意与远端那份**字节不同**（多一行 REMARK），但 HEADER 仍是 1M17。
+        # 原来靠 `write_text` 在 Windows 上把 \n 翻成 \r\n 来凑这个差异——那是平台
+        # 特性，POSIX 上两份字节完全相同，会走「内容已在登记表里」那条分支，
+        # 「同名不同内容绝不覆盖」这一组断言就整段验不到了。
+        imported.write_text(
+            _pdb_fixture() + "REMARK 999 LOCAL IMPORT COPY\n", encoding="utf-8"
+        )
         importer = structure_module.ImportStructureTool()
 
         calls.clear()
@@ -8862,57 +8972,107 @@ def check_plan_deny() -> None:
     )
 
 
-async def run_agent_checks() -> None:
-    """循环层与 provider 的全部断言。"""
-    check_agent_types()
-    check_arguments()
-    check_trace()
-    check_rules()
-    check_permission()
-    check_hook_config()
-    await check_hook_runner()
-    check_workspace()
-    check_ledger()
-    await check_tool_context()
-    await check_uniprot_tools()
-    check_pdbtext()
-    check_export_geometry()
-    check_complexes()
-    check_prankweb()
-    check_pockets()
-    check_align_and_prior()
-    await check_write_run()
-    await check_rsearch()
-    await check_literature()
-    check_structure_parse()
-    await check_structure_tools()
-    await check_chembl_tools()
-    check_chemistry_gate()
-    await check_receptor_tool()
-    await check_listing_tools()
-    check_plan_deny()
-    check_prompt()
-    await check_memory()
-    await check_task_state()
-    await check_selective_compression()
-    await check_evidence_layer()
-    await check_bash_tool()
-    await check_file_tools()
+# 检查组：名字给 `--only` 过滤用，函数一律零参数（同步与异步混着，调用处看返回值）。
+# 名字取函数名里有意义的那一段，`--only permission` 能直接命中。
+GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
+    ("types", check_agent_types),
+    ("arguments", check_arguments),
+    ("trace", check_trace),
+    ("rules", check_rules),
+    ("permission", check_permission),
+    ("hooks-config", check_hook_config),
+    ("hooks-runner", check_hook_runner),
+    ("workspace", check_workspace),
+    ("ledger", check_ledger),
+    ("tool-context", check_tool_context),
+    ("uniprot", check_uniprot_tools),
+    ("pdbtext", check_pdbtext),
+    ("export-geometry", check_export_geometry),
+    ("complexes", check_complexes),
+    ("prankweb", check_prankweb),
+    ("pockets", check_pockets),
+    ("align-prior", check_align_and_prior),
+    ("write-run", check_write_run),
+    ("rsearch", check_rsearch),
+    ("literature", check_literature),
+    ("structure-parse", check_structure_parse),
+    ("structure-tools", check_structure_tools),
+    ("chembl", check_chembl_tools),
+    ("chemistry-gate", check_chemistry_gate),
+    ("receptor", check_receptor_tool),
+    ("listing", check_listing_tools),
+    ("plan-deny", check_plan_deny),
+    ("prompt", check_prompt),
+    ("memory", check_memory),
+    ("task-state", check_task_state),
+    ("selective-compression", check_selective_compression),
+    ("evidence", check_evidence_layer),
+    ("bash", check_bash_tool),
+    ("file-tools", check_file_tools),
+)
+
+# 需要假模型服务的组。只有命中其中之一才起服务，否则不占端口、也不等它。
+SERVER_GROUPS: tuple[tuple[str, Callable[[Any], Any]], ...] = (
+    ("provider", check_provider),
+    ("loop", check_loop),
+    ("permission-in-loop", check_permission_in_loop),
+    ("hooks-in-loop", check_hooks_in_loop),
+    ("summary-compaction", check_summary_compaction),
+    ("live-app", check_live_app),
+)
+
+
+def _wanted(name: str, only: str | None) -> bool:
+    """`only` 为空时全选，否则按子串匹配组名。"""
+    return only is None or only in name
+
+
+async def run_agent_checks(only: str | None = None) -> None:
+    """循环层与 provider 的全部断言。
+
+    `only` 是组名子串：传 `"permission"` 就只跑名字里带它的那些组。
+    **不传时行为与以前完全一样**，`test_smoke.py` 就是按这个形状调的。
+    """
+    selected = [(name, group) for name, group in GROUPS if _wanted(name, only)]
+    with_server = [
+        (name, group) for name, group in SERVER_GROUPS if _wanted(name, only)
+    ]
+    if only is not None and not selected and not with_server:
+        raise SystemExit(f"没有匹配 {only!r} 的检查组，用 --list 看全部名字")
+
+    for name, group in selected:
+        result = group()
+        if inspect.isawaitable(result):
+            await result
+    if not with_server:
+        return
     server = FakeModelServer()
     server.start()
     try:
-        await check_provider(server)
-        await check_loop(server)
-        await check_permission_in_loop(server)
-        await check_hooks_in_loop(server)
-        await check_summary_compaction(server)
-        await check_live_app(server)
+        for name, group in with_server:
+            await group(server)
     finally:
         server.stop()
 
 
-if __name__ == "__main__":
-    asyncio.run(run_agent_checks())
+def _main() -> None:
+    """命令行入口：`--list` 看组名，`--only <子串>` 只跑匹配的组。"""
+    argv = sys.argv[1:]
+    if "--list" in argv:
+        for name, _ in (*GROUPS, *SERVER_GROUPS):
+            print(name)
+        return
+    only: str | None = None
+    if "--only" in argv:
+        index = argv.index("--only")
+        if index + 1 >= len(argv):
+            raise SystemExit("--only 需要一个组名子串，用 --list 看全部名字")
+        only = argv[index + 1]
+    asyncio.run(run_agent_checks(only))
     print(f"通过 {len(CHECKS)} 项检查：")
     for item in CHECKS:
         print(f"  - {item}")
+
+
+if __name__ == "__main__":
+    _main()

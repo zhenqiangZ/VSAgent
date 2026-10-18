@@ -4,6 +4,7 @@ import fnmatch
 import os
 import re
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from enum import Enum
@@ -44,17 +45,34 @@ PATH_ARGUMENTS: dict[str, tuple[str, ...]] = {
 # 从 bash 命令里挑绝对路径用的模式。
 #
 # 只认「明确的绝对路径」：盘符开头（`C:\`、`D:/`）、UNC（`\\主机\共享`）、
-# 以及 POSIX 的 `/...`。**不认域名与 URL**——`https://www.ebi.ac.uk/...`
-# 里的 `//` 会被误当成 UNC，所以先把 URL 剔掉再找。
+# 家目录（`~/...`）、以及 POSIX 的 `/...`。**不认域名与 URL**——
+# `https://www.ebi.ac.uk/...` 里的 `//` 会被误当成 UNC，所以先把 URL 剔掉再找。
 #
-# POSIX 那一条要求至少两级（`/a/b`），一级的 `/T`、`/S` 是 Windows 命令的开关，
-# 不是路径。`dir /T:W`、`ping -n 2` 这类写法在真命令里非常常见，
-# 放宽成「斜杠开头即路径」会让每一条带开关的命令都被判成越界。
+# 左边界（`_PATH_START`）是这套判定的前提，不是优化。少了它，正则会在一条相对
+# 路径的中间找到一个「斜杠开头」的片段：`./scripts/run.sh` 摘成 `/scripts/run.sh`、
+# `ls a/b/c` 摘成 `/b/c`，于是每一条带目录的相对路径都被判成越界。误报比漏判更伤
+# ——用户被无意义地拦几次之后，就会对越界询问条件反射地按 y。
+_PATH_START = r"""(?<![\w.~/\\*?\-}])"""
+# 一级名字。`:` 与 `/` 都排除：前者会把 `http:` 这种协议头卷进来，后者是层级分隔。
+_SEGMENT = r"""[^\s"'|&;<>():/]+"""
+_TAIL = r"""[^\s"'|&;<>():]*"""
+
+# POSIX 上单级绝对路径也是路径：`rm -rf /usr`、`cat /etc`、`ls /` 都是要拦的动作。
+# Windows 不能这么放宽——`dir /T:W` 里的 `/T`、`/S` 是开关，不是目录。
+#
+# 量词写成 `(?:seg/)*seg/?` 而不是 `(?:seg/?)+`：后者每一级都可以自己吃掉后面的
+# 斜杠、也可以不吃，两条路都通向「匹配成功」，失败时要把这些组合全试一遍。
+# 前者没有这个歧义——`seg` 里不含 `/`，每一级吃掉的字符是唯一确定的。
+_SHALLOW = "" if os.name == "nt" else rf"""
+        | {_PATH_START}/(?:{_SEGMENT}/)*{_SEGMENT}/?              # /usr、/etc/passwd
+        | {_PATH_START}/(?=$|[\s"'|&;<>()])                      # 根目录本身"""
+
 _ABSOLUTE_PATH = re.compile(
-    r"""(?P<path>
-          [A-Za-z]:[\\/][^\s"'|&;<>()]*          # C:\... 或 C:/...
-        | \\\\[^\s"'|&;<>()]+                    # \\主机\共享
-        | /[^\s"'|&;<>():/]+/[^\s"'|&;<>():]*    # /一级/... 至少两级
+    rf"""(?P<path>
+          [A-Za-z]:[\\/][^\s"'|&;<>()]*                     # C:\... 或 C:/
+        | \\\\[^\s"'|&;<>()]+                               # \\主机\共享
+        | {_PATH_START}~(?:/[^\s"'|&;<>()]*)?(?=$|[\s"'|&;<>()])   # ~ 与 ~/...
+        | {_PATH_START}/(?:{_SEGMENT}/)+{_TAIL}{_SHALLOW}
     )""",
     re.VERBOSE,
 )
@@ -64,7 +82,7 @@ _URL = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://\S+")
 
 # 判「在工作目录之外」时要放过的前缀。
 #
-# 这些是「本来就不属于用户工程」的位置：临时目录、Windows 目录、程序自己的
+# 这些是「本来就不属于用户工程」的位置：临时目录、系统目录、程序自己的
 # 数据目录、用户的个人配置目录。模型经常要往临时目录写中间文件，
 # 也要读自己下载到 `~/.opencode_tui` 下的结构与靶点，这些都算正常动作。
 # 不放过它们的话，越界询问会响得太频繁，用户很快就会条件反射地一直按 y。
@@ -73,17 +91,33 @@ _ESCAPE_PREFIXES: tuple[str, ...] = (
     os.environ.get("TMP", ""),
 )
 
+# POSIX 上的设备节点。**只列这两个**，理由有两条：
+# 一是不整个 `/dev`——那会把 `/dev/sda` 一起放行；
+# 二是不列 `/dev/stdin|stdout|stderr`——它们是符号链接，`resolve()` 之后指向真正的
+# 终端（`/dev/pts/N`），放进放行表等于放行那个终端，而原样的字符串又匹配不上。
+# 少了 `/dev/null` 这一条，`cmd 2>/dev/null` 这种每天都在写的命令会次次弹越界询问。
+_DEV_PATHS: tuple[str, ...] = ("/dev/null", "/dev/tty")
+
 
 def _escape_prefixes() -> list[Path]:
     """要放过的工作目录之外的前缀，都是绝对路径。"""
     home = Path.home()
     candidates = [
         *_ESCAPE_PREFIXES,
+        # 平台自己的临时目录：POSIX 认 TMPDIR 再退 /tmp，Windows 就是 %TEMP%。
+        # 只读 TEMP/TMP 两个环境变量是不够的——它们在 POSIX 上通常根本没设，
+        # 于是 /tmp 被当成越界，正是这条清单想避免的「条件反射按 y」。
+        tempfile.gettempdir(),
         str(home / CONFIG_DIRECTORY),
         str(home / "AppData" / "Local" / "Temp"),
-        os.environ.get("WINDIR", "C:\\Windows"),
-        os.environ.get("SystemRoot", ""),
     ]
+    if os.name == "nt":
+        candidates += [
+            os.environ.get("WINDIR", "C:\\Windows"),
+            os.environ.get("SystemRoot", ""),
+        ]
+    else:
+        candidates += _DEV_PATHS
     out: list[Path] = []
     for item in candidates:
         if not item:
@@ -113,15 +147,26 @@ def paths_outside(command_or_path: str, root: Path) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
     for match in _ABSOLUTE_PATH.finditer(stripped):
-        raw = match.group("path").rstrip("\\/,.")
+        raw = match.group("path").rstrip("\\,.")
+        # 结尾的斜杠是命令行里的写法，不是路径的一部分。但**根 `/` 不能剥**：
+        # 剥完就成了空串，`rm -rf /` 会被当成「没有越界」直接放过去。
+        if len(raw) > 1:
+            raw = raw.rstrip("/")
         if not raw or raw in seen:
             continue
         seen.add(raw)
         try:
-            target = Path(raw).resolve()
+            # `~` 是 shell 展开的写法，判定要按展开后的位置算，否则
+            # `rm -rf ~` 和 `~/x` 都落不到任何放行前缀上、也判不出越界。
+            target = Path(raw).expanduser().resolve()
         except (OSError, ValueError):
             continue
-        if any(target == item or item in target.parents for item in allowed):
+        # 按 parts 前缀比，不遍历父目录：`item in target.parents`（以及它在 3.12 里
+        # 的等价物 `is_relative_to`）会为这条路径的每一级都造一个父 Path，
+        # 深度两万时是平方级——实测 9 秒。命令内容由模型给，那等于一个卡死判定
+        # 的入口。`target.parts` 只取一次，切给每个前缀比的就是两三个元素。
+        target_parts = target.parts
+        if any(target_parts[: len(item.parts)] == item.parts for item in allowed):
             continue
         found.append(raw)
     return found

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import os
 import re
+import signal
 import subprocess
 import sys
 from abc import ABC, abstractmethod
@@ -449,6 +451,10 @@ def terminate_tree(process: asyncio.subprocess.Process) -> None:
     """终止一条命令以及它自己再起的那些子进程。
 
     shell 会再起一层子进程，只结束 shell 那一个进程的话，真正干活的那个会留下来。
+    Windows 有 `taskkill /T` 能把整棵树带走；POSIX 没有等价的单条命令，所以
+    **起进程时就把它放进自己的会话**（`start_new_session=True`，见 `BashTool.run`），
+    这里按进程组杀。不建会话的话 `kill()` 只杀掉 shell，孙子进程会被 init 收养、
+    继续跑完并写出它那一步的产物——取消看上去生效了，实际上没有。
     """
     if process.returncode is not None:
         return
@@ -458,7 +464,15 @@ def terminate_tree(process: asyncio.subprocess.Process) -> None:
             capture_output=True,
             check=False,
         )
-    else:
+        return
+    try:
+        # 建会话之后 pgid 等于 pid，所以拿 pid 当进程组号。
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        # 没有以 pid 命名的进程组：这条进程不是按 `start_new_session` 起的
+        # （外部调用方漏了那个开关）。退回只杀它自己，至少不让它占着管道继续跑。
+        process.kill()
+    except OSError:
         process.kill()
 
 
@@ -577,11 +591,15 @@ class BashTool(Tool):
         command = arguments.get("command")
         if not isinstance(command, str) or not command.strip():
             raise ToolError("缺少参数 command")
+        # POSIX 上让子进程自成会话，`terminate_tree` 才能按进程组把孙子进程一起收掉。
+        # Windows 不支持这个开关，那边靠 taskkill /T。
+        extra: dict[str, Any] = {} if sys.platform == "win32" else {"start_new_session": True}
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(self.cwd) if self.cwd else None,
+            **extra,
         )
         stdout = await self._collect(process)
         output = decode_output(stdout).strip()

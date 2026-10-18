@@ -1,0 +1,57 @@
+name: checks
+
+# 只跑 Ubuntu。
+#
+# 判据在 Linux 上是全绿的（内核 1838 项、界面 + 内核 2374 项，干净 checkout 上验过），
+# 而 Windows 那条路（verify_exe / verify_modal_transparency）要 pywinpty，只能在
+# Windows 上跑，这台机器验不了。**先不写一个自己没跑过的 job**：红灯的时候分不清
+# 是代码坏了还是配置写错了，那种 CI 会很快被无视。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 断言里有大量中文标签，别让 runner 的 locale 影响编码。
+  PYTHONIOENCODING: utf-8
+
+# 装依赖：两份都装。
+#
+# requirements-chem.txt 在程序里是可选的（不装只有 prepare_receptor 会报安装指令），
+# 但判据不是：check_align_and_prior 走 align.sequences，那一步要 gemmi；
+# check_write_run 的先验口袋那一侧同样要它。缺了化学栈这两块会直接抛 ToolError。
+# 用「缺依赖就跳过」掩盖过去，等于把刚补回来的覆盖又让出去——那正是这次要修的病。
+# 代价是 CI 多装 rdkit / meeko / gemmi / numpy / scipy，几分钟。
+
+jobs:
+  kernel:
+    name: 内核判据
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-chem.txt
+      # 独立脚本，不是 pytest：末尾打印「通过 N 项检查」，失败时抛 AssertionError。
+      - run: python tests/test_agent.py
+
+  ui:
+    name: 界面 + 内核
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-chem.txt
+      # 超集：跑完界面的检查之后会再跑一遍 test_agent 的全部断言。
+      - run: python tests/test_smoke.py

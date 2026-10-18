@@ -1110,9 +1110,19 @@ def check_permission() -> None:
 
     # 判定用的路径要先补成绝对路径：`..\..\x` 看字符串是相对的，
     # 补全之后才知道跑到了外面。分隔符跟着平台走——POSIX 上反斜杠不是分隔符。
+    #
+    # 往上几级不能写死。仓库本身可能就落在 /tmp 下（CI 模拟常见），那时往上两级
+    # 还在 `tempfile.gettempdir()` 这条放行前缀里，解析出来是「站内」，断言就假失败。
+    # POSIX 上按 /etc 反算相对路径：目标固定在工作目录之外，与仓库被 clone 到哪无关。
+    # Windows 保留原样——跨盘符算不出相对路径，那边的 `..\..\` 本来就指着别的盘。
+    traversal = (
+        OUTSIDE_TRAVERSAL
+        if os.name == "nt"
+        else os.path.relpath(Path(OUTSIDE_PATH).parent / "x.txt", WORKSPACE_FIXTURE)
+    )
     check(
-        judge(bounded, "read", {"path": OUTSIDE_TRAVERSAL}).verdict is Verdict.ASK,
-        "相对路径补全之后跑到外面的，也要问",
+        judge(bounded, "read", {"path": traversal}).verdict is Verdict.ASK,
+        f"相对路径补全之后跑到外面的，也要问：{traversal}",
     )
     check(
         judge(bounded, "read", {"path": "sub/notes.md"}).verdict is Verdict.ALLOW,

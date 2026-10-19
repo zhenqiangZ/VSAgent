@@ -10,7 +10,8 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 
 没有 README，没有 pyproject / setup.py / pytest / ruff / mypy 配置，也没有 Makefile。
 依赖手工装，测试是**直接跑的脚本**。详细逐文件导览见 `docs/source-map.md`（很长但准确，
-注意其中「56 个文件 / 17669 行」的统计已过期，实际 67 文件 / 22,883 行，且不含 `web/` `viz/`）。
+注意其中「56 个文件 / 17669 行」的统计已过期；具体数字随改动变化，不要拿它当基线，
+且不含 `web/` `viz/`）。
 
 CI 只有一个 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，**两份依赖都装**
 （叠合与先验口袋那几条断言要 gemmi，缺了会直接抛 ToolError，不是跳过）。
@@ -37,7 +38,8 @@ python tests/test_agent.py --only hooks-in-loop
 python tests/dump_layout.py       # 100x30 布局快照，写到 tests/output/
 
 # 领域工具调试：唯一需要真实网络的脚本（真的打 UniProt/ChEMBL/RCSB/PubMed）
-python debug_tools.py             # 全跑 8 模块 15 工具，顺序即依赖顺序，零参数
+python debug_tools.py             # 全跑 10 模块 18 工具，顺序即依赖顺序，零参数
+# dock 需要外部 vina：PATH 里有 vina，或设置 VSA_VINA_BIN；没有时这一步照实失败
 python debug_tools.py --list
 python debug_tools.py structure fetch_structure pdb_id=4HJO        # 显式：单工具单参数
 python debug_tools.py structure fetch_structure '{"pdb_id":"4HJO"}'
@@ -83,6 +85,7 @@ python tests/verify_modal_transparency.py  # 模态居中/半透明，聊天透�
 | `VSA_LLM_PROVIDER` / `_TEMPERATURE` / `_MAX_TOKENS` / `_CONTEXT_WINDOW` / `_PRICE_INPUT` / `_PRICE_OUTPUT` / `_PRICE_CACHED` | 可选，其余字段从模型目录 `lookup_model()` 兜底 |
 | `VSA_MAX_STEPS` | 一轮步数上限，写错**回落到 24 而不是抛错** |
 | `VSA_WEB_PORT` | 本地网页端口，默认 8860，不合法同样回落 |
+| `VSA_VINA_BIN` | 外部 AutoDock Vina 可执行文件；不设时从 PATH 找 `vina`，缺失时 `dock` 返回安装指引。引擎**不随 exe 打包** |
 | `EDITOR` / `VISUAL` | `/editor` 外部编辑器往返 |
 
 测试不读 `.env`：`FakeModelServer` 起在 `127.0.0.1:0`，测试进程内自己设
@@ -126,7 +129,7 @@ __main__.py → app.py ───────────────────
   否则每步都击穿 prompt cache。`project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`，32KB 上限）。
 - `permission.py` — `PermissionPolicy.check` 的判定顺序是有讲究的：取消 → 用户手打 bash →
   Plan 模式 `PLAN_DENY` → 项目规则 → **越界路径检查** → 会话 allow_all → 单工具允许 → 默认
-  `{write, patch, bash}` 要问。越界检查刻意排在会话「全部允许」之前：**允许一个工具不等于允许整个磁盘**。
+  `{write, patch, bash, dock}` 要问。越界检查刻意排在会话「全部允许」之前：**允许一个工具不等于允许整个磁盘**。
 - `hooks.py` — `hooks.toml` 里的外部命令，stdin 收一行 JSON。退出码 2 拦截（stderr 当原因），
   0 放行，30s 超时算拦截。
 - `ledger.py` — 会话登记表，`receptor#1` / `ligandset#3` 这类 handle 的真相所在。
@@ -150,9 +153,13 @@ __main__.py → app.py ───────────────────
 - 每个登记工具的模块暴露一个模块级 `domain_tools() -> list[Tool]`，文件末尾带
   `if __name__ == "__main__": from debug_tools import main` 块。
 - `all_tools.py:domain_tools()` 按**浏览 → 检索 → 改动**的顺序拼装
-  （listing, uniprot, structure, chembl, rsearch, literature, receptor, export）。
+  （listing, uniprot, structure, chembl, rsearch, literature, receptor, ligand, docking, export）。
   这个顺序同时决定了工具在请求体里的先后，靠前的更容易被模型选中——**顺序是语义，不是排版**。
-- 不登记工具的模块（`pockets` / `complexes` / `prankweb` / `align` / `chemistry` / `pdbtext` / `http`）
+- 配体链路：`import_ligandset`（文件 → raw ligandset）→ `prepare_ligands`（ETKDGv3 +
+  MMFF/UFF + Meeko → prepared ligandset）→ `dock`（Vina → docking artifact）→
+  `write_run(docking=...)`（pose 进运行目录）。`ligand.py` 与 `docking.py` 是这条链，
+  `products.py` 是两者共用的产物目录/原子写盘。
+- 不登记工具的模块（`pockets` / `complexes` / `prankweb` / `align` / `chemistry` / `pdbtext` / `http` / `products`）
   是库层，被 `WriteRunTool` 之类调用。口袋来源因此是四层叠合：共晶配体 → 复合物 → p2rank 预测 → 先验叠合。
 - `http.py` 是**全仓唯一的网络出口**，测试整体替换的就是它。4xx → `ToolError`，
   429/5xx/网络 → `RetryableToolError`。
@@ -160,7 +167,8 @@ __main__.py → app.py ───────────────────
   （`test_agent.py:check_chemistry_gate`）。装依赖后要**重启会话**，探测只在进程启动后第一次调用时做一遍。
 
 `domain/__init__.py` 顶部有**八条纪律**，是踩坑攒的而非风格偏好。新加领域工具逐条对一遍，
-其中最容易违反的三条：收 handle 不收路径（全库只 `import_structure` 收路径）、
+其中最容易违反的三条：收 handle 不收路径（全库只 `import_structure` 与
+`import_ligandset` 收路径）、
 纯查询不声明 `context_argument`、要算数就用代码算（RMSD / Tanimoto / 接触距离绝不交给模型心算）。
 
 ### 界面（`screens/` + `widgets/`）

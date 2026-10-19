@@ -95,8 +95,10 @@ def prepare_runs():
 
     linked = FIXTURE_DIR / "web-linked"
     linked.mkdir(parents=True)
+    # 用提交在仓库里的 1IEP 夹具，不依赖 gitignore 的 runs/1iep-demo：
+    # 后者在干净 checkout 上不存在，这个脚本会先 FileNotFoundError。
     shutil.copy(
-        PROJECT_ROOT / "runs" / "1iep-demo" / "receptor_full.pdb",
+        PROJECT_ROOT / "tests" / "fixtures" / "1iep.pdb",
         linked / "receptor_full.pdb",
     )
     return FIXTURE_DIR

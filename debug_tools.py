@@ -1,12 +1,12 @@
 """领域工具的调试入口：**直接跑，不用敲任何参数**。
 
 放在仓库根目录，不放在 `opencode_tui/core/agent/domain/` 里：它是开发期用的东西，
-不该和那 15 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
+不该和那 18 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
 
-    # 一、全跑：8 个模块、15 个工具，按依赖顺序一个接一个（不需要任何参数）
+    # 一、全跑：10 个模块、18 个工具，按依赖顺序一个接一个（不需要任何参数）
     .venv/Scripts/python.exe debug_tools.py
 
-    # 二、只跑一个模块（8 个工具模块末尾的块就是这么用的）
+    # 二、只跑一个模块（10 个工具模块末尾的块就是这么用的）
     .venv/Scripts/python.exe -m opencode_tui.core.agent.domain.structure
 
 想看清单而不是跑，加 `--list`：
@@ -47,7 +47,8 @@
 
 有一条是环境决定的：`open_viewer` 要本地结构服务在监听，`python debug_tools.py`
 单独跑起来时那个服务不在，它会照实报「没连上」。先起应用或
-`python -m opencode_tui.core.web`，这一条才会是绿的。
+`python -m opencode_tui.core.web`，这一条才会是绿的。`dock` 同理：PATH 里要有
+`vina`，或用 `VSA_VINA_BIN` 指向它；没有引擎时这一条会照实失败，`--list` 不受影响。
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ from opencode_tui.core.agent.context import EvidenceStore
 from opencode_tui.core.agent.ledger import SessionLedger
 from opencode_tui.core.agent.tools import Tool, ToolError, argument_error
 from opencode_tui.core.models import TaskState
+from opencode_tui.env import load_env
 
 # 全跑时依次调用的每一个工具：**顺序与参数都写在这里，一次一行**。
 #
@@ -92,6 +94,21 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     # 导一份本机坐标（全库唯一收路径的动作）。**排在这里是为了让 `{receptor:raw}`
     # 仍指向 1M17**：它也会登记一条 raw 受体，排在准备受体之前就会被换掉
     ("import_structure", {"path": ".probe/1iep.pdb"}),
+    # 导入一份本机配体文件（第二个收路径的动作）：.smi 每行 `SMILES 名字`。
+    # 里面的盐会被去掉、无效 SMILES 会被跳过并逐条报出来。
+    ("import_ligandset", {"path": "tests/fixtures/ligands.smi"}),
+    # 把它准备成 PDBQT：真跑 ETKDGv3 + Meeko，3 个分子通常几秒
+    ("prepare_ligands", {"ligands": "{ligandset:raw}", "confirm": True, "limit": 10}),
+    # 真跑 Vina：需要 PATH 里有 vina 或设置 VSA_VINA_BIN；没有时这一步会照实失败。
+    # 参数调小是为了调试快，不是推荐值。
+    ("dock", {
+        "receptor": "{receptor:prepared}",
+        "ligands": "{ligandset:prepared}",
+        "exhaustiveness": 4,
+        "num_modes": 3,
+        "limit": 3,
+        "timeout": 120,
+    }),
     # 两个搜索工具：只给候选、不给结论
     ("search_pdb", {"query": "EGFR kinase", "limit": 5}),
     # 已知活性 → 类似物 → 分子画像
@@ -100,7 +117,11 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("describe_molecule", {"molecule": "CHEMBL25"}),
     ("search_literature", {"query": "EGFR inhibitor resistance", "limit": 5}),
     # 产物：受体 → 运行目录 → 网页地址
-    ("write_run", {"receptor": "{receptor:prepared}", "uniprot": "P00533"}),
+    ("write_run", {
+        "receptor": "{receptor:prepared}",
+        "docking": "{artifact:docking}",
+        "uniprot": "P00533",
+    }),
     ("open_viewer", {"run": "{artifact}"}),
     # 最后回来看准备后的受体那一条
     ("describe_entry", {"handle": "{receptor:prepared}"}),
@@ -141,14 +162,16 @@ def main(module_name: str, tools: list[Tool], argv: list[str] | None = None) -> 
 
     不带参数时把这一组的工具**全跑一遍**（参数取自 `CALLS`），加 `--list` 才只列清单。
     """
+    load_env()
     return _dispatch(_module_name(module_name), tools, list(sys.argv[1:] if argv is None else argv))
 
 
 def root_main(argv: list[str] | None = None) -> int:
     """根目录那一侧的入口：第一个词是模块名就用它，是工具名就去找它在哪个模块。
 
-    不带参数时按模块表把 8 个模块、15 个工具全跑一遍。
+    不带参数时按模块表把 10 个模块、18 个工具全跑一遍。
     """
+    load_env()
     args = list(sys.argv[1:] if argv is None else argv)
     positional = [item for item in args if item not in SWITCHES]
     modules = _tool_modules()
@@ -240,7 +263,7 @@ def _tool_modules() -> list[tuple[str, list[Tool]]]:
 
 
 def _run_batch(groups: list[tuple[str, list[Tool]]]) -> int:
-    """全跑：`CALLS` 里那 15 个工具依次跑一遍，最后给一张表。
+    """全跑：`CALLS` 里那 18 个工具依次跑一遍，最后给一张表。
 
     开跑前清空登记表：全跑的价值在于「一条链从头串到尾」，起点必须是同一份空表。
     单个工具失败不打断后面的——调试要看的正是「哪一个不行、为什么」。

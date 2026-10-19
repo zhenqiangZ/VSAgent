@@ -413,13 +413,19 @@ class SessionLedger:
         fingerprint: str = "",
         parents: list[Handle | str] | tuple[Handle | str, ...] = (),
         meta: dict[str, Any] | None = None,
+        link_current_receptor: bool = True,
     ) -> Entry:
-        """登记一个新条目并返回它。"""
+        """登记一个新条目并返回它。
+
+        `link_current_receptor=False` 给跨靶点的配体库用：它不属于某个受体，
+        换靶点时不该跟着被搁置。对接产物、运行目录这些与受体绑定的条目仍用默认值。
+        """
         with self._lock:
             handle = self._allocate(kind)
             resolved = [coerce_handle(item) for item in parents]
             if (
-                self._link_current_receptor
+                link_current_receptor
+                and self._link_current_receptor
                 and kind != "receptor"
                 and self._current_receptor is not None
                 and not any(isinstance(item, ReceptorHandle) for item in resolved)

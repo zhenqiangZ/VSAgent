@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import shutil
 import socket
+import tempfile
 import webbrowser
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -40,6 +43,7 @@ from ..ledger import (
     fingerprint_text,
 )
 from ..tools import Tool, ToolResult, ToolSpec
+from . import products
 from .pdbtext import HeteroGroup, PdbDocument, ResidueKey, hetero_groups
 
 __all__ = [
@@ -736,13 +740,13 @@ def _run_summary(name: str, target_pdb: str, chains: Sequence[str], ligand: str)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    """按 `indent=2` + 不写尾随换行写一份 JSON。
+    """原子写一份 JSON：临时文件 + `os.replace`。
 
-    `newline=""` 是刻意的：默认的换行翻译会在 Windows 上把每个 `\\n` 写成 `\\r\\n`，
-    与仓库里已有的 `runs/1iep-molstar/meta.json` 形状不一致，成对比对时会全行失配。
+    `meta.json` 是运行目录的提交标记；直接覆盖时中途失败会留下半截 JSON，
+    网页端每次请求都重新读它，读到半截就是整页空白。`products.write_json_atomic`
+    保持 `indent=2`、`ensure_ascii=False`、不写尾随换行，与旧实现逐字节一致。
     """
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    products.write_json_atomic(path, payload)
 
 
 class WriteRunTool(Tool):
@@ -751,9 +755,12 @@ class WriteRunTool(Tool):
     spec = ToolSpec(
         name="write_run",
         description=(
-            "把一个受体（与可选的配体集合）写成一个**运行目录**：`meta.json` 记目标与口袋来源、"
-            "`receptor.pdb` 是坐标、`ligands/` 放配体位姿。产出的目录登记成 artifact，"
+            "把一个受体（与可选的对接产物）写成一个**运行目录**：`meta.json` 记目标与口袋来源、"
+            "`receptor.pdb` 是坐标、`ligands/` 放对接后的最佳位姿。产出的目录登记成 artifact，"
             "网页端据此渲染结构页。\n\n"
+            "**给了 docking 就走对接结果这一侧**：把 `status=ok` 的 pose 复制进 `ligands/`、"
+            "填 `molecules` 的分数与排名、并在 `provenance.poses` 里记下引擎与分数方向。"
+            "`docking` 与 `ligands` 不能同时给——前者已经带着配体集。\n\n"
             "**口袋来源按优先级自动选，两条路二选一**：\n"
             "  · 给了 candidates（你自己给出的 PDB 编号清单）就走**先验这一侧**："
             "逐个取回来核对（编号是否存在、链序列是不是受体序列），通过的按 CA 原子"
@@ -777,7 +784,17 @@ class WriteRunTool(Tool):
                 },
                 "ligands": {
                     "type": "string",
-                    "description": "配体集合条目引用，例如 ligandset#2。本轮可留空",
+                    "description": (
+                        "配体集合条目引用，例如 ligandset#2。没有对接结果时可选；"
+                        "**给了 docking 就不要传它**"
+                    ),
+                },
+                "docking": {
+                    "type": "string",
+                    "description": (
+                        "对接产物 handle，例如 artifact#4。给了它就把最佳 pose 写进 "
+                        "`ligands/` 并填 `molecules`；不要再传 ligands"
+                    ),
                 },
                 "run_id": {
                     "type": "string",
@@ -840,7 +857,16 @@ class WriteRunTool(Tool):
         if coordinate is None:
             return ToolResult(output=_no_coordinate_note(entry), failed=True)
 
-        # ---- 配体集合（本轮可空，但形状要留出来）----
+        # ---- 对接产物 / 配体集合（二选一）----
+        docking_entry = None
+        raw_docking = arguments.get("docking")
+        if raw_docking is not None and str(raw_docking).strip() != "":
+            try:
+                docking_entry = ledger.get(raw_docking)
+                expect_handle(docking_entry, ArtifactHandle, "docking")
+            except Exception as error:
+                return ToolResult(output=str(error), failed=True)
+
         ligand_entries: list = []
         raw_ligands = arguments.get("ligands")
         if raw_ligands is not None and str(raw_ligands).strip() != "":
@@ -850,6 +876,11 @@ class WriteRunTool(Tool):
             except Exception as error:
                 return ToolResult(output=str(error), failed=True)
             ligand_entries.append(ligand_entry)
+        if docking_entry is not None and ligand_entries:
+            return ToolResult(
+                output="docking 已经带着配体集，不要再传 ligands；二选一。",
+                failed=True,
+            )
 
         # ---- 目标与主键 ----
         meta = dict(entry.meta or {})
@@ -857,6 +888,18 @@ class WriteRunTool(Tool):
         pdb_id = _pdb_id_of(arguments.get("pdb_id"), meta)
         name = _name_of(arguments.get("name"), meta, entry)
         chains = _chains_of(meta, entry)
+
+        # ---- 对接产物：在写任何文件之前校验完 ----
+        docking_manifest: dict[str, Any] | None = None
+        docking_results: list[dict[str, Any]] = []
+        docking_skipped = 0
+        if docking_entry is not None:
+            try:
+                docking_manifest, _root, docking_results, docking_skipped = _read_docking(
+                    docking_entry, entry
+                )
+            except ValueError as error:
+                return ToolResult(output=str(error), failed=True)
 
         # ---- 取出受体文本，解析事实 ----
         try:
@@ -939,8 +982,28 @@ class WriteRunTool(Tool):
             )
         try:
             target = _prepare_run_dir(run_id)
+            molecules = _write_ligands(target, ligand_entries)
+            staging: Path | None = None
+            poses: dict[str, Any] | None = None
+            if docking_manifest is not None:
+                # 先全部复制到 staging；这一步失败时旧 pose / 旧 meta 都没动。
+                molecules, staging = _stage_docking_poses(
+                    target, docking_results, chains
+                )
+            else:
+                # 同一 run_id 上一次是对接结果、这一次没给 docking：旧 pose 必须清掉，
+                # 否则目录里留着新 meta 不认识的位姿文件。
+                for old in (target / RUN_LIGANDS).glob("pose-*.pdb"):
+                    old.unlink()
             (target / RUN_RECEPTOR).write_text(text, encoding="utf-8", newline="")
-            written_ligands = _write_ligands(target, ligand_entries)
+            if staging is not None:
+                _commit_docking_poses(target, staging)
+                poses = _poses_provenance(
+                    docking_manifest,
+                    docking_handle=str(docking_entry.handle),
+                    written=len(molecules),
+                    skipped=docking_skipped,
+                )
             payload = _build_meta(
                 run_id=run_id,
                 name=name,
@@ -949,13 +1012,18 @@ class WriteRunTool(Tool):
                 chains=chains,
                 reference=reference,
                 bundle=bundle,
-                ligands=written_ligands,
+                ligands=molecules,
                 prior=verdicts,
+                poses=poses,
             )
             _write_json(target / RUN_META, payload)
         except OSError as error:
             return ToolResult(
-                output=f"写运行目录失败（{type(error).__name__}：{error}）", failed=True
+                output=(
+                    f"写运行目录失败（{type(error).__name__}：{error}）；"
+                    "旧的 meta.json 没有被改动"
+                ),
+                failed=True,
             )
 
         # ---- 登记成 artifact，父项挂受体 ----
@@ -967,6 +1035,13 @@ class WriteRunTool(Tool):
             parents=[entry.handle],
             meta={"kind": "run", "run_id": run_id, "origin": bundle.origin},
         )
+
+        docking_report = (
+            _docking_summary(docking_manifest, molecules, docking_skipped)
+            if docking_manifest is not None
+            else None
+        )
+        docking_handle = str(docking_entry.handle) if docking_entry is not None else ""
 
         return ToolResult(
             output=_run_report(
@@ -981,6 +1056,7 @@ class WriteRunTool(Tool):
                 reference=reference,
                 note_parts=note_parts,
                 prior=verdicts,
+                docking=docking_report,
             ),
             meta={
                 "handle": str(artifact.handle),
@@ -990,6 +1066,11 @@ class WriteRunTool(Tool):
                 "total": p0_total,
                 "used": p0_used,
                 "p2rank": p1_state,
+                "docking": docking_handle,
+                "molecules": len(molecules),
+                "best_score": (
+                    docking_report["best_score"] if docking_report else None
+                ),
             },
         )
 
@@ -1071,6 +1152,10 @@ def _chains_of(meta: dict[str, Any], entry: Any) -> tuple[str, ...]:
             chain_id = str(item.get("chain_id") or "")
             if chain_id:
                 out.append(chain_id)
+        elif isinstance(item, str) and item.strip():
+            # prepared 受体的 meta 里是 `["A"]`，远端原始结构里是
+            # `[{"chain_id": "A", "polymer": true}]`；两种都要认。
+            out.append(item.strip())
     return tuple(out)
 
 
@@ -1132,22 +1217,191 @@ def _prepare_run_dir(run_id: str) -> Path:
 
 
 def _write_ligands(target: Path, ligand_entries: list) -> list[dict[str, Any]]:
-    """把配体位姿写进 `ligands/`。本轮配体集合通常为空，返回空清单即可。
+    """没有对接产物时 `molecules` 留空。
 
-    **不复制路径对应的文件**：配体集合在本轮还没有稳定形态（见方案稿 §6），
-    这里只留目录与登记说明，等它成形再补。
+    配体集合在这一步只用于找参考配体（`_reference_ligand`），不往运行目录里复制
+    任何文件。以前这里写 `{handle, name, file: ""}` 占位，前端读到 `score` 会直接
+    抛异常——一份「打不开的运行目录」比空数组更糟。
     """
-    written: list[dict[str, Any]] = []
-    for index, entry in enumerate(ligand_entries, start=1):
-        ligand_meta = dict(getattr(entry, "meta", {}) or {})
-        written.append(
-            {
-                "handle": str(entry.handle),
-                "name": str(ligand_meta.get("ligand") or f"set-{index}"),
-                "file": "",
-            }
+    del target, ligand_entries
+    return []
+
+
+def _read_docking(
+    entry: Any, receptor_entry: Any
+) -> tuple[dict[str, Any], Path, list[dict[str, Any]], int]:
+    """校验 docking artifact，返回 `(manifest, 根目录, 可用结果, 跳过数)`。
+
+    这一步在写任何文件之前跑：pose 路径不存在、受体不匹配都应当让旧运行目录
+    保持原样，而不是先写一半再报错。
+    """
+    if str(getattr(entry, "meta", {}).get("kind") or "") != "docking":
+        raise ValueError(
+            "这是运行目录或其他产物，不是对接产物；docking 参数要的是 kind=docking 的 artifact"
         )
-    return written
+    root = getattr(entry, "path", None)
+    if root is None or not Path(root).is_dir():
+        raise ValueError("对接产物的目录不在了；重新跑 dock")
+    root = Path(root).resolve()
+    try:
+        manifest = products.read_json(root / "manifest.json")
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"读对接 manifest 失败（{type(error).__name__}：{error}）"
+        ) from error
+    if (
+        str(manifest.get("kind") or "") != "docking"
+        or str(manifest.get("stage") or "") != "docking"
+    ):
+        raise ValueError("对接 manifest 不是 docking 状态；重新跑 dock")
+
+    expected = str(getattr(receptor_entry, "fingerprint", "") or "")
+    actual = str((manifest.get("receptor") or {}).get("fingerprint") or "")
+    if expected and actual:
+        if expected != actual:
+            raise ValueError(
+                "对接产物属于另一份受体（指纹不一致）；先 switch_receptor，或对当前受体重新对接"
+            )
+    else:
+        handle = str((manifest.get("receptor") or {}).get("handle") or "")
+        if handle and handle != str(receptor_entry.handle):
+            raise ValueError(
+                f"对接产物属于 {handle}，本次给的是 {receptor_entry.handle}；不要跨受体混用"
+            )
+
+    usable: list[dict[str, Any]] = []
+    skipped = 0
+    for result in manifest.get("results") or []:
+        if str(result.get("status") or "") != "ok":
+            # no_pdb 这类有分数但没有位姿的记录：不写进运行目录，但要计数。
+            skipped += 1
+            continue
+        relative = str(result.get("pose_pdb") or "")
+        if not relative:
+            skipped += 1
+            continue
+        source = (root / relative).resolve()
+        if not source.is_relative_to(root) or not source.is_file():
+            raise ValueError(f"对接 manifest 指向的 pose 不存在或越界：{relative}")
+        score = result.get("score")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+        ):
+            skipped += 1
+            continue
+        usable.append({**result, "_source": source, "score": float(score)})
+
+    # 按 dock 给的 rank 排；没有 rank 的退回分数升序。写进运行目录后重新密集编号。
+    usable.sort(
+        key=lambda item: (
+            int(item.get("rank") or 0) or 1_000_000,
+            float(item["score"]),
+            str(item.get("id") or ""),
+        )
+    )
+    if not usable:
+        raise ValueError(
+            "对接产物里没有可用的 pose（status=ok 且 pose_pdb 存在的记录为零）；"
+            "先看 dock 的 manifest.failures"
+        )
+    return manifest, root, usable, skipped
+
+
+def _stage_docking_poses(
+    target: Path, results: Sequence[dict[str, Any]], chains: Sequence[str]
+) -> tuple[list[dict[str, Any]], Path]:
+    """把 pose 复制到 `ligands/.staging-*`，返回 `(molecules, staging)`。
+
+    先全部复制成功再动旧文件：复制阶段失败时旧 `pose-*.pdb` 与旧 `meta.json`
+    都还在，运行目录仍是上一次那份完整结果。
+    """
+    ligands_dir = target / RUN_LIGANDS
+    ligands_dir.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=ligands_dir))
+    molecules: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    try:
+        for index, result in enumerate(results, start=1):
+            filename = f"pose-{index:02d}.pdb"
+            shutil.copyfile(result["_source"], staging / filename)
+            identifier = str(result.get("id") or f"LIG-{index:04d}")
+            base = identifier
+            suffix = 2
+            while identifier.lower() in used_ids:
+                identifier = f"{base}-{suffix}"
+                suffix += 1
+            used_ids.add(identifier.lower())
+            molecules.append(
+                {
+                    "id": identifier,
+                    "name": str(result.get("name") or identifier),
+                    "score": float(result["score"]),
+                    "pose": f"{RUN_LIGANDS}/{filename}",
+                    "chain": chains[0] if chains else "",
+                    "rank": index,
+                }
+            )
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return molecules, staging
+
+
+def _commit_docking_poses(target: Path, staging: Path) -> None:
+    """删除旧 `pose-*.pdb`，把 staging 里的新文件换到 `ligands/`。"""
+    ligands_dir = target / RUN_LIGANDS
+    for old in ligands_dir.glob("pose-*.pdb"):
+        old.unlink()
+    try:
+        for staged in sorted(staging.iterdir()):
+            os.replace(staged, ligands_dir / staged.name)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _poses_provenance(
+    manifest: dict[str, Any],
+    *,
+    docking_handle: str,
+    written: int,
+    skipped: int,
+) -> dict[str, Any]:
+    counts = manifest.get("counts") or {}
+    engine = manifest.get("engine") or {}
+    return {
+        "source": "vina",
+        "engine": str(engine.get("version") or engine.get("name") or "vina"),
+        "score_direction": "lower_is_better",
+        "score_unit": "kcal/mol",
+        "ranked_by": "score",
+        "receptor": str((manifest.get("receptor") or {}).get("handle") or ""),
+        "ligandset": str((manifest.get("ligands") or {}).get("handle") or ""),
+        "docking": str(docking_handle),
+        "params": dict(manifest.get("params") or {}),
+        "counts": {
+            "docked": int(counts.get("docked") or 0),
+            "failed": int(counts.get("failed") or 0),
+            "written": written,
+            "skipped": skipped,
+        },
+    }
+
+
+def _docking_summary(
+    manifest: dict[str, Any], molecules: Sequence[dict[str, Any]], skipped: int
+) -> dict[str, Any]:
+    counts = manifest.get("counts") or {}
+    best = molecules[0] if molecules else None
+    return {
+        "written": len(molecules),
+        "docked": int(counts.get("docked") or 0),
+        "failed": int(counts.get("failed") or 0),
+        "skipped": skipped,
+        "best_score": float(best["score"]) if best else None,
+        "best_id": str(best["id"]) if best else "",
+    }
 
 
 def _build_meta(
@@ -1161,6 +1415,7 @@ def _build_meta(
     bundle: Any,
     ligands: list[dict[str, Any]],
     prior: Sequence[Any] = (),
+    poses: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """装配 `meta.json`。
 
@@ -1211,6 +1466,8 @@ def _build_meta(
             }
             for item in prior
         ]
+    if poses is not None:
+        payload["provenance"]["poses"] = poses
     return payload
 
 
@@ -1281,6 +1538,7 @@ def _run_report(
     reference: str,
     note_parts: list[str],
     prior: Sequence[Any] = (),
+    docking: dict[str, Any] | None = None,
 ) -> str:
     # 延迟导入：`align` 与 `pockets` 都不在模块顶层引，避免绕回成环。
     from . import align as align_module
@@ -1330,6 +1588,20 @@ def _run_report(
     )
     if reference:
         lines.append(f"  参考配体：{reference}（同名的簇已标 is_reference）。")
+    if docking:
+        best = docking.get("best_score")
+        if isinstance(best, (int, float)):
+            best_text = f"最佳 {best:.2f} kcal/mol（{docking.get('best_id') or '—'}）"
+        else:
+            best_text = "没有可比较的分数"
+        lines.append(
+            f"  对接：{docking.get('written', 0)} 个位姿写入 {RUN_LIGANDS}/，"
+            f"{best_text}；失败 {docking.get('failed', 0)}、"
+            f"跳过 {docking.get('skipped', 0)}。"
+        )
+        lines.append(
+            "  提示：分数越低越好，只能在同一受体、同一盒子内比较，不是结合自由能。"
+        )
     return "\n".join(lines)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import csv
 import inspect
 import json
 import os
@@ -150,12 +151,15 @@ from opencode_tui.core.agent.domain import structure as structure_module  # noqa
 from opencode_tui.core.agent.domain import chembl as chembl_module  # noqa: E402
 from opencode_tui.core.agent.domain import chemistry as chemistry_module  # noqa: E402
 from opencode_tui.core.agent.domain import receptor as receptor_module  # noqa: E402
+from opencode_tui.core.agent.domain import ligand as ligand_module  # noqa: E402
+from opencode_tui.core.agent.domain import docking as docking_module  # noqa: E402
 from opencode_tui.core.agent.domain import listing as listing_module  # noqa: E402
 from opencode_tui.core.agent.domain import export as export_module  # noqa: E402
 from opencode_tui.core.agent.domain import complexes as complexes_module  # noqa: E402
 from opencode_tui.core.agent.domain import prankweb as prankweb_module  # noqa: E402
 from opencode_tui.core.agent.domain import pockets as pockets_module  # noqa: E402
 from opencode_tui.core.agent.domain import align as align_module  # noqa: E402
+from opencode_tui.core.agent.domain import products as products_module  # noqa: E402
 from opencode_tui.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
 from opencode_tui.core.agent.trace import TraceWriter, log_directory_for  # noqa: E402
 from opencode_tui.core.event_bus import EventBus  # noqa: E402
@@ -3791,6 +3795,13 @@ def check_ledger() -> None:
         [str(item) for item in ligandset.parents] == ["receptor#1"],
         "非受体条目登记时自动挂当前受体为父项",
     )
+    detached = ledger.add(
+        "ligandset", summary="跨靶点配体库", link_current_receptor=False
+    )
+    check(
+        detached.parents == (),
+        "link_current_receptor=False 时不把当前受体挂成父项",
+    )
 
     wrong = None
     try:
@@ -3848,6 +3859,10 @@ def check_ledger() -> None:
     check(
         not ledger.is_archived(other_receptor.handle),
         "新受体自己不被搁置",
+    )
+    check(
+        not ledger.is_archived(detached.handle),
+        "跨靶点配体库不随受体切换被搁置",
     )
     check(
         ledger.current_receptor() == other_receptor.handle,
@@ -3972,6 +3987,1072 @@ def check_ledger() -> None:
     )
 
     shutil.rmtree(root, ignore_errors=True)
+
+
+def check_products() -> None:
+    """内容寻址产物目录：复用、参数变化、半成品、原子写。"""
+    root = PROBE / "products_fixture"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        params = {"seed": 42, "limit": 10}
+        required = ("manifest.json", "params.json")
+        target, reused = products_module.content_dir(root, "lib", params, required)
+        check(
+            not reused and not target.exists(),
+            "第一次给的是新目录，且不替调用方建目录",
+        )
+        products_module.write_json_atomic(target / "manifest.json", {"ok": True})
+        products_module.write_json_atomic(target / "params.json", params)
+
+        again, reused = products_module.content_dir(root, "lib", params, required)
+        check(reused and again == target, "同参数且产物齐全时复用同一目录")
+
+        changed, reused = products_module.content_dir(
+            root, "lib", {"seed": 7, "limit": 10}, required
+        )
+        check(
+            not reused and changed != target,
+            "参数不同时换新目录，不复用旧产物",
+        )
+
+        (target / "manifest.json").unlink()
+        incomplete, reused = products_module.content_dir(root, "lib", params, required)
+        check(
+            not reused and incomplete.name.endswith("-2"),
+            f"参数相同但产物不齐时不复用半成品，改用 -2：{incomplete.name}",
+        )
+
+        atomic = root / "atomic.json"
+        products_module.write_json_atomic(atomic, {"中文": "值"})
+        check(
+            json.loads(atomic.read_text(encoding="utf-8")) == {"中文": "值"},
+            "原子写出的 JSON 能原样读回",
+        )
+        check(
+            not list(root.glob(".atomic.json.*.tmp")),
+            "原子写不留下临时文件",
+        )
+        check(
+            products_module.safe_stem("lib 01/x") == "lib_01_x",
+            "显示名里的空格与斜杠被压成下划线",
+        )
+        check(
+            products_module.safe_stem("中文") == "product",
+            "全是不安全字符时回落到默认 stem",
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_ligand_import() -> None:
+    """导入配体集：格式、去盐、去重、截断、失败与复用。
+
+    只替换化学清洗那一段（`canonicalize_smiles`）与 SDF 读取：这两处要真 RDKit，
+    而本机判据不依赖具体化学实现。文件读取、产物目录、写盘、登记全部是真的。
+    """
+    work = PROBE / "ligand_import"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    original_dir = ligand_module.ligands_dir
+    original_canon = ligand_module.canonicalize_smiles
+    original_sdf = ligand_module._read_sdf
+    original_probe = chemistry_module._probe_deps
+
+    def fake_canonical(raw: str) -> ligand_module.Cleaned:
+        text = str(raw).strip()
+        if not text or text.startswith("-") or "bad" in text:
+            raise ligand_module.LigandError("SMILES 解析失败")
+        parts = text.split(".")
+        main = parts[0]
+        heavy = sum(1 for char in main if char.isalpha() and char.isupper())
+        return ligand_module.Cleaned(
+            input_smiles=text,
+            smiles=main,
+            heavy_atoms=heavy,
+            fragments_removed=len(parts) - 1,
+            warnings=(f"去掉了 {len(parts) - 1} 个片段",) if len(parts) > 1 else (),
+        )
+
+    try:
+        ligand_module.ligands_dir = lambda: work / "ligands"
+        ligand_module.canonicalize_smiles = fake_canonical
+        chemistry_module._probe_deps = lambda: ()
+
+        tool = ligand_module.ImportLigandsetTool()
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+
+        # ---- 一、CSV：ChEMBL 列、去重、无效 ----
+        library = work / "library.csv"
+        library.write_text(
+            "molecule_chembl_id,molecule_pref_name,smiles,pchembl_value\n"
+            "CHEMBL1,aspirin,CCO,5.0\n"
+            "CHEMBL2,caffeine,CCN,6.0\n"
+            "CHEMBL3,duplicate,CCO,4.0\n"
+            "CHEMBL4,broken,bad-smiles,3.0\n",
+            encoding="utf-8",
+        )
+        result = await tool.execute({"path": str(library)}, context=ledger)
+        check(not result.failed, f"CSV 导入成功：{result.output}")
+        check(
+            result.meta["count"] == 2
+            and result.meta["duplicate"] == 1
+            and result.meta["invalid"] == 1,
+            f"可用 2、重复 1、无效 1：{result.meta}",
+        )
+        handle = result.meta["handle"]
+        entry = ledger.get(handle)
+        check(
+            isinstance(entry.handle, LigandSetHandle),
+            "导入登记成 ligandset",
+        )
+        check(
+            entry.meta.get("stage") == "raw" and entry.path is not None and entry.path.is_dir(),
+            "原始配体集登记成 raw，path 是产物目录",
+        )
+        check(
+            entry.parents == (),
+            "配体库不挂当前受体（换靶点不该被搁置）",
+        )
+        rows = list(csv.DictReader((entry.path / "ligands.csv").open(encoding="utf-8")))
+        check(
+            len(rows) == 2,
+            f"CSV 只写可用分子：{len(rows)} 行",
+        )
+        check(
+            rows[0]["id"] == "CHEMBL1" and rows[0]["name"] == "aspirin",
+            f"保留 ChEMBL 的 id 与名称：{rows[0]}",
+        )
+        check(
+            rows[0]["smiles"] == "CCO" and rows[0]["heavy_atoms"] == "3",
+            f"canonical SMILES 与重原子数写进 CSV：{rows[0]}",
+        )
+        manifest = json.loads((entry.path / "manifest.json").read_text(encoding="utf-8"))
+        check(
+            manifest["counts"]["input"] == 4 and manifest["counts"]["accepted"] == 2,
+            f"manifest 计数与 CSV 一致：{manifest['counts']}",
+        )
+        check(
+            {item["reason"] for item in manifest["skipped"]} == {"duplicate", "invalid_smiles"},
+            f"跳过原因逐条记下：{manifest['skipped']}",
+        )
+
+        # ---- 二、SMI：盐被去掉、注释与空行跳过 ----
+        salts = work / "salts.smi"
+        salts.write_text(
+            "# 注释行\n"
+            "CC(=O)[O-].[Na+] sodium_acetate\n"
+            "\n"
+            "CCO ethanol\n",
+            encoding="utf-8",
+        )
+        salt_result = await tool.execute({"path": str(salts)}, context=ledger)
+        check(not salt_result.failed, f"SMI 导入成功：{salt_result.output}")
+        salt_entry = ledger.get(salt_result.meta["handle"])
+        salt_rows = list(
+            csv.DictReader((salt_entry.path / "ligands.csv").open(encoding="utf-8"))
+        )
+        salt_row = next(row for row in salt_rows if row["id"] == "sodium_acetate")
+        check(
+            salt_row["smiles"] == "CC(=O)[O-]" and "Na" not in salt_row["smiles"],
+            f"盐只留最大片段：{salt_row}",
+        )
+        check(
+            len(salt_rows) == 2,
+            f"注释与空行不占记录：{len(salt_rows)} 行",
+        )
+
+        # ---- 三、limit：截断文案与计数 ----
+        limited = await tool.execute({"path": str(library), "limit": 1}, context=ledger)
+        check(
+            not limited.failed and limited.meta["count"] == 1 and limited.meta["remaining"] == 1,
+            f"limit 截断后只留 1 个、还剩 1 个：{limited.meta}",
+        )
+        check(
+            "没有导入" in limited.output and "limit" in limited.output,
+            f"截断时说清还剩多少、怎么接着做：{limited.output}",
+        )
+
+        # ---- 四、全部无效：失败且不登记 ----
+        before = len(ledger)
+        broken = work / "broken.csv"
+        broken.write_text("smiles\nbad-1\nbad-2\n", encoding="utf-8")
+        failed = await tool.execute({"path": str(broken)}, context=ledger)
+        check(
+            failed.failed and "没有可导入的分子" in failed.output,
+            f"全部无效时失败并说清：{failed.output}",
+        )
+        check(len(ledger) == before, "全部无效时登记表不增加")
+
+        # ---- 五、后缀与列名：失败要能指出可走的路 ----
+        notes = work / "notes.txt"
+        notes.write_text("hello\n", encoding="utf-8")
+        wrong_ext = await tool.execute({"path": str(notes)}, context=ledger)
+        check(
+            wrong_ext.failed and ".sdf" in wrong_ext.output and ".csv" in wrong_ext.output,
+            f"不认识的扩展名列清能收的：{wrong_ext.output}",
+        )
+        wrong_column = await tool.execute(
+            {"path": str(library), "smiles_column": "nope"}, context=ledger
+        )
+        check(
+            wrong_column.failed and "没有指定的 SMILES 列" in wrong_column.output,
+            f"指定列不存在时列实际表头：{wrong_column.output}",
+        )
+        custom = work / "custom.csv"
+        custom.write_text("id,name,molecule\nX,ex,CCO\n", encoding="utf-8")
+        custom_result = await tool.execute(
+            {"path": str(custom), "smiles_column": "molecule"}, context=ledger
+        )
+        check(
+            not custom_result.failed and custom_result.meta["count"] == 1,
+            f"smiles_column 能指定非默认列：{custom_result.output}",
+        )
+
+        # ---- 六、复用：同内容同参数不重复登记 ----
+        count_before = len(
+            [item for item in ledger.entries(include_archived=True)
+             if isinstance(item.handle, LigandSetHandle)]
+        )
+        again = await tool.execute({"path": str(library)}, context=ledger)
+        count_after = len(
+            [item for item in ledger.entries(include_archived=True)
+             if isinstance(item.handle, LigandSetHandle)]
+        )
+        check(
+            again.meta["handle"] == handle,
+            f"同内容同参数回到同一个 handle：{again.meta['handle']} 对 {handle}",
+        )
+        check(
+            count_after == count_before and "未重复导入" in again.output,
+            f"不重复登记，输出也说明：{again.output.splitlines()[0]}",
+        )
+
+        # ---- 七、SDF 分派：替换读取函数即可覆盖，不依赖真 RDKit ----
+        def fake_read_sdf(path: Path) -> list[ligand_module.RawLigand]:
+            return [
+                ligand_module.RawLigand(
+                    index=1, id="SDF1", name="sdf-one", smiles="CCO", source_ref="第 1 条记录"
+                ),
+                ligand_module.RawLigand(
+                    index=2, id="SDF2", name="sdf-two", smiles="bad", source_ref="第 2 条记录"
+                ),
+            ]
+
+        ligand_module._read_sdf = fake_read_sdf
+        sdf = work / "library.sdf"
+        sdf.write_text("fake sdf\n", encoding="utf-8")
+        sdf_result = await tool.execute({"path": str(sdf)}, context=ledger)
+        check(
+            not sdf_result.failed
+            and sdf_result.meta["count"] == 1
+            and sdf_result.meta["invalid"] == 1,
+            f"SDF 走同一条清洗链：{sdf_result.meta}",
+        )
+        _, sdf_skipped, sdf_counts = ligand_module._clean_records(
+            [
+                ligand_module.RawLigand(
+                    index=1,
+                    id="X",
+                    name="",
+                    smiles="",
+                    source_ref="第 1 条记录",
+                    problem="SDF 记录解析失败（sanitize 没通过）",
+                )
+            ],
+            limit=10,
+        )
+        check(
+            sdf_counts["invalid"] == 1
+            and sdf_skipped[0]["reason"] == "sdf_parse_failed",
+            f"读取阶段就坏掉的记录单独一档原因：{sdf_skipped}",
+        )
+
+        # ---- 八、接口与装配 ----
+        properties = tool.spec.parameters.get("properties") or {}
+        check(
+            tool.spec.parameters.get("required") == ["path"],
+            "path 是唯一必填参数",
+        )
+        check(
+            "ledger" not in properties,
+            "参数模式里不列 ledger（那是内核注入的）",
+        )
+        check(
+            tool.spec.parameters.get("additionalProperties") is False,
+            "不认识的参数直接拒绝",
+        )
+        check(
+            chemistry_module.CHEM_TOOL_DESCRIPTION_NOTE in tool.spec.description,
+            "描述里带了「需要化学依赖」那句",
+        )
+        missing = await tool.execute({"path": str(library)}, context=None)
+        check(
+            missing.failed and "内核装配问题" in missing.output,
+            f"没拿到登记表时报装配问题：{missing.output}",
+        )
+        no_file = await tool.execute({"path": str(work / "nope.csv")}, context=ledger)
+        check(
+            no_file.failed and "找不到" in no_file.output,
+            f"文件不存在时说清：{no_file.output}",
+        )
+        as_dir = await tool.execute({"path": str(work)}, context=ledger)
+        check(
+            as_dir.failed and "不是目录" in as_dir.output,
+            f"传目录时说清要的是文件：{as_dir.output}",
+        )
+        bad_limit = await tool.execute({"path": str(library), "limit": 0}, context=ledger)
+        check(
+            bad_limit.failed and "1 到" in bad_limit.output,
+            f"limit 越界时给出范围：{bad_limit.output}",
+        )
+    finally:
+        ligand_module.ligands_dir = original_dir
+        ligand_module.canonicalize_smiles = original_canon
+        ligand_module._read_sdf = original_sdf
+        chemistry_module._probe_deps = original_probe
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def check_ligand_prepare() -> None:
+    """准备配体：预演、ETKDG/Meeko 失败分档、复用、seed、limit、提交标记。"""
+    work = PROBE / "ligand_prepare"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    original_dir = ligand_module.ligands_dir
+    original_prepare = ligand_module.prepare_molecule
+    original_probe = chemistry_module._probe_deps
+    calls: list[tuple[str, int]] = []
+
+    def fake_prepare(cleaned: ligand_module.Cleaned, *, seed: int) -> ligand_module.PreparedMolecule:
+        calls.append((cleaned.smiles, seed))
+        if cleaned.smiles == "CCN":
+            raise ligand_module.MeekoError("Meeko 没有生成任何 setup")
+        if cleaned.smiles == "CCCl":
+            raise ligand_module.EmbedError("3D 构象生成失败（ETKDGv3 两次都没嵌进去）")
+        return ligand_module.PreparedMolecule(
+            pdbqt=f"REMARK SMILES {cleaned.smiles}\nTORSDOF 0\n",
+            heavy_atoms=cleaned.heavy_atoms,
+            forcefield="MMFF94",
+            setups=1,
+        )
+
+    def make_raw(name: str, rows: list[tuple[str, str]]) -> Path:
+        directory = work / "raw" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "manifest.json").write_text(
+            json.dumps({"kind": "ligandset", "stage": "raw"}), encoding="utf-8"
+        )
+        lines = [
+            "id,name,smiles,input_smiles,heavy_atoms,pchembl_value,source_index",
+            *[
+                f"{identifier},{identifier},{smiles},{smiles},3,5.0,{index}"
+                for index, (identifier, smiles) in enumerate(rows, start=1)
+            ],
+        ]
+        (directory / "ligands.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return directory
+
+    try:
+        ligand_module.ligands_dir = lambda: work / "ligands"
+        ligand_module.prepare_molecule = fake_prepare
+        chemistry_module._probe_deps = lambda: ()
+
+        tool = ligand_module.PrepareLigandsTool()
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+
+        source_dir = make_raw(
+            "library-abc",
+            [
+                ("A", "CCO"),
+                ("B", "CCN"),
+                ("C", "CCO"),
+                ("D", "CCC"),
+            ],
+        )
+        source = ledger.add(
+            "ligandset",
+            path=source_dir,
+            summary="原始库",
+            fingerprint=fingerprint_path(source_dir),
+            meta={"stage": "raw"},
+            link_current_receptor=False,
+        )
+
+        # ---- 一、预演：不写盘、不登记、不跑 3D/Meeko ----
+        preview = await tool.execute({"ligands": str(source.handle)}, context=ledger)
+        check(not preview.failed, f"预演成功：{preview.output}")
+        check(
+            preview.meta.get("preview") is True and preview.meta.get("count") == 3,
+            f"预演报出去重后的条数：{preview.meta}",
+        )
+        check(
+            "预演" in preview.output and "confirm=true" in preview.output,
+            f"预演说清下一步：{preview.output}",
+        )
+        check(calls == [], "预演不跑 3D/Meeko")
+        check(
+            not (work / "ligands" / "prepared").exists(),
+            "预演不建产物目录",
+        )
+
+        # ---- 二、confirm：成功与失败分档，重复不占名额 ----
+        result = await tool.execute(
+            {"ligands": str(source.handle), "confirm": True}, context=ledger
+        )
+        check(not result.failed, f"准备成功：{result.output}")
+        check(
+            result.meta.get("count") == 2 and result.meta.get("failed") == 1,
+            f"成功 2、失败 1：{result.meta}",
+        )
+        handle = result.meta["handle"]
+        entry = ledger.get(handle)
+        check(
+            isinstance(entry.handle, LigandSetHandle)
+            and entry.meta.get("stage") == "prepared",
+            "准备后登记成 prepared ligandset",
+        )
+        check(entry.parents == (), "准备后的配体库仍不挂当前受体")
+        check(
+            entry.path is not None
+            and (entry.path / "manifest.json").is_file()
+            and (entry.path / "params.json").is_file(),
+            "产物目录有 manifest 与 params 提交标记",
+        )
+        manifest = json.loads((entry.path / "manifest.json").read_text(encoding="utf-8"))
+        counts = manifest["counts"]
+        check(
+            counts["input"] == 4
+            and counts["unique"] == 3
+            and counts["duplicate"] == 1
+            and counts["selected"] == 3
+            and counts["prepared"] == 2
+            and counts["meeko_failed"] == 1,
+            f"计数覆盖去重、截断与失败：{counts}",
+        )
+        pdbqts = sorted(item.name for item in (entry.path / "ligands").glob("*.pdbqt"))
+        check(
+            pdbqts == ["A.pdbqt", "D.pdbqt"],
+            f"只给成功的分子写 PDBQT：{pdbqts}",
+        )
+        statuses = {item["id"]: item["status"] for item in manifest["records"]}
+        check(
+            statuses == {"A": "ok", "B": "meeko_failed", "D": "ok"},
+            f"逐条记下成功与失败原因：{statuses}",
+        )
+        check(
+            calls == [("CCO", 42), ("CCN", 42), ("CCC", 42)],
+            f"按源顺序准备、重复的跳过：{calls}",
+        )
+
+        # ---- 三、同参数复用：不重跑 3D/Meeko ----
+        before_calls = len(calls)
+        again = await tool.execute(
+            {"ligands": str(source.handle), "confirm": True}, context=ledger
+        )
+        check(
+            not again.failed and again.meta["handle"] == handle,
+            f"同参数回到同一个 handle：{again.meta}",
+        )
+        check(len(calls) == before_calls, "同参数复用不重跑 3D/Meeko")
+        check("未重复准备" in again.output, f"输出说明复用：{again.output}")
+
+        # ---- 四、换 seed：新目录、旧产物还在 ----
+        seeded = await tool.execute(
+            {"ligands": str(source.handle), "confirm": True, "seed": 7}, context=ledger
+        )
+        check(
+            not seeded.failed and seeded.meta["handle"] != handle,
+            f"换 seed 生成另一份准备产物：{seeded.meta}",
+        )
+        check(
+            len(calls) > before_calls and all(seed == 7 for _, seed in calls[before_calls:]),
+            f"新 seed 真的传下去了：{calls[before_calls:]}",
+        )
+        check(entry.path.is_dir(), "换 seed 不覆盖旧产物")
+
+        # ---- 五、limit：只准备前 N 个，并说明还剩多少 ----
+        limited = await tool.execute(
+            {"ligands": str(source.handle), "confirm": True, "limit": 1}, context=ledger
+        )
+        check(
+            not limited.failed and limited.meta.get("count") == 1,
+            f"limit 只准备 1 个：{limited.meta}",
+        )
+        limited_entry = ledger.get(limited.meta["handle"])
+        limited_manifest = json.loads(
+            (limited_entry.path / "manifest.json").read_text(encoding="utf-8")
+        )
+        check(
+            limited_manifest["counts"]["remaining"] == 2
+            and "没有处理" in limited.output,
+            f"截断说清还剩 2 个：{limited_manifest['counts']}",
+        )
+
+        # ---- 六、已经 prepared 的 handle 拒绝重复准备 ----
+        reject = await tool.execute({"ligands": handle}, context=ledger)
+        check(
+            reject.failed and "已经准备过" in reject.output,
+            f"prepared handle 被拒：{reject.output}",
+        )
+
+        # ---- 七、全部失败：不登记 ----
+        fail_dir = make_raw("only-bad", [("E", "CCCl")])
+        fail_source = ledger.add(
+            "ligandset",
+            path=fail_dir,
+            summary="全失败",
+            fingerprint=fingerprint_path(fail_dir),
+            meta={"stage": "raw"},
+            link_current_receptor=False,
+        )
+        before_entries = len(ledger)
+        fail_result = await tool.execute(
+            {"ligands": str(fail_source.handle), "confirm": True}, context=ledger
+        )
+        check(
+            fail_result.failed and "没有准备出任何 PDBQT" in fail_result.output,
+            f"全部失败时失败并给出分档：{fail_result.output}",
+        )
+        check(len(ledger) == before_entries, "全部失败时不登记")
+
+        # ---- 八、删掉 params.json：提交标记失效，不复用 ----
+        assert entry.path is not None
+        (entry.path / "params.json").unlink()
+        rebuilt = await tool.execute(
+            {"ligands": str(source.handle), "confirm": True}, context=ledger
+        )
+        check(
+            not rebuilt.failed and rebuilt.meta["handle"] != handle,
+            f"缺 params.json 时不复用旧目录：{rebuilt.meta}",
+        )
+
+        # ---- 九、参数与装配 ----
+        properties = tool.spec.parameters.get("properties") or {}
+        check(
+            "ligands" in (tool.spec.parameters.get("required") or []),
+            "ligands 是必填",
+        )
+        check(
+            "ledger" not in properties,
+            "参数模式里不列 ledger（那是内核注入的）",
+        )
+        check(
+            tool.spec.parameters.get("additionalProperties") is False,
+            "不认识的参数直接拒绝",
+        )
+        check(
+            chemistry_module.CHEM_TOOL_DESCRIPTION_NOTE in tool.spec.description,
+            "描述里带了「需要化学依赖」那句",
+        )
+        no_handle = await tool.execute({"ligands": ""}, context=ledger)
+        check(no_handle.failed and "缺少参数" in no_handle.output, "空 handle 被拦下")
+        missing = await tool.execute({"ligands": str(source.handle)}, context=None)
+        check(
+            missing.failed and "内核装配问题" in missing.output,
+            f"没拿到登记表时报装配问题：{missing.output}",
+        )
+        bad_limit = await tool.execute(
+            {"ligands": str(source.handle), "limit": 0}, context=ledger
+        )
+        check(
+            bad_limit.failed and "1 到" in bad_limit.output,
+            f"limit 越界时给出范围：{bad_limit.output}",
+        )
+        bad_seed = await tool.execute(
+            {"ligands": str(source.handle), "seed": -1}, context=ledger
+        )
+        check(
+            bad_seed.failed and "0 到" in bad_seed.output,
+            f"seed 越界时给出范围：{bad_seed.output}",
+        )
+        bad_confirm = await tool.execute(
+            {"ligands": str(source.handle), "confirm": "yes"}, context=ledger
+        )
+        check(
+            bad_confirm.failed and "true 或 false" in bad_confirm.output,
+            f"confirm 不是布尔时拒绝：{bad_confirm.output}",
+        )
+
+        # ---- 十、缺化学依赖：失败且不写盘 ----
+        chemistry_module._probe_deps = lambda: ("rdkit",)
+        before = len(ledger)
+        blocked = await tool.execute(
+            {"ligands": str(source.handle), "confirm": True}, context=ledger
+        )
+        check(
+            blocked.failed and "本机缺化学依赖" in blocked.output,
+            f"缺依赖时给出安装指引：{blocked.output}",
+        )
+        check(len(ledger) == before, "缺依赖时不登记")
+    finally:
+        ligand_module.ligands_dir = original_dir
+        ligand_module.prepare_molecule = original_prepare
+        chemistry_module._probe_deps = original_probe
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def check_docking() -> None:
+    """对接：Vina 定位、盒子、命令构造、失败分档、分数排序、artifact 与复用。"""
+    work = PROBE / "docking_tool"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    original_dir = docking_module.dockings_dir
+    original_resolve = docking_module.resolve_vina
+    original_run = docking_module.run_vina
+    original_convert = docking_module.best_pose_to_pdb
+    original_probe = chemistry_module._probe_deps
+    runs: list[tuple[str, ...]] = []
+
+    async def fake_run_vina(
+        argv, *, cwd, timeout, log_path
+    ) -> docking_module.VinaRun:
+        runs.append(tuple(argv))
+        ligand_path = Path(argv[argv.index("--ligand") + 1])
+        out_path = Path(argv[argv.index("--out") + 1])
+        stem = ligand_path.stem
+        if stem == "B":
+            log_path.write_text("boom\n", encoding="utf-8")
+            return docking_module.VinaRun(tuple(argv), 1, "boom", False, log_path)
+        if stem == "C":
+            log_path.write_text("timeout\n", encoding="utf-8")
+            return docking_module.VinaRun(tuple(argv), -9, "timeout", True, log_path)
+        if stem == "D":
+            out_path.write_text("ATOM\n", encoding="utf-8")
+            log_path.write_text("no result\n", encoding="utf-8")
+            return docking_module.VinaRun(tuple(argv), 0, "no result", False, log_path)
+        score = -8.0 if stem == "A" else -6.0
+        out_path.write_text(
+            f"MODEL 1\nREMARK VINA RESULT: {score} 0.0 0.0\nATOM\nENDMDL\n"
+            "MODEL 2\nREMARK VINA RESULT: -5.0 0.1 0.2\nATOM\nENDMDL\n",
+            encoding="utf-8",
+        )
+        log_path.write_text("ok\n", encoding="utf-8")
+        return docking_module.VinaRun(tuple(argv), 0, "ok", False, log_path)
+
+    def fake_convert(pose_pdbqt: Path, dest: Path) -> bool:
+        if pose_pdbqt.stem.startswith("E"):
+            return False
+        dest.write_text(
+            "ATOM      1  C   LIG A   1       0.000   0.000   0.000  1.00  0.00           C\n",
+            encoding="utf-8",
+        )
+        return True
+
+    def make_ligandset(name: str, ids: list[str]) -> Path:
+        directory = work / "ligands" / name
+        (directory / "ligands").mkdir(parents=True, exist_ok=True)
+        records = []
+        for index, identifier in enumerate(ids, start=1):
+            relative = f"ligands/{identifier}.pdbqt"
+            (directory / relative).write_text(f"REMARK {identifier}\n", encoding="utf-8")
+            records.append(
+                {
+                    "id": identifier,
+                    "name": identifier.lower(),
+                    "smiles": "CCO",
+                    "heavy_atoms": 3,
+                    "source_index": index,
+                    "status": "ok",
+                    "pdbqt": relative,
+                    "forcefield": "MMFF94",
+                    "setups": 1,
+                    "error": "",
+                    "warnings": [],
+                }
+            )
+        (directory / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "kind": "ligandset",
+                    "stage": "prepared",
+                    "records": records,
+                    "counts": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return directory
+
+    try:
+        docking_module.dockings_dir = lambda: work / "docking"
+        docking_module.resolve_vina = lambda: docking_module.VinaBinary("/fake/vina", "1.2.5")
+        docking_module.run_vina = fake_run_vina
+        docking_module.best_pose_to_pdb = fake_convert
+        chemistry_module._probe_deps = lambda: ()
+
+        tool = docking_module.DockTool()
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+
+        receptor_dir = work / "receptor"
+        receptor_dir.mkdir(parents=True, exist_ok=True)
+        (receptor_dir / "receptor.pdbqt").write_text("REMARK receptor\n", encoding="utf-8")
+        (receptor_dir / "box.txt").write_text(
+            "center_x = 1.0\ncenter_y = 2.0\ncenter_z = 3.0\n"
+            "size_x = 20.0\nsize_y = 21.0\nsize_z = 22.0\n",
+            encoding="utf-8",
+        )
+        receptor = ledger.add(
+            "receptor",
+            path=receptor_dir,
+            summary="prepared receptor",
+            fingerprint=fingerprint_path(receptor_dir),
+            meta={
+                "stage": "prepared",
+                "pdbqt_file": "receptor.pdbqt",
+                "box_file": "box.txt",
+            },
+        )
+        ligand_dir = make_ligandset("five", ["A", "B", "C", "D", "E"])
+        ligand_set = ledger.add(
+            "ligandset",
+            path=ligand_dir,
+            summary="prepared ligands",
+            fingerprint=fingerprint_path(ligand_dir),
+            meta={"stage": "prepared"},
+            link_current_receptor=False,
+        )
+
+        # ---- 一、整批：成功、无 PDB、非零退出、超时、无结果 ----
+        result = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "ligands": str(ligand_set.handle),
+                "limit": 5,
+            },
+            context=ledger,
+        )
+        check(not result.failed, f"对接成功：{result.output}")
+        check(
+            result.meta.get("docked") == 2
+            and result.meta.get("pdb") == 1
+            and result.meta.get("failed") == 4
+            and result.meta.get("best_score") == -8.0,
+            f"计数与最佳分数正确：{result.meta}",
+        )
+        handle = result.meta["handle"]
+        entry = ledger.get(handle)
+        check(
+            isinstance(entry.handle, ArtifactHandle)
+            and entry.meta.get("kind") == "docking"
+            and entry.meta.get("stage") == "docking",
+            "登记成 artifact + kind=docking + stage=docking",
+        )
+        check(
+            {str(item) for item in entry.parents}
+            == {str(receptor.handle), str(ligand_set.handle)},
+            f"父项挂受体与配体集：{[str(item) for item in entry.parents]}",
+        )
+        check(
+            entry.path is not None
+            and (entry.path / "manifest.json").is_file()
+            and (entry.path / "params.json").is_file(),
+            "产物目录有 manifest 与 params 提交标记",
+        )
+        manifest = json.loads((entry.path / "manifest.json").read_text(encoding="utf-8"))
+        counts = manifest["counts"]
+        check(
+            counts
+            == {
+                "input": 5,
+                "docked": 2,
+                "pdb": 1,
+                "failed": 4,
+                "remaining": 0,
+                "best_score": -8.0,
+            },
+            f"计数口径：{counts}",
+        )
+        results = manifest["results"]
+        check(
+            [item["id"] for item in results] == ["A", "E"],
+            f"结果按分数升序：{[item['id'] for item in results]}",
+        )
+        check(
+            results[0]["rank"] == 1
+            and results[0]["ligand_efficiency"] == round(8.0 / 3, 3),
+            f"rank 与配体效率由代码算：{results[0]}",
+        )
+        check(
+            results[1]["status"] == "no_pdb" and results[1]["pose_pdb"] == "",
+            "转不成 PDB 的记录保留分数但标 no_pdb",
+        )
+        reasons = {item["reason"] for item in manifest["failures"]}
+        check(
+            reasons == {"vina_exit_1", "timeout", "no_result", "no_pdb"},
+            f"失败原因分档：{reasons}",
+        )
+        check(
+            (entry.path / "poses" / "A_out.pdbqt").is_file()
+            and (entry.path / "poses" / "A.pdb").is_file()
+            and (entry.path / "logs" / "B.log").is_file(),
+            "每个配体留下 PDBQT、最佳 PDB 与日志",
+        )
+        check(
+            not (entry.path / "poses" / "E.pdb").exists(),
+            "没转出 PDB 的记录不写空文件",
+        )
+        check(
+            manifest["receptor"]["box"]["center"] == [1.0, 2.0, 3.0]
+            and manifest["receptor"]["box"]["size"] == [20.0, 21.0, 22.0],
+            f"盒子原样写进 manifest：{manifest['receptor']['box']}",
+        )
+        check(
+            manifest["engine"]["version"] == "1.2.5",
+            f"引擎版本进 manifest：{manifest['engine']}",
+        )
+
+        # ---- 二、同参数复用：不重跑 Vina ----
+        before_runs = len(runs)
+        again = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "ligands": str(ligand_set.handle),
+                "limit": 5,
+            },
+            context=ledger,
+        )
+        check(
+            not again.failed
+            and again.meta.get("handle") == handle
+            and again.meta.get("reused") is True,
+            f"同参数复用同一 artifact：{again.meta}",
+        )
+        check(len(runs) == before_runs, "复用不重跑 Vina")
+        check("未重复对接" in again.output, f"输出说明复用：{again.output}")
+
+        # ---- 三、limit：只跑前 N 个并说明未处理 ----
+        limited = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "ligands": str(ligand_set.handle),
+                "limit": 1,
+            },
+            context=ledger,
+        )
+        check(
+            not limited.failed
+            and limited.meta.get("docked") == 1
+            and limited.meta.get("remaining") == 4,
+            f"limit 只跑 1 个、剩 4 个：{limited.meta}",
+        )
+        check("未处理 4" in limited.output, f"截断说清剩多少：{limited.output}")
+
+        # ---- 四、全部失败：不登记 ----
+        fail_dir = make_ligandset("only-b", ["B"])
+        fail_set = ledger.add(
+            "ligandset",
+            path=fail_dir,
+            summary="only bad",
+            fingerprint=fingerprint_path(fail_dir),
+            meta={"stage": "prepared"},
+            link_current_receptor=False,
+        )
+        before_entries = len(ledger)
+        failed = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(fail_set.handle)},
+            context=ledger,
+        )
+        check(
+            failed.failed and "没有产生可用的对接结果" in failed.output,
+            f"全部失败时失败并给原因：{failed.output}",
+        )
+        check(len(ledger) == before_entries, "全部失败时不登记 artifact")
+
+        # ---- 五、阶段检查：raw 受体 / raw 配体集 ----
+        raw_ligand = ledger.add(
+            "ligandset",
+            path=work / "raw-ligands",
+            summary="raw",
+            meta={"stage": "raw"},
+            link_current_receptor=False,
+        )
+        raw_result = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(raw_ligand.handle)},
+            context=ledger,
+        )
+        check(
+            raw_result.failed and "prepared 状态" in raw_result.output,
+            f"raw 配体集被拒：{raw_result.output}",
+        )
+        raw_receptor = ledger.add(
+            "receptor",
+            path=work / "raw.pdb",
+            summary="raw receptor",
+            meta={"stage": "raw"},
+        )
+        raw_receptor_result = await tool.execute(
+            {"receptor": str(raw_receptor.handle), "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(
+            raw_receptor_result.failed and "prepared 状态" in raw_receptor_result.output,
+            f"raw 受体被拒：{raw_receptor_result.output}",
+        )
+
+        # ---- 六、缺 Vina：失败并给安装指引 ----
+        def no_vina() -> docking_module.VinaBinary:
+            raise ToolError(f"本机没有找到 AutoDock Vina。用 {docking_module.VINA_ENV} 指定。")
+
+        docking_module.resolve_vina = no_vina
+        missing_engine = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(
+            missing_engine.failed and "VSA_VINA_BIN" in missing_engine.output,
+            f"缺 Vina 时给安装指引：{missing_engine.output}",
+        )
+        docking_module.resolve_vina = lambda: docking_module.VinaBinary("/fake/vina", "1.2.5")
+
+        # ---- 七、盒子与命令构造 ----
+        box = docking_module.read_box(receptor_dir, receptor.meta)
+        check(
+            box.center == (1.0, 2.0, 3.0) and box.size == (20.0, 21.0, 22.0),
+            f"box.txt 解析正确：{box}",
+        )
+        fallback = docking_module.read_box(
+            receptor_dir,
+            {
+                "box_file": "missing.txt",
+                "params": {"box_center": [1, 2, 3], "box_size": [10, 11, 12]},
+            },
+        )
+        check(fallback.source == "meta.params", "box.txt 不在时回退 meta.params")
+        bad_box = receptor_dir / "bad-box.txt"
+        bad_box.write_text("center_x = 1\ncenter_y = 2\ncenter_z = 3\n", encoding="utf-8")
+        try:
+            docking_module.read_box(receptor_dir, {"box_file": "bad-box.txt"})
+            check(False, "缺盒子字段应当失败")
+        except ToolError as error:
+            check("size_x" in str(error), f"缺字段时说清缺哪个：{error}")
+        zero_box = receptor_dir / "zero-box.txt"
+        zero_box.write_text(
+            "center_x=1\ncenter_y=2\ncenter_z=3\nsize_x=0\nsize_y=1\nsize_z=1\n",
+            encoding="utf-8",
+        )
+        try:
+            docking_module.read_box(receptor_dir, {"box_file": "zero-box.txt"})
+            check(False, "零边长应当失败")
+        except ToolError as error:
+            check("大于 0" in str(error), f"零边长时说清：{error}")
+
+        params = docking_module.DockParams()
+        argv = docking_module.build_command(
+            "/fake/vina",
+            Path("receptor.pdbqt"),
+            Path("ligand.pdbqt"),
+            Path("out.pdbqt"),
+            box,
+            params,
+        )
+        check(isinstance(argv, list) and argv[0] == "/fake/vina", "命令是参数数组，不是字符串")
+        for flag in (
+            "--receptor",
+            "--ligand",
+            "--center_x",
+            "--center_y",
+            "--center_z",
+            "--size_x",
+            "--size_y",
+            "--size_z",
+            "--exhaustiveness",
+            "--num_modes",
+            "--seed",
+            "--cpu",
+            "--energy_range",
+            "--out",
+        ):
+            check(flag in argv, f"命令里有 {flag}")
+        source = (
+            ROOT / "opencode_tui" / "core" / "agent" / "domain" / "docking.py"
+        ).read_text(encoding="utf-8")
+        check("create_subprocess_shell" not in source, "对接不拼 shell")
+
+        modes = docking_module.parse_vina_results(
+            "REMARK VINA RESULT: -8.0 0.1 0.2\nREMARK VINA RESULT: -7.0 0.3 0.4\n"
+        )
+        check(
+            [item.score for item in modes] == [-8.0, -7.0],
+            f"多 mode 分数解析正确：{modes}",
+        )
+        check(docking_module.parse_vina_results("nothing") == [], "没有结果行时返回空表")
+
+        # ---- 八、真实子进程：超时与进程树终止 ----
+        timeout_run = await original_run(
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            cwd=work,
+            timeout=0.2,
+            log_path=work / "timeout.log",
+        )
+        check(timeout_run.timed_out, "超时被识别")
+        check((work / "timeout.log").is_file(), "超时也留下日志文件")
+
+        # ---- 九、参数与装配 ----
+        properties = tool.spec.parameters.get("properties") or {}
+        check(
+            {"receptor", "ligands"}.issubset(
+                set(tool.spec.parameters.get("required") or [])
+            ),
+            "receptor 与 ligands 都是必填",
+        )
+        check(
+            "ledger" not in properties,
+            "参数模式里不列 ledger（那是内核注入的）",
+        )
+        check(
+            tool.spec.parameters.get("additionalProperties") is False,
+            "不认识的参数直接拒绝",
+        )
+        check(
+            chemistry_module.CHEM_TOOL_DESCRIPTION_NOTE in tool.spec.description,
+            "描述里带了「需要化学依赖」那句",
+        )
+        check(
+            "越低越好" in tool.spec.description,
+            "描述第一段写清分数方向",
+        )
+        empty = await tool.execute({}, context=ledger)
+        check(
+            empty.failed and "缺少参数 receptor" in empty.output,
+            f"空调用被拦下：{empty.output}",
+        )
+        missing_ledger = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle)},
+            context=None,
+        )
+        check(
+            missing_ledger.failed and "内核装配问题" in missing_ledger.output,
+            f"没拿到登记表时报装配问题：{missing_ledger.output}",
+        )
+        for name, value, expected in (
+            ("exhaustiveness", 0, "1 到 64"),
+            ("num_modes", 0, "1 到 20"),
+            ("limit", 0, "1 到 500"),
+            ("timeout", 1, "10 到 3600"),
+        ):
+            bad = await tool.execute(
+                {
+                    "receptor": str(receptor.handle),
+                    "ligands": str(ligand_set.handle),
+                    name: value,
+                },
+                context=ledger,
+            )
+            check(
+                bad.failed and expected in bad.output,
+                f"{name} 越界时给出范围：{bad.output}",
+            )
+    finally:
+        docking_module.dockings_dir = original_dir
+        docking_module.resolve_vina = original_resolve
+        docking_module.run_vina = original_run
+        docking_module.best_pose_to_pdb = original_convert
+        chemistry_module._probe_deps = original_probe
+        shutil.rmtree(work, ignore_errors=True)
 
 
 async def check_tool_context() -> None:
@@ -5272,6 +6353,323 @@ async def check_write_run() -> None:
         shutil.rmtree(runs_root, ignore_errors=True)
 
 
+async def check_write_run_docking() -> None:
+    """`write_run` 接入对接产物：复制 pose、填 molecules、provenance.poses、清理旧 pose。"""
+    import json as _json
+    import shutil
+    import tempfile
+    from pathlib import Path as _Path
+
+    from opencode_tui.core.agent.ledger import SessionLedger
+
+    runs_root = _Path(tempfile.mkdtemp(prefix="vsa-run-dock-"))
+    original_runs_dir = export_module.runs_dir
+    original_complex = pockets_module.complex_pockets
+    original_p2rank = pockets_module.p2rank_pockets
+
+    def stub_pockets(**kwargs):
+        return pockets_module.PocketBundle(origin="none", note="stub")
+
+    try:
+        export_module.runs_dir = lambda: runs_root
+        pockets_module.complex_pockets = stub_pockets
+        pockets_module.p2rank_pockets = stub_pockets
+
+        ledger = SessionLedger(
+            session_id="probe", snapshot_path=runs_root / "ledger.json"
+        )
+        receptor_dir = runs_root / "receptor-art"
+        receptor_dir.mkdir()
+        (receptor_dir / "receptor.pdb").write_text(
+            IEP_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        receptor = ledger.add(
+            "receptor",
+            path=receptor_dir,
+            summary="prepared 1IEP",
+            fingerprint=fingerprint_path(receptor_dir),
+            meta={
+                "stage": "prepared",
+                "pdb_file": "receptor.pdb",
+                "pdb_id": "1IEP",
+                "chains": ["A"],
+                "title": "ABL kinase",
+            },
+        )
+
+        def make_docking(name: str, results: list[dict], *, receptor_fp: str = ""):
+            directory = runs_root / name
+            (directory / "poses").mkdir(parents=True)
+            for item in results:
+                relative = str(item.get("pose_pdb") or "")
+                if relative:
+                    (directory / relative).write_text(
+                        f"REMARK {item['id']}\n", encoding="utf-8"
+                    )
+            manifest = {
+                "kind": "docking",
+                "stage": "docking",
+                "engine": {"name": "vina", "version": "AutoDock Vina v1.2.5"},
+                "receptor": {
+                    "handle": str(receptor.handle),
+                    "fingerprint": receptor_fp or str(receptor.fingerprint),
+                },
+                "ligands": {"handle": "ligandset#1", "fingerprint": "lig-fp"},
+                "params": {"exhaustiveness": 8, "num_modes": 9, "seed": 42},
+                "counts": {
+                    "docked": sum(1 for item in results if item.get("status") == "ok"),
+                    "failed": 1,
+                },
+                "results": results,
+                "failures": [{"id": "D", "reason": "timeout"}],
+            }
+            (directory / "manifest.json").write_text(
+                _json.dumps(manifest), encoding="utf-8"
+            )
+            (directory / "params.json").write_text("{}", encoding="utf-8")
+            return ledger.add(
+                "artifact",
+                path=directory,
+                summary=f"docking {name}",
+                fingerprint=fingerprint_path(directory),
+                meta={"kind": "docking", "stage": "docking"},
+            )
+
+        base_results = [
+            {
+                "id": "A",
+                "name": "a",
+                "score": -9.0,
+                "rank": 1,
+                "status": "ok",
+                "pose_pdb": "poses/A.pdb",
+                "ligand_efficiency": 0.7,
+            },
+            {
+                "id": "B",
+                "name": "b",
+                "score": -8.0,
+                "rank": 2,
+                "status": "ok",
+                "pose_pdb": "poses/B.pdb",
+                "ligand_efficiency": 0.6,
+            },
+            {
+                "id": "C",
+                "name": "c",
+                "score": -7.0,
+                "rank": 3,
+                "status": "no_pdb",
+                "pose_pdb": "",
+                "ligand_efficiency": 0.5,
+            },
+        ]
+        docking = make_docking("docking-art", base_results)
+        tool = export_module.WriteRunTool()
+
+        result = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "docking": str(docking.handle),
+                "run_id": "dock-run",
+                "name": "docked",
+            },
+            context=ledger,
+        )
+        check(not result.failed, f"write_run(docking=...) 跑通：{result.output[:300]}")
+        run_dir = runs_root / "dock-run"
+        meta = _json.loads(
+            (run_dir / export_module.RUN_META).read_text(encoding="utf-8")
+        )
+        demo = _json.loads(DEMO_META_FIXTURE.read_text(encoding="utf-8"))
+        expected = set(demo) - {"contacts"}
+        check(
+            set(meta) == expected,
+            f"顶层键没有新增：多 {set(meta) - expected}，缺 {expected - set(meta)}",
+        )
+        check("contacts" not in meta, "对接结果不写假的 contacts")
+        molecules = meta["molecules"]
+        check(len(molecules) == 2, f"只写 status=ok 的 pose：{len(molecules)}")
+        check(
+            [item["id"] for item in molecules] == ["A", "B"],
+            f"按 rank 顺序写：{[item['id'] for item in molecules]}",
+        )
+        check(
+            [item["pose"] for item in molecules]
+            == ["ligands/pose-01.pdb", "ligands/pose-02.pdb"],
+            f"pose 路径密集编号：{[item['pose'] for item in molecules]}",
+        )
+        check(
+            [item["rank"] for item in molecules] == [1, 2]
+            and all(item["chain"] == "A" for item in molecules),
+            f"rank 与 chain 写对：{molecules}",
+        )
+        check(
+            (run_dir / "ligands" / "pose-01.pdb").read_text(encoding="utf-8")
+            == "REMARK A\n",
+            "pose 内容来自对接产物",
+        )
+        check(
+            not (run_dir / "ligands" / "pose-03.pdb").exists(),
+            "no_pdb 的记录不写空文件",
+        )
+        poses = meta["provenance"]["poses"]
+        check(
+            poses["score_direction"] == "lower_is_better"
+            and poses["score_unit"] == "kcal/mol"
+            and poses["docking"] == str(docking.handle),
+            f"provenance.poses 说清方向与来源：{poses}",
+        )
+        check(
+            poses["counts"]["written"] == 2
+            and poses["counts"]["skipped"] == 1
+            and poses["counts"]["docked"] == 2,
+            f"计数口径：{poses['counts']}",
+        )
+        check(
+            str(poses["engine"]).startswith("AutoDock Vina"),
+            f"引擎版本进 provenance：{poses['engine']}",
+        )
+        check(
+            result.meta.get("molecules") == 2
+            and result.meta.get("best_score") == -9.0,
+            f"返回 meta 带上写出数量与最佳分数：{result.meta}",
+        )
+
+        # ---- 同 run_id 二次写更少 pose：旧的 pose-02 必须清掉 ----
+        fewer = make_docking("docking-art-fewer", [base_results[0]])
+        again = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "docking": str(fewer.handle),
+                "run_id": "dock-run",
+            },
+            context=ledger,
+        )
+        check(not again.failed, f"同 run_id 重写成功：{again.output[:200]}")
+        meta2 = _json.loads(
+            (run_dir / export_module.RUN_META).read_text(encoding="utf-8")
+        )
+        check(
+            len(meta2["molecules"]) == 1 and meta2["molecules"][0]["id"] == "A",
+            f"molecules 同步变少：{meta2['molecules']}",
+        )
+        check(
+            (run_dir / "ligands" / "pose-01.pdb").is_file()
+            and not (run_dir / "ligands" / "pose-02.pdb").exists(),
+            "旧 pose 被清理，没有新旧混在一起",
+        )
+
+        # ---- 坏 pose 路径：失败且旧 meta.json 一个字节都不动 ----
+        before_meta = (run_dir / export_module.RUN_META).read_bytes()
+        bad = make_docking(
+            "docking-art-bad",
+            [{**base_results[0], "pose_pdb": "poses/missing.pdb"}],
+        )
+        # 造出「manifest 指向一个不存在的 pose」：文件建完再删掉。
+        (bad.path / "poses" / "missing.pdb").unlink()
+        bad_result = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "docking": str(bad.handle),
+                "run_id": "dock-run",
+            },
+            context=ledger,
+        )
+        check(
+            bad_result.failed and "不存在或越界" in bad_result.output,
+            f"坏 pose 路径被拦下：{bad_result.output}",
+        )
+        check(
+            (run_dir / export_module.RUN_META).read_bytes() == before_meta,
+            "坏 pose 不改旧 meta.json",
+        )
+
+        # ---- 受体指纹不匹配 ----
+        wrong = make_docking(
+            "docking-art-wrong",
+            [base_results[0]],
+            receptor_fp="other-fp",
+        )
+        wrong_result = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "docking": str(wrong.handle),
+                "run_id": "dock-run",
+            },
+            context=ledger,
+        )
+        check(
+            wrong_result.failed and "另一份受体" in wrong_result.output,
+            f"跨受体混用被拦下：{wrong_result.output}",
+        )
+
+        # ---- docking 与 ligands 同时给：二选一 ----
+        ligand_dir = runs_root / "ligandset"
+        (ligand_dir / "ligands").mkdir(parents=True)
+        (ligand_dir / "manifest.json").write_text(
+            _json.dumps({"kind": "ligandset", "stage": "prepared"}),
+            encoding="utf-8",
+        )
+        ligandset = ledger.add(
+            "ligandset",
+            path=ligand_dir,
+            summary="prepared ligands",
+            meta={"stage": "prepared"},
+            link_current_receptor=False,
+        )
+        both = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "docking": str(docking.handle),
+                "ligands": str(ligandset.handle),
+                "run_id": "dock-run",
+            },
+            context=ledger,
+        )
+        check(
+            both.failed and "二选一" in both.output,
+            f"docking 与 ligands 同时给时明确拒绝：{both.output}",
+        )
+
+        # ---- 没有 docking：molecules 为空、provenance 不带 poses ----
+        plain = await tool.execute(
+            {"receptor": str(receptor.handle), "run_id": "plain-run"},
+            context=ledger,
+        )
+        check(not plain.failed, f"无对接的旧路径仍能跑：{plain.output[:200]}")
+        plain_meta = _json.loads(
+            (runs_root / "plain-run" / export_module.RUN_META).read_text(
+                encoding="utf-8"
+            )
+        )
+        check(plain_meta["molecules"] == [], "没有对接时 molecules 为空数组")
+        check(
+            "poses" not in plain_meta["provenance"],
+            "没有对接时不写 provenance.poses",
+        )
+
+        # ---- 同一个 run_id 从「有对接」改写成「没对接」：旧 pose 也要清掉 ----
+        cleared = await tool.execute(
+            {"receptor": str(receptor.handle), "run_id": "dock-run"},
+            context=ledger,
+        )
+        check(not cleared.failed, f"同一 run_id 改写成无对接成功：{cleared.output[:200]}")
+        cleared_meta = _json.loads(
+            (run_dir / export_module.RUN_META).read_text(encoding="utf-8")
+        )
+        check(cleared_meta["molecules"] == [], "改写成无对接后 molecules 为空")
+        check(
+            not list((run_dir / "ligands").glob("pose-*.pdb")),
+            "改写成无对接后旧 pose 文件被清掉",
+        )
+    finally:
+        export_module.runs_dir = original_runs_dir
+        pockets_module.complex_pockets = original_complex
+        pockets_module.p2rank_pockets = original_p2rank
+        shutil.rmtree(runs_root, ignore_errors=True)
+
+
 async def _check_write_run_body(export_module, pockets_module, prankweb_module,
                                 complexes_module, SessionLedger, text, runs_root,
                                 _json) -> None:
@@ -6314,15 +7712,19 @@ async def check_structure_tools() -> None:
             "导入没拿到登记表时报装配问题",
         )
 
-        # 收路径的动作只有一个：其余工具的参数里不该出现 path。
+        # 收路径的动作只有两个：其余工具的参数里不该出现 path。
         path_takers = [
             tool.spec.name
-            for tool in (*uniprot_module.domain_tools(), *structure_module.domain_tools())
+            for tool in (
+                *uniprot_module.domain_tools(),
+                *structure_module.domain_tools(),
+                *ligand_module.domain_tools(),
+            )
             if "path" in (tool.spec.parameters.get("properties") or {})
         ]
         check(
-            path_takers == ["import_structure"],
-            f"全库只有 import_structure 收路径：{path_takers}",
+            path_takers == ["import_structure", "import_ligandset"],
+            f"全库只有 import_structure 与 import_ligandset 收路径：{path_takers}",
         )
 
         # 纯查询/取结构的工具都收登记表，且参数模式里不列它。
@@ -7198,6 +8600,69 @@ def check_chemistry_gate() -> None:
         "定位参数 structure 是必填",
     )
 
+    ligand_tools = ligand_module.domain_tools()
+    check(
+        [item.spec.name for item in ligand_tools]
+        == ["import_ligandset", "prepare_ligands"],
+        f"配体模块导出导入与准备两个工具：{[item.spec.name for item in ligand_tools]}",
+    )
+    for item in ligand_tools:
+        check(
+            chemistry_module.CHEM_TOOL_DESCRIPTION_NOTE in item.spec.description,
+            f"{item.spec.name} 的描述里带了「需要化学依赖」那句",
+        )
+        check(
+            item.context_argument == "ledger",
+            f"{item.spec.name} 会登记条目，所以要收登记表",
+        )
+        check(
+            "ledger" not in (item.spec.parameters.get("properties") or {}),
+            f"{item.spec.name} 的参数模式里不列 ledger",
+        )
+    import_tool, prepare_tool = ligand_tools
+    check(
+        "path" in (import_tool.spec.parameters.get("required") or []),
+        "配体导入的 path 是必填",
+    )
+    check(
+        "ligands" in (prepare_tool.spec.parameters.get("required") or []),
+        "配体准备的 ligands 是必填",
+    )
+    check(
+        prepare_tool.spec.parameters.get("properties", {})
+        .get("confirm", {})
+        .get("type")
+        == "boolean",
+        "配体准备的 confirm 是布尔（两阶段开关）",
+    )
+
+    docking_tools = docking_module.domain_tools()
+    check(
+        [item.spec.name for item in docking_tools] == ["dock"],
+        f"对接模块导出一个工具：{[item.spec.name for item in docking_tools]}",
+    )
+    dock_tool = docking_tools[0]
+    check(
+        chemistry_module.CHEM_TOOL_DESCRIPTION_NOTE in dock_tool.spec.description,
+        "对接的描述里带了「需要化学依赖」那句",
+    )
+    check(
+        dock_tool.context_argument == "ledger",
+        "对接会登记 artifact，所以要收登记表",
+    )
+    check(
+        "ledger" not in (dock_tool.spec.parameters.get("properties") or {}),
+        "对接的参数模式里不列 ledger",
+    )
+    check(
+        {"receptor", "ligands"}.issubset(set(dock_tool.spec.parameters.get("required") or [])),
+        "对接的 receptor 与 ligands 都是必填",
+    )
+    check(
+        "越低越好" in dock_tool.spec.description,
+        "描述第一段写清分数方向（模型最先看到的那一行）",
+    )
+
 
 async def check_receptor_tool() -> None:
     """准备受体：依赖闸、编辑计划、两阶段确认、按参数缓存。
@@ -8022,10 +9487,18 @@ async def check_listing_tools() -> None:
         f"浏览工具排在最前（模型的第一件事是看清手上有哪些条目）：{names[:3]}",
     )
     check(
-        len(all_tools) == len(DOMAIN_TOOL_NAMES) and len(DOMAIN_TOOL_NAMES) >= 15,
-        f"领域工具条数与 DOMAIN_TOOL_NAMES 一致、且不少于 15 个：{len(all_tools)} 个 {names}",
+        len(all_tools) == len(DOMAIN_TOOL_NAMES) and len(DOMAIN_TOOL_NAMES) >= 18,
+        f"领域工具条数与 DOMAIN_TOOL_NAMES 一致、且不少于 18 个：{len(all_tools)} 个 {names}",
     )
-    for expected in ("write_run", "open_viewer", "search_pdb", "search_literature"):
+    for expected in (
+        "write_run",
+        "open_viewer",
+        "search_pdb",
+        "search_literature",
+        "import_ligandset",
+        "prepare_ligands",
+        "dock",
+    ):
         check(expected in names, f"新工具 {expected} 装上了（写了却没装，界面上完全看不出来）")
     # 两个搜索工具是只读的：Plan 方式下必须放行（放进去就等于「查文献都做不到」）。
     from opencode_tui.core.agent.permission import PLAN_DENY
@@ -8997,6 +10470,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("hooks-runner", check_hook_runner),
     ("workspace", check_workspace),
     ("ledger", check_ledger),
+    ("products", check_products),
     ("tool-context", check_tool_context),
     ("uniprot", check_uniprot_tools),
     ("pdbtext", check_pdbtext),
@@ -9006,6 +10480,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("pockets", check_pockets),
     ("align-prior", check_align_and_prior),
     ("write-run", check_write_run),
+    ("write-run-docking", check_write_run_docking),
     ("rsearch", check_rsearch),
     ("literature", check_literature),
     ("structure-parse", check_structure_parse),
@@ -9013,6 +10488,9 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("chembl", check_chembl_tools),
     ("chemistry-gate", check_chemistry_gate),
     ("receptor", check_receptor_tool),
+    ("ligand-import", check_ligand_import),
+    ("ligand-prep", check_ligand_prepare),
+    ("docking", check_docking),
     ("listing", check_listing_tools),
     ("plan-deny", check_plan_deny),
     ("prompt", check_prompt),

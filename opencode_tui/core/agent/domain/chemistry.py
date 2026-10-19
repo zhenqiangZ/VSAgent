@@ -1,6 +1,6 @@
 """可选化学依赖（RDKit / Meeko / gemmi）的守门人。
 
-化学工具（准备受体、对接、类药性筛选）要 import RDKit 与 Meeko，而它们装在
+化学工具（准备受体、导入/准备配体、对接结果转换）要 import RDKit 与 Meeko，而它们装在
 `requirements-chem.txt` 这个可选包里——**不装它的人应当照常能用内核**（检索、会话、
 界面全都不受影响）。这个模块负责那件事：把「本机没有化学依赖」变成一条
 **模型能原样转述给用户**的错误。
@@ -134,7 +134,7 @@ def chem_missing_message(missing: Sequence[str] | None = None) -> str:
     names = list(missing) if missing is not None else missing_chem()
     return (
         f"本机缺化学依赖：{'、'.join(names)}。"
-        "准备受体这个工具要它，其余功能不受影响。"
+        "准备受体、导入/准备配体、对接结果转换这几个工具要它，其余功能不受影响。"
         f"装上它：{CHEM_INSTALL_HINT}，装完重启会话即可。"
     )
 

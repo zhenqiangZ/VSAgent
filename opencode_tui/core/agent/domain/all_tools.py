@@ -13,7 +13,18 @@
 from __future__ import annotations
 
 from ..tools import Tool
-from . import chembl, export, listing, literature, receptor, rsearch, structure, uniprot
+from . import (
+    chembl,
+    docking,
+    export,
+    ligand,
+    listing,
+    literature,
+    receptor,
+    rsearch,
+    structure,
+    uniprot,
+)
 
 
 def domain_tools() -> list[Tool]:
@@ -26,5 +37,7 @@ def domain_tools() -> list[Tool]:
         *rsearch.domain_tools(),
         *literature.domain_tools(),
         *receptor.domain_tools(),
+        *ligand.domain_tools(),
+        *docking.domain_tools(),
         *export.domain_tools(),
     ]

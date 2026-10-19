@@ -146,6 +146,52 @@
     return MOLECULE_COLORS[index % MOLECULE_COLORS.length];
   }
 
+  // 旧运行目录没有 `provenance.poses`（或者是字符串），沿用「高分在前」；
+  // 新的对接结果在 `provenance.poses.score_direction` 里写清方向。
+  // 返回 1 表示按分数升序（越低越好），-1 表示降序。
+  function scoreDirection() {
+    const poses = meta && meta.provenance ? meta.provenance.poses : null;
+    if (poses && typeof poses === "object" && !Array.isArray(poses)) {
+      if (poses.score_direction === "lower_is_better") return 1;
+      if (poses.score_direction === "higher_is_better") return -1;
+    }
+    return -1;
+  }
+
+  function formatScore(value) {
+    return Number.isFinite(value) ? value.toFixed(2) : "—";
+  }
+
+  function moleculeList() {
+    return meta && Array.isArray(meta.molecules) ? meta.molecules : [];
+  }
+
+  function pocketList() {
+    return meta && Array.isArray(meta.pockets) ? meta.pockets : [];
+  }
+
+  // 有 rank 就按 rank；没有 rank 才看分数方向。两者都缺时按 id 稳定排序，
+  // 避免同一分数下每次刷新顺序都变。
+  function rankedMolecules() {
+    const direction = scoreDirection();
+    return [...moleculeList()].sort((a, b) => {
+      const ar = Number.isFinite(a.rank) ? a.rank : null;
+      const br = Number.isFinite(b.rank) ? b.rank : null;
+      if (ar !== null || br !== null) {
+        const byRank = (ar === null ? Infinity : ar) - (br === null ? Infinity : br);
+        if (byRank) return byRank;
+      }
+      const as = Number.isFinite(a.score) ? a.score : null;
+      const bs = Number.isFinite(b.score) ? b.score : null;
+      if (as === null && bs === null) return String(a.id).localeCompare(String(b.id));
+      if (as === null) return 1;
+      if (bs === null) return -1;
+      return (
+        direction * (as - bs) || String(a.id).localeCompare(String(b.id))
+      );
+    });
+  }
+
   function fail(message) {
     const box = root.querySelector("#fatal");
     box.textContent = message;
@@ -165,16 +211,18 @@
   function renderSnapshot() {
     const detail = detailMoleculeId;
     const visible = detail ? [detail] : [...visibleMolecules];
+    const pockets = pocketList();
     const pocket = activePocketId
-      ? meta.pockets.find((item) => item.id === activePocketId)
+      ? pockets.find((item) => item.id === activePocketId)
       : null;
+    const residues = pocket && Array.isArray(pocket.residues) ? pocket.residues : [];
     return {
       mode,
       chainBVisible,
       runId: currentRunId,
       pocketId: pocket ? pocket.id : null,
-      pocketResidues: pocket ? pocket.residues.map((item) => `${item.resname}${item.resseq}`) : [],
-      pocketResidueCount: pocket ? pocket.residues.length : 0,
+      pocketResidues: residues.map((item) => `${item.resname}${item.resseq}`),
+      pocketResidueCount: residues.length,
       visibleMolecules: visible,
       ligandStructuresTotal: ligandIndexes.length,
       ligandStructuresShown: ligandIndexes.filter((item) => visible.includes(item.moleculeId)).length,
@@ -184,7 +232,7 @@
   }
 
   function pocketResidueLabel(pocket) {
-    const list = pocket.residues;
+    const list = Array.isArray(pocket.residues) ? pocket.residues : [];
     if (!list.length) return "无残基";
     const formatter = (item) => `${item.resname}${item.resseq}`;
     if (list.length <= 4) return list.map(formatter).join("、");
@@ -194,9 +242,10 @@
   function renderPocketList() {
     const list = root.querySelector("#pocket-list");
     list.innerHTML = "";
+    const pockets = pocketList();
     // 零口袋是正常的一态（两侧来源都没有时 `write_run` 就写这个）。
     // 空列表要配一句话，否则用户分不清「没有口袋」与「页面坏了」。
-    if (!meta.pockets.length) {
+    if (!pockets.length) {
       const empty = document.createElement("li");
       // 这一行的标识与真口袋分开：判据按 `data-pocket-id` 数真口袋，
       // 空态行没有这个属性，不会被算成一个口袋。
@@ -205,7 +254,7 @@
       list.appendChild(empty);
       return;
     }
-    for (const pocket of meta.pockets) {
+    for (const pocket of pockets) {
       const item = document.createElement("li");
       item.dataset.pocketId = pocket.id;
       if (pocket.id === activePocketId) item.classList.add("is-active");
@@ -214,7 +263,7 @@
       head.className = "pocket-head";
       const id = document.createElement("span");
       id.className = "pocket-id";
-      id.textContent = `${pocket.id} ${pocket.label}`;
+      id.textContent = `${pocket.id} ${pocket.label || "口袋"}`;
       if (pocket.is_reference) {
         const mark = document.createElement("span");
         mark.className = "pocket-ref";
@@ -233,7 +282,11 @@
       }
       const score = document.createElement("span");
       score.className = "pocket-score";
-      score.textContent = `打分 ${pocket.score}`;
+      // P0 的实验口袋没有打分；写「打分 undefined」会被当成算出来是空的。
+      // 没有分数就整格留空，而不是显示一个看起来像分数的值。
+      const scoreText = Number.isFinite(pocket.score) ? `打分 ${pocket.score}` : "";
+      score.textContent = scoreText;
+      score.classList.toggle("is-hidden", !scoreText);
       head.append(id, score);
 
       const metaLine = document.createElement("div");
@@ -249,7 +302,7 @@
   function renderMoleculeTable() {
     const body = root.querySelector("#molecule-table tbody");
     body.innerHTML = "";
-    const ranked = [...meta.molecules].sort((a, b) => b.score - a.score);
+    const ranked = rankedMolecules();
     ranked.forEach((molecule, index) => {
       const row = document.createElement("tr");
       if (index === 0) row.classList.add("rank-1");
@@ -271,10 +324,10 @@
       const dot = document.createElement("span");
       dot.className = "color-dot";
       dot.style.background = colorOfMolecule(index);
-      idCell.append(dot, document.createTextNode(molecule.name));
+      idCell.append(dot, document.createTextNode(molecule.name || molecule.id || "—"));
 
       const scoreCell = document.createElement("td");
-      scoreCell.textContent = molecule.score.toFixed(2);
+      scoreCell.textContent = formatScore(molecule.score);
 
       row.append(checkCell, idCell, scoreCell);
       row.addEventListener("click", () => showDetail(molecule.id));
@@ -284,21 +337,27 @@
 
   function showDetail(moleculeId) {
     detailMoleculeId = moleculeId;
-    const molecule = meta.molecules.find((item) => item.id === moleculeId);
+    const molecule = moleculeList().find((item) => item.id === moleculeId);
+    if (!molecule) return;
 
     root.querySelector("#panel-molecules").classList.add("is-hidden");
     root.querySelector("#panel-pockets").classList.add("is-hidden");
     root.querySelector("#panel-detail").classList.remove("is-hidden");
 
-    root.querySelector("#detail-title").textContent = `${molecule.name}（${molecule.id}）`;
+    root.querySelector("#detail-title").textContent =
+      `${molecule.name || molecule.id}（${molecule.id}）`;
 
     const summary = root.querySelector("#detail-summary");
     summary.innerHTML = "";
+    const pockets = pocketList();
     const rows = [
-      ["对接打分", molecule.score.toFixed(2)],
-      ["位姿文件", molecule.pose],
-      ["作用链", molecule.chain],
-      ["口袋", meta.pockets[0].label],
+      ["对接打分", formatScore(molecule.score)],
+      ["位姿文件", molecule.pose || "—"],
+      ["作用链", molecule.chain || "—"],
+      [
+        "口袋",
+        pockets.length ? (pockets[0].label || pockets[0].id || "—") : "—",
+      ],
     ];
     for (const [key, value] of rows) {
       const dt = document.createElement("dt");
@@ -310,16 +369,29 @@
 
     const body = root.querySelector("#contact-table tbody");
     body.innerHTML = "";
-    for (const contact of meta.contacts) {
+    // 对接结果只有分数与位姿，没有逐原子接触；这里必须是空态而不是抛异常。
+    const contacts = Array.isArray(meta.contacts) ? meta.contacts : [];
+    if (!contacts.length) {
       const row = document.createElement("tr");
-      const residue = document.createElement("td");
-      residue.textContent = contact.residue;
-      const kind = document.createElement("td");
-      kind.textContent = contact.kind;
-      const distance = document.createElement("td");
-      distance.textContent = `${contact.distance.toFixed(2)} A`;
-      row.append(residue, kind, distance);
+      const cell = document.createElement("td");
+      cell.colSpan = 3;
+      cell.textContent = "这份运行没有接触数据（对接结果只给分数与位姿）。";
+      row.appendChild(cell);
       body.appendChild(row);
+    } else {
+      for (const contact of contacts) {
+        const row = document.createElement("tr");
+        const residue = document.createElement("td");
+        residue.textContent = contact.residue || "—";
+        const kind = document.createElement("td");
+        kind.textContent = contact.kind || "—";
+        const distance = document.createElement("td");
+        distance.textContent = Number.isFinite(contact.distance)
+          ? `${contact.distance.toFixed(2)} A`
+          : "—";
+        row.append(residue, kind, distance);
+        body.appendChild(row);
+      }
     }
 
     renderMoleculeTable();
@@ -337,9 +409,10 @@
 
   // 受体底色的重建。整结构给灰底，B 链按开关给浅灰或抹掉。
   async function paintReceptor(highlight, showB) {
+    const allChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
     const chains = showB
-      ? meta.target.chains
-      : meta.target.chains.filter((chain) => chain !== "B");
+      ? allChains
+      : allChains.filter((chain) => chain !== "B");
 
     await window.vsViewer.showChains(chains, RECEPTOR_COLOR, "cartoon", {}, 0);
     if (showB) {
@@ -361,23 +434,30 @@
 
   async function selectPocket(pocketId) {
     activePocketId = pocketId;
+    const allChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
     if (pocketId === null) {
       await paintReceptor(null, chainBVisible);
       await window.vsViewer.focusChainsOnly(
-        meta.target.chains.filter((chain) => chainBVisible || chain !== "B"), 0
+        allChains.filter((chain) => chainBVisible || chain !== "B"), 0
       );
       renderPocketList();
       return;
     }
 
-    const pocket = meta.pockets.find((item) => item.id === pocketId);
+    const pocket = pocketList().find((item) => item.id === pocketId);
+    if (!pocket) {
+      await paintReceptor(null, chainBVisible);
+      renderPocketList();
+      return;
+    }
+    const residues = Array.isArray(pocket.residues) ? pocket.residues : [];
     await paintReceptor(
-      { residues: pocket.residues, color: POCKET_COLOR, surface: true },
+      { residues, color: POCKET_COLOR, surface: true },
       chainBVisible
     );
     // 视野对准整条参考链，口袋在蛋白里的位置才看得出来。
     await window.vsViewer.focusChainsOnly(
-      meta.target.chains.filter((chain) => chainBVisible || chain !== "B"), 0
+      allChains.filter((chain) => chainBVisible || chain !== "B"), 0
     );
     renderPocketList();
   }
@@ -385,18 +465,20 @@
   async function drawMolecules() {
     const detail = detailMoleculeId;
     const visible = detail ? new Set([detail]) : visibleMolecules;
+    const contacts = Array.isArray(meta.contacts) ? meta.contacts : [];
+    const allChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
 
     let highlight = null;
-    if (detail) {
-      highlight = { residues: meta.contacts, color: CONTACT_COLOR, surface: false };
+    if (detail && contacts.length) {
+      highlight = { residues: contacts, color: CONTACT_COLOR, surface: false };
     }
     await paintReceptor(highlight, chainBVisible);
 
     // 配体位姿：逐个给表示或抹掉。每个位姿都是一个独立结构。
-    const ranked = [...meta.molecules].sort((a, b) => b.score - a.score);
+    const ranked = rankedMolecules();
     for (const item of ligandIndexes) {
       const index = ranked.findIndex((m) => m.id === item.moleculeId);
-      const color = colorOfMolecule(index);
+      const color = colorOfMolecule(index < 0 ? 0 : index);
       if (visible.has(item.moleculeId)) {
         await window.vsViewer.setRepresentation("ball-and-stick", {
           color,
@@ -407,8 +489,8 @@
       }
     }
 
-    if (detail) {
-      await window.vsViewer.addResidueRepresentation(meta.contacts, "ball-and-stick", {
+    if (detail && contacts.length) {
+      await window.vsViewer.addResidueRepresentation(contacts, "ball-and-stick", {
         color: CONTACT_COLOR,
         ...CONTACT_STICK,
       }, 0);
@@ -422,7 +504,7 @@
       await window.vsViewer.focusStructures(refs, framingMargin(refs.length));
     } else {
       await window.vsViewer.focusChainsOnly(
-        meta.target.chains.filter((chain) => chainBVisible || chain !== "B"), 0
+        allChains.filter((chain) => chainBVisible || chain !== "B"), 0
       );
     }
   }
@@ -440,12 +522,14 @@
       // **零口袋是正常的一态**（`write_run` 报 `origin=none` 时就写这个），
       // 不是错误。取 `meta.pockets[0].id` 会在这一态抛异常，而异常在 async 里
       // 被吞掉、`window.__ready` 永远不置真——页面看着加载完了其实没就绪。
-      if (meta.pockets.length) {
-        await selectPocket(activePocketId || meta.pockets[0].id);
+      const pockets = pocketList();
+      const allChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
+      if (pockets.length) {
+        await selectPocket(activePocketId || pockets[0].id);
       } else {
         await paintReceptor(null, chainBVisible);
         await window.vsViewer.focusChainsOnly(
-          meta.target.chains.filter((chain) => chainBVisible || chain !== "B"), 0
+          allChains.filter((chain) => chainBVisible || chain !== "B"), 0
         );
         renderPocketList();
       }
@@ -457,9 +541,10 @@
     detailMoleculeId = null;
     root.querySelector("#panel-detail").classList.add("is-hidden");
     root.querySelector("#panel-molecules").classList.remove("is-hidden");
-    // 候选分子同样可能一个都没有（本轮不做对接，`molecules` 就是空数组）。
-    if (visibleMolecules.size === 0 && meta.molecules.length) {
-      visibleMolecules.add(meta.molecules[0].id);
+    // 候选分子同样可能一个都没有（没有对接时 `molecules` 就是空数组）。
+    if (visibleMolecules.size === 0) {
+      const first = rankedMolecules().find((item) => item.pose);
+      if (first) visibleMolecules.add(first.id);
     }
     renderMoleculeTable();
     await drawMolecules();
@@ -515,7 +600,7 @@
     });
 
     root.querySelector("#select-all").addEventListener("click", () => {
-      for (const molecule of meta.molecules) visibleMolecules.add(molecule.id);
+      for (const molecule of moleculeList()) visibleMolecules.add(molecule.id);
       renderMoleculeTable();
       drawMolecules();
     });
@@ -527,7 +612,7 @@
     });
 
     root.querySelector("#select-top3").addEventListener("click", () => {
-      const ranked = [...meta.molecules].sort((a, b) => b.score - a.score).slice(0, 3);
+      const ranked = rankedMolecules().slice(0, 3);
       visibleMolecules = new Set(ranked.map((item) => item.id));
       renderMoleculeTable();
       drawMolecules();
@@ -564,8 +649,10 @@
 
     await window.vsViewer.loadStructure({ url: `${base}${meta.structure}`, format: "pdb" });
 
-    const ranked = [...meta.molecules].sort((a, b) => b.score - a.score);
+    const ranked = rankedMolecules();
     for (const molecule of ranked) {
+      // 没有 pose 的记录只用于列表/详情，不往 Mol* 里塞一个 undefined URL。
+      if (!molecule.pose) continue;
       const index = await window.vsViewer.loadStructure({
         url: `${base}${molecule.pose}`,
         format: "pdb",
@@ -582,9 +669,12 @@
 
     root.querySelector("#target-name").textContent =
       `${meta.target.name}（${meta.target.pdb_id}）`;
+    const targetChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
+    const pockets = pocketList();
+    const molecules = moleculeList();
     root.querySelector("#target-meta").textContent =
-      `链 ${meta.target.chains.join("/")} · 共晶配体 ${meta.target.ligand} · ` +
-      `${meta.pockets.length} 个口袋 · ${meta.molecules.length} 个候选分子`;
+      `链 ${targetChains.join("/") || "—"} · 共晶配体 ${meta.target.ligand || "—"} · ` +
+      `${pockets.length} 个口袋 · ${molecules.length} 个候选分子`;
     // 口袋的来源说明。旧的演示目录这一项是字符串，新一轮是对象，两种都能读；
     // 都没有（`provenance` 里压根没这个键）时把那一行藏起来，不留空行。
     const originLine = root.querySelector("#pocket-origin");
@@ -599,7 +689,7 @@
     requestAnimationFrame(() => {
       window.vsViewer.handleResize();
       window.vsViewer.focusChainsOnly(
-        meta.target.chains.filter((chain) => chainBVisible || chain !== "B"), 0
+        targetChains.filter((chain) => chainBVisible || chain !== "B"), 0
       );
     });
     window.__ready = true;

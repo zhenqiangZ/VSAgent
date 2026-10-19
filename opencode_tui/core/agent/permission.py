@@ -19,7 +19,7 @@ PERMISSIONS_FILE = "permissions.toml"
 # 开关管「装配时装不装进来」——后者决定工具在不在请求体的 tools 数组里。
 TOOLS_FILE = "tools.toml"
 # 默认策略下要问一次的工具：会改动文件或运行命令的那些
-DEFAULT_ASK = frozenset({"write", "patch", "bash"})
+DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock"})
 # Plan 方式下一律拒绝的工具。一条命令会不会改动看不出来，所以 bash 也算在里面
 #
 # 领域工具里只有 prepare_receptor 与 write_run 进这一档：它们会往磁盘上写一组产物
@@ -28,7 +28,9 @@ DEFAULT_ASK = frozenset({"write", "patch", "bash"})
 # 其余领域工具都不进：浏览登记表、查 UniProt / ChEMBL、取结构、搜索、开结构页
 # 都是读或取；取结构固然会写盘，但那是**把远端的东西拿回来**（下载缓存），
 # 与「改动用户的工程」不是一回事；把它们一并挡掉会让 Plan 方式连查资料都做不到。
-PLAN_DENY = frozenset({"write", "patch", "bash", "prepare_receptor", "write_run"})
+PLAN_DENY = frozenset(
+    {"write", "patch", "bash", "prepare_receptor", "prepare_ligands", "dock", "write_run"}
+)
 
 # 收「路径类」参数的工具。这几个工具的调用会指向磁盘的某个具体位置，
 # 因此可以拿它的参数去判「这一步是不是踩到了工作目录之外」。
@@ -39,7 +41,7 @@ PATH_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "patch": ("path", "filePath"),
     "grep": ("path", "pattern"),
     "import_structure": ("path",),
-    "prepare_receptor": ("path",),
+    "import_ligandset": ("path",),
 }
 
 # 从 bash 命令里挑绝对路径用的模式。

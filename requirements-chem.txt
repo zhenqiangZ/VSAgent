@@ -1,11 +1,14 @@
-# 可选化学依赖：准备受体要用。
+# 可选化学依赖：准备受体、导入/准备配体、对接结果转换要用。
 #
 # 不装它也能用整个程序——检索靶点、查已知活性、取结构、会话与界面全都不受影响，
-# 只有 prepare_receptor 会返回一条带这份文件路径的安装指令。
+# 只有 prepare_receptor / prepare_ligands / import_ligandset / dock 的位姿转换
+# 会返回一条带这份文件路径的安装指令。
 #
 #   pip install -r requirements-chem.txt
 #
 # 装完重启会话（依赖探测只在进程启动后第一次调用时做一遍）。
+#
+# AutoDock Vina 是**外部二进制**，不列在本文件里：装到 PATH，或设置 VSA_VINA_BIN。
 
 # 按残基做模板匹配 → 指派 AutoDock 原子类型与部分电荷 → 出 PDBQT。
 meeko

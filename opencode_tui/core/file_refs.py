@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .file_log import record as log_read
 from .models import Part, PartType
 
 FILE_REF = re.compile(r"@([^\s@]+)")
@@ -25,6 +26,8 @@ def resolve_file_refs(text: str, root: Path) -> tuple[str, list[Part]]:
         if not path.is_file():
             continue
         content = path.read_text(encoding="utf-8", errors="replace")[:MAX_FILE_CHARS]
+        # 这段内容直接进了发出去的请求，读取有没有发生看日志比看请求体容易。
+        log_read(path, purpose="prompt.file_ref", size=len(content))
         parts.append(
             Part(
                 type=PartType.FILE,

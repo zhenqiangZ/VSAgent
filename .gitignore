@@ -1,6 +1,7 @@
 # 运行与打包产物
 .probe/
 runs/
+logs/
 tests/output/
 build/
 dist/

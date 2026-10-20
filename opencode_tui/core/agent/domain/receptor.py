@@ -42,6 +42,7 @@ from typing import Any
 
 from ..ledger import SessionLedger, fingerprint_parts, fingerprint_path
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
+from ...file_log import record as log_read
 from . import pdbtext
 from .chemistry import CHEM_TOOL_DESCRIPTION_NOTE, require_chem
 from .pdbtext import HeteroGroup, PdbDocument, PdbEditError
@@ -1069,6 +1070,7 @@ class PrepareReceptorTool(Tool):
         confirm = bool(arguments.get("confirm"))
         try:
             text = entry.path.read_text(encoding="utf-8", errors="replace")
+            log_read(entry.path, purpose="receptor.prepare", size=len(text.encode("utf-8")))
             built = _build(
                 text,
                 chain_raw=str(arguments.get("chain") or ""),

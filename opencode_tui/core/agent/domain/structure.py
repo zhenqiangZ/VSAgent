@@ -59,6 +59,7 @@ from typing import Any
 
 from ..ledger import SessionLedger, fingerprint_bytes, fingerprint_text
 from ..tools import Tool, ToolResult, ToolSpec
+from ...file_log import record as log_read
 from . import http
 from .pdbtext import (
     ATOM_ALT_LOC,
@@ -894,20 +895,24 @@ def _check_importable(source: Path) -> bytes:
     """
     try:
         if not source.exists():
+            log_read(source, purpose="import.structure", ok=False, detail="文件不存在")
             raise http.ToolError(
                 f"找不到文件 {source}。请用**绝对路径**，并确认它在这台机器上"
                 "（登记表里已有的结构请直接用 handle，不要再传路径）"
             )
         if source.is_dir():
+            log_read(source, purpose="import.structure", ok=False, detail="是目录")
             raise http.ToolError(
                 f"{source} 是一个目录。导入要的是**一个坐标文件**——"
                 "若这是一份准备后的受体产物，它已经作为 receptor 条目登记过，"
                 "用 list_workspace 找到它的 handle 即可"
             )
         payload = source.read_bytes()
+        log_read(source, purpose="import.structure", size=len(payload))
     except http.ToolError:
         raise
     except OSError as error:
+        log_read(source, purpose="import.structure", ok=False, detail=f"{type(error).__name__}：{error}")
         raise http.ToolError(f"读不到 {source}（{type(error).__name__}：{error}）") from error
 
     suffix = source.suffix.lower()

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from ..file_log import record as log_read
 from .tools import Tool
 
 # 项目配置所在目录，与状态文件的位置惯例一致
@@ -457,13 +458,16 @@ def load_disabled(root: Path) -> tuple[frozenset[str], Path | None]:
         Path.home() / CONFIG_DIRECTORY / TOOLS_FILE,
     ):
         if not path.is_file():
+            log_read(path, purpose="tools.load", ok=False, detail="文件不存在")
             continue
         try:
             with path.open("rb") as handle:
                 data = tomllib.load(handle)
-        except (OSError, tomllib.TOMLDecodeError):
+        except (OSError, tomllib.TOMLDecodeError) as error:
             # 配置文件坏了不应连累启动：当作没读到，继续走。
+            log_read(path, purpose="tools.load", ok=False, detail=f"{type(error).__name__}：{error}")
             continue
+        log_read(path, purpose="tools.load", size=path.stat().st_size)
         table = data.get("tools")
         if not isinstance(table, dict):
             continue

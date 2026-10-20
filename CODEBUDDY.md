@@ -87,6 +87,7 @@ python tests/verify_modal_transparency.py  # 模态居中/半透明，聊天透�
 | `VSA_WEB_PORT` | 本地网页端口，默认 8860，不合法同样回落 |
 | `VSA_VINA_BIN` | 外部 AutoDock Vina 可执行文件；不设时从 PATH 找 `vina`，缺失时 `dock` 返回安装指引。引擎**不随 exe 打包** |
 | `EDITOR` / `VISUAL` | `/editor` 外部编辑器往返 |
+| `VSA_FILE_READ_LOG` | 设为 `0` / `off` / `false` 关掉文件读取日志。默认写**项目根**的 `logs/file-reads.jsonl`（已 gitignore），一行一次读取：`purpose`（`tool.read` / `tool.grep` / `import.structure` / `import.ligands` / `receptor.prepare` / `prompt.file_ref` / `state.load` / `rules.load` / `tools.load` / `memory.load`）、绝对路径、字节数、`ok`，失败时带 `detail`。`app.py` 启动时按 `root` 配置目录；没有应用可问的脚本与领域工具落到当前目录的 `logs/` |
 
 测试不读 `.env`：`FakeModelServer` 起在 `127.0.0.1:0`，测试进程内自己设
 `VSA_LLM_BASE_URL/API_KEY/MODEL` 指过去，**全程离线**。

@@ -37,6 +37,7 @@ from .core.agent.tools import (
 from .core.agent.trace import TraceWriter, log_directory_for
 from .core.command_registry import CommandRegistry
 from .core.event_bus import EventBus
+from .core.file_log import PROJECT_LOG_DIRECTORY, configure as configure_file_log
 from .core.exporter import export_filename, render_session_markdown
 from .core.external_editor import (
     editor_buffer_path,
@@ -87,11 +88,15 @@ class OpenCodeApp(App[None]):
         self.command_registry = CommandRegistry()
         self.keybind_manager = KeybindManager(self.command_registry)
         self.event_bus = EventBus()
+        trace_directory = log_directory or log_directory_for(self.session_manager.state_path)
         self.trace = TraceWriter(
             self.event_bus,
             lambda: self.session_manager.current_session_id,
-            log_directory or log_directory_for(self.session_manager.state_path),
+            trace_directory,
         )
+        # 文件读取日志落在项目自己的 logs/ 下：它跟着仓库走，换项目就换一份，
+        # 不像 trace 那样跟着 state.toml 跑去用户目录。
+        configure_file_log(self.root / PROJECT_LOG_DIRECTORY)
         self._policy = policy
         self._hooks = hooks
         self._disabled: frozenset[str] | None = None

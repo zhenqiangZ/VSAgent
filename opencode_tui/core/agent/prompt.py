@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ..file_log import record as log_read
 from ..models import Message, Part, PartType, Session, ToolStatus
 from .workspace import Workspace
 
@@ -224,8 +225,12 @@ def project_rules(root: Path) -> str:
     """
     path = root / RULES_FILE
     if not path.is_file():
+        log_read(path, purpose="rules.load", ok=False, detail="文件不存在")
         return ""
     text = path.read_text(encoding="utf-8").strip()
+    # 每个 step 都重读一次，所以这里也每个 step 记一行：看到它连续出现，
+    # 说明规则确实是「每次发问都重新读」，而不是被缓存的旧内容。
+    log_read(path, purpose="rules.load", size=len(text.encode("utf-8")))
     if len(text.encode("utf-8")) <= RULES_LIMIT:
         return text
     return _cut_rules(text)

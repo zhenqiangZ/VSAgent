@@ -9,6 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from ..file_log import record as log_read
 from .ledger import LedgerError, fingerprint_path, parse_handle
 from .prompt import estimate_tokens
 from .tools import Tool, ToolError, ToolResult, ToolSpec
@@ -181,11 +182,16 @@ class MemoryStore:
         """从磁盘读条目，文件不存在或读不出来时返回 False。"""
         target = self.entries_path
         if not target.is_file():
+            log_read(target, purpose="memory.load", ok=False, detail="文件不存在")
             return False
         try:
-            data = json.loads(target.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            raw = target.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, ValueError) as error:
+            # 读不出来与「没有记忆」在行为上一样，日志里要分开。
+            log_read(target, purpose="memory.load", ok=False, detail=f"{type(error).__name__}：{error}")
             return False
+        log_read(target, purpose="memory.load", size=len(raw.encode("utf-8")))
         if not isinstance(data, dict):
             return False
         self.load_snapshot(data)

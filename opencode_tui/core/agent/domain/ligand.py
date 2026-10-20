@@ -26,6 +26,7 @@ from ..ledger import (
     fingerprint_path,
 )
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
+from ...file_log import record as log_read
 from . import products
 from .chemistry import CHEM_TOOL_DESCRIPTION_NOTE, require_chem
 
@@ -373,16 +374,19 @@ def load_ligand_file(
     """读一份配体文件并清洗。失败抛 `LigandError`，调用方转成 `failed=True`。"""
     source = Path(path).expanduser()
     if not source.is_file():
+        log_read(source, purpose="import.ligands", ok=False, detail="文件不存在或不是普通文件")
         raise LigandError(f"找不到这个文件，或它不是普通文件：{source}")
 
     suffix = source.suffix.lower()
     if suffix not in FORMAT_BY_SUFFIX:
+        log_read(source, purpose="import.ligands", ok=False, detail=f"不支持的格式：{suffix}")
         raise LigandError(
             f"不支持的配体文件格式：{suffix or '（没有扩展名）'}；"
             "支持 .sdf / .sd / .smi / .csv"
         )
 
     payload = source.read_bytes()
+    log_read(source, purpose="import.ligands", size=len(payload))
     if not payload:
         raise LigandError("文件是空的")
     if len(payload) > MAX_IMPORT_BYTES:

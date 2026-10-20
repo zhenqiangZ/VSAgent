@@ -8,6 +8,7 @@ from typing import Any
 
 import tomli_w
 
+from .file_log import record as log_read
 from .models import Session, new_session_id, sync_sequences
 
 STATE_VERSION = 1
@@ -130,9 +131,16 @@ class SessionManager:
         """从 TOML 文件载入状态，文件不存在时返回 False。"""
         target = Path(path) if path else self.state_path
         if not target.exists():
+            log_read(target, purpose="state.load", ok=False, detail="文件不存在")
             return False
-        with target.open("rb") as handle:
-            state = tomllib.load(handle)
+        try:
+            with target.open("rb") as handle:
+                state = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            # 坏状态文件在这里只记一笔再抛：上层要自己决定是重建还是退出。
+            log_read(target, purpose="state.load", ok=False, detail=f"{type(error).__name__}：{error}")
+            raise
+        log_read(target, purpose="state.load", size=target.stat().st_size)
         self.load_from_state(state)
         return True
 

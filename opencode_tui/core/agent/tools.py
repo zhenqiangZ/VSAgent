@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..file_log import record as log_read
+
 # bash 一次调用的等待上限。
 #
 # 这个名字与 `provider.DEFAULT_TIMEOUT` 刻意不同：两处原先都叫 DEFAULT_TIMEOUT，
@@ -667,8 +669,10 @@ class ReadTool(Tool):
             raise ToolError("缺少参数 path")
         path = resolve_path(self.cwd, raw)
         if not path.exists():
+            log_read(path, purpose="tool.read", ok=False, detail="文件不存在")
             return ToolResult(output=f"文件不存在：{path}", failed=True)
         if path.is_dir():
+            log_read(path, purpose="tool.read", ok=False, detail="是目录")
             return ToolResult(output=f"{path} 是目录，读它需要给出具体的文件名", failed=True)
         offset = arguments.get("offset")
         if offset is None:
@@ -685,10 +689,13 @@ class ReadTool(Tool):
         try:
             blob = path.read_bytes()
         except OSError as error:
+            log_read(path, purpose="tool.read", ok=False, detail=f"{type(error).__name__}：{error}")
             return ToolResult(output=f"读 {path} 出错：{error}", failed=True)
         text = decode_text(blob)
         if text is None:
+            log_read(path, purpose="tool.read", ok=False, size=len(blob), detail="不是文本文件")
             return ToolResult(output=f"{path} 不是文本文件，读不出来", failed=True)
+        log_read(path, purpose="tool.read", size=len(blob))
         lines = text.split("\n")
         if lines and lines[-1] == "":
             lines.pop()
@@ -907,11 +914,13 @@ class GrepTool(Tool):
         files = [root] if root.is_file() else self._walk(root, glob)
         matches: list[str] = []
         hit_files = 0
+        scanned = 0
         truncated = False
         for path in files:
             if len(matches) >= self.limit:
                 truncated = True
                 break
+            scanned += 1
             found = self._scan(path, matcher)
             if not found:
                 continue
@@ -920,6 +929,13 @@ class GrepTool(Tool):
                 truncated = True
                 break
             matches.extend(found[: self.limit - len(matches)])
+        # 一次 grep 会读很多文件，逐个记会把日志淹掉；这里只记一条汇总，
+        # 看得到「搜了哪儿、扫了几个、命中几个」就够判断读取有没有发生。
+        log_read(
+            root,
+            purpose="tool.grep",
+            detail=f"扫描 {scanned} 个文件，命中 {hit_files} 个",
+        )
         if not matches:
             return ToolResult(output=f"没有找到匹配 {pattern} 的行")
         tail = "（命中太多，只列出前面的）" if truncated else ""

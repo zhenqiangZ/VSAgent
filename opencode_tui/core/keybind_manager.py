@@ -14,8 +14,8 @@ class KeybindManager:
         self.registry = registry
         self.direct_bindings: dict[str, str] = {
             "ctrl+p": "命令面板",
-            "ctrl+c": "中断生成",
-            "ctrl+d": "退出应用",
+            "escape": "中断生成",
+            "ctrl+c": "退出应用",
             "tab": "切换 Agent",
         }
         # 启动界面自己接住的那一组按键。与 direct_bindings 一样是手写的表，
@@ -24,7 +24,7 @@ class KeybindManager:
             "enter": "发送",
             "tab": "切换 Agent",
             "ctrl+p": "命令面板",
-            "ctrl+d": "退出应用",
+            "ctrl+c": "退出应用",
         }
 
     def describe(self) -> list[tuple[str, str]]:

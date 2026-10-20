@@ -228,7 +228,7 @@ def shape_of(manager: SessionManager) -> list[tuple[str, str, int]]:
 def declared_bindings() -> list[tuple[type, str, str]]:
     """列出包里每条按键绑定声明的（类, 按键, 动作）。
 
-    `Binding("ctrl+d", "quit_app", ...)` 这类绑定如果找不到对应的动作方法，
+    `Binding("ctrl+c", "quit_app", ...)` 这类绑定如果找不到对应的动作方法，
     Textual 不会报错，按下去也没有任何反应，所以要把这个对应关系静态查一遍。
     """
     found: list[tuple[type, str, str]] = []
@@ -1137,7 +1137,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(isinstance(app.screen, HelpScreen), "/help 打开帮助界面")
         keys_help = str(app.screen.query_one("#help-keys").content)
         check(
-            "ctrl+p" in keys_help and "ctrl+c" in keys_help and "ctrl+d" in keys_help,
+            "ctrl+p" in keys_help and "ctrl+c" in keys_help and "escape" in keys_help,
             f"帮助界面列出聊天界面的快捷键：{keys_help.splitlines()[:5]}",
         )
         check(
@@ -1150,7 +1150,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         )
         home_help = str(app.screen.query_one("#help-home").content)
         check("ctrl+p" in home_help and "tab" in home_help, "帮助界面单列启动界面的快捷键")
-        check("ctrl+d" in home_help, "启动界面的退出键也在这一列")
+        check("ctrl+c" in home_help, "启动界面的退出键也在这一列")
         check(
             app.screen.query_one("#help-keys").region.y
             < app.screen.query_one("#help-home").region.y,
@@ -1478,8 +1478,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         )
         chat_keys = {entry.key for entry in ChatScreen.BINDINGS}
         check(
-            chat_keys == {"ctrl+p", "ctrl+c", "ctrl+d", "tab"},
-            f"聊天界面只留四个快捷键：{sorted(chat_keys)}",
+            chat_keys == {"ctrl+p", "ctrl+c", "tab"},
+            f"聊天界面只留三个快捷键：{sorted(chat_keys)}",
         )
 
         await type_text(pilot, "/connect")
@@ -1685,12 +1685,17 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             (HomeScreen, app.keybind_manager.home_bindings, "启动界面"),
         ]:
             real = {(entry[0] if isinstance(entry, tuple) else entry.key) for entry in cls.BINDINGS}
-            # 上下键与 esc 只在命令补全弹窗开着时才归弹窗，不进帮助界面那张快捷键表。
+            # 上下键与 esc 只在命令补全弹窗开着时才归弹窗，不进帮助界面那张快捷键表；
+            # esc 中断同样绑在输入框那一层（`EditorPane`），帮助界面仍要把它列出来，
+            # 所以这一边减掉、那一边留着单独断言。
             real -= CONTEXTUAL_KEYS
+            listed = set(table) - CONTEXTUAL_KEYS
             check(
-                real == set(table),
-                f"帮助界面为{label}列出的按键与真实绑定一致，差异：{sorted(set(table) ^ real)}",
+                real == listed,
+                f"帮助界面为{label}列出的按键与真实绑定一致，差异：{sorted(listed ^ real)}",
             )
+            if cls is ChatScreen:
+                check("escape" in table, f"帮助界面列出 esc 中断：{sorted(table)}")
 
         # 每种 Part 都要归入一条渲染路径。多出一种类型而没决定它怎么渲染，界面会把内容整个吞掉。
         routed = set(SIMPLE_PART_TYPES) | {
@@ -2382,9 +2387,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"空会话上导出被拦住：{latest_toast(app)}",
         )
 
-        await pilot.press("ctrl+d")
+        await pilot.press("ctrl+c")
         await pilot.pause()
-        check(app.return_code == 0, "ctrl+d 退出应用")
+        check(app.return_code == 0, "ctrl+c 退出应用")
 
     # 启动界面上那几条命令原先各有各的按键（ctrl+n/l/m/t/h/q），现在统一走 /命令。
     # 单独开一个会话逐个走一遍：焦点在输入框里，按键都被输入框先接住。
@@ -2505,15 +2510,15 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             "/new 在启动界面新建了会话",
         )
 
-    # 启动界面的 ctrl+d 退出单独跑：按下去应用就结束了，同一会话里后面几步没法再走。
+    # 启动界面的 ctrl+c 退出单独跑：按下去应用就结束了，同一会话里后面几步没法再走。
     STATE_PATH.unlink(missing_ok=True)
     fourth = build_app(STATE_PATH)
     async with fourth.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         check(isinstance(fourth.screen, HomeScreen), "又一次从启动界面开始")
-        await pilot.press("ctrl+d")
+        await pilot.press("ctrl+c")
         await pilot.pause()
-        check(fourth.return_code == 0, "启动界面 ctrl+d 退出应用")
+        check(fourth.return_code == 0, "启动界面 ctrl+c 退出应用")
         STATE_PATH.unlink(missing_ok=True)
 
     # 界面开始收拾自己的时候要立刻断掉后端事件。Textual 卸载一棵子树时先把消息区摘掉、
@@ -2577,7 +2582,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         )
         restore_path.unlink(missing_ok=True)
 
-    # 中断生成要趁这一轮还在跑的时候按下去。等它自己跑完再按 ctrl+c，界面早就回到可用状态，
+    # 中断生成要趁这一轮还在跑的时候按下去。等它自己跑完再按 esc，界面早就回到可用状态，
     # 那条断言就变成永远通过。所以先跑完一轮作为对照，再在下一轮的工具执行期间打断。
     # 单独开一个会话：被打断的那一轮会留在消息区，影响前面几条按历史长度断言的检查。
     # 对照那一轮要跑完两步（工具执行完再问一次），打断那一轮要在工具执行期间按下去，
@@ -2644,10 +2649,10 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"打断的时机取在工具执行期间，这条检查才说明得了问题："
             f"{[(part.tool_status or ToolStatus.PENDING).value for part in last_parts() if part.type is PartType.TOOL]}",
         )
-        check(chat._busy, "按 ctrl+c 之前这一轮还在跑")
+        check(chat._busy, "按 esc 之前这一轮还在跑")
         kinds_before = [part.type.value for part in last_parts()]
 
-        await pilot.press("ctrl+c")
+        await pilot.press("escape")
         await pilot.pause()
         check(not chat._busy, "中断之后界面回到可用状态")
         check("已中断当前生成" in latest_toast(third), f"中断给出提示：{latest_toast(third)}")
@@ -2679,7 +2684,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"内存 {shape_of(third.session_manager)}",
         )
 
-        # 聊天界面的 /exit 退出：与 ctrl+d 走的是同一条命令，都要真的结束应用。
+        # 聊天界面的 /exit 退出：与 ctrl+c 走的是同一条命令，都要真的结束应用。
         await type_text(pilot, "/exit")
         await pilot.press("enter")
         await pilot.pause()

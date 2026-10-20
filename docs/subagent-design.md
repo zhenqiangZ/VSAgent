@@ -62,7 +62,7 @@
 
 **共用同一个实例**换来的是一串免费的正确性：
 
-- `ctrl+c` 的 `cancelled` 是同一个标志，中断天然传导；
+- `esc` 中断用的 `cancelled` 是同一个标志，中断天然传导；
 - 权限询问的 `_pending_permissions` 是同一本账，`resolve_permission` 不用为子代理另写一套；
 - `_run_steps` / `_execute_tool` 本来就是「会话当参数传」的形状，递归调用天然成立。
 

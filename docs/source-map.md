@@ -207,7 +207,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 | 模块级               | `CONTEXTUAL_KEYS`  | `up`/`down`/`escape` 三个「只在补全弹窗开着时生效」的键；比对时剔除 |
 
 **分两层的事实**（2026-10-06 定）：命令一律走 `/command` 或 `ctrl+p`，**命令不带键位**。  
-快捷键只留四个：`ctrl+p` 命令面板、`ctrl+c` 中断、`ctrl+d` 退出、`tab` 切 Agent。  
+快捷键只留三个：`ctrl+p` 命令面板、`ctrl+c` 退出、`tab` 切 Agent；中断生成用 `esc`，绑在输入框那一层。  
 前导键（`ctrl+x` + 第二击）整套已删除，不要再往回加。
 
 ### 2.6 `exporter.py`（95 行 / 5 个函数）
@@ -398,7 +398,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 | ---------------------------- | ------------------------ |
 | `stream_reply(prompt)`       | 主入口：跑完一整轮，通过回调把事件推给界面    |
 | `run_bash(command)`          | `!命令` 直通（不经模型）           |
-| `cancel()`                   | 中断当前生成（`ctrl+c`）；**并写盘** |
+| `cancel()`                   | 中断当前生成（`esc`）；**并写盘** |
 | `resolve_permission(answer)` | 把权限弹窗的答案交回挂起的那个 `await`  |
 | `switch_model(spec)`         | 换模型                      |
 | `compact_session()`          | 手动触发一次上下文压缩              |
@@ -426,7 +426,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 > 1. **`MAX_STEPS=24` 是硬上限。** 到顶时循环必须给模型一句可解释的话结束，  
 >    不能静默停。否则模型「以为还在跑」而用户以为早就结束了。
 > 2. **权限询问是 `await` 挂起的**，靠 `_PendingPermission` 把答案送回来。  
->    期间 `cancel()` 必须能把它唤醒（否则 `ctrl+c` 卡住）——这是取消路径上最易漏的一处。
+>    期间 `cancel()` 必须能把它唤醒（否则按 `esc` 中断会卡住）——这是取消路径上最易漏的一处。
 > 3. **`_execute_tool` 的四个动作有固定顺序**：查表 → 策略 → 钩子 → 执行。  
 >    顺序换了语义就变（比如钩子在策略之前就绕过权限，策略在执行之后就没有意义）。
 >
@@ -1032,7 +1032,7 @@ JSONL 事件日志。
 | `action_cycle_agent()`    | 切 Agent                                     |
 | `action_quit_app()`       | **屏幕自己的退出动作**——不是绑 App 层的 `quit`            |
 
-> **值得注意**：启动界面的 `ctrl+d` 原来绑动作名 `quit`（动作在 App 层），  
+> **值得注意**：启动界面的退出键（现为 `ctrl+c`）原来绑动作名 `quit`（动作在 App 层），  
 > 按下去**没有任何反应**——因为 `TextArea.check_consume_key` 先把按键接住了，  
 > App 层的绑定轮不到。改成屏幕自己的 `action_quit_app()` 走  
 > `execute_command("exit")` 才生效。**新加屏幕级快捷键时先按一次确认。**

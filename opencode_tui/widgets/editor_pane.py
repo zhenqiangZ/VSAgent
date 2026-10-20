@@ -165,6 +165,9 @@ class EditorPane(Container):
             super().__init__()
             self.agent = agent
 
+    class InterruptRequested(Message):
+        """没有弹窗可关的时候按 esc：这一次按键交给聊天界面去中断生成。"""
+
     BINDINGS = [
         Binding("enter", "submit", "Submit", priority=True),
         Binding("shift+enter", "insert_newline", "Newline", priority=True),
@@ -273,8 +276,12 @@ class EditorPane(Container):
         self.input.text = value
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
-        """仅在补全弹窗打开时启用上下选择与关闭动作。"""
-        if action in ("popup_up", "popup_down", "close_popup"):
+        """仅在补全弹窗打开时启用上下选择；esc 一直有效。
+
+        esc 没有弹窗可关时要交给聊天界面去中断生成，所以不能像上下键那样
+        在弹窗关着时被禁掉——禁掉之后这个键连动作都进不去。
+        """
+        if action in ("popup_up", "popup_down"):
             return self._active_popup() is not None
         return True
 
@@ -325,13 +332,16 @@ class EditorPane(Container):
         self.agent_popup.open_list()
 
     def action_close_popup(self) -> None:
-        """关闭当前补全弹窗。
+        """关闭当前补全弹窗，没有弹窗时把这一下当成中断。
 
         关掉命令补全之后，这一次输入就不再弹了：只收起一个的话，接着打下一个字母
         又会去匹配一次，esc 等于没按。
+        中断之所以不直接绑在聊天界面上：输入框自己拿着 esc 的优先级绑定，
+        屏幕上那一条永远轮不到；这里发消息才是唯一可靠的通道。
         """
         popup = self._active_popup()
         if popup is None:
+            self.post_message(self.InterruptRequested())
             return
         if popup is self.command_popup:
             self._command_dismissed = True

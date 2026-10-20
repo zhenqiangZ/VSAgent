@@ -106,12 +106,13 @@ class ChatScreen(Screen):
     focused: Reactive[Widget | None] = Reactive(None, repaint=False)
     _select_state: Reactive[SelectState | None] = Reactive(None, repaint=False)
 
-    # 快捷键只留最常按的这四个：命令面板、中断、退出、切 Agent。
+    # 快捷键只留最常按的这三个：命令面板、退出、切 Agent。
+    # 中断生成挂在输入框的 esc 上（见 `on_editor_pane_interrupt_requested`）：
+    # 输入框自己接住 esc 关补全，没有弹窗可关时才把这一下交上来。
     # 其余操作一律走 /命令（输入框里打 / 会列出全部）或 ctrl+p 命令面板。
     BINDINGS = [
         Binding("ctrl+p", "command_palette", "Commands", priority=True),
-        Binding("ctrl+c", "interrupt", "Interrupt", priority=True),
-        Binding("ctrl+d", "quit_app", "Quit", priority=True),
+        Binding("ctrl+c", "quit_app", "Quit", priority=True),
         Binding("tab", "switch_agent", "Agent"),
     ]
 
@@ -283,6 +284,15 @@ class ChatScreen(Screen):
         """
         self.editor.command_popup.hide()
         self.app.push_screen(CommandPalette(self.app.command_registry), self._on_palette_result)
+
+    def on_editor_pane_interrupt_requested(self) -> None:
+        """输入框没有弹窗可关时按了 esc：中断当前生成。
+
+        空闲状态下 esc 不做任何事：没有东西可中断，弹一句"已中断"只会让人以为
+        自己误触了什么。
+        """
+        if self._busy:
+            self.action_interrupt()
 
     def action_interrupt(self) -> None:
         """中断当前生成。"""

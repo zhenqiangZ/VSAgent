@@ -64,7 +64,7 @@ class HomeScreen(Screen):
         Binding("tab", "switch_agent", "Agent", priority=True),
         # 退出走自己的动作：动作名 `quit` 挂在 App 那一层，而输入框把按键先接住了，
         # App 那一条接不到（实测按下去没有任何反应）。自己接住再走 /exit 那条命令。
-        Binding("ctrl+d", "quit_app", "Quit", priority=True),
+        Binding("ctrl+c", "quit_app", "Quit", priority=True),
         # 这三条只在命令补全弹窗开着时才生效，否则上下键要留给输入框挪光标。
         Binding("up", "popup_up", "Up", priority=True),
         Binding("down", "popup_down", "Down", priority=True),

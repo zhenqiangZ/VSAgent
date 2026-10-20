@@ -3757,7 +3757,7 @@ async def check_live_app(server: FakeModelServer) -> None:
             bool(started) and started[0].tool_status is ToolStatus.RUNNING,
             "命令开始执行时工具卡片进入执行中",
         )
-        await pilot.press("ctrl+c")
+        await pilot.press("escape")
         await pilot.pause()
         await pilot.pause()
         check(not turns, "从界面中断之后没有 turn.done")

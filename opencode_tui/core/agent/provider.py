@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterator, Protocol
@@ -182,8 +181,9 @@ def guess_provider(name: str) -> str:
 class ProviderConfig:
     """模型接口的连接参数、计费参数与采样参数。
 
-    密钥只从环境变量读，不写进状态文件。
-    计费参数、上下文窗口与采样参数先按内置清单取默认值，环境变量里显式给出的项再覆盖。
+    连接参数（地址、密钥、模型名）由 `/model` 在应用内给定，存在
+    `connection.toml` 里；计费参数、上下文窗口与采样参数先按内置清单取默认值，
+    连接配置里显式给出的项再覆盖。
     """
 
     base_url: str
@@ -199,6 +199,15 @@ class ProviderConfig:
     temperature: float | None = UNSET
     max_tokens: int | None = UNSET
 
+    @property
+    def configured(self) -> bool:
+        """三项连接参数是否齐全。
+
+        没配齐时应用照常起来，但发消息之前会被拦住——比在构造期抛错、
+        连界面都进不去要好，用户至少还能用 `/model` 把它补上。
+        """
+        return bool(self.base_url.strip() and self.api_key.strip() and self.model.strip())
+
     def cached_price(self) -> float:
         """缓存命中的输入单价。没有单独给出时按未命中价的一折算。"""
         if self.price_cached >= 0:
@@ -210,7 +219,7 @@ class ProviderConfig:
 
         用户在选择界面上换模型时走这条路径：换成清单里的模型就按清单里的
         窗口、单价、采样参数与推理能力走；换成清单里没有的就退回兜底值，
-        与 `from_env` 给一个陌生模型的处理完全一致。
+        与 `from_values` 给一个陌生模型的处理完全一致。
         """
         key = (name or "").strip()
         if not key or key == self.model:
@@ -239,51 +248,39 @@ class ProviderConfig:
         )
 
     @classmethod
-    def from_env(cls, environ: dict[str, str] | None = None) -> ProviderConfig:
-        """从 `VSA_LLM_` 开头的环境变量读出连接参数与计费参数。
+    def from_values(
+        cls,
+        base_url: str,
+        api_key: str,
+        model: str,
+        *,
+        context_window: int | None = None,
+        price_in: float | None = None,
+        price_out: float | None = None,
+    ) -> ProviderConfig:
+        """由连接配置拼出完整参数。
 
-        base_url、api_key、model 三个必须有；
-        其余项先查内置清单，环境变量里写了的以环境变量为准。
+        三个位置参数就是 `/model` 表单上的必填项；三个关键字参数是可选项，
+        给清单外的模型补窗口与单价，没给就按清单或兜底值算。
         """
-        source = os.environ if environ is None else environ
-        missing = [
-            name
-            for name in ("VSA_LLM_BASE_URL", "VSA_LLM_API_KEY", "VSA_LLM_MODEL")
-            if not source.get(name)
-        ]
-        if missing:
-            raise RuntimeError("缺少环境变量：" + "、".join(missing))
-        model = source["VSA_LLM_MODEL"]
         spec = lookup_model(model)
-        cached = source.get("VSA_LLM_PRICE_CACHED")
-        price_cached = float(cached) if cached else (spec.price_cached if spec else PRICE_UNKNOWN)
-        context_window = source.get("VSA_LLM_CONTEXT_WINDOW")
-        temperature = source.get("VSA_LLM_TEMPERATURE")
-        max_tokens = source.get("VSA_LLM_MAX_TOKENS")
         return cls(
-            base_url=source["VSA_LLM_BASE_URL"],
-            api_key=source["VSA_LLM_API_KEY"],
+            base_url=base_url,
+            api_key=api_key,
             model=model,
-            provider=source.get("VSA_LLM_PROVIDER") or (spec.provider if spec else guess_provider(model)),
-            price_in=float(
-                source.get("VSA_LLM_PRICE_INPUT") or (spec.price_in if spec else 0.0)
-            ),
-            price_out=float(
-                source.get("VSA_LLM_PRICE_OUTPUT") or (spec.price_out if spec else 0.0)
-            ),
-            price_cached=price_cached,
-            context_window=int(context_window) if context_window else (
+            provider=spec.provider if spec else guess_provider(model),
+            price_in=price_in if price_in is not None else (spec.price_in if spec else 0.0),
+            price_out=price_out if price_out is not None else (spec.price_out if spec else 0.0),
+            price_cached=spec.price_cached if spec else PRICE_UNKNOWN,
+            context_window=context_window or (
                 spec.context_window if spec else DEFAULT_CONTEXT_WINDOW
             ),
             supports_reasoning=spec.reasoning if spec else False,
             known=spec is not None,
-            temperature=float(temperature) if temperature else (
-                spec.temperature if spec else UNSET
-            ),
-            max_tokens=int(max_tokens) if max_tokens else (
-                spec.max_tokens if spec else UNSET
-            ),
+            temperature=spec.temperature if spec else UNSET,
+            max_tokens=spec.max_tokens if spec else UNSET,
         )
+
 
 
 class ProviderEventType(Enum):

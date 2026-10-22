@@ -14,15 +14,23 @@ const fs = require("fs");
 const path = require("path");
 
 const BASE = process.env.DEMO_URL || "http://127.0.0.1:8851";
+// 页面是 hash 路由，结构页在 `#/structure/<run_id>`。直接开 /index.html 会落到
+// 历史列表，`window.__ready` 永远不置真——判据会以「页面没载入」的形式超时，
+// 看起来像结构解析失败，实际只是地址少了一段。
+const RUN_ID = process.env.DEMO_RUN || "1iep-molstar";
 const OUT_DIR = path.resolve(__dirname, "..", "tests", "output");
 
 // 视图状态的期望值。这几个数对不上就说明有一条渲染路径没生效。
 //
-// 口袋态 8 = 2 卡通（底色 + B 链覆盖）+ 2 选区子树 + 2 棍状 + 2 表面。
-// 关掉 B 链后 6 = 少一个卡通覆盖与一个表面的份额。
+// 计数口径是**状态树里的节点数**，不是「画了几样东西」：一次选区表示会建
+// 两棵节点（选区子树 + 表示本身），所以一条链算 2。
+//
+// 口袋态 8 = 每条可见链一份卡通（2 条链 → 4）+ 2 棍状 + 2 表面。
+// 关掉 B 链后 6 = 少一条链的卡通（少 2 个节点）。
 // 候选分子态 5 = 2 卡通 + 1 选中的配体 + 2 选区子树（配体表示走整结构，不建子树）。
 const EXPECT = {
   pockets: 8,
+  // 每条链一个卡通表示（选区 + 表示两个节点），关掉 B 链少 2。
   pocketsNoChainB: 6,
   moleculesOne: 5,
 };
@@ -189,7 +197,7 @@ async function countColorPixels(page, hexColors, tolerance = 40) {
     if (message.type() === "error") pageErrors.push(`console: ${message.text()}`);
   });
 
-  await page.goto(`${BASE}/index.html`, { waitUntil: "load" });
+  await page.goto(`${BASE}/index.html#/structure/${RUN_ID}`, { waitUntil: "load" });
 
   // 载入 11 个结构（1 受体 + 10 配体），给足时间
   try {
@@ -238,12 +246,26 @@ async function countColorPixels(page, hexColors, tolerance = 40) {
   );
 
   // ---- 配色真的是页面指定的，不是 Mol* 的默认主题 ----
-  // 默认主题会按链分配橙色与绿色。页面指定的灰底不会出现这两种色。
-  const defaultThemePixels = await countColorPixels(page, ["#e07030", "#00b090"]);
+  // 不再用「默认主题会出现橙与绿」这种像素代理：页面自己的调色板里也有橙红
+  // （链 B 是 #e05a4f），在容差内会互相命中，判据会时红时绿。改成两条更硬的：
+  //   1. 快照里每条可见链的颜色互不相同 —— 这是页面自己的分配，Mol* 不知道这回事
+  //   2. 这些颜色真的出现在画布上 —— 分配了却没画上去，等于没生效
+  const palette = await page.evaluate(() => window.__snapshot().chainColors);
+  const shownChains = await page.evaluate(() => window.__snapshot().visibleChains);
+  const distinctColors = new Set(shownChains.map((chain) => palette[chain]));
   check(
-    "受体用的是页面指定的灰底",
-    defaultThemePixels[0] < 200 && defaultThemePixels[1] < 200,
-    `默认主题配色像素 橙 ${defaultThemePixels[0]} / 绿 ${defaultThemePixels[1]}`
+    "每条可见链一种颜色",
+    distinctColors.size === shownChains.length,
+    `${shownChains.length} 条链 → ${distinctColors.size} 种颜色：${JSON.stringify(palette)}`
+  );
+  const chainPixels = await countColorPixels(
+    page,
+    [palette.A, palette.B].filter(Boolean)
+  );
+  check(
+    "链 A / 链 B 的配色都画上去了",
+    chainPixels.length === 2 && chainPixels.every((n) => n > 60),
+    `像素 ${chainPixels.join(" / ")}`
   );
   const pocketBlue = await countColorPixels(page, ["#1a6dd4", "#4a9eff"]);
   check(
@@ -303,28 +325,31 @@ async function countColorPixels(page, hexColors, tolerance = 40) {
     `读到 ${p3State.viewer.representationTotal}，期望 ${EXPECT.pockets}`
   );
 
-  // ---- 关掉 B 链 ----
-  await page.click("#chain-toggle");
+  // ---- 关掉 B 链（链图例里链 B 那一枚）----
+  // 每条可见链一份卡通表示，关掉一条就少那一份。节点口径下一条链是 2 个节点
+  // （选区子树 + 表示），所以期望值是 pockets-2。
+  const chainBChip = '#chain-legend .chain-chip[data-chain="B"]';
+  await page.click(chainBChip);
   await page.waitForTimeout(2000);
   const noB = await readState(page);
   check(
     "关掉 B 链后状态正确",
-    noB.snap.chainBVisible === false,
-    `chainBVisible=${noB.snap.chainBVisible}`
+    !noB.snap.visibleChains.includes("B"),
+    `visibleChains=${noB.snap.visibleChains.join("/")}`
   );
   check(
     "关掉 B 链后表示数下降",
     noB.viewer.representationTotal === EXPECT.pocketsNoChainB,
     `读到 ${noB.viewer.representationTotal}，期望 ${EXPECT.pocketsNoChainB}`
   );
-  await page.click("#chain-toggle");
+  await page.click(chainBChip);
   await page.waitForTimeout(1500);
   const withB = await readState(page);
   check(
     "打开 B 链后恢复",
-    withB.snap.chainBVisible === true
+    withB.snap.visibleChains.includes("B")
       && withB.viewer.representationTotal === EXPECT.pockets,
-    `chainBVisible=${withB.snap.chainBVisible}，表示 ${withB.viewer.representationTotal}`
+    `visibleChains=${withB.snap.visibleChains.join("/")}，表示 ${withB.viewer.representationTotal}`
   );
 
   // ---- 候选分子态 ----

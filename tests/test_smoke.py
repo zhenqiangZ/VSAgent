@@ -14,15 +14,24 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import opencode_tui  # noqa: E402
+import re  # noqa: E402
+from textual import events  # noqa: E402
+from textual.app import App, ComposeResult  # noqa: E402
 from textual.css.stylesheet import Stylesheet  # noqa: E402
+from textual.scrollbar import ScrollTo  # noqa: E402
 from textual.widget import Widget  # noqa: E402
-from textual.widgets import ListView  # noqa: E402
+from textual.widgets import Input, ListView  # noqa: E402
 
 from opencode_tui.app import OpenCodeApp  # noqa: E402
 from opencode_tui.core.agent.memory import MemoryStore  # noqa: E402
 from opencode_tui.core.agent.permission import PermissionPolicy, Verdict  # noqa: E402
 from opencode_tui.core.agent.prompt import KEEP_MESSAGES  # noqa: E402
 from opencode_tui.core.command_registry import CommandRegistry  # noqa: E402
+from opencode_tui.core.connection import (  # noqa: E402
+    Connection,
+    connection_path_for,
+    save_connection,
+)
 from opencode_tui.core.event_bus import EventBus  # noqa: E402
 from opencode_tui.core.exporter import export_filename, render_session_markdown  # noqa: E402
 from opencode_tui.core.external_editor import (  # noqa: E402
@@ -38,10 +47,10 @@ from opencode_tui.core.models import EFFORTS, Message, Part, PartType, ToolStatu
 from opencode_tui.core.project_scan import BEGIN_MARK, END_MARK  # noqa: E402
 from opencode_tui.core.session_manager import SessionManager  # noqa: E402
 from opencode_tui.screens.chat import ChatScreen, SidePanel  # noqa: E402
+from opencode_tui.screens.connection_form import ConnectionFormScreen  # noqa: E402
 from opencode_tui.screens.help import HelpScreen  # noqa: E402
 from opencode_tui.screens.home import HomeInput, HomeScreen  # noqa: E402
 from opencode_tui.screens.message import MessageScreen  # noqa: E402
-from opencode_tui.screens.model_selector import ModelSelectorScreen  # noqa: E402
 from opencode_tui.screens.permission import PermissionDialog  # noqa: E402
 from opencode_tui.screens.session_picker import (  # noqa: E402
     ConfirmDialog,
@@ -49,6 +58,7 @@ from opencode_tui.screens.session_picker import (  # noqa: E402
     SessionPickerScreen,
 )
 from opencode_tui.screens.theme_selector import ThemeSelectorScreen  # noqa: E402
+from opencode_tui.screens.tools_panel import ToolsPanelScreen  # noqa: E402
 from opencode_tui.widgets.agent_autocomplete import AGENTS  # noqa: E402
 from opencode_tui.widgets.command_palette import CommandPalette  # noqa: E402
 from opencode_tui.widgets.editor_pane import (  # noqa: E402
@@ -289,19 +299,271 @@ PART_SAMPLES: dict[PartType, Part] = {
 }
 
 
+async def run_coalesce_checks() -> None:
+    """流式文本的合并窗口：连着来的更新只重写一次。
+
+    正文与思考块重写一次都不便宜（Markdown 要重解析，思考块是整段 Static 重排），
+    所以这里数「重写了几次」而不是量耗时——次数是确定的，耗时在慢机器上会飘。
+    """
+
+    class Demo(App):
+        def compose(self) -> ComposeResult:
+            self.fold = ReasoningPartView(Part(type=PartType.REASONING))
+            self.text = TextPartView(Part(type=PartType.TEXT))
+            yield self.fold
+            yield self.text
+
+    app = Demo()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        writes: list[str] = []
+        real_write = app.fold.write_text
+
+        def counting(text: str) -> None:
+            writes.append(text)
+            real_write(text)
+
+        app.fold.write_text = counting  # type: ignore[method-assign]
+
+        part = Part(type=PartType.REASONING)
+        # 一口气推 20 段、中间不让出事件循环：合并窗口还没到点，一次都不该写。
+        for index in range(20):
+            part.text += f"第 {index} 句。"
+            app.fold.sync(part)
+        check(not writes, f"连着来的更新没有一段一次重写：{len(writes)} 次")
+
+        await pilot.pause(0.3)
+        check(len(writes) == 1, f"窗口到点之后只重写一次：{len(writes)} 次")
+        check(
+            str(app.fold._body.render()) == part.text,
+            f"写出去的是最后一份文本：{str(app.fold._body.render())!r}",
+        )
+
+        # 一轮结束时不等窗口：`flush_text` 立刻把压在里面的最后一段写出来。
+        part.text += "收尾。"
+        app.fold.sync(part)
+        app.fold.flush_text()
+        check(len(writes) == 2, f"收尾那次不等窗口：{len(writes)} 次")
+        check(
+            str(app.fold._body.render()).endswith("收尾。"),
+            f"收尾那段也写出来了：{str(app.fold._body.render())!r}",
+        )
+
+
+async def run_tools_panel_checks() -> None:
+    """`/tools` 面板：列出全部工具、逐条开关、改完立刻生效。
+
+    单独开一个应用，`root` 指向 `.probe/` 下的一份副本：面板会写
+    `root/.opencode_tui/tools.toml`，用仓库根那个会把开发机上的真实开关冲掉。
+    """
+    root = ROOT / ".probe" / "tools_panel"
+    shutil.rmtree(root, ignore_errors=True)
+    config = root / ".opencode_tui"
+    config.mkdir(parents=True, exist_ok=True)
+    tools_file = config / "tools.toml"
+    tools_file.write_text("[tools]\nsearch_pdb = false\n", encoding="utf-8")
+
+    app = OpenCodeApp(
+        root=root,
+        state_path=root / "state.toml",
+        policy=PermissionPolicy(default_ask=frozenset()),
+    )
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.execute_command("/tools")
+        await pilot.pause()
+        screen = app.screen
+        check(isinstance(screen, ToolsPanelScreen), f"/tools 打开的是工具面板：{type(screen).__name__}")
+        if not isinstance(screen, ToolsPanelScreen):
+            return
+
+        view = screen.query_one("#tools-list", ListView)
+
+        def titles() -> list[str]:
+            return [str(item.query_one(".tool-row-title").render()) for item in view.children]
+
+        # 面板要列的是**全部**工具：只列开着的那些，关掉之后就再也打不开了。
+        check(
+            len(titles()) == len(app.tool_catalog()),
+            f"面板列出全部工具：画面 {len(titles())}，全部 {len(app.tool_catalog())}",
+        )
+        check("○ search_pdb" in titles(), f"关掉的工具是空心圆：{titles()[:4]}")
+        check("● bash" in titles(), "开着的工具是实心圆")
+        check(
+            f"{len(app.tool_catalog()) - 1}/{len(app.tool_catalog())} 已启用"
+            in str(screen.query_one("#tools-title").render()),
+            f"标题栏报开着几个：{str(screen.query_one('#tools-title').render())!r}",
+        )
+        check("search_pdb" not in app.agent.registry.names(), "开面板之前它就不在注册表里")
+
+        # 光标移到那一行，按空格打开。
+        index = [entry.name for entry in screen.entries].index("search_pdb")
+        view.index = index
+        await pilot.pause()
+        await pilot.press("space")
+        await pilot.pause()
+        check(
+            "● search_pdb" in str(view.children[index].query_one(".tool-row-title").render()),
+            f"空格打开被关掉的工具：{str(view.children[index].query_one('.tool-row-title').render())!r}",
+        )
+        check("search_pdb" in app.agent.registry.names(), "打开之后工具立刻进了注册表，不用重启")
+        check(
+            "search_pdb" in {spec["function"]["name"] for spec in app.agent.registry.specs()},
+            "打开之后它在请求体的 tools 数组里",
+        )
+        check(
+            "search_pdb = false" not in tools_file.read_text(encoding="utf-8"),
+            f"打开之后文件里不再有它：{tools_file.read_text(encoding='utf-8')!r}",
+        )
+
+        # 再按一次关回去：写盘、注册表、请求体三处要一起变。
+        await pilot.press("space")
+        await pilot.pause()
+        check(
+            "○ search_pdb" in str(view.children[index].query_one(".tool-row-title").render()),
+            "再按一次关掉",
+        )
+        check("search_pdb" not in app.agent.registry.names(), "关掉之后它又不在注册表里了")
+        check(
+            "search_pdb = false" in tools_file.read_text(encoding="utf-8"),
+            f"关掉之后写回文件：{tools_file.read_text(encoding='utf-8')!r}",
+        )
+
+        # enter 与空格是同一件事：面板上没写「按空格」以外的键位提示，
+        # 但回车是这类列表的默认动作，不该按了没反应。
+        await pilot.press("enter")
+        await pilot.pause()
+        check(
+            "search_pdb" in app.agent.registry.names(),
+            "回车也能开关，不是只有空格",
+        )
+        await pilot.press("enter")
+        await pilot.pause()
+
+        await pilot.press("escape")
+        await pilot.pause()
+        check(not isinstance(app.screen, ToolsPanelScreen), "esc 关掉面板，回到原来的界面")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
 async def run() -> None:
     server = FakeModelServer()
     server.start()
-    os.environ["VSA_LLM_BASE_URL"] = server.base_url
-    os.environ["VSA_LLM_API_KEY"] = "secret"
-    os.environ["VSA_LLM_MODEL"] = "smoke-model"
-    os.environ["VSA_LLM_CONTEXT_WINDOW"] = "1000000"
-    os.environ["VSA_LLM_PRICE_INPUT"] = "0.5"
-    os.environ["VSA_LLM_PRICE_OUTPUT"] = "1.5"
+    # 接口参数写进与状态文件同目录的 connection.toml：所有测试应用的 state_path
+    # 都在 `.probe/` 下，因此这一份对它们同时生效。
+    save_connection(
+        connection_path_for(STATE_PATH),
+        Connection(server.base_url, "secret", "smoke-model", context_window=1_000_000),
+    )
     try:
+        await run_tool_card_checks()
+        await run_coalesce_checks()
+        await run_tools_panel_checks()
         await run_interface_checks(server)
     finally:
         server.stop()
+
+
+async def run_tool_card_checks() -> None:
+    """工具卡：两级折叠、工具图标、执行计时。
+
+    这几条不依赖会话，单独开一个只放一张卡片的小应用，断言不用绕开别的组件。
+    """
+    long_output = "\n".join(f"line {i:02d}" for i in range(40))
+
+    def make_part(status: ToolStatus, age: float = 0.0) -> Part:
+        return Part(
+            type=PartType.TOOL,
+            tool_name="bash",
+            tool_status=status,
+            tool_input={"command": "echo hi"},
+            tool_output=long_output,
+            timestamp=time.time() - age,
+        )
+
+    class Demo(App):
+        def compose(self) -> ComposeResult:
+            self.card = ToolCard(make_part(ToolStatus.COMPLETED))
+            self.card.sync(make_part(ToolStatus.COMPLETED))
+            yield self.card
+
+    app = Demo()
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause(0.2)
+        card = app.card
+        header = str(card.query_one(".tool-header").render())
+        check("$ bash" in header, f"卡片头上有工具图标：{header}")
+
+        output = card.query_one(".tool-output")
+        tail = card.query_one(".tool-tail")
+        more = card.query_one(".tool-more")
+        check(
+            str(output.render()).splitlines() == ["line 00", "line 01", "line 02"],
+            f"折叠时只留开头三行：{str(output.render()).splitlines()[:4]}",
+        )
+        check(
+            str(tail.render()).splitlines() == ["line 37", "line 38", "line 39"],
+            f"折叠时末尾三行还在：{str(tail.render()).splitlines()}",
+        )
+        check("省略 34 行" in str(more.render()), f"省略行写明折了多少行：{more.render()}")
+
+        # 点省略行展开：省略行留在原地（不然展开几百行之后「收起」就滚出屏幕了），
+        # 中间那一段接在它后面。
+        await pilot.click(more)
+        await pilot.pause()
+        check("收起" in str(more.render()), f"展开之后省略行变成「收起」：{more.render()}")
+        check(
+            len(str(tail.render()).splitlines()) == 37,
+            f"展开之后中间那段接在省略行后面：{len(str(tail.render()).splitlines())} 行",
+        )
+        check(
+            str(output.render()).splitlines() == ["line 00", "line 01", "line 02"],
+            "展开不挪动省略行，开头三行仍在它上面",
+        )
+
+        # 点正文不该有任何动作：用户点一下常常只是想读或选中。
+        await pilot.click(output)
+        await pilot.pause()
+        check("收起" in str(more.render()), "点正文不会把展开的输出去掉")
+        check(str(output.styles.display) == "block", "点正文不会把输出收起来")
+
+        await pilot.click(more)
+        await pilot.pause()
+        check("省略 34 行" in str(more.render()), "再点一次折回去")
+
+        # 标题行才是整段输出的开关。
+        await pilot.click(card.query_one(".tool-header"))
+        await pilot.pause()
+        check(str(output.styles.display) == "none", "点标题行收起整段输出")
+        check(str(more.styles.display) == "none", "收起时省略行也一起收起")
+        check(str(tail.styles.display) == "none", "收起时末尾三行也一起收起")
+        await pilot.click(card.query_one(".tool-header"))
+        await pilot.pause()
+        check(str(output.styles.display) == "block", "再点标题行展开整段输出")
+
+        # 执行计时：看到「执行中」才开始计时，完成后停在最终值。
+        card.sync(make_part(ToolStatus.RUNNING, age=5))
+        header = str(card.query_one(".tool-header").render())
+        check(
+            re.search(r"执行中 \d+(\.\d+)?s", header) is not None,
+            f"执行中的卡片带耗时：{header}",
+        )
+        card.sync(make_part(ToolStatus.COMPLETED, age=5))
+        header = str(card.query_one(".tool-header").render())
+        check(
+            re.search(r"完成 \d+(\.\d+)?s", header) is not None,
+            f"完成之后耗时停在最终值：{header}",
+        )
+
+        # 旧会话里建出来的完成态卡片：时间戳是几天前，不能算出一个几天的耗时。
+        old = ToolCard(make_part(ToolStatus.COMPLETED, age=86400))
+        old.sync(make_part(ToolStatus.COMPLETED, age=86400))
+        header = str(old._header.render())
+        check(
+            re.search(r"\d+(\.\d+)?s", header) is None,
+            f"没亲眼看到执行中的卡片不显示耗时：{header}",
+        )
 
 
 PERMISSION_STATE_PATH = ROOT / ".probe" / "state_permission.toml"
@@ -338,10 +600,21 @@ async def wait_for_screen(app: OpenCodeApp, pilot, kind: type, timeout: float = 
 
 
 def dialog_text(dialog: PermissionDialog) -> str:
-    """把弹窗上三行文字拼成一段，便于断言。"""
+    """把弹窗上的文字拼成一段，便于断言。
+
+    原因那一行是条件渲染的（没有原因就不出），用 `query` 而不是 `query_one`，
+    少一个组件时这里不会先抛 NoMatches。
+    """
+    selectors = (
+        "#permission-title",
+        "#permission-detail",
+        "#permission-label",
+        "#permission-argument-text",
+        "#permission-reason",
+        "#permission-hint",
+    )
     return " ".join(
-        str(dialog.query_one(selector).render())
-        for selector in ("#permission-title", "#permission-detail", "#permission-hint")
+        str(node.render()) for selector in selectors for node in dialog.query(selector)
     )
 
 
@@ -376,6 +649,21 @@ async def run_permission_round(server: FakeModelServer, key: str) -> tuple[ToolS
         check(
             "放行所有工具" in hint and "工作目录之外" in hint,
             f"提示行写明 a 键的真实范围（所有工具，且管不到工作目录之外）：{hint}",
+        )
+        preview = dialog.query_one("#permission-argument")
+        check(preview.region.height >= 3, f"参数单独放在带边框的预览框里：{preview.region}")
+        # 标签跟着工具走：bash 的主参数是命令，不是笼统的「参数」。
+        check(
+            str(dialog.query_one("#permission-label").render()) == "命令",
+            f"参数标签按工具命名：{dialog.query_one('#permission-label').render()!r}",
+        )
+        check(
+            TOOL_MARK in str(dialog.query_one("#permission-argument-text").render()),
+            "预览框里是这次要执行的那条命令",
+        )
+        check(
+            dialog.query_one("#permission-hint").region.height >= 2,
+            "提示行分成两行，按键与范围说明都完整显示",
         )
         await pilot.press(key)
         await wait_idle(app, pilot)
@@ -527,20 +815,22 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(isinstance(app.screen, HomeScreen), "esc 关闭命令面板回到启动界面")
 
-        await type_text(pilot, "/models")
+        await type_text(pilot, "/model")
         await pilot.press("enter")
         await pilot.pause()
-        check(isinstance(app.screen, ModelSelectorScreen), "启动界面上 /models 打开模型选择器")
+        check(isinstance(app.screen, ConnectionFormScreen), "启动界面上 /model 打开接口表单")
         check(
-            len(app.screen.query_one("#model-list").children) == len(app.available_models),
-            "模型选择器列出全部可选模型",
+            app.screen.query_one("#connection-model", Input).value == app.agent.config.model,
+            "表单里预填了当前模型名",
         )
-        await pilot.press("enter")
+        check(
+            app.screen.query_one("#connection-base-url", Input).value
+            == app.agent.config.base_url,
+            "表单里预填了当前接口地址",
+        )
+        await pilot.press("escape")
         await pilot.pause()
-        check(
-            app.agent.config.model in str(home.query_one("#home-info").content),
-            f"选择模型后状态行显示它：{home.query_one('#home-info').content}",
-        )
+        check(isinstance(app.screen, HomeScreen), "关闭接口表单回到启动界面")
 
         await type_text(pilot, "from home")
         await pilot.press("enter")
@@ -610,29 +900,82 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(accent.rich_style.bgcolor.name == "#4a9eff", "重新聚焦后指示线恢复亮蓝")
 
-        # 输入区的高度固定：输入再多也不增高，多出来的行由输入框自己滚动。
-        # 写成 auto 的话，输入每跨过一次换行边界，区块就长高一行、上边缘往上退一行，
-        # 上面的消息区被压短一行，提交清空之后整块又退回来。
-        pane_top = editor.region.y
-        pane_height = editor.region.height
-        messages_height = pane.region.height
-        editor.input.text = "x" * 1200
+        # 光标是白底深字的方块。光标落在空格上时只有底色看得见，蓝底会和强调色混在一起，
+        # 看不出现在打到哪一格。
+        cursor_style = editor.input.get_component_rich_style("text-area--cursor")
+        check(
+            cursor_style.bgcolor.name == "#ffffff",
+            f"输入光标为白色方块：{cursor_style.bgcolor.name}",
+        )
+        check(
+            cursor_style.color.name == "#0a0a0a",
+            f"光标下的字用深色，白底上才看得清：{cursor_style.color.name}",
+        )
+        # 消息区右侧的滚动条取纯白。默认档跟随主题的 $scrollbar，在纯黑底上偏暗。
+        # 这里读的是 `styles` 上的 textual 颜色对象，取 `.hex`（大写、带 #），不是 rich 的 `.name`。
+        check(
+            pane.styles.scrollbar_color.hex.lower() == "#ffffff",
+            f"消息区滚动条为白色：{pane.styles.scrollbar_color.hex}",
+        )
+
+        # 输入区的高度跟着内容走，与启动界面 `#home-input` 同一套：随内容长高、
+        # 6 行封顶，再多出来的行由输入框自己滚动。区别是这里给了 3 行底高——
+        # 聊天界面空着的时候框太窄，贴着上界线看起来像没地方输入。
+        # 区块贴着底边、高度 auto，所以长高时是上边缘往上退、消息区被压短，
+        # 状态行与状态栏不动；提交清空之后整块退回 6 行。
+        editor.input.text = ""
+        await pilot.pause()
+        await pilot.pause()
+        empty_height = editor.input.region.height
+        check(empty_height == 3, f"空输入时输入区占 3 行底高：{empty_height}")
+        check(
+            editor.region.height == 6,
+            f"空输入时区块共 6 行（上界线 1 + 输入 3 + 间距 1 + 状态行 1）：{editor.region.height}",
+        )
+        pane_bottom = editor.region.bottom
+        status_bar = app.screen.query_one("#status-bar")
+        status_height = status_bar.region.height
+
+        editor.input.text = "第一行\n第二行\n第三行\n第四行\n第五行"
+        await pilot.pause()
+        await pilot.pause()
+        check(
+            editor.input.region.height == 5,
+            f"输入 5 行时输入区跟着长到 5 行：{editor.input.region.height}",
+        )
+        check(
+            editor.region.bottom == pane_bottom,
+            f"长高时区块贴着底边往上长：底边 {editor.region.bottom}（原本 {pane_bottom}）",
+        )
+
+        editor.input.text = "\n".join(f"第 {index} 行" for index in range(20))
         await pilot.pause()
         await pilot.pause()
         rows_needed = editor.input.virtual_size.height
         check(
+            editor.input.region.height == 6,
+            f"输入 20 行时输入区 6 行封顶：{editor.input.region.height}",
+        )
+        check(
             rows_needed > editor.input.region.height,
-            f"输入内容确实超过了输入区的高度，下面两条断言才有意义："
+            f"封顶之后多出来的行由输入框自己滚动："
             f"内容 {rows_needed} 行，输入区 {editor.input.region.height} 行",
         )
         check(
-            editor.region.y == pane_top and editor.region.height == pane_height,
-            f"输入多行时输入区块的位置与高度不变："
-            f"y {editor.region.y}（原本 {pane_top}），高 {editor.region.height}（原本 {pane_height}）",
+            editor.region.bottom == pane_bottom,
+            f"封顶后区块底边仍然不动：{editor.region.bottom}（原本 {pane_bottom}）",
         )
         check(
-            pane.region.height == messages_height,
-            f"输入多行时消息区高度不变：{pane.region.height}（原本 {messages_height}）",
+            status_bar.region.height == status_height,
+            f"状态栏不被长高的输入区挤掉：{status_bar.region.height}（原本 {status_height}）",
+        )
+
+        editor.input.text = ""
+        await pilot.pause()
+        await pilot.pause()
+        check(
+            editor.input.region.height == empty_height,
+            f"清空后输入区退回 3 行底高：{editor.input.region.height}",
         )
 
         # 光标要跟着滚动走到底。TextArea 在光标移动时只滚一次，用的还是插入之前算出来的
@@ -1005,10 +1348,20 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             str(fold._body.styles.display) == "block",
             f"展开之后正文显示出来：display={fold._body.styles.display}",
         )
+        # 正文走的是合并窗口，最后一段由 `turn.done` 的 flush 写出来。这条断言盯的
+        # 就是那次 flush：漏了它，思考块平时收起着看不出问题，一展开就是空的。
+        check(
+            "先看一下上下文" in str(fold._body.render()),
+            f"展开之后看得到思考正文：{str(fold._body.render())!r}",
+        )
         check(
             "点击折叠" in str(fold._header.content),
             f"标题上的提示跟着换：{str(fold._header.content)!r}",
         )
+        # 点正文不能把展开的思考收起来：展开之后点它，多半是想读或者选中。
+        await pilot.click(fold._body)
+        await pilot.pause()
+        check(fold._expanded, "点正文不会把展开的思考收起来")
         await pilot.click(fold._header)
         await pilot.pause()
         check(not fold._expanded, "再点一下收回折叠")
@@ -1050,15 +1403,19 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             and "第 4 行" not in long_shown,
             f"长输出开头留到上界以内：{long_shown!r}",
         )
+        long_tail = str(card._tail.render())
         check(
-            long_shown.rstrip().endswith("第 20 行") and "第 18 行" in long_shown,
-            f"长输出末尾照原样留到最后一行：{long_shown!r}",
+            long_tail.rstrip().endswith("第 20 行") and "第 18 行" in long_tail,
+            f"长输出末尾照原样留到最后一行：{long_tail!r}",
         )
-        check("… 省略 14 行" in long_shown, f"中间折成一行写明省略多少行：{long_shown!r}")
+        check(
+            "中间省略 14 行" in str(card._more.render()),
+            f"中间折成一行写明省略多少行：{card._more.render()!r}",
+        )
         card._part.tool_output = original_output
         card.sync(card._part)
 
-        # 点卡片可以把这一条输出单独收起，再点一下展开。点的是屏幕坐标，先把头部滚进视野。
+        # 点标题行可以把这一条输出单独收起，再点一下展开。点的是屏幕坐标，先把头部滚进视野。
         # 这时思考块刚被点过，焦点在消息区里，点完要把焦点交还输入框。
         window = pane.region
         card.scroll_visible(animate=False)
@@ -1790,6 +2147,24 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         app.execute_command("sessions")
         await pilot.pause()
         check(isinstance(app.screen, SessionPickerScreen), "/sessions 打开会话选择器")
+        check(
+            "共" in str(app.screen.query_one("#picker-title").render()),
+            f"标题栏写着会话总数：{app.screen.query_one('#picker-title').render()}",
+        )
+        titles = app.screen.query(".session-row-title")
+        check(
+            len(titles) == len(app.session_manager.sessions),
+            f"列表一行一个会话：{len(titles)} 行 / {len(app.session_manager.sessions)} 个",
+        )
+        check(
+            len(app.screen.query(".session-row-title.-current")) == 1,
+            "当前会话那一行带 ▸ 标记",
+        )
+        metas = [str(item.render()) for item in app.screen.query(".session-row-meta")]
+        check(
+            bool(metas) and all("条消息" in text for text in metas),
+            f"每行元信息写着消息数：{metas[:2]}",
+        )
         box = app.screen.query_one("#session-picker").region
         check(
             abs(box.x - (app.size.width - box.right)) <= 1,
@@ -1836,28 +2211,28 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"重建后工具卡登记表仍然对得上：画面 {len(rebuilt_cards)}，登记 {len(pane._tool_cards)}",
         )
 
-        app.execute_command("models")
+        app.execute_command("model")
         await pilot.pause()
-        check(isinstance(app.screen, ModelSelectorScreen), "models 命令打开模型选择器")
-        box = app.screen.query_one("#model-selector")
+        check(isinstance(app.screen, ConnectionFormScreen), "/model 命令打开接口表单")
+        box = app.screen.query_one("#connection-form")
         region = box.region
         check(
             2 * region.x + region.width == app.size.width,
-            "模型选择器在屏幕内水平居中",
+            "接口表单在屏幕内水平居中",
         )
         check(
             abs(2 * region.y + region.height - app.size.height) <= 1,
-            "模型选择器在屏幕内垂直居中",
+            "接口表单在屏幕内垂直居中",
         )
-        check(app.screen.styles.background.a < 1, "模型选择器的遮罩带透明度")
-        check(box.styles.background.a < 1, "模型选择器弹窗本体带透明度")
-        await pilot.press("enter")
+        check(app.screen.styles.background.a < 1, "接口表单的遮罩带透明度")
+        check(box.styles.background.a < 1, "接口表单弹窗本体带透明度")
+        await pilot.press("escape")
         await pilot.pause()
-        check(app.current_model_label != "", "选择模型后写入当前模型")
+        check(isinstance(app.screen, ChatScreen), "关闭接口表单后回到聊天界面")
         model_label_now = chat.query_one("#editor-model")
         check(
             str(model_label_now.render()) == app.current_model_label,
-            f"弹窗关闭后输入框状态行跟着刷新模型：{model_label_now.render()}",
+            f"输入框状态行与当前模型一致：{model_label_now.render()}",
         )
 
         app.execute_command("themes")
@@ -2120,6 +2495,48 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(pane.scroll_y >= pane.max_scroll_y - 1, "end 跳到消息列表底部")
         check(pane.following, "跳到底部后恢复自动跟随")
 
+        # 窗口维护自己也会改滚动量：裁掉上端之后布局把 scroll_y 夹回一行，
+        # 这一下看起来像「用户往上翻」，但用户根本没动。夹回之后跟随必须还开着，
+        # 否则用户什么都没做，新消息就再也不跟到底了（实测偶发，跑十次挂三次）。
+        pane.scroll_to(y=pane.max_scroll_y - 1, animate=False, immediate=True)
+        await pilot.pause()
+        check(pane.following, "维护把滚动量夹回一行时跟随不被关掉")
+
+        # 滚轮与拖动滚动条是另外两条入口，都不走 action_scroll_*。
+        # 滚轮往上滚一格落点仍在底部（容差内），必须由滚轮自己的处理关掉跟随。
+        pane.post_message(events.MouseScrollUp(pane, 0, 0, 0, 0, 0, False, False, False))
+        await pilot.pause()
+        check(not pane.following, "滚轮往上滚一格就停止跟随")
+
+        # 拖动滚动条：没拖到底就不跟，拖到底就恢复。
+        await pilot.press("end")
+        await pilot.pause()
+        pane.post_message(ScrollTo(x=None, y=pane.max_scroll_y - 2, animate=False))
+        await pilot.pause()
+        check(not pane.following, "滚动条停在离底部两行处不跟随")
+        pane.post_message(ScrollTo(x=None, y=pane.max_scroll_y, animate=False))
+        await pilot.pause()
+        check(pane.following, "滚动条拖到底恢复跟随")
+        await pilot.press("end")
+        await pilot.pause()
+
+        # 离开底部之后有新内容进来：底部亮一条提示，点一下回到底部并恢复跟随。
+        # 不亮提示的话，长回合里用户在上面翻历史，界面上一点动静都没有。
+        await pilot.press("home")
+        await pilot.pause()
+        check(not pane.following, "回到顶部之后跟随是关着的")
+        check(not pane._new_hint.has_class("-visible"), "没有新内容时不亮提示")
+        visible_part = pane._messages[pane._mounted_start].parts[-1]
+        pane.update_part(visible_part)
+        await pilot.pause()
+        check(pane._new_hint.has_class("-visible"), "离开底部时新内容进来会亮提示")
+        await pilot.click("#new-messages")
+        await pilot.pause()
+        check(pane.following, "点提示条回到底部并恢复跟随")
+        check(not pane._new_hint.has_class("-visible"), "回到底部之后提示收起来")
+        await pilot.press("end")
+        await pilot.pause()
+
         # 另外四个滚动键沿用 ScrollableContainer 自带的绑定（本类只覆盖了动作方法），
         # 按下去会不会真的动，只能实测。
         await pilot.press("home")
@@ -2192,11 +2609,11 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         editor.text = ""
         await pilot.pause()
 
-        # 另外几条命令在别处都没走过。models/sessions 打开各自的界面，export 写出导出文件，
+        # 另外几条命令在别处都没走过。model/sessions 打开各自的界面，export 写出导出文件，
         # compact 与 init 会真改东西，share 是还没接入的命令。
         # editor 走外部编辑器，测试环境不支持挂起，不在这一轮里按。
         for name, screen_type, label in [
-            ("models", ModelSelectorScreen, "模型选择器"),
+            ("model", ConnectionFormScreen, "接口表单"),
             ("sessions", SessionPickerScreen, "会话选择器"),
             ("help", HelpScreen, "帮助界面"),
         ]:
@@ -2423,7 +2840,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         for name, screen_type, opened, closed in [
             ("help", HelpScreen, "/help 打开帮助界面", "帮助界面"),
             ("sessions", SessionPickerScreen, "/sessions 打开会话选择器", "会话选择器"),
-            ("models", ModelSelectorScreen, "/models 打开模型选择器", "模型选择器"),
+            ("model", ConnectionFormScreen, "/model 打开接口表单", "接口表单"),
         ]:
             await type_text(pilot, f"/{name}")
             await pilot.press("enter")
@@ -2565,7 +2982,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(restored.theme == last_theme, f"启动时把上次选的主题读回来：{restored.theme}")
         check(
             restored.current_model_label == restored.agent.config.model,
-            f"状态行上的模型取自 `.env`：{restored.current_model_label}",
+            f"状态行上的模型取自连接配置：{restored.current_model_label}",
         )
         info_line = str(restored.screen.query_one("#home-info").content)
         check(

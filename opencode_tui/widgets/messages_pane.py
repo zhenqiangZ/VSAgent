@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Callable, cast
 
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container, ScrollableContainer, Vertical
+from textual.scrollbar import ScrollTo
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Markdown, Static
@@ -30,6 +32,55 @@ STATUS_TEXT = {
     ToolStatus.FAILED: "失败",
 }
 
+# 卡片头上的工具图标。全是单格宽的字形（`☰` 是两格，没用它）：卡片头是一行文字，
+# 混进一个双宽字形会让后面整段右移一格，几张卡叠在一起就看得出参差。
+# 同一类工具给同一个图标——一眼分得出「这是检索」还是「这是算」比分清具体是哪个更重要。
+TOOL_ICON = {
+    "bash": "$",
+    "read": "▤",
+    "write": "✎",
+    "patch": "◇",
+    "grep": "⌕",
+    "list_workspace": "≡",
+    "describe_entry": "?",
+    "switch_receptor": "⇄",
+    "search_targets": "⌕",
+    "fetch_target": "⇣",
+    "fetch_structure": "⇣",
+    "search_actives": "⌕",
+    "find_analogs": "≈",
+    "describe_molecule": "⬡",
+    "search_pdb": "⌕",
+    "search_literature": "⌕",
+    "import_structure": "⇥",
+    "import_ligandset": "⇥",
+    "prepare_receptor": "⚙",
+    "prepare_ligands": "⚙",
+    "dock": "⊙",
+    "write_run": "▣",
+    "open_viewer": "◎",
+}
+
+
+def tool_icon(tool_name: str) -> str:
+    """工具在卡片头上的图标。没登记过的工具用一个中性符号。"""
+    return TOOL_ICON.get(tool_name, "◆")
+
+
+def format_seconds(seconds: float) -> str:
+    """把秒数写成「0.4s」「12s」「2m03s」。
+
+    十秒以内留一位小数：工具大多几秒就回来了，都写成「0s」「3s」的话，
+    看不出哪个快哪个慢。
+    """
+    seconds = max(0.0, seconds)
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    return f"{int(seconds) // 60}m{int(seconds) % 60:02d}s"
+
+
 # 工具输出最多显示这么多行，超出的部分折成一行提示，免得长输出把消息区整个刷过去。
 MAX_OUTPUT_LINES = 6
 
@@ -38,7 +89,8 @@ MAX_OUTPUT_LINES = 6
 OUTPUT_HEAD_LINES = 3
 OUTPUT_TAIL_LINES = 3
 
-# 流式文本两次重解析之间的最短间隔。窗口里累积的文本由 flush_text 写出来。
+# 流式文本两次重写之间的最短间隔。窗口里累积的文本由 flush_text 写出来。
+# 正文（Markdown 重解析）与思考块（Static 整段重排）共用这一个窗口。
 TEXT_REFRESH_SECONDS = 0.05
 
 # 打开会话时先建出最后这么多条消息，更早的那些留到滚到顶端时再补。
@@ -56,38 +108,45 @@ LOAD_MORE_MARGIN = 3
 MAX_MOUNTED = 90
 
 
-class TextPartView(Markdown):
-    """文本 Part，按 Markdown 渲染。
+class CoalescedText:
+    """流式文本的合并窗口。
 
-    流式生成时每追加几个字符就来一次更新，逐次把整段文本重新解析一遍，
-    一段回复下来是平方级的开销（实测一轮里重解析了 36 次）。两次重解析之间隔一个短窗口，
-    窗口里连着来的更新合并成一次；一轮结束时由 MessagesPane 把最后一份立刻写出来。
+    正文与思考块面对的是同一件事：模型每吐几个字就来一次更新，每次都要把整段
+    重新写一遍——Markdown 要重解析，Static 要重排整段。一段回复下来是平方级的
+    开销（实测正文一轮里重解析了 36 次）。两次重写之间隔一个短窗口，窗口里连着
+    来的更新合并成一次；一轮结束时由 `MessagesPane.flush_text` 把最后一份立刻写出去。
+
+    子类只管两件事：`__init__` 里调一次 `_start_window` 记下初始文本，
+    再实现 `write_text` 把文本真的画出来。
     """
 
-    def __init__(self, part: Part) -> None:
-        super().__init__(part.text, classes="part part-text")
-        self.part_id = part.id
-        self._shown_text = part.text
-        self._latest_text = part.text
+    def _start_window(self, text: str) -> None:
+        """记下初始文本，当作「已经写出去的那一份」。"""
+        self._shown_text = text
+        self._latest_text = text
         self._refresh_timer: Timer | None = None
 
-    def sync(self, part: Part) -> None:
-        """收到新文本，等这个窗口结束再重解析。"""
-        self._latest_text = part.text
-        if self._latest_text == self._shown_text:
+    def queue_text(self, text: str) -> None:
+        """收到新文本，等这个窗口结束再写。"""
+        if text == self._latest_text:
             return
+        self._latest_text = text
         if self._refresh_timer is None:
             self._refresh_timer = self.set_timer(TEXT_REFRESH_SECONDS, self.flush_text)
 
     def flush_text(self) -> None:
-        """把窗口里累积的最新文本写进 Markdown。"""
+        """把窗口里累积的最新文本立刻写出去。"""
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
             self._refresh_timer = None
         if self._latest_text == self._shown_text:
             return
         self._shown_text = self._latest_text
-        self.update(self._shown_text)
+        self.write_text(self._shown_text)
+
+    def write_text(self, text: str) -> None:
+        """子类负责把文本真的画出来。"""
+        raise NotImplementedError
 
     def on_unmount(self) -> None:
         """卸载时停掉还没到点的窗口。"""
@@ -96,8 +155,34 @@ class TextPartView(Markdown):
             self._refresh_timer = None
 
 
-class FoldBlock(Container):
-    """可折叠的块，用于思考过程。"""
+class TextPartView(CoalescedText, Markdown):
+    """文本 Part，按 Markdown 渲染。
+
+    流式更新走 `CoalescedText` 的合并窗口：两次重解析之间隔一个短窗口，
+    窗口里连着来的更新合并成一次。
+    """
+
+    def __init__(self, part: Part) -> None:
+        super().__init__(part.text, classes="part part-text")
+        self.part_id = part.id
+        self._start_window(part.text)
+
+    def sync(self, part: Part) -> None:
+        """收到新文本，等这个窗口结束再重解析。"""
+        self.queue_text(part.text)
+
+    def write_text(self, text: str) -> None:
+        """把文本写进 Markdown。"""
+        self.update(text)
+
+
+class FoldBlock(CoalescedText, Container):
+    """可折叠的块，用于思考过程。
+
+    正文也走 `CoalescedText` 的合并窗口：思考块是整段 `Static` 重排，流式时每来
+    一小段就重排一次，比正文重解析 Markdown 还贵，而它默认还是收起的——重排半天
+    用户一个字都看不见。
+    """
 
     DEFAULT_CSS = """
     FoldBlock {
@@ -114,9 +199,9 @@ class FoldBlock(Container):
         super().__init__(classes=classes)
         self._title = title
         self._expanded = False
-        self._body_text = ""
         self._header = Static(self._header_text(), classes="fold-header", markup=False)
         self._body = Static("", classes="fold-body -hidden", markup=False)
+        self._start_window("")
 
     def compose(self) -> ComposeResult:
         yield self._header
@@ -127,15 +212,23 @@ class FoldBlock(Container):
         hint = "点击折叠" if self._expanded else "点击展开"
         return f"{symbol} {self._title}（{hint}）"
 
-    def on_click(self) -> None:
-        """点击标题时切换展开状态。"""
+    def on_click(self, event: events.Click) -> None:
+        """点击标题时切换展开状态。
+
+        只认标题行：正文展开之后点它多半是想读或选中，整段收起来是把人赶走。
+        """
+        if event.widget is not self._header:
+            return
         self._expanded = not self._expanded
         self._header.update(self._header_text())
         self._body.set_class(not self._expanded, "-hidden")
 
     def set_body(self, text: str) -> None:
-        """更新折叠块正文。"""
-        self._body_text = text
+        """收到新正文，等这个窗口结束再重排。"""
+        self.queue_text(text)
+
+    def write_text(self, text: str) -> None:
+        """把正文真的画进折叠块。"""
         self._body.update(text)
 
 
@@ -152,7 +245,15 @@ class ReasoningPartView(FoldBlock):
 
 
 class ToolCard(Container):
-    """工具调用卡片，左侧竖条按状态着色，输出截断且可收起。"""
+    """工具调用卡片，左侧竖条按状态着色，输出截断且可收起。
+
+    卡片上有两级折叠，各自管一段：
+
+    - 标题行（`▾/▸`）收起整段输出。点标题行才切换，点正文什么都不做——
+      用户点一下输出多半只是想选中它读一眼，整段消失是最烦人的一种「帮忙」。
+    - 省略行（`▾ 中间省略 N 行 · 点开看全文`）只展开被折掉的中间部分，点一下换回「收起」。
+      没有这一条，长输出被折掉的那几十行在界面上就再也看不到了，只能去翻 trace。
+    """
 
     DEFAULT_CSS = """
     ToolCard {
@@ -171,7 +272,11 @@ class ToolCard(Container):
     ToolCard.-completed .tool-header { color: #66BB6A; }
     ToolCard.-failed .tool-header { color: #EF5350; }
     ToolCard .tool-output { color: #6E7681; }
-    ToolCard .tool-output.-hidden { display: none; }
+    ToolCard .tool-tail { color: #6E7681; }
+    ToolCard .tool-more { color: #4A9EFF; height: 1; }
+    ToolCard .tool-output.-hidden,
+    ToolCard .tool-tail.-hidden,
+    ToolCard .tool-more.-hidden { display: none; }
     """
 
     def __init__(self, part: Part) -> None:
@@ -179,21 +284,40 @@ class ToolCard(Container):
         self.part_id = part.id
         self._part = part
         self._show_output = True
+        self._expanded = False
+        # 执行耗时：只认亲眼看到的那一段。卡片是完成态建出来的（打开旧会话）时
+        # `part.timestamp` 是几天前，减出来没有意义，宁可不显示。
+        self._started_at: float | None = None
+        self._elapsed: float | None = None
+        self._timer: Timer | None = None
         self._header = Static(self._header_text(), classes="tool-header", markup=False)
-        self._output = Static(part.tool_output, classes="tool-output", markup=False)
+        self._output = Static("", classes="tool-output", markup=False)
+        self._more = Static("", classes="tool-more", markup=False)
+        self._tail = Static("", classes="tool-tail", markup=False)
+        self._refresh()
 
     def compose(self) -> ComposeResult:
         yield self._header
         yield self._output
+        yield self._more
+        yield self._tail
 
     def _header_text(self) -> str:
         status = self._part.tool_status or ToolStatus.PENDING
-        icon = STATUS_ICON.get(status, "○")
         mark = "▾" if self._show_output else "▸"
         return (
-            f"{mark} {icon} {self._part.tool_name or 'tool'} · {STATUS_TEXT[status]}"
+            f"{mark} {tool_icon(self._part.tool_name)} {self._part.tool_name or 'tool'}"
+            f" · {STATUS_TEXT[status]}{self._elapsed_text()}"
             f"{self._permission_text()}{self._detail_text()}"
         )
+
+    def _elapsed_text(self) -> str:
+        """执行耗时。执行中跟着秒表走，结束后停在最终值。"""
+        if self._started_at is not None:
+            return f" {format_seconds(time.time() - self._started_at)}"
+        if self._elapsed is not None:
+            return f" {format_seconds(self._elapsed)}"
+        return ""
 
     def _permission_text(self) -> str:
         """判定那一层留下的说明。
@@ -217,46 +341,109 @@ class ToolCard(Container):
             value = value[:37] + "..."
         return f"  {first_key}={value}"
 
-    @staticmethod
-    def _output_text(part: Part) -> str:
-        """工具输出：超过上界的开头与末尾各留几行，中间折成一行提示。
+    def _split_output(self) -> tuple[str, str, int]:
+        """把输出拆成「开头、末尾、被省略的行数」。
 
         命令的结论（报错、退出码）写在输出的末尾，只留开头会把结论切掉，
         跑失败的 bash 就只剩命令本身，看不出为什么失败。
         """
-        lines = part.tool_output.splitlines()
+        lines = self._part.tool_output.splitlines()
         if len(lines) <= MAX_OUTPUT_LINES:
-            return part.tool_output
+            return self._part.tool_output, "", 0
         hidden = len(lines) - OUTPUT_HEAD_LINES - OUTPUT_TAIL_LINES
-        return "\n".join(
-            [
-                *lines[:OUTPUT_HEAD_LINES],
-                f"… 省略 {hidden} 行",
-                *lines[-OUTPUT_TAIL_LINES:],
-            ]
+        return (
+            "\n".join(lines[:OUTPUT_HEAD_LINES]),
+            "\n".join(lines[-OUTPUT_TAIL_LINES:]),
+            hidden,
         )
+
+    def _output_text(self) -> str:
+        head, _tail, hidden = self._split_output()
+        if hidden == 0:
+            return self._part.tool_output
+        return head
+
+    def _tail_text(self) -> str:
+        _head, tail, hidden = self._split_output()
+        if hidden == 0:
+            return ""
+        if self._expanded:
+            # 展开时中间那一段接在省略行后面，省略行本身留在原地：
+            # 挪到整段末尾的话，展开一条几百行的输出之后「收起」就滚出屏幕了。
+            lines = self._part.tool_output.splitlines()
+            return "\n".join(lines[OUTPUT_HEAD_LINES:])
+        return tail
+
+    def _more_text(self) -> str:
+        _head, _tail, hidden = self._split_output()
+        if hidden == 0:
+            return ""
+        if self._expanded:
+            return "▴ 收起"
+        return f"▾ 中间省略 {hidden} 行 · 点开看全文"
+
+    def _refresh(self) -> None:
+        """按当前状态把四块内容与可见性一起写好。"""
+        output = self._output_text()
+        tail = self._tail_text()
+        more = self._more_text()
+        self._header.update(self._header_text())
+        self._output.update(output)
+        self._tail.update(tail)
+        self._more.update(more)
+        # 还没输出的卡片（等待、执行中）不留一行空白：空 Static 的 auto 高度是 1 行，
+        # 每张卡多一行，几张卡叠起来就是一屏的空白。
+        self._output.set_class(not self._show_output or not output, "-hidden")
+        self._tail.set_class(not self._show_output or not tail, "-hidden")
+        self._more.set_class(not self._show_output or not more, "-hidden")
+
+    def _track_elapsed(self, status: ToolStatus) -> None:
+        """执行中起一个一秒一跳的秒表，离开执行中就把最终值定下来。"""
+        if status is ToolStatus.RUNNING:
+            if self._started_at is None:
+                self._started_at = self._part.timestamp or time.time()
+                self._elapsed = None
+                self._timer = self.set_interval(1.0, self._tick)
+        elif self._started_at is not None:
+            self._elapsed = max(0.0, time.time() - self._started_at)
+            self._started_at = None
+            if self._timer is not None:
+                self._timer.stop()
+                self._timer = None
+
+    def _tick(self) -> None:
+        """秒表每跳一次只改标题行。"""
+        self._header.update(self._header_text())
 
     def sync(self, part: Part) -> None:
         """刷新工具状态与输出。"""
         self._part = part
         status = part.tool_status or ToolStatus.PENDING
+        self._track_elapsed(status)
         self.set_class(status is ToolStatus.RUNNING, "-running")
         self.set_class(status is ToolStatus.AWAITING, "-awaiting")
         self.set_class(status is ToolStatus.COMPLETED, "-completed")
         self.set_class(status is ToolStatus.FAILED, "-failed")
-        self._header.update(self._header_text())
-        self._output.update(self._output_text(part))
-        self._output.set_class(not self._show_output, "-hidden")
+        self._refresh()
 
-    def on_click(self) -> None:
-        """点击卡片时收起或展开这条工具的输出。"""
-        self.set_output_visible(not self._show_output)
+    def on_click(self, event: events.Click) -> None:
+        """只有标题行与省略行响应点击，点正文不动。"""
+        if event.widget is self._header:
+            self.set_output_visible(not self._show_output)
+        elif event.widget is self._more:
+            self._expanded = not self._expanded
+            self._refresh()
 
     def set_output_visible(self, visible: bool) -> None:
-        """控制工具输出是否显示（对应 /details 开关与点击收起）。"""
+        """控制工具输出是否显示（对应 /details 开关与点标题行收起）。"""
         self._show_output = visible
-        self._output.set_class(not visible, "-hidden")
-        self._header.update(self._header_text())
+        self._refresh()
+
+    def on_unmount(self) -> None:
+        """卡片被裁掉时停掉秒表，别让定时器去打一个已经摘掉的组件。"""
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
 
 
 class SimplePartView(Static):
@@ -363,6 +550,37 @@ class MessageView(Container):
                 yield self.pane._build_and_register(part)
 
 
+class NewMessagesHint(Static):
+    """消息区底部的「有新内容」提示条。
+
+    用户往上翻历史时不跟随，新内容还在下面长。没有这条提示的话，界面上一点动静
+    都没有，长回合里用户不知道下面有没有东西；有了它，点一下就能回到底部。
+
+    停靠在消息区底部（`dock: bottom`），所以它跟着视口走，不随内容滚动。
+    """
+
+    DEFAULT_CSS = """
+    NewMessagesHint {
+        dock: bottom;
+        height: 1;
+        display: none;
+        background: #16212E;
+        color: #4A9EFF;
+        content-align: center middle;
+    }
+    NewMessagesHint.-visible { display: block; }
+    """
+
+    def __init__(self, id: str | None = None) -> None:
+        super().__init__("↓ 有新内容 · 点这里回到底部", id=id, markup=False)
+
+    def on_click(self) -> None:
+        """点一下回到底部，跟随随之恢复。"""
+        parent = self.parent
+        if isinstance(parent, MessagesPane):
+            parent.scroll_to_bottom()
+
+
 class MessagesPane(ScrollableContainer):
     """消息列表，支持增量更新与自动滚动到底部。
 
@@ -390,6 +608,12 @@ class MessagesPane(ScrollableContainer):
         self._loading = False
         self._was_at_bottom = False
         self._history_hint: Static | None = None
+        self._new_hint: NewMessagesHint | None = None
+
+    def compose(self) -> ComposeResult:
+        """底部那条「有新内容」提示。停靠的组件不参与内容滚动，也不进窗口索引。"""
+        self._new_hint = NewMessagesHint(id="new-messages")
+        yield self._new_hint
 
     def on_unmount(self) -> None:
         """自己离开界面时通知外层：从这一刻起界面不再接后端事件。
@@ -484,10 +708,10 @@ class MessagesPane(ScrollableContainer):
         """把还压在合并窗口里的流式文本立刻写出来。
 
         一轮生成结束时调用：最后一次更新多半还没到点，不写出来的话屏幕上就少一段，
-        要等到下一次有更新才补上。
+        要等到下一次有更新才补上。正文与思考块用的是同一个窗口，这里一并收尾。
         """
         for widget in self._part_views.values():
-            if isinstance(widget, TextPartView):
+            if isinstance(widget, CoalescedText):
                 widget.flush_text()
 
     def rebuild(self, messages: list[Message]) -> None:
@@ -510,7 +734,7 @@ class MessagesPane(ScrollableContainer):
         widgets.extend(self._build_views(self._mounted_start, self._mounted_end))
         if widgets:
             self.mount_all(widgets)
-        self._follow = True
+        self._set_follow(True)
         self.scroll_end(animate=False)
         self.call_after_refresh(self._fill_viewport)
 
@@ -534,9 +758,15 @@ class MessagesPane(ScrollableContainer):
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         """滚动之后维护跟随状态，并滑动消息窗口（接近边界补挂、离远裁剪）。
 
-        跟随状态按滚动量判，不再只认键盘动作：鼠标滚轮与拖动滚动条都会改滚动量，
+        跟随状态按滚动量判，不只认键盘动作：鼠标滚轮与拖动滚动条都会改滚动量，
         它们不走 `action_scroll_up` 这几个动作。原先只认动作的写法下，用滚轮往上翻
         之后 `_follow` 还开着，下一条消息一到就把画面拽回底部，懒加载也不会被滚轮触发。
+
+        例外是「减一行，但落点仍在底部」。滚动量有两个来源：用户输入与窗口维护，
+        而维护自己也要改滚动量——裁掉上端要把位置减回来，布局还会把超出的位置夹回
+        一行。按方向一律判成「用户往上翻」的话，滚到最底之后裁一次上端、位置被夹回
+        一行，跟随就永远关着了：用户没动过键盘，新消息却不再跟到底。落点仍在底部时
+        不动跟随，要关由用户动作去关（`action_scroll_up` 等自己会写 `_follow`）。
 
         父类那条负责滚动条位置与重绘，少了它滚动条不跟着动，所以先调它。
         """
@@ -544,7 +774,9 @@ class MessagesPane(ScrollableContainer):
         if self._loading:
             return
         if new_value < old_value:
-            self._follow = False
+            # 底部留一行容差：夹回之后还在底部，就不算用户往上翻。
+            if new_value < self.max_scroll_y - 1:
+                self._set_follow(False)
         elif new_value > old_value:
             # 竖向虚拟高度要等这次刷新之后才算得出来，紧接着读 max_scroll_y 读不准
             self.call_after_refresh(self._resume_follow_at_bottom)
@@ -554,6 +786,25 @@ class MessagesPane(ScrollableContainer):
             self._maintain_window_up()
         elif new_value > old_value:
             self._maintain_window_down()
+
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        """滚轮往上：停止跟随。
+
+        上面那条按位置判的分支在底部留了容差，从底部滚一格（24 → 23）落点仍在底部，
+        不会关跟随。滚轮是明确的用户动作，这里补上，不然贴着底滚一格就再也停不下来。
+        """
+        self._set_follow(False)
+        super()._on_mouse_scroll_up(event)
+
+    def _on_scroll_to(self, message: ScrollTo) -> None:
+        """拖动滚动条：按目标位置决定跟不跟。
+
+        滚动条只发一条 `ScrollTo`，不经过上面那些动作，同样得显式写 `_follow`。
+        目标正好到底才算跟：拖到差一行松手也当作用户要停在那一行。
+        """
+        if message.y is not None:
+            self._set_follow(message.y >= self.max_scroll_y)
+        super()._on_scroll_to(message)
 
     def _history_hint_text(self) -> str:
         """顶端那条提示的文字，写明还剩多少条没建出来。"""
@@ -780,7 +1031,7 @@ class MessagesPane(ScrollableContainer):
 
     def scroll_to_bottom(self) -> None:
         """滚动到底部并恢复跟随。"""
-        self._follow = True
+        self._set_follow(True)
         self.scroll_end(animate=False)
 
     def set_details(self, visible: bool) -> None:
@@ -847,9 +1098,35 @@ class MessagesPane(ScrollableContainer):
             self.add_part(message_id, part)
 
     def _auto_scroll(self) -> None:
-        """处于跟随状态时自动滚到底部。"""
+        """跟随中滚到底部；没跟随就把「有新内容」那条提示亮起来。
+
+        新内容进来时用户可能正翻在上面看历史。这里不能滚（会把人拽走），
+        但也不能一声不响：亮一条提示，让他知道下面长了东西、点一下就能回去。
+        """
         if self._follow:
             self.scroll_end(animate=False)
+        else:
+            self._show_new_hint()
+
+    def _set_follow(self, follow: bool) -> None:
+        """统一写跟随状态：打开跟随就把「有新内容」提示收起来。
+
+        提示只在离开底部时才有意义；所有恢复跟随的路径（end 键、滚轮、拖动、
+        点提示条自己）都走这里，不用各自记着去收。
+        """
+        self._follow = follow
+        if follow:
+            self._hide_new_hint()
+
+    def _show_new_hint(self) -> None:
+        """亮起底部提示。已经亮着时这次调用什么也不做。"""
+        if self._new_hint is not None and not self._new_hint.has_class("-visible"):
+            self._new_hint.add_class("-visible")
+
+    def _hide_new_hint(self) -> None:
+        """收起底部提示。"""
+        if self._new_hint is not None and self._new_hint.has_class("-visible"):
+            self._new_hint.remove_class("-visible")
 
     def _at_bottom(self) -> bool:
         """判断当前是否已经滚到底部。"""
@@ -857,7 +1134,7 @@ class MessagesPane(ScrollableContainer):
 
     def action_scroll_up(self) -> None:
         """向上滚动时停止自动跟随。"""
-        self._follow = False
+        self._set_follow(False)
         self.scroll_relative(y=-1, animate=False)
 
     def action_scroll_down(self) -> None:
@@ -867,7 +1144,7 @@ class MessagesPane(ScrollableContainer):
 
     def action_page_up(self) -> None:
         """向上翻页并停止跟随。"""
-        self._follow = False
+        self._set_follow(False)
         self.scroll_page_up(animate=False)
 
     def action_page_down(self) -> None:
@@ -883,11 +1160,11 @@ class MessagesPane(ScrollableContainer):
         跟着刷新之后再判一次，读到的才是新的位置。
         """
         if self._at_bottom():
-            self._follow = True
+            self._set_follow(True)
 
     def action_scroll_home(self) -> None:
         """回到顶部并停止跟随。"""
-        self._follow = False
+        self._set_follow(False)
         self.scroll_home(animate=False)
 
     def action_scroll_end(self) -> None:

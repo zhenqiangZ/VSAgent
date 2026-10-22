@@ -49,7 +49,7 @@ __main__.py  →  app.py  ──────────────────
 
 | 函数       | 作用                                                           |
 | -------- | ------------------------------------------------------------ |
-| `main()` | 唯一入口：`OpenCodeApp().run()`。没有参数解析——窗口尺寸、模型、凭据全走 `.env` 与环境变量 |
+| `main()` | 唯一入口：`OpenCodeApp().run()`。没有参数解析——窗口尺寸走 `.env`，模型与凭据走应用内 `/model` 填的 `connection.toml` |
 
 刻意保持这么薄：入口里写逻辑，就没法被断言用「建一个 App 敲两个键」的方式覆盖。
 
@@ -92,7 +92,7 @@ __main__.py  →  app.py  ──────────────────
 | ---------------------- | ------- | ------------------ |
 | `_on_turn_done()`      | 一轮生成结束  | 刷状态栏、写 trace、必要时压缩 |
 | `_on_session_picked()` | 会话选择器返回 | 切会话、重建消息区          |
-| `_on_model_picked()`   | 模型选择器返回 | 切模型、重置 provider 缓存 |
+| `_apply_model()`       | `/model <名字>` | 切模型、重置 provider 缓存 |
 | `_on_theme_picked()`   | 主题选择器返回 | 换主题并写回 `.env`      |
 
 #### 第四组：Textual 生命周期与工具方法
@@ -265,7 +265,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 | 类                                     | 作用                                                                   |
 | ------------------------------------- | -------------------------------------------------------------------- |
 | `ModelSpec`                           | 一个模型的静态信息：名字、上下文窗口、单价                                                |
-| `ProviderConfig`                      | 连接配置；`from_env()` 从 `.env` 读、`for_model()` 换模型、`cached_price()` 缓存单价 |
+| `ProviderConfig`                      | 连接配置；`from_values()` 由 `connection.toml` 拼装、`for_model()` 换模型、`cached_price()` 缓存单价 |
 | `ProviderEventType` / `ProviderEvent` | 流式事件的类型与载荷（文本增量、工具调用、用量…）                                            |
 | `ProviderError`                       | 供应商侧错误                                                               |
 | `ChatProvider`                        | 协议：`stream()` 是唯一必须实现的方法                                             |
@@ -347,7 +347,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 | `check(tool, arguments)`             | 查规则给出判定；**取最严的那条**（层级：DENY > ASK > ALLOW）                          |                      |
 | `remember(tool, arguments, verdict)` | 记住这次选择（「本次会话都允许」）                                                  |                      |
 | `clear_session()`                    | 清掉本会话记住的选择                                                         |                      |
-| 模块级                                  | `argument_value` / `load_permissions` / `default_permission_paths` / `project_config_directory` / **`load_disabled`** |                      |
+| 模块级                                  | `argument_value` / `load_permissions` / `default_permission_paths` / `project_config_directory` / **`load_disabled`** / `load_tool_switches` / `save_disabled` / `tools_config_path` |                      |
 | 常量                                   | `DEFAULT_ASK` / `PLAN_DENY` / **`TOOLS_FILE`**                     | 默认要问；Plan 模式下默认拒绝写操作 |
 
 > **值得注意**：多档判定要取**最严**。若按「第一条命中」来判，规则表的顺序就定义了  
@@ -368,6 +368,12 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 源码运行时读 `<启动目录>/.opencode_tui/tools.toml`（`project_config_directory()`，与 `env.env_file()` 同一套判断）。
 用户侧始终是 `~/.opencode_tui/tools.toml`，两份都读、任一处说关就关。
 这样 exe 挪到哪、从哪个目录启动，开关都读得到。
+
+**改开关不必手写文件**：`/tools` 面板（`screens/tools_panel.py`）列出全部工具逐条开关，
+写的就是项目侧那份 `tools.toml`（`save_disabled`，原子替换）。面板改完立刻重装注册表
+（`app.toggle_tool`），不必重启——工具在不在请求体的 `tools` 数组里，下一次发问就生效。
+只写 `false` 条目：写 `true` 会在用户侧那份也写了 `false` 时给出「本文件能打开它」的错觉。
+用户侧关掉的工具在面板上标「由用户配置关闭」，面板改不动它。
 
 
 ### 3.4 `hooks.py`（207 行 / 4 个类 / 9 个函数）
@@ -844,12 +850,53 @@ JSONL 事件日志。
 | `select_altloc(doc, choice)` | 选一个交替构象，其余清空格位              |
 | `calc_box(points, padding)`  | 算盒子中心与边长                    |
 | `format_box(center, size)`   | 渲染盒子文本                      |
+| `is_heavy(atom)`             | 判一个原子是否重原子（去氢与几何筛查共用）      |
 
 列位置全是模块级常量（`ATOM_CHAIN = 21`、`ATOM_X = slice(30, 38)`…）。  
 **按列切，不按空格 split**：PDB 是固定列格式，空格 split 在负坐标（坐标挤在一起）  
 时会错位。
 
-### 4.5 `chembl.py`（2290 行 / 7 个类 / 61 个函数）
+> **值得注意**：`is_heavy` 原本在 `export.py` 里，清洗与算口袋都要用之后搬到这一层。
+> 两份的话，「重原子」的定义会在某次改动里分叉，而分叉后的症状是口袋数与配体数对不上——
+> 看起来像数据问题，实际是两处口径不一致。
+
+### 4.5 `preprocess.py`（422 行 / 4 个类 / 8 个函数）
+
+**结构清洗与杂原子筛查。零第三方依赖**（不登记工具，被 `export.py` 与 `pockets.py` 用）。
+
+它是「展示」与「算口袋」共用的**同一道闸**：两者都要先拿到一份干净、只剩聚合物加真配体的坐标，
+否则会把溶剂、缓冲液、单原子离子当成配体，最后掺进一堆假口袋。
+
+| 类                   | 作用                                                        |
+| ------------------- | --------------------------------------------------------- |
+| `LigandScreen`      | 筛查结果：`kept` / `excluded`（原因 → 计数）/ `describe()`        |
+| `PreprocessReport`  | 清洗账本：链、丢掉的链、水、杂原子组、交替构象、氢、模型；`as_dict()` 进 `meta` |
+| `PreprocessResult`  | 清洗后的文本 + 报告                                              |
+| `_ProteinIndex`     | 蛋白原子的网格索引，`near(atom, cutoff)` 只查相邻 27 格              |
+
+| 函数                                                | 作用                                                    |
+| ------------------------------------------------- | ----------------------------------------------------- |
+| `polymer_chains(doc)`                             | 只认 `ATOM` 记录的链（`HETATM` 上的链号不算聚合物链）                |
+| `screen_ligands(doc, groups, chains=())`          | 三条几何判据：重原子太少 / 与蛋白共价连接 / 蛋白接触不足，命中即排除           |
+| `clean_structure(text, chains=(), modified_names=(), keep_ligands=True)` | 一条流水线：选链 → 选交替构象 → 名字筛 → 几何筛 → 删杂原子 → 删水 → 去氢 |
+
+常量 `MIN_LIGAND_HEAVY_ATOMS=4` / `COVALENT_CUTOFF=1.9` / `CONTACT_CUTOFF=4.5` /
+`MIN_CONTACT_RESIDUES=3`，四个数一起表达同一个取向：**宁可漏，不要错杀**。
+
+> **值得注意（四处）**：
+>
+> 1. **名单永远收不全，所以名单之后必须还有一道几何判据。** `export.BUFFER_LIKE` 列了上百个
+>    常见溶剂/缓冲液/离子，但 PDB 里能出现的杂分子没有上限（不同实验室的不同沉淀剂）。
+>    几何判据只问三件与化学无关的事，因此对没见过的分子同样成立。
+> 2. **三条判据是「或」不是「且」，且每条都要能报出原因。** 报给用户的不是一个数字，
+>    而是「重原子太少 6 个、蛋白接触不足 3 个」——不然用户只会看到配体凭空消失。
+> 3. **网格索引不是优化，是可用性前提。** 十万原子的结构上全表扫蛋白原子要几分钟；
+>    按 `CONTACT_CUTOFF` 分格后只看相邻 27 格。结果与全表扫完全一致（判据里有对照用例）。
+> 4. **交替构象按残基选，并把 altLoc 列擦干净。** 按文件选会在「A 链选 A、B 链只有 B」时
+>    把整条链删空；留着 `altLoc` 字母则会被 Meeko 直接拒收。同一残基的多个构象必须整体二选一。
+>    修饰残基（`MODRES`）虽然写着 `HETATM`，却是聚合物的一部分，必须按名字保留。
+
+### 4.6 `chembl.py`（2290 行 / 7 个类 / 61 个函数）
 
 已知活性与类似物。3 个工具。**全仓最大的文件。**
 
@@ -892,7 +939,7 @@ JSONL 事件日志。
 > 4. **`sanity_check_smiles` 在发请求之前**。相似性检索那个端点对写错的结构回 HTTP 500，  
 >    所以本地先做基本合法性检查，能把一部分错误挡在出网之前。
 
-### 4.6 `chemistry.py`（153 行 / 5 个函数）
+### 4.7 `chemistry.py`（153 行 / 5 个函数）
 
 可选化学依赖（RDKit / Meeko / gemmi）的守门人。不登记工具。
 
@@ -924,7 +971,7 @@ JSONL 事件日志。
 但 meeko 0.8.0 的元数据里 `requires_dist` 是空的——它不声明依赖。gemmi 那一项  
 不是理论上的：`meeko/__init__.py` 一路 `import gemmi`，是导入 meeko 的硬前提。
 
-### 4.7 `receptor.py`（1351 行 / 6 个类 / 37 个函数）
+### 4.8 `receptor.py`（1351 行 / 6 个类 / 37 个函数）
 
 准备受体。1 个工具（`PrepareReceptorTool`），但它是全仓最长的单个工具。
 
@@ -962,7 +1009,7 @@ JSONL 事件日志。
 > 4. **复用只发生在真要写盘的那一次**：预演仍然把 Meeko 跑一遍。  
 >    反过来的话，「预演说会产出多少原子」就会变成一句没法验证的话。
 
-### 4.8 `listing.py`（406 行 / 4 个类 / 9 个函数）
+### 4.9 `listing.py`（406 行 / 4 个类 / 9 个函数）
 
 登记表的浏览与切换。3 个工具。**与领域无关**——手里拿的是受体还是配体集，  
 它们并不需要知道。
@@ -992,13 +1039,13 @@ JSONL 事件日志。
 >    有条数上限，被截断时恰好可能把出问题的那几条截掉，而「哪些不能用」  
 >    是这份清单里最不能漏的信息。
 
-### 4.9 `all_tools.py`（27 行 / 1 个函数）
+### 4.10 `all_tools.py`（27 行 / 1 个函数）
 
 把上面各模块的工具合成一份，供应用一次装完。
 
 | 函数               | 作用                                                                 |
 | ---------------- | ------------------------------------------------------------------ |
-| `domain_tools()` | 按固定顺序拼：**先 `listing`，再 `uniprot`、`structure`、`chembl`、`receptor`** |
+| `domain_tools()` | 按固定顺序拼：`listing` → `uniprot` → `structure` → `chembl` → `rsearch` → `literature` → `receptor` → `ligand` → `docking` → `export` |
 
 > **值得注意**：顺序**有意如此**——先浏览、再检索、最后改动。浏览排最前，  
 > 因为模型的第一件事应当是看清手上有哪些条目，而不是先动手。  
@@ -1012,7 +1059,7 @@ JSONL 事件日志。
 
 ## 五、界面层
 
-### 5.1 `screens/`（9 个文件 / 12 个类）
+### 5.1 `screens/`（10 个文件 / 14 个类）
 
 一个屏幕 = 一种界面状态。
 
@@ -1062,8 +1109,9 @@ JSONL 事件日志。
 | ------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------- |
 | `permission.py`     | `PermissionAnswer` / `PermissionDialog`                  | 权限询问对话框；`PermissionAnswer` 是答案枚举，`PermissionDialog` 把答案 `dismiss()` 回去 |
 | `session_picker.py` | `ConfirmDialog` / `RenameDialog` / `SessionPickerScreen` | 会话列表 + 两个小对话框（确认删除 / 改名）                                               |
-| `model_selector.py` | `ModelInfo` / `ModelSelectorScreen`                      | 模型列表（上下文窗口与单价）                                                         |
+| `connection_form.py` | `ConnectionFormScreen`                                  | `/model` 的接口表单（地址、密钥、模型名、窗口）                                           |
 | `theme_selector.py` | `ThemeSelectorScreen`                                    | 主题列表                                                                   |
+| `tools_panel.py`    | `ToolEntry` / `ToolsPanelScreen`                         | `/tools` 工具开关面板：空格/回车逐条开关，改完立刻生效                             |
 | `help.py`           | `HelpScreen`                                             | 帮助：命令表 + 快捷键表（快捷键来自 `keybind_manager`）                                 |
 | `diff_overlay.py`   | `DiffOverlayScreen`                                      | 补丁的 diff 展示                                                            |
 | `message.py`        | `MessageScreen`                                          | 只读文本弹窗。`esc` / `enter` / `q` 关掉                                        |
@@ -1071,14 +1119,15 @@ JSONL 事件日志。
 > **值得注意**：`MessageScreen` 的 `ident` 参数让同一个类服务多个弹窗  
 > （id 前缀不同），帮助界面、diff 弹窗与它同一类：只显示、不收输入。
 
-### 5.2 `widgets/`（8 个文件 / 18 个类）
+### 5.2 `widgets/`（8 个文件 / 20 个类）
 
-#### `messages_pane.py`（893 行 / 8 个类 / 70 个方法）
+#### `messages_pane.py`（1172 行 / 10 个类）
 
 **界面层最大的文件。** 消息列表，支持增量更新、虚拟滚动与自动滚到底。
 
 | 类                   | 作用                          |
 | ------------------- | --------------------------- |
+| `CoalescedText`     | 流式文本的合并窗口（正文与思考块共用）        |
 | `TextPartView`      | 一段正文                        |
 | `FoldBlock`         | 可折叠区块（长内容折叠）                |
 | `ReasoningPartView` | 一段思考                        |
@@ -1086,6 +1135,7 @@ JSONL 事件日志。
 | `SimplePartView`    | 其余 Part 的通用渲染               |
 | `PatchPartView`     | 补丁（点开进 diff 弹窗）             |
 | `MessageView`       | **一条消息** = 若干 Part 视图       |
+| `NewMessagesHint`   | 底部「有新内容」提示条（`dock: bottom`） |
 | `MessagesPane`      | 列表本体（`ScrollableContainer`） |
 
 `MessagesPane` 的两个机制：
@@ -1094,7 +1144,7 @@ JSONL 事件日志。
 | -------- | ----------------------------------------------------------- | ------------------------------ |
 | **虚拟滚动** | `HISTORY_PAGE=30` / `MAX_MOUNTED=90` / `LOAD_MORE_MARGIN=3` | 只挂载最近的 N 条；滚到顶再挂上一页            |
 | **增量更新** | `_part_views` / `_message_views`                            | Part 变化只改对应的那个视图，不重建整条消息       |
-| **流式合并** | `TEXT_REFRESH_SECONDS=0.05`                                 | 流式文本按 50ms 合批刷新，不是每个 token 刷一次 |
+| **流式合并** | `TEXT_REFRESH_SECONDS=0.05` / `CoalescedText`                | 正文与思考块都按 50ms 合批重写，不是每个 token 刷一次 |
 | **焦点重绘** | `_on_focus` / `_on_blur` / `watch_has_focus`                | 焦点变化不重画整块                      |
 
 | 方法组 | 方法                                         |

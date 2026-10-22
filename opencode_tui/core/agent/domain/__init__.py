@@ -35,6 +35,7 @@
 | `http.py` | 全仓唯一的网络出口，测试整体替换的就是它 |
 | `uniprot.py` | 靶点检索与取详情（2 个工具） |
 | `pdbtext.py` | PDB 纯文本编辑层（零第三方依赖，不登记工具） |
+| `preprocess.py` | 结构清洗与杂原子组几何筛查（不登记工具） |
 | `structure.py` | 取结构、导结构（2 个工具） |
 | `chembl.py` | 已知活性与类似物（3 个工具） |
 | `chemistry.py` | 可选化学依赖的守门人（不登记工具） |
@@ -72,6 +73,7 @@ __all__ = [
     "pdbtext",
     "pockets",
     "prankweb",
+    "preprocess",
     "products",
     "receptor",
     "rsearch",

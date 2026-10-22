@@ -6,8 +6,15 @@
 (function () {
   const { ensureViewer, fetchJson } = window.vsWeb;
 
-  const RECEPTOR_COLOR = "#b8bec7";
-  const CHAIN_B_COLOR = "#cdd2d8";
+  // 每条链一个颜色。顺序固定（按链号排序后的下标取色），所以同一条链在
+  // 图例、卡通、切模式之间颜色不变——颜色在这里是**身份**，不是装饰。
+  // 调色板挑的是明度接近、色相拉开的 12 色，浅色背景上都看得清。
+  const CHAIN_COLORS = [
+    "#3b6fe0", "#e05a4f", "#2f9e6b", "#d68a2e", "#8b5cf6",
+    "#0e9aa7", "#d9468f", "#6b8e23", "#e2663a", "#4f6bd8",
+    "#2a9d8f", "#b05a1f",
+  ];
+  const BASE_COLOR = "#9aa4b2";
   const POCKET_COLOR = "#1a6dd4";
   const POCKET_SURFACE_COLOR = "#4a9eff";
   const CONTACT_COLOR = "#e08a3c";
@@ -74,25 +81,38 @@
         <span id="target-meta"></span>
         <span id="pocket-origin" class="is-hidden"></span>
       </div>
-      <select id="run-picker"></select>
-      <a id="run-session" class="link-button is-hidden">回到会话</a>
+      <div id="run-block">
+        <select id="run-picker"></select>
+        <a id="run-session" class="link-button is-hidden">回到会话</a>
+      </div>
       <nav id="mode-tabs">
+        <button class="tab" data-mode="structure">结构总览</button>
         <button class="tab is-active" data-mode="pockets">口袋浏览</button>
         <button class="tab" data-mode="molecules">候选分子</button>
       </nav>
       <div id="view-actions">
-        <label class="toggle"><input type="checkbox" id="chain-toggle" checked> 显示 B 链</label>
-        <button id="reset-view">复位视角</button>
+        <button id="reset-view" title="把镜头拉回整份结构">复位视角</button>
       </div>
     </header>
 
     <main id="stage">
-      <div id="viewer"></div>
+      <div id="viewer-wrap">
+        <div id="viewer"></div>
+        <div id="chain-legend" class="is-hidden"></div>
+      </div>
       <aside id="side">
+        <section id="panel-structure" class="panel is-hidden">
+          <h2>结构总览</h2>
+          <p class="hint">每条链一种颜色。点链名可以隐藏或显示它，颜色在两种视图里都不变。</p>
+          <ul id="chain-list"></ul>
+          <p id="preprocess-note" class="note is-hidden"></p>
+        </section>
+
         <section id="panel-pockets" class="panel">
           <h2>口袋清单</h2>
           <p class="hint">点一行，在三维视图里只突出这一个口袋，其余部分变暗。</p>
           <ul id="pocket-list"></ul>
+          <p id="pocket-excluded" class="note is-hidden"></p>
         </section>
 
         <section id="panel-molecules" class="panel is-hidden">
@@ -139,11 +159,44 @@
   let activePocketId = null;
   let visibleMolecules = new Set();
   let detailMoleculeId = null;
-  let chainBVisible = true;
+  let allChains = [];
+  let visibleChains = new Set();
   let ligandIndexes = [];
 
   function colorOfMolecule(index) {
     return MOLECULE_COLORS[index % MOLECULE_COLORS.length];
+  }
+
+  // 链的颜色只由它在 `allChains` 里的下标决定。切模式、点口袋、开关链
+  // 都不重排 `allChains`，所以颜色不会跳。
+  //
+  // 超出调色板时不能取模：两条链撞成同一个颜色，「颜色即身份」就断了
+  // （未预处理的旧运行里，HETATM 链会让链数轻松超过 12 条）。溢出部分
+  // 按黄金角在色相环上继续走、明度交替，相邻下标也拉得开。
+  function chainColor(chain) {
+    const index = allChains.indexOf(chain);
+    const slot = index < 0 ? 0 : index;
+    if (slot < CHAIN_COLORS.length) return CHAIN_COLORS[slot];
+    const overflow = slot - CHAIN_COLORS.length;
+    const hue = (198 + overflow * 137.508) % 360;
+    const light = 42 + (overflow % 2) * 14;
+    return hslToHex(hue, 62, light);
+  }
+
+  function hslToHex(hue, saturation, light) {
+    const s = saturation / 100;
+    const l = light / 100;
+    const k = (n) => (n + hue / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const channel = (n) => {
+      const value = l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+      return Math.round(255 * value).toString(16).padStart(2, "0");
+    };
+    return `#${channel(0)}${channel(8)}${channel(4)}`;
+  }
+
+  function shownChains() {
+    return allChains.filter((chain) => visibleChains.has(chain));
   }
 
   // 旧运行目录没有 `provenance.poses`（或者是字符串），沿用「高分在前」；
@@ -218,7 +271,8 @@
     const residues = pocket && Array.isArray(pocket.residues) ? pocket.residues : [];
     return {
       mode,
-      chainBVisible,
+      visibleChains: [...visibleChains],
+      chainColors: Object.fromEntries(allChains.map((chain) => [chain, chainColor(chain)])),
       runId: currentRunId,
       pocketId: pocket ? pocket.id : null,
       pocketResidues: residues.map((item) => `${item.resname}${item.resseq}`),
@@ -239,7 +293,115 @@
     return `${formatter(list[0])} … ${formatter(list[list.length - 1])}（共 ${list.length} 个）`;
   }
 
+  function isStructureView() {
+    return !!(meta && meta.provenance && meta.provenance.view === "structure");
+  }
+
+  // 预处理报告是 `write_run` 写进 `provenance.preprocess` 的。旧运行目录没有
+  // 这一项——那时**整行不出现**，而不是显示一句「无预处理」，否则用户会把
+  // 「老数据」读成「这份结构确实没洗过」。
+  function preprocessText() {
+    const pre = meta && meta.provenance ? meta.provenance.preprocess : null;
+    if (!pre || typeof pre !== "object") return "";
+    const parts = [];
+    if (Array.isArray(pre.chains) && pre.chains.length) {
+      parts.push(`保留链 ${pre.chains.join("")}`);
+    }
+    if (pre.waters) parts.push(`去水 ${pre.waters} 个`);
+    const removed = pre.removed && typeof pre.removed === "object" ? pre.removed : {};
+    const reasons = Object.keys(removed);
+    if (reasons.length) {
+      const detail = reasons.map((key) => `${key} ${removed[key]} 个`).join("、");
+      parts.push(`去掉杂原子组（${detail}）`);
+    }
+    if (Array.isArray(pre.kept_ligands) && pre.kept_ligands.length) {
+      const shown = pre.kept_ligands.slice(0, 8);
+      const suffix = pre.kept_ligands.length > shown.length
+        ? ` 等 ${pre.kept_ligands.length} 个`
+        : "";
+      parts.push(`保留配体 ${shown.join("+")}${suffix}`);
+    }
+    if (pre.hydrogens) parts.push(`去氢 ${pre.hydrogens} 个`);
+    if (pre.models) parts.push(`只留第一套模型`);
+    return parts.join("；");
+  }
+
+  // 视口左下角的链图例：点一下就是显示/隐藏这条链。
+  function renderChainLegend() {
+    const box = root.querySelector("#chain-legend");
+    box.innerHTML = "";
+    box.classList.toggle("is-hidden", !allChains.length);
+    for (const chain of allChains) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chain-chip" + (visibleChains.has(chain) ? "" : " is-off");
+      chip.dataset.chain = chain;
+      chip.title = visibleChains.has(chain) ? "点击隐藏这条链" : "点击显示这条链";
+      const dot = document.createElement("span");
+      dot.className = "color-dot";
+      dot.style.background = chainColor(chain);
+      const label = document.createElement("span");
+      label.textContent = `链 ${chain}`;
+      chip.append(dot, label);
+      chip.addEventListener("click", () => {
+        if (visibleChains.has(chain)) visibleChains.delete(chain);
+        else visibleChains.add(chain);
+        applyChainVisibility();
+      });
+      box.appendChild(chip);
+    }
+  }
+
+  function renderChainList() {
+    const list = root.querySelector("#chain-list");
+    list.innerHTML = "";
+    if (!allChains.length) {
+      const empty = document.createElement("li");
+      empty.className = "pocket-empty";
+      empty.textContent = "这份结构里没有可识别的聚合物链。";
+      list.appendChild(empty);
+    }
+    for (const chain of allChains) {
+      const item = document.createElement("li");
+      item.dataset.chain = chain;
+      if (!visibleChains.has(chain)) item.classList.add("is-off");
+
+      const label = document.createElement("label");
+      label.className = "chain-row";
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.checked = visibleChains.has(chain);
+      check.addEventListener("change", () => {
+        if (check.checked) visibleChains.add(chain);
+        else visibleChains.delete(chain);
+        applyChainVisibility();
+      });
+
+      const dot = document.createElement("span");
+      dot.className = "color-dot";
+      dot.style.background = chainColor(chain);
+
+      const name = document.createElement("span");
+      name.className = "chain-name";
+      name.textContent = `链 ${chain}`;
+
+      const count = document.createElement("span");
+      count.className = "chain-count";
+      count.textContent = `${window.vsViewer.countChainResidues(chain, 0)} 个残基`;
+
+      label.append(check, dot, name, count);
+      item.appendChild(label);
+      list.appendChild(item);
+    }
+
+    const note = root.querySelector("#preprocess-note");
+    const text = preprocessText();
+    note.textContent = text ? `预处理：${text}` : "";
+    note.classList.toggle("is-hidden", !text);
+  }
+
   function renderPocketList() {
+    renderExcluded();
     const list = root.querySelector("#pocket-list");
     list.innerHTML = "";
     const pockets = pocketList();
@@ -250,7 +412,9 @@
       // 这一行的标识与真口袋分开：判据按 `data-pocket-id` 数真口袋，
       // 空态行没有这个属性，不会被算成一个口袋。
       empty.className = "pocket-empty";
-      empty.textContent = "这一份没有口袋。两条来源都没给出结果，具体原因见上方那行说明。";
+      empty.textContent = isStructureView()
+        ? "这是一份只展示结构的运行，没有计算口袋。切到「结构总览」看按链配色的结构。"
+        : "这一份没有口袋。两条来源都没给出结果，具体原因见上方那行说明。";
       list.appendChild(empty);
       return;
     }
@@ -297,6 +461,20 @@
       item.addEventListener("click", () => selectPocket(pocket.id));
       list.appendChild(item);
     }
+  }
+
+  // 口袋来源筛掉了哪些杂原子组。用户看不到的就是没发生的——不显示这一段，
+  // 他就分不清「这个结构只有两个配体」与「另外五个被当成溶剂筛掉了」。
+  function renderExcluded() {
+    const note = root.querySelector("#pocket-excluded");
+    const pockets = meta && meta.provenance ? meta.provenance.pockets : null;
+    const excluded = pockets && typeof pockets === "object" ? pockets.excluded : null;
+    const reasons = excluded && typeof excluded === "object" ? Object.keys(excluded) : [];
+    const text = reasons.length
+      ? `已筛掉的杂原子组：${reasons.map((key) => `${key} ${excluded[key]} 个`).join("、")}`
+      : "";
+    note.textContent = text;
+    note.classList.toggle("is-hidden", !text);
   }
 
   function renderMoleculeTable() {
@@ -407,16 +585,18 @@
     drawMolecules();
   }
 
-  // 受体底色的重建。整结构给灰底，B 链按开关给浅灰或抹掉。
-  async function paintReceptor(highlight, showB) {
-    const allChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
-    const chains = showB
-      ? allChains
-      : allChains.filter((chain) => chain !== "B");
-
-    await window.vsViewer.showChains(chains, RECEPTOR_COLOR, "cartoon", {}, 0);
-    if (showB) {
-      await window.vsViewer.colorChains({ B: CHAIN_B_COLOR }, "cartoon", {}, 0);
+  // 受体底色的重建：先清掉旧表示，再按当前可见的链逐条上色。
+  //
+  // 不能只给整结构一个底色再覆盖某条链——那样没被覆盖的链会共用同一个灰，
+  // 用户分不清哪条是哪条。这里改成「每条可见链一个表示、一个颜色」，
+  // 底色只在一条链都没有时兜底（正常不会发生）。
+  async function paintReceptor(highlight) {
+    const chains = shownChains();
+    await window.vsViewer.showChains([], BASE_COLOR, "cartoon", {}, 0);
+    if (chains.length) {
+      const assignment = {};
+      for (const chain of chains) assignment[chain] = chainColor(chain);
+      await window.vsViewer.colorChains(assignment, "cartoon", {}, 0);
     }
 
     if (!highlight) return;
@@ -432,33 +612,36 @@
     }
   }
 
+  async function focusShownChains() {
+    const chains = shownChains();
+    if (!chains.length) {
+      // `buildChainQuery` 收到空列表会抛；全部隐藏时把镜头拉回整份结构。
+      await window.vsViewer.focusAll(0);
+      return;
+    }
+    await window.vsViewer.focusChainsOnly(chains, 0);
+  }
+
   async function selectPocket(pocketId) {
     activePocketId = pocketId;
-    const allChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
     if (pocketId === null) {
-      await paintReceptor(null, chainBVisible);
-      await window.vsViewer.focusChainsOnly(
-        allChains.filter((chain) => chainBVisible || chain !== "B"), 0
-      );
+      await paintReceptor(null);
+      await focusShownChains();
       renderPocketList();
       return;
     }
 
     const pocket = pocketList().find((item) => item.id === pocketId);
     if (!pocket) {
-      await paintReceptor(null, chainBVisible);
+      await paintReceptor(null);
+      await focusShownChains();
       renderPocketList();
       return;
     }
     const residues = Array.isArray(pocket.residues) ? pocket.residues : [];
-    await paintReceptor(
-      { residues, color: POCKET_COLOR, surface: true },
-      chainBVisible
-    );
-    // 视野对准整条参考链，口袋在蛋白里的位置才看得出来。
-    await window.vsViewer.focusChainsOnly(
-      allChains.filter((chain) => chainBVisible || chain !== "B"), 0
-    );
+    await paintReceptor({ residues, color: POCKET_COLOR, surface: true });
+    // 视野对准整份结构，口袋在蛋白里的位置才看得出来。
+    await focusShownChains();
     renderPocketList();
   }
 
@@ -466,13 +649,12 @@
     const detail = detailMoleculeId;
     const visible = detail ? new Set([detail]) : visibleMolecules;
     const contacts = Array.isArray(meta.contacts) ? meta.contacts : [];
-    const allChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
 
     let highlight = null;
     if (detail && contacts.length) {
       highlight = { residues: contacts, color: CONTACT_COLOR, surface: false };
     }
-    await paintReceptor(highlight, chainBVisible);
+    await paintReceptor(highlight);
 
     // 配体位姿：逐个给表示或抹掉。每个位姿都是一个独立结构。
     const ranked = rankedMolecules();
@@ -503,10 +685,16 @@
     if (refs.length) {
       await window.vsViewer.focusStructures(refs, framingMargin(refs.length));
     } else {
-      await window.vsViewer.focusChainsOnly(
-        allChains.filter((chain) => chainBVisible || chain !== "B"), 0
-      );
+      await focusShownChains();
     }
+  }
+
+  // 结构总览：不挂口袋高亮，只按链上色。
+  async function drawStructure() {
+    activePocketId = null;
+    await paintReceptor(null);
+    await focusShownChains();
+    renderChainList();
   }
 
   async function setMode(next) {
@@ -514,6 +702,17 @@
     for (const tab of root.querySelectorAll(".tab")) {
       tab.classList.toggle("is-active", tab.dataset.mode === next);
     }
+
+    if (next === "structure") {
+      root.querySelector("#panel-pockets").classList.add("is-hidden");
+      root.querySelector("#panel-molecules").classList.add("is-hidden");
+      root.querySelector("#panel-detail").classList.add("is-hidden");
+      root.querySelector("#panel-structure").classList.remove("is-hidden");
+      await drawStructure();
+      return;
+    }
+
+    root.querySelector("#panel-structure").classList.add("is-hidden");
 
     if (next === "pockets") {
       root.querySelector("#panel-molecules").classList.add("is-hidden");
@@ -523,14 +722,11 @@
       // 不是错误。取 `meta.pockets[0].id` 会在这一态抛异常，而异常在 async 里
       // 被吞掉、`window.__ready` 永远不置真——页面看着加载完了其实没就绪。
       const pockets = pocketList();
-      const allChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
       if (pockets.length) {
         await selectPocket(activePocketId || pockets[0].id);
       } else {
-        await paintReceptor(null, chainBVisible);
-        await window.vsViewer.focusChainsOnly(
-          allChains.filter((chain) => chainBVisible || chain !== "B"), 0
-        );
+        await paintReceptor(null);
+        await focusShownChains();
         renderPocketList();
       }
       return;
@@ -550,12 +746,16 @@
     await drawMolecules();
   }
 
-  async function applyChainVisibility(showB) {
-    chainBVisible = showB;
+  // 链的显示/隐藏对三种模式都生效：重画受体，再按当前模式决定镜头。
+  async function applyChainVisibility() {
+    renderChainLegend();
+    renderChainList();
     if (mode === "pockets") {
       await selectPocket(activePocketId);
-    } else {
+    } else if (mode === "molecules") {
       await drawMolecules();
+    } else {
+      await drawStructure();
     }
   }
 
@@ -593,10 +793,6 @@
 
     root.querySelector("#reset-view").addEventListener("click", async () => {
       await window.vsViewer.focusAll(0);
-    });
-
-    root.querySelector("#chain-toggle").addEventListener("change", (event) => {
-      applyChainVisibility(event.target.checked);
     });
 
     root.querySelector("#select-all").addEventListener("click", () => {
@@ -638,16 +834,28 @@
     activePocketId = null;
     visibleMolecules = new Set();
     detailMoleculeId = null;
-    chainBVisible = root.querySelector("#chain-toggle").checked;
+    allChains = [];
+    visibleChains = new Set();
     ligandIndexes = [];
 
     renderRunPicker();
     renderSessionLink(runs.find((item) => item.id === runId));
 
-    await window.vsViewer.initViewer(viewerEl, { background: "#f2f4f7" });
+    await window.vsViewer.initViewer(viewerEl, { background: "#eef2f7" });
     window.__snapshot = renderSnapshot;
 
     await window.vsViewer.loadStructure({ url: `${base}${meta.structure}`, format: "pdb" });
+
+    // 链清单以**结构里真实存在的链**为准，不信 `meta.target.chains`：
+    // 预处理会删链，而 meta 是删之前写的。旧运行目录里 meta 的链也可能不全。
+    allChains = window.vsViewer.listChains(0);
+    if (!allChains.length) {
+      const declared = Array.isArray(meta.target.chains) ? meta.target.chains : [];
+      allChains = [...declared];
+    }
+    visibleChains = new Set(allChains);
+    renderChainLegend();
+    renderChainList();
 
     const ranked = rankedMolecules();
     for (const molecule of ranked) {
@@ -669,28 +877,32 @@
 
     root.querySelector("#target-name").textContent =
       `${meta.target.name}（${meta.target.pdb_id}）`;
-    const targetChains = Array.isArray(meta.target.chains) ? meta.target.chains : [];
     const pockets = pocketList();
     const molecules = moleculeList();
     root.querySelector("#target-meta").textContent =
-      `链 ${targetChains.join("/") || "—"} · 共晶配体 ${meta.target.ligand || "—"} · ` +
+      `链 ${allChains.join("/") || "—"} · 共晶配体 ${meta.target.ligand || "—"} · ` +
       `${pockets.length} 个口袋 · ${molecules.length} 个候选分子`;
     // 口袋的来源说明。旧的演示目录这一项是字符串，新一轮是对象，两种都能读；
     // 都没有（`provenance` 里压根没这个键）时把那一行藏起来，不留空行。
     const originLine = root.querySelector("#pocket-origin");
-    const origin = provenanceText(meta.provenance && meta.provenance.pockets);
-    originLine.textContent = origin ? `口袋来源：${origin}` : "";
-    originLine.classList.toggle("is-hidden", !origin);
+    if (isStructureView()) {
+      originLine.textContent = "展示模式：结构总览（未计算口袋）";
+    } else {
+      const origin = provenanceText(meta.provenance && meta.provenance.pockets);
+      originLine.textContent = origin ? `口袋来源：${origin}` : "";
+    }
+    originLine.classList.toggle("is-hidden", !originLine.textContent);
 
     root.querySelector("#loading").classList.add("is-hidden");
 
-    await setMode("pockets");
+    // 结构模式写出的运行目录默认停在「结构总览」：它本来就没有口袋，
+    // 直接落在口袋页会先看到一句「这一份没有口袋」，像是出错了。
+    const view = meta.provenance && meta.provenance.view;
+    await setMode(view === "structure" ? "structure" : "pockets");
     // 浏览器在首次布局之前给的画布尺寸与最终尺寸不同。
     requestAnimationFrame(() => {
       window.vsViewer.handleResize();
-      window.vsViewer.focusChainsOnly(
-        targetChains.filter((chain) => chainBVisible || chain !== "B"), 0
-      );
+      focusShownChains();
     });
     window.__ready = true;
   }

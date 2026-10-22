@@ -19,7 +19,7 @@ COMMANDS: dict[str, dict[str, object]] = {
     "init": {"desc": "创建或更新 AGENTS.md", "aliases": []},
     "log": {"desc": "显示事件日志路径", "aliases": []},
     "memory": {"desc": "列出项目记忆", "aliases": []},
-    "models": {"desc": "列出可用模型", "aliases": []},
+    "model": {"desc": "配置模型接口", "aliases": []},
     "new": {"desc": "新会话", "aliases": ["clear"]},
     "redo": {"desc": "重做撤销的消息", "aliases": []},
     "remember": {"desc": "记住一条项目事实", "aliases": []},
@@ -29,6 +29,7 @@ COMMANDS: dict[str, dict[str, object]] = {
     "task": {"desc": "查看或更新任务状态", "aliases": []},
     "themes": {"desc": "列出主题", "aliases": []},
     "thinking": {"desc": "切换思考块可见性", "aliases": []},
+    "tools": {"desc": "管理工具开关", "aliases": []},
     "undo": {"desc": "撤销最后一条消息", "aliases": []},
     "unshare": {"desc": "取消分享", "aliases": []},
 }

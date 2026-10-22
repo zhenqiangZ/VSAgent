@@ -255,6 +255,15 @@ class ChatScreen(Screen):
 
     def _submit_prompt(self, text: str) -> None:
         """把一段普通文本作为用户消息发出，并启动流式回复。"""
+        if not self.app.is_configured:
+            # 把这句话放回输入框：配完接口回来按回车就能重发，不用重打一遍。
+            # 同时把表单弹出来，提示不是一闪而过的 toast，而是当场能填的地方。
+            self.editor.text = text
+            self.app.show_toast(
+                "还没有配置模型接口，先填接口地址、密钥与模型名", "warning"
+            )
+            self.app.execute_command("model")
+            return
         session = self.app.session_manager.current
         self.app._sync_ledger()
         clean_text, file_parts = resolve_file_refs(text, self.root)

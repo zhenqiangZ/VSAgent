@@ -269,19 +269,31 @@ async function main() {
     failures.push("返回之后没有回到候选分子列表");
   }
 
-  // 判据十一：B 链开关真的改变了渲染用的状态
+  // 判据十一：链图例真的改变了渲染用的状态
+  // 旧版这里点的是硬编码的「显示 B 链」开关；现在每条链都能单独开关，
+  // 判据改成点图例里链 B 的那一枚（没有 B 就点第一枚）。
+  const chainChip = (await page.locator('#chain-legend .chain-chip[data-chain="B"]').count())
+    ? '#chain-legend .chain-chip[data-chain="B"]'
+    : "#chain-legend .chain-chip";
   const beforeToggle = await page.evaluate(() => window.__snapshot());
-  await page.locator("#chain-toggle").click();
+  const chainToToggle = await page.locator(chainChip).first().getAttribute("data-chain");
+  await page.locator(chainChip).first().click();
   await page.waitForTimeout(400);
-  const hiddenB = await page.evaluate(() => window.__snapshot());
-  await page.locator("#chain-toggle").click();
+  const hiddenChain = await page.evaluate(() => window.__snapshot());
+  await page.locator(chainChip).first().click();
   await page.waitForTimeout(300);
-  const restoredB = await page.evaluate(() => window.__snapshot());
-  console.log(`B 链开关：初始 ${beforeToggle.chainBVisible}，关掉后 ${hiddenB.chainBVisible}，`
-    + `打开后 ${restoredB.chainBVisible}`);
-  if (beforeToggle.chainBVisible !== true) failures.push("初始状态里 B 链应当是显示的");
-  if (hiddenB.chainBVisible !== false) failures.push("关掉 B 链开关之后渲染状态没有跟着变");
-  if (restoredB.chainBVisible !== true) failures.push("再次打开 B 链开关之后状态没有恢复");
+  const restoredChain = await page.evaluate(() => window.__snapshot());
+  console.log(`链开关：初始 ${beforeToggle.visibleChains.join("/")}，关掉后 `
+    + `${hiddenChain.visibleChains.join("/")}，打开后 ${restoredChain.visibleChains.join("/")}`);
+  if (!beforeToggle.visibleChains.includes(chainToToggle)) {
+    failures.push("初始状态里这条链应当是显示的");
+  }
+  if (hiddenChain.visibleChains.includes(chainToToggle)) {
+    failures.push("关掉这条链之后渲染状态没有跟着变");
+  }
+  if (!restoredChain.visibleChains.includes(chainToToggle)) {
+    failures.push("再次打开这条链之后状态没有恢复");
+  }
 
   // 判据十二：口袋模式下高亮的选区覆盖当前口袋的全部残基，且真的生成了表面。
   // 只检查选区字符串非空没有用：resi 写成含逗号的列表时，3Dmol 只认到其中一段，

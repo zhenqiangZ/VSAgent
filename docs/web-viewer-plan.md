@@ -496,9 +496,13 @@ write_run(
     uniprot: str | None              # P0 用：搜该蛋白所有复合物；留空时从 Entry.meta 找
     pdb_id: str | None               # P1 用（仅当 P0 为空）；留空时从 Entry.meta 找
     name: str | None                 # 运行显示名
+    view: "pockets" | "structure"    # 展示什么；默认 pockets
 )
 ```
 
+- **`view` 让同一个工具负责两种展示。** `structure` 只写受体与结构，**完全不碰口袋来源**
+  （不联网、不转 P1），两种模式共用同一套 `preprocess.clean_structure`——预处理只写一份，
+  否则「展示的口袋」和「展示的结构」会来自两份不同的坐标。
 - **收 handle 不收路径**（`import_structure` 是唯一例外）。
 - **不再有 `pocket_ligand` 参数**：口袋由三层来源给出（见 2.3.3），
   不再「挑一个参考配体」。P0 由复合物配体聚类自己定，P1 由 `pocket1/pocket2` 排序定。

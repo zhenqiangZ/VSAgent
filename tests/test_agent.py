@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+from textual.widgets import Input  # noqa: E402
+
 from opencode_tui.app import OpenCodeApp  # noqa: E402
 from opencode_tui.core.agent.hooks import (  # noqa: E402
     POST_TOOL_USE,
@@ -44,7 +46,9 @@ from opencode_tui.core.agent.permission import (  # noqa: E402
     Verdict,
     load_disabled,
     load_permissions,
+    load_tool_switches,
     project_config_directory,
+    save_disabled,
 )
 from opencode_tui.core.agent.memory import (  # noqa: E402
     MEMORY_DIR_NAME,
@@ -70,6 +74,12 @@ from opencode_tui.core.agent.context import (  # noqa: E402
     ordered_degraded,
 )
 from opencode_tui.core.agent.task import TaskTool  # noqa: E402
+from opencode_tui.core.connection import (  # noqa: E402
+    Connection,
+    connection_path_for,
+    load_connection,
+    save_connection,
+)
 from opencode_tui.core.session_manager import SessionManager  # noqa: E402
 from opencode_tui.core.agent.prompt import (  # noqa: E402
     DEEP_MARK,
@@ -147,6 +157,7 @@ from opencode_tui.core.agent.ledger import (  # noqa: E402
 )
 from opencode_tui.core.agent.domain import uniprot as uniprot_module  # noqa: E402
 from opencode_tui.core.agent.domain import pdbtext  # noqa: E402
+from opencode_tui.core.agent.domain import preprocess as preprocess_module  # noqa: E402
 from opencode_tui.core.agent.domain import structure as structure_module  # noqa: E402
 from opencode_tui.core.agent.domain import chembl as chembl_module  # noqa: E402
 from opencode_tui.core.agent.domain import chemistry as chemistry_module  # noqa: E402
@@ -172,6 +183,8 @@ from opencode_tui.core.models import (  # noqa: E402
     ToolStatus,
 )
 from opencode_tui.screens.chat import ChatScreen  # noqa: E402
+from opencode_tui.screens.connection_form import ConnectionFormScreen  # noqa: E402
+from opencode_tui.screens.home import HomeScreen  # noqa: E402
 
 from fake_model_server import (  # noqa: E402
     FakeModelServer,
@@ -409,41 +422,26 @@ def check_agent_types() -> None:
     check(error.status_code == 429 and error.retryable, "ProviderError 带得住状态码与可否重试")
     check(str(error) == "连接中断", "ProviderError 的文本就是错误原文")
 
-    config = ProviderConfig.from_env(
-        {
-            "VSA_LLM_BASE_URL": "http://127.0.0.1:1/v1",
-            "VSA_LLM_API_KEY": "k",
-            "VSA_LLM_MODEL": "m",
-            "VSA_LLM_PRICE_INPUT": "0.5",
-            "VSA_LLM_PRICE_OUTPUT": "1.5",
-            "VSA_LLM_CONTEXT_WINDOW": "1000000",
-        }
+    config = ProviderConfig.from_values(
+        "http://127.0.0.1:1/v1",
+        "k",
+        "m",
+        price_in=0.5,
+        price_out=1.5,
+        context_window=1_000_000,
     )
-    check(config.model == "m" and config.price_out == 1.5, "ProviderConfig 从环境变量读出连接参数")
-    check(config.price_in == 0.5 and config.context_window == 1_000_000, "单价与上下文窗口一并读出来")
+    check(config.model == "m" and config.price_out == 1.5, "ProviderConfig 从连接参数读出地址、密钥与模型")
+    check(config.price_in == 0.5 and config.context_window == 1_000_000, "显式给出的单价与上下文窗口一并读出来")
     check(config.cached_price() == 0.05, "没有单独给缓存单价时按未命中价的一折算")
-    with_cached = ProviderConfig.from_env(
-        {
-            "VSA_LLM_BASE_URL": "u",
-            "VSA_LLM_API_KEY": "k",
-            "VSA_LLM_MODEL": "m",
-            "VSA_LLM_PRICE_INPUT": "0.5",
-            "VSA_LLM_PRICE_CACHED": "0.02",
-        }
-    )
-    check(with_cached.cached_price() == 0.02, "单独给出的缓存单价优先")
-    bare = ProviderConfig.from_env(
-        {"VSA_LLM_BASE_URL": "u", "VSA_LLM_API_KEY": "k", "VSA_LLM_MODEL": "m"}
-    )
+    bare = ProviderConfig.from_values("u", "k", "m")
     check(bare.price_in == 0.0 and bare.price_out == 0.0, "没给单价时按零计")
     check(bare.context_window == 128_000, "没给上下文窗口时用默认值")
-
-    missing = ""
-    try:
-        ProviderConfig.from_env({})
-    except RuntimeError as error:
-        missing = str(error)
-    check("VSA_LLM_BASE_URL" in missing, "缺少环境变量时直接抛错并点名缺了哪一个")
+    check(bare.configured, "三项连接参数都有时算配置完整")
+    check(not ProviderConfig(base_url="", api_key="", model="").configured, "缺项时标着没配置")
+    check(
+        not ProviderConfig.from_values("u", "", "m").configured,
+        "密钥为空也算没配置",
+    )
     check_models()
 
 
@@ -469,28 +467,13 @@ def check_models() -> None:
     check(guess_provider("claude-3-5-haiku-20241022") == "anthropic", "按名字前缀猜出发行方")
     check(guess_provider("纳豆模型") == "", "猜不出来时给空字符串")
 
-    config = ProviderConfig.from_env(
-        {"VSA_LLM_BASE_URL": "u", "VSA_LLM_API_KEY": "k", "VSA_LLM_MODEL": "deepseek-flash"}
-    )
+    config = ProviderConfig.from_values("u", "k", "deepseek-flash")
     check(config.price_in == 0.3 and config.price_out == 1.2, "只写模型名时单价取自内置清单")
     check(config.context_window == 1_000_000, "只写模型名时窗口取自内置清单")
     check(config.provider == "deepseek", "只写模型名时发行方取自内置清单")
     check(config.known and not config.supports_reasoning, "认得出来的模型标着在清单里")
 
-    override = ProviderConfig.from_env(
-        {
-            "VSA_LLM_BASE_URL": "u",
-            "VSA_LLM_API_KEY": "k",
-            "VSA_LLM_MODEL": "deepseek-flash",
-            "VSA_LLM_PRICE_INPUT": "9.9",
-            "VSA_LLM_CONTEXT_WINDOW": "2000",
-        }
-    )
-    check(override.price_in == 9.9 and override.context_window == 2_000, "环境变量里写了的项盖过清单")
-
-    unknown = ProviderConfig.from_env(
-        {"VSA_LLM_BASE_URL": "u", "VSA_LLM_API_KEY": "k", "VSA_LLM_MODEL": "自研模型"}
-    )
+    unknown = ProviderConfig.from_values("u", "k", "自研模型")
     check(not unknown.known, "清单里没有的模型标着不在清单里")
     check(unknown.price_in == 0.0 and unknown.context_window == DEFAULT_CONTEXT_WINDOW, "清单里没有的模型用兜底值")
     check(not unknown.supports_reasoning, "清单里没有的模型按不接受推理强度处理")
@@ -502,16 +485,6 @@ def check_models() -> None:
     check(reasoner.max_tokens == 32_000, "清单里写了输出上限时带上")
 
     check(config.temperature == 0.0, "只写模型名时采样参数也取自清单")
-    tuned = ProviderConfig.from_env(
-        {
-            "VSA_LLM_BASE_URL": "u",
-            "VSA_LLM_API_KEY": "k",
-            "VSA_LLM_MODEL": "deepseek-flash",
-            "VSA_LLM_TEMPERATURE": "0.7",
-            "VSA_LLM_MAX_TOKENS": "1234",
-        }
-    )
-    check(tuned.temperature == 0.7 and tuned.max_tokens == 1_234, "环境变量里写了的采样参数盖过清单")
     check(unknown.temperature is None and unknown.max_tokens is None, "清单外的模型不写采样参数")
 
     swapped = config.for_model("gpt-4o")
@@ -526,6 +499,39 @@ def check_models() -> None:
     check(stranger.model == "自研模型" and not stranger.known, "换到清单外的模型时标着不在清单里")
     check(stranger.base_url == config.base_url, "换到清单外的模型时连接参数照旧")
     check(stranger.temperature is None, "换到清单外的模型时不写采样参数")
+
+
+def check_connection_file() -> None:
+    """连接配置的读写：与状态文件同目录、权限 0600、坏文件不炸启动。"""
+    path = ROOT / ".probe" / "connection_roundtrip.toml"
+    path.unlink(missing_ok=True)
+    check(load_connection(path) is None, "文件不存在时读出来是 None")
+
+    saved = save_connection(
+        path,
+        Connection("https://api.example.com/v1", "sk-test", "自研模型", context_window=200_000),
+    )
+    check(saved == path and path.is_file(), "保存之后文件落在给定路径上")
+    loaded = load_connection(path)
+    check(
+        loaded == Connection("https://api.example.com/v1", "sk-test", "自研模型", context_window=200_000),
+        f"读回来的连接参数与写进去的一致：{loaded}",
+    )
+    if os.name != "nt":
+        mode = path.stat().st_mode & 0o777
+        check(mode == 0o600, f"密钥文件权限收到 0600：{oct(mode)}")
+
+    path.write_text("这不是 TOML [[[", encoding="utf-8")
+    check(load_connection(path) is None, "坏文件当作没配置，不让启动失败")
+    path.write_text('base_url = "u"\napi_key = "k"\n', encoding="utf-8")
+    check(load_connection(path) is None, "缺模型名时当作没配置")
+    path.unlink(missing_ok=True)
+
+    check(
+        connection_path_for(ROOT / ".probe" / "state.toml")
+        == ROOT / ".probe" / "connection.toml",
+        "连接配置与状态文件同目录",
+    )
 
 
 def check_arguments() -> None:
@@ -1373,6 +1379,35 @@ def check_disabled_tools() -> None:
         "少的正好是那一个，没有连带别的",
     )
     path.unlink(missing_ok=True)
+
+    # `/tools` 面板写盘的那条路：写出去的必须读得回来，而且只写 false。
+    #
+    # 单独用一份 fixture，不碰上面那份：上面几条验的是「读」的语义，
+    # 这里验的是「面板改完立刻生效」靠不靠得住。
+    panel_root = ROOT / ".probe" / "tools_panel_write"
+    shutil.rmtree(panel_root, ignore_errors=True)
+    written = save_disabled(panel_root, ["bash", "search_pdb"])
+    check(
+        written == panel_root / CONFIG_DIRECTORY / TOOLS_FILE,
+        f"写的是项目侧那份 tools.toml：{written}",
+    )
+    names, sources = load_tool_switches(panel_root)
+    check(
+        {"bash", "search_pdb"} <= names,
+        f"面板写出去的开关读得回来：{sorted(names)}",
+    )
+    check(sources.get("bash") == written, f"来源指向刚写的那份：{sources.get('bash')}")
+    text = written.read_text(encoding="utf-8")
+    check("bash = false" in text, f"关掉的工具写成 false：{text!r}")
+    check("= true" not in text, "只写 false——写 true 会让人以为本文件能把它打开")
+
+    # 一条都不关时也要留一份文件：面板把最后一个开关关掉再打开，读到的必须是空清单，
+    # 而不是「文件没了所以不知道」。
+    save_disabled(panel_root, [])
+    names, sources = load_tool_switches(panel_root)
+    check("bash" not in sources, "清空之后不再关任何工具")
+    check("bash = false" not in written.read_text(encoding="utf-8"), "清空之后文件里没有残留")
+    shutil.rmtree(panel_root, ignore_errors=True)
 
     # 打包之后项目侧配置跟着**可执行文件**走，不跟着启动目录走：换个目录启动、
     # 或把 exe 挪到别处，禁用清单照样读得到。这里直接改 `sys.frozen` 与
@@ -3603,6 +3638,109 @@ def tool_parts_of(app: OpenCodeApp) -> list[Part]:
     ]
 
 
+async def check_home_new_session() -> None:
+    """主页面提问默认开新会话：有内容就另起，空会话复用。"""
+    root = ROOT / ".probe" / "home_session"
+    root.mkdir(parents=True, exist_ok=True)
+    state = root / "state.toml"
+    state.unlink(missing_ok=True)
+    save_connection(
+        connection_path_for(state),
+        Connection("https://api.example.com/v1", "k", "deepseek-flash"),
+    )
+
+    app = OpenCodeApp(root=ROOT, state_path=state)
+
+    async def fake_stream(session: object, prompt: str) -> None:
+        """不发请求：这一组验的是会话选择，不是模型链路。"""
+        return None
+
+    app.agent.stream_reply = fake_stream  # type: ignore[method-assign]
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        empty_id = app.session_manager.current_session_id
+        app.start_chat_with("第一句")
+        await pilot.pause()
+        check(
+            app.session_manager.current_session_id == empty_id,
+            "当前会话还是空的时候直接复用，不另开一个",
+        )
+        check(len(app.session_manager.current.messages) == 1, "第一句写进复用的会话")
+
+        app.switch_screen(HomeScreen())
+        await pilot.pause()
+        app.start_chat_with("第二句")
+        await pilot.pause()
+        check(
+            app.session_manager.current_session_id != empty_id,
+            "主页面再提问时另开一个新会话",
+        )
+        check(
+            [message.parts[0].text for message in app.session_manager.current.messages]
+            == ["第二句"],
+            "新会话里只有这一句，旧会话的内容不会串进来",
+        )
+        check(
+            len(app.session_manager.sessions) == 2,
+            f"旧会话还留在列表里：{len(app.session_manager.sessions)} 个",
+        )
+
+
+async def check_unconfigured_app() -> None:
+    """没有 connection.toml 时：应用照常起来、发消息被拦、/model 填完即用。"""
+    root = ROOT / ".probe" / "unconfigured"
+    root.mkdir(parents=True, exist_ok=True)
+    state = root / "state.toml"
+    state.unlink(missing_ok=True)
+    connection_path_for(state).unlink(missing_ok=True)
+
+    app = OpenCodeApp(root=ROOT, state_path=state)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        check(not app.is_configured, "没有连接配置时应用照常启动")
+        check(app.current_model_label == "（未配置）", "状态行显示未配置")
+
+        app.start_chat_with("hello")
+        await pilot.pause()
+        check(
+            isinstance(app.screen, ConnectionFormScreen),
+            "未配置时提问直接弹出接口表单",
+        )
+        chat = next(screen for screen in app.screen_stack if isinstance(screen, ChatScreen))
+        check(chat.editor.text == "hello", "被拦下的问题放回输入框，配好即可重发")
+        check(
+            len(app.session_manager.current.messages) == 0,
+            "未配置时发消息被拦下，不写进会话",
+        )
+
+        form = app.screen
+        form.query_one("#connection-base-url", Input).value = "https://api.example.com/v1"
+        form.query_one("#connection-api-key", Input).value = "k"
+        form.query_one("#connection-model", Input).value = "deepseek-flash"
+        form.query_one("#connection-window", Input).value = "1000000"
+        form.action_save()
+        await pilot.pause()
+        check(app.is_configured, "表单保存之后接口就绪")
+        saved = load_connection(connection_path_for(state))
+        check(
+            saved is not None and saved.model == "deepseek-flash",
+            "表单把配置写进 connection.toml",
+        )
+        check(app.agent.config.context_window == 1_000_000, "表单里的窗口跟着生效")
+        check(
+            app.session_manager.current.model_id == "deepseek-flash",
+            "保存后会话记下新模型",
+        )
+
+        app.execute_command("model gpt-4o")
+        await pilot.pause()
+        check(app.agent.config.model == "gpt-4o", "/model 带参数只换模型")
+        check(
+            app.agent.config.base_url == "https://api.example.com/v1",
+            "换模型时接口地址不动",
+        )
+
+
 async def check_live_app(server: FakeModelServer) -> None:
     """从界面提交一句话到消息区出现完整回复。
 
@@ -3614,12 +3752,17 @@ async def check_live_app(server: FakeModelServer) -> None:
     state = ROOT / ".probe" / "state_live.toml"
     bare_root = ROOT / ".probe" / "live_root"
     bare_root.mkdir(parents=True, exist_ok=True)
-    os.environ["VSA_LLM_BASE_URL"] = server.base_url
-    os.environ["VSA_LLM_API_KEY"] = "secret"
-    os.environ["VSA_LLM_MODEL"] = "fake-model"
-    os.environ["VSA_LLM_CONTEXT_WINDOW"] = "1000000"
-    os.environ["VSA_LLM_PRICE_INPUT"] = "0.5"
-    os.environ["VSA_LLM_PRICE_OUTPUT"] = "1.5"
+    save_connection(
+        connection_path_for(state),
+        Connection(
+            server.base_url,
+            "secret",
+            "fake-model",
+            context_window=1_000_000,
+            price_in=0.5,
+            price_out=1.5,
+        ),
+    )
 
     state.unlink(missing_ok=True)
     logs = log_directory_for(state)
@@ -3671,24 +3814,8 @@ async def check_live_app(server: FakeModelServer) -> None:
             any(row["payload"].get("session_id") == session.id for row in rows),
             "日志里的 session_id 是这一轮那个会话",
         )
-        check(app.current_model_label == "fake-model", "状态行上的模型名取自 .env")
-        check(app.context_window == 1_000_000, "上下文窗口取自 .env")
-        names = [model.name for model in app.available_models]
-        check(names[0] == "fake-model", "不在内置清单里的当前模型排在最前面")
-        check(
-            set(names) == set(BUILTIN_MODELS) | {"fake-model"},
-            "模型列表是内置清单再加当前这一个",
-        )
-        check("deepseek-flash" in names, "内置清单里的模型在选择界面上")
-        listed = {model.name: model for model in app.available_models}
-        check(
-            listed["fake-model"].context_window == 1_000_000,
-            "当前模型的上下文窗口取自 .env",
-        )
-        check(
-            listed["deepseek-flash"].context_window == 1_000_000,
-            "内置清单里那一个窗口取自清单",
-        )
+        check(app.current_model_label == "fake-model", "状态行上的模型名取自连接配置")
+        check(app.context_window == 1_000_000, "上下文窗口取自连接配置")
         check(
             app.agent.registry.get("read") is not None
             and app.agent.registry.get("write") is not None
@@ -3712,7 +3839,7 @@ async def check_live_app(server: FakeModelServer) -> None:
         )
         check(
             abs(assistant.cost - 0.000021) < 1e-9,
-            f"这一轮的金额按 .env 里的单价算：{assistant.cost}",
+            f"这一轮的金额按连接配置里的单价算：{assistant.cost}",
         )
         check(
             "界面上的回答。" in " ".join(rendered_lines(app.screen.messages)),
@@ -5742,6 +5869,124 @@ def check_export_geometry() -> None:
     )
 
 
+def check_preprocess() -> None:
+    """结构预处理：清洗（选链/构象/去水/去杂/去氢）与配体几何筛查。"""
+    # ---- 清洗：拿一份带两套模型、两条链、水、修饰残基、交替构象的夹具 ----
+    cleaned = preprocess_module.clean_structure(
+        _pdb_fixture(), chains=("A", "B"), modified_names=("MSE",)
+    )
+    report = cleaned.report
+    check(report.chains == ("A", "B"), f"只留指定链：{report.chains}")
+    check(report.dropped_chains == (("C", 1),), f"去掉链 C 并计数：{report.dropped_chains}")
+    check(report.waters == 1, f"去水计数是残基数：{report.waters}")
+    check(report.models == 1, f"第二套模型被丢掉并计数：{report.models}")
+    check(
+        report.altloc == (("A:1", "B"),),
+        f"残基里只有 B 构象时退回 B 并报出来：{report.altloc}",
+    )
+    check(
+        [name for name, _reason in report.removed] == ["AQ4"],
+        f"只有 AQ4 被当杂原子组删掉：{report.removed}",
+    )
+    check(
+        "重原子太少" in report.removed_counts,
+        f"AQ4 只有两个重原子，按「重原子太少」排除：{report.removed_counts}",
+    )
+    check("HOH" not in cleaned.text, "写出的坐标里没有水")
+    check("NAG" not in cleaned.text, "链 C 上的 NAG 随链一起去掉")
+    check("MSE" in cleaned.text, "修饰残基写着 HETATM 也保留（它属于聚合物）")
+    check("AQ4" not in cleaned.text, "被筛掉的杂原子组不在输出里")
+    check("去水 1 个" in report.describe(), f"报告里写了去水：{report.describe()}")
+    payload = report.as_dict()
+    check(payload["chains"] == ["A", "B"], f"as_dict 的链是列表：{payload['chains']}")
+    check(payload["removed"].get("重原子太少") == 1, f"as_dict 按原因计数：{payload['removed']}")
+
+    # 不给 chains 时保留全部聚合物链；纯 HETATM 的链号不算聚合物链。
+    keep_all = preprocess_module.clean_structure(_pdb_fixture(), modified_names=("MSE",))
+    check(keep_all.report.chains == ("A", "B"), f"不指定链时保留全部聚合物链：{keep_all.report.chains}")
+    hetero_only = pdbtext.parse(
+        _pdb_atom(1, "CA", "ALA", "A", 1, 0.0, 0.0, 0.0)
+        + _pdb_atom(2, "C1", "LIG", "Z", 1, 5.0, 0.0, 0.0, kind="HETATM")
+    )
+    check(
+        preprocess_module.polymer_chains(hetero_only) == ("A",),
+        "只有 HETATM 的链号不算聚合物链",
+    )
+    alt_text = _pdb_atom(1, "CA", "ALA", "A", 1, 1.0, 1.0, 1.0, altloc="A") + _pdb_atom(
+        2, "CA", "ALA", "A", 1, 1.0, 2.0, 1.0, altloc="B"
+    ) + _pdb_atom(
+        3, "CA", "GLY", "A", 2, 3.0, 1.0, 1.0, altloc="B"
+    ) + _pdb_atom(
+        4, "CA", "GLY", "A", 2, 3.0, 2.0, 1.0, altloc="A"
+    )
+    alt = preprocess_module.clean_structure(alt_text)
+    check(
+        alt.report.altloc == (("A:1", "A"), ("A:2", "A")),
+        f"两个残基各选 A，并按残基键排序：{alt.report.altloc}",
+    )
+    check(
+        alt.text.count("  CA  ALA A   1") == 1,
+        "选完构象只剩一份坐标",
+    )
+
+    # ---- 几何筛查：四条判据各拦一类，真配体留下 ----
+    protein = "".join(
+        [
+            _pdb_atom(1, "CA", "ALA", "A", 1, 0.0, 0.0, 0.0),
+            _pdb_atom(2, "CA", "GLY", "A", 2, 2.0, 0.0, 0.0),
+            _pdb_atom(3, "CA", "SER", "A", 3, 4.0, 0.0, 0.0),
+        ]
+    )
+    real = "".join(
+        _pdb_atom(
+            100 + index, "C1", "LG1", "A", 10, 1.0 + index * 0.5, 3.0, 0.0,
+            kind="HETATM",
+        )
+        for index in range(4)
+    )
+    tiny = "".join(
+        _pdb_atom(
+            200 + index, "C1", "TNY", "A", 11, 10.0 + index, 10.0, 10.0,
+            kind="HETATM",
+        )
+        for index in range(2)
+    )
+    far = "".join(
+        _pdb_atom(
+            300 + index, "C1", "FAR", "A", 12, 30.0 + index, 30.0, 30.0,
+            kind="HETATM",
+        )
+        for index in range(4)
+    )
+    covalent = "".join(
+        _pdb_atom(
+            400 + index, "C1", "COV", "A", 13, index * 0.5, 0.0, 1.5,
+            kind="HETATM",
+        )
+        for index in range(4)
+    )
+    screen_doc = pdbtext.parse(protein + real + tiny + far + covalent)
+    groups = export_module.ligand_groups(screen_doc)
+    screen = preprocess_module.screen_ligands(screen_doc, groups.kept)
+    check(
+        [group.resname for group in screen.kept] == ["LG1"],
+        f"只有真配体留下：{[group.resname for group in screen.kept]}",
+    )
+    reasons = {name: reason for name, reason in screen.excluded}
+    check(reasons.get("TNY") == "重原子太少", f"两个重原子的组被拦下：{reasons}")
+    check(reasons.get("FAR") == "蛋白接触不足", f"离蛋白 30 埃的组被拦下：{reasons}")
+    check(reasons.get("COV") == "与蛋白共价连接", f"1.5 埃贴住蛋白的组被拦下：{reasons}")
+    check(
+        screen.counts == {"重原子太少": 1, "蛋白接触不足": 1, "与蛋白共价连接": 1},
+        f"每类原因各计一个：{screen.counts}",
+    )
+    check("几何筛查排除了 3 个" in screen.describe(), f"排除要报出来：{screen.describe()}")
+
+    # 空输入不报错、也不编东西。
+    empty = preprocess_module.screen_ligands(screen_doc, ())
+    check(empty.kept == () and empty.excluded == (), "没有候选组时返回空结果")
+
+
 def _pdb_fixture() -> str:
     """一份像真的坐标文件：两套模型、两条聚合物链、配体、水、修饰残基、交替构象。
 
@@ -6783,6 +7028,68 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
         )
         check(artifact_entry.meta.get("kind") == "run", "artifact meta.kind=run")
 
+        # ---- view=structure：只展示结构，不碰任何口袋来源 ----
+        # 把两条来源都换成「一调就炸」的桩：结构模式只要碰了它们，这里就会红。
+        def _explode(**kwargs):
+            raise AssertionError("view=structure 不该调用口袋来源")
+
+        saved_complex = pockets_module.complex_pockets
+        saved_p2rank = pockets_module.p2rank_pockets
+        pockets_module.complex_pockets = _explode
+        pockets_module.p2rank_pockets = _explode
+        try:
+            structure_result = await _run_tool(
+                tool,
+                {
+                    "receptor": str(entry.handle),
+                    "run_id": "structure-check",
+                    "view": "structure",
+                    "uniprot": "P00519",
+                },
+            )
+        finally:
+            pockets_module.complex_pockets = saved_complex
+            pockets_module.p2rank_pockets = saved_p2rank
+        check(not structure_result.failed, f"结构模式跑通：{structure_result.output[:200]}")
+        check(
+            structure_result.meta.get("view") == "structure",
+            f"返回里标了 view=structure：{structure_result.meta.get('view')}",
+        )
+        structure_meta = _json.loads(
+            (runs_root / "structure-check" / export_module.RUN_META).read_text(encoding="utf-8")
+        )
+        check(structure_meta["pockets"] == [], "结构模式不写口袋")
+        check(
+            structure_meta["provenance"]["view"] == "structure",
+            "provenance.view 记下展示模式",
+        )
+        pre = structure_meta["provenance"].get("preprocess")
+        check(isinstance(pre, dict), "provenance.preprocess 是一份结构化报告")
+        check(pre["waters"] > 0, f"预处理报告里写了去水数量：{pre.get('waters')}")
+        check("STI" in pre["kept_ligands"], f"真配体留在结构里：{pre.get('kept_ligands')}")
+        cleaned = (runs_root / "structure-check" / export_module.RUN_RECEPTOR).read_text(
+            encoding="utf-8"
+        )
+        check(
+            not any(
+                line.startswith("HETATM") and line[17:20].strip() == "HOH"
+                for line in cleaned.splitlines()
+            ),
+            "写出的 receptor.pdb 里没有水的坐标行（HETNAM 等说明行不算）",
+        )
+        check("STI" in cleaned, "写出的 receptor.pdb 里保留了共晶配体")
+        check(
+            any(
+                line.startswith("HETATM") and line[17:20].strip() == "STI"
+                for line in cleaned.splitlines()
+            ),
+            "保留的是 STI 的坐标行，不只是说明行",
+        )
+        check(
+            "结构预处理" in structure_result.output,
+            f"返回里报预处理做了什么：{structure_result.output[:200]}",
+        )
+
         # ---- 两个相距 20 埃的配体 → 两个口袋 ----
         two = runs_root / "two.pdb"
         two.write_text(_two_ligand_pdb(), encoding="utf-8")
@@ -7038,26 +7345,29 @@ def _predicted_bundle(pockets_module):
 
 
 def _two_ligand_pdb() -> str:
-    """造一份有两个相距 20 埃的配体的最小结构（用来验「多配体出多口袋」）。"""
+    """造一份有两个相距 20 埃的配体的最小结构（用来验「多配体出多口袋」）。
+
+    每个配体给 4 个重原子、离蛋白 3 埃左右：预处理会筛掉重原子太少的组，
+    单原子配体在这条判据里已经不是合法输入了。蛋白沿 x 每 2 埃一个 CA，
+    配体放在 y=3，正好被三个以上残基围住。
+    """
     lines = []
-    for number in range(1, 21):
+    for number in range(1, 41):
         lines.append(
-            f"ATOM  {number:5d}  CA  ALA A{number:4d}    "
-            f"{float(number):8.3f}{0.0:8.3f}{0.0:8.3f}  1.00 0.00           C"
+            _pdb_atom(
+                number, "CA", "ALA", "A", number, float((number - 1) * 2), 0.0, 0.0
+            )
         )
-    for number in range(1, 21):
+    for serial, x in ((201, 10.0), (202, 11.0), (203, 12.0), (204, 13.0)):
         lines.append(
-            f"ATOM  {number + 100:5d}  CA  ALA A{number:4d}    "
-            f"{float(number) + 40:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00 0.00           C"
+            _pdb_atom(serial, "C1", "LG2", "A", 101, x, 3.0, 0.0, kind="HETATM")
         )
-    lines.append(
-        f"HETATM  201  C1  LG2 A 101       1.000   0.000   0.000  1.00 0.00           C"
-    )
-    lines.append(
-        f"HETATM  202  C1  LG2 A 102      21.000   0.000   0.000  1.00 0.00           C"
-    )
+    for serial, x in ((211, 30.0), (212, 31.0), (213, 32.0), (214, 33.0)):
+        lines.append(
+            _pdb_atom(serial, "C1", "LG2", "A", 102, x, 3.0, 0.0, kind="HETATM")
+        )
     lines.append("END")
-    return "\n".join(lines) + "\n"
+    return "".join(lines)
 
 
 async def check_rsearch() -> None:
@@ -10463,6 +10773,7 @@ def check_plan_deny() -> None:
 GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("types", check_agent_types),
     ("arguments", check_arguments),
+    ("connection", check_connection_file),
     ("trace", check_trace),
     ("rules", check_rules),
     ("permission", check_permission),
@@ -10474,6 +10785,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("tool-context", check_tool_context),
     ("uniprot", check_uniprot_tools),
     ("pdbtext", check_pdbtext),
+    ("preprocess", check_preprocess),
     ("export-geometry", check_export_geometry),
     ("complexes", check_complexes),
     ("prankweb", check_prankweb),
@@ -10500,6 +10812,8 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("evidence", check_evidence_layer),
     ("bash", check_bash_tool),
     ("file-tools", check_file_tools),
+    ("unconfigured", check_unconfigured_app),
+    ("home-session", check_home_new_session),
 )
 
 # 需要假模型服务的组。只有命中其中之一才起服务，否则不占端口、也不等它。

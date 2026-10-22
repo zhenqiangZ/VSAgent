@@ -8,6 +8,11 @@ dist/
 __pycache__/
 *.pyc
 
+# 外部模型（VCrossFormer）：代码 54MB、自带的 .venv 1.6GB、权重 15GB，全部不入库。
+# 它放在 models/ 而不是包内，是因为 check_chemistry_gate 会扫 opencode_tui/ 下所有
+# .py 的顶层 import，DTA 有 45 处 import torch/rdkit。装法见 models/DTA/README.md。
+models/DTA/
+
 # 前端依赖与打包产物（viz/ 是唯一装 npm 包的地方）
 node_modules/
 viz/build/

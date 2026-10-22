@@ -109,6 +109,14 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "limit": 3,
         "timeout": 120,
     }),
+    # 亲和力打分：真加载模型，需要 DTA 的独立 Python 环境（见 models/DTA/README.md）。
+    # 没有环境时这一步会照实失败并给出安装指引；limit 调小是为了调试快。
+    ("score_affinity", {
+        "receptor": "{receptor:prepared}",
+        "ligands": "{ligandset:prepared}",
+        "limit": 3,
+        "timeout": 300,
+    }),
     # 两个搜索工具：只给候选、不给结论
     ("search_pdb", {"query": "EGFR kinase", "limit": 5}),
     # 已知活性 → 类似物 → 分子画像

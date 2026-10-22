@@ -164,6 +164,7 @@ from opencode_tui.core.agent.domain import chemistry as chemistry_module  # noqa
 from opencode_tui.core.agent.domain import receptor as receptor_module  # noqa: E402
 from opencode_tui.core.agent.domain import ligand as ligand_module  # noqa: E402
 from opencode_tui.core.agent.domain import docking as docking_module  # noqa: E402
+from opencode_tui.core.agent.domain import affinity as affinity_module  # noqa: E402
 from opencode_tui.core.agent.domain import listing as listing_module  # noqa: E402
 from opencode_tui.core.agent.domain import export as export_module  # noqa: E402
 from opencode_tui.core.agent.domain import complexes as complexes_module  # noqa: E402
@@ -5182,6 +5183,419 @@ async def check_docking() -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+async def check_affinity() -> None:
+    """亲和力打分：环境定位、handle 分档、批量计数、产物与复用、失败分档。"""
+    work = PROBE / "affinity_tool"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    original_dir = affinity_module.scorings_dir
+    original_python = affinity_module.dta_python
+    original_root = affinity_module.dta_root
+    original_run = affinity_module.run_batch
+    runs: list[tuple[str, ...]] = []
+    behaviour = {"mode": "ok"}
+
+    async def fake_run_batch(argv, *, cwd, timeout, log_path):
+        runs.append(tuple(argv))
+        output_path = Path(argv[argv.index("--output") + 1])
+        tasks = json.loads(
+            Path(argv[argv.index("--tasks") + 1]).read_text(encoding="utf-8")
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("fake engine log\n", encoding="utf-8")
+
+        mode = behaviour["mode"]
+        if mode == "timeout":
+            return affinity_module.BatchRun(tuple(argv), -9, "timed out", True, log_path)
+        if mode == "exit":
+            return affinity_module.BatchRun(tuple(argv), 3, "boom: no checkpoint", False, log_path)
+
+        rows = []
+        lines = ["口袋：从 receptor.pdb 截出 57 个残基（半径 10 A）"]
+        for index, task in enumerate(tasks):
+            if mode == "all_fail" or task["id"].startswith("BAD"):
+                lines.append(f"ERROR {task['id']}: ValueError: 坏的配体")
+                continue
+            pk = 8.0 - index
+            rows.append((task["id"], "CCO", f"{pk:.4f}", f"{10 ** (-pk) * 1e9:.1f}", "Ki", "Ki"))
+        header = ("ligand_name", "smiles", "predicted_pK",
+                  "predicted_value_nM", "predicted_unit", "condition_unit")
+        text = "\n".join(",".join(row) for row in [header, *rows]) + "\n"
+        output_path.write_text(text, encoding="utf-8")
+        lines.append("SUMMARY " + json.dumps(
+            {"input": len(tasks), "scored": len(rows), "failed": len(tasks) - len(rows)}))
+        return affinity_module.BatchRun(
+            tuple(argv), 0, "\n".join(lines), False, log_path)
+
+    def make_ligandset(name: str, ids: list[str]) -> Path:
+        directory = work / "ligands" / name
+        (directory / "ligands").mkdir(parents=True, exist_ok=True)
+        records = []
+        for index, identifier in enumerate(ids, start=1):
+            relative = f"ligands/{identifier}.pdbqt"
+            (directory / relative).write_text(f"REMARK {identifier}\n", encoding="utf-8")
+            records.append({
+                "id": identifier,
+                "name": identifier.lower(),
+                "smiles": "CCO",
+                "status": "ok",
+                "pdbqt": relative,
+            })
+        (directory / "manifest.json").write_text(
+            json.dumps({"kind": "ligandset", "stage": "prepared",
+                        "records": records, "counts": {}}),
+            encoding="utf-8",
+        )
+        return directory
+
+    try:
+        affinity_module.scorings_dir = lambda: work / "scorings"
+        affinity_module.dta_python = lambda: "/fake/python"
+        affinity_module.dta_root = lambda: work / "DTA"
+        affinity_module.run_batch = fake_run_batch
+
+        tool = affinity_module.ScoreAffinityTool()
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+
+        receptor_dir = work / "receptor"
+        receptor_dir.mkdir(parents=True, exist_ok=True)
+        (receptor_dir / "receptor.pdb").write_text("ATOM\n", encoding="utf-8")
+        (receptor_dir / "box.txt").write_text(
+            "center_x = 1.0\ncenter_y = 2.0\ncenter_z = 3.0\n"
+            "size_x = 20.0\nsize_y = 21.0\nsize_z = 22.0\n",
+            encoding="utf-8",
+        )
+        receptor = ledger.add(
+            "receptor",
+            path=receptor_dir,
+            summary="prepared receptor",
+            fingerprint=fingerprint_path(receptor_dir),
+            meta={"stage": "prepared", "pdb_file": "receptor.pdb", "box_file": "box.txt"},
+        )
+        ligand_dir = make_ligandset("three", ["A", "BAD1", "B"])
+        ligand_set = ledger.add(
+            "ligandset",
+            path=ligand_dir,
+            summary="prepared ligands",
+            fingerprint=fingerprint_path(ligand_dir),
+            meta={"stage": "prepared"},
+            link_current_receptor=False,
+        )
+
+        # ---- 一、整批：2 成功 1 失败 ----
+        result = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(not result.failed, f"打分成功：{result.output}")
+        check(
+            result.meta.get("scored") == 2
+            and result.meta.get("failed") == 1
+            and result.meta.get("best_pk") == 8.0
+            and result.meta.get("best_id") == "A",
+            f"计数与最佳分数正确（pK 取最大）：{result.meta}",
+        )
+        check("结论：" in result.output, f"首行以「结论：」开头，压缩后仍进证据：{result.output}")
+        check("越高越好" in result.output, "输出写清方向（与 dock 相反）")
+
+        handle = result.meta["handle"]
+        entry = ledger.get(handle)
+        check(
+            isinstance(entry.handle, ArtifactHandle)
+            and entry.meta.get("kind") == "affinity"
+            and entry.meta.get("stage") == "affinity",
+            "登记成 artifact + kind=affinity",
+        )
+        check(
+            {str(item) for item in entry.parents}
+            == {str(receptor.handle), str(ligand_set.handle)},
+            f"父项挂受体与配体集：{[str(item) for item in entry.parents]}",
+        )
+        manifest = json.loads((entry.path / "manifest.json").read_text(encoding="utf-8"))
+        check(
+            [item["id"] for item in manifest["results"]] == ["A", "B"],
+            f"结果按 pK 降序：{[item['id'] for item in manifest['results']]}",
+        )
+        check(
+            manifest["results"][0]["pk"] == 8.0
+            and abs(manifest["results"][0]["nM"] - 10 ** (-8.0) * 1e9) < 1e-6,
+            f"pK 与 nM 由代码换算：{manifest['results'][0]}",
+        )
+        check(
+            manifest["counts"]["input"] == 3
+            and manifest["counts"]["scored"] == 2
+            and manifest["counts"]["failed"] == 1,
+            f"manifest 计数：{manifest['counts']}",
+        )
+        check(
+            manifest["pocket"]["residues"] == 57
+            and manifest["pocket"]["radius"] == 10.0,
+            f"口袋参数进 manifest：{manifest['pocket']}",
+        )
+        check(
+            manifest["failures"] and manifest["failures"][0]["id"] == "BAD1",
+            f"单条失败进 manifest：{manifest['failures']}",
+        )
+        check(
+            (entry.path / "scores.csv").is_file()
+            and (entry.path / "tasks.json").is_file()
+            and (entry.path / "params.json").is_file()
+            and (entry.path / "logs" / "run.log").is_file(),
+            "产物目录有 scores / tasks / params / 日志",
+        )
+
+        # ---- 二、同参数复用：不重跑模型 ----
+        before = len(runs)
+        again = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(
+            not again.failed
+            and again.meta.get("handle") == handle
+            and again.meta.get("reused") is True,
+            f"同参数复用同一 artifact：{again.meta}",
+        )
+        check(len(runs) == before, "复用不重跑模型")
+        check("复用已有结果" in again.output, f"输出说明复用：{again.output}")
+
+        # ---- 三、命令构造 ----
+        argv = runs[-1]
+        check(argv[0] == "/fake/python", "用解析到的解释器跑")
+        check(argv[1].endswith("virtual_screen.py"), f"跑 DTA 的批量入口：{argv[1]}")
+        for flag in ("--receptor", "--pocket-center", "--pocket-radius",
+                     "--tasks", "--output", "--aff_unit", "--device"):
+            check(flag in argv, f"命令里有 {flag}")
+        check("--pocket" not in argv, "给了 receptor 就不再传 --pocket")
+        center = argv[argv.index("--pocket-center") + 1]
+        check(center == "1,2,3", f"口袋中心来自受体的 box.txt：{center}")
+
+        # ---- 四、limit ----
+        limited = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle),
+             "limit": 1},
+            context=ledger,
+        )
+        check(
+            not limited.failed
+            and limited.meta.get("input") == 1
+            and limited.meta.get("handle") != handle,
+            f"limit 只打 1 个，且换了产物目录：{limited.meta}",
+        )
+
+        # ---- 五、全部失败：仍然失败、但产物留下 ----
+        behaviour["mode"] = "all_fail"
+        fail_dir = make_ligandset("bad", ["BAD2"])
+        fail_set = ledger.add(
+            "ligandset",
+            path=fail_dir,
+            summary="all bad",
+            fingerprint=fingerprint_path(fail_dir),
+            meta={"stage": "prepared"},
+            link_current_receptor=False,
+        )
+        failed = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(fail_set.handle)},
+            context=ledger,
+        )
+        check(
+            failed.failed and "没有配体打分成功" in failed.output,
+            f"全失败时失败并说明：{failed.output}",
+        )
+        check(
+            failed.meta.get("scored") == 0 and "日志" in failed.output,
+            f"全失败也留日志路径：{failed.output}",
+        )
+        behaviour["mode"] = "ok"
+
+        # ---- 六、整批超时 / 非零退出 ----
+        behaviour["mode"] = "timeout"
+        timed = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle),
+             "limit": 2},
+            context=ledger,
+        )
+        check(timed.failed and "超时" in timed.output, f"超时被识别：{timed.output}")
+        behaviour["mode"] = "exit"
+        exited = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle),
+             "limit": 2},
+            context=ledger,
+        )
+        check(
+            exited.failed and "退出码 3" in exited.output,
+            f"非零退出被识别：{exited.output}",
+        )
+        behaviour["mode"] = "ok"
+
+        # ---- 七、handle 与阶段分档 ----
+        raw_ligand = ledger.add(
+            "ligandset",
+            path=make_ligandset("raw", ["A"]),
+            summary="raw",
+            meta={"stage": "raw"},
+            link_current_receptor=False,
+        )
+        raw_result = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(raw_ligand.handle)},
+            context=ledger,
+        )
+        check(
+            raw_result.failed and "prepared 状态" in raw_result.output,
+            f"raw 配体集被拒：{raw_result.output}",
+        )
+
+        raw_receptor = ledger.add(
+            "receptor",
+            path=receptor_dir,
+            summary="raw receptor",
+            meta={"stage": "raw"},
+        )
+        raw_receptor_result = await tool.execute(
+            {"receptor": str(raw_receptor.handle), "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(
+            raw_receptor_result.failed and "prepared 状态" in raw_receptor_result.output,
+            f"raw 受体被拒：{raw_receptor_result.output}",
+        )
+
+        wrong_kind = await tool.execute(
+            {"receptor": str(ligand_set.handle), "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(
+            wrong_kind.failed and "receptor" in wrong_kind.output,
+            f"handle 类型拿错时说清参数：{wrong_kind.output}",
+        )
+        unknown = await tool.execute(
+            {"receptor": "receptor#99", "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(unknown.failed and "receptor#99" in unknown.output,
+            f"不存在的 handle 被拒：{unknown.output}")
+
+        # ---- 八、docking 产物作为输入 ----
+        docking_dir = work / "docking"
+        (docking_dir / "poses").mkdir(parents=True, exist_ok=True)
+        (docking_dir / "poses" / "A_out.pdbqt").write_text("REMARK A\n", encoding="utf-8")
+        (docking_dir / "poses" / "B_out.pdbqt").write_text("REMARK B\n", encoding="utf-8")
+        (docking_dir / "manifest.json").write_text(
+            json.dumps({
+                "kind": "docking", "stage": "docking",
+                "results": [
+                    {"id": "A", "status": "ok", "pose_pdbqt": "poses/A_out.pdbqt"},
+                    {"id": "B", "status": "failed", "pose_pdbqt": "poses/B_out.pdbqt"},
+                ],
+            }),
+            encoding="utf-8",
+        )
+        docking_artifact = ledger.add(
+            "artifact",
+            path=docking_dir,
+            summary="docking",
+            fingerprint=fingerprint_path(docking_dir),
+            meta={"kind": "docking", "stage": "docking"},
+            link_current_receptor=False,
+        )
+        rescored = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(docking_artifact.handle)},
+            context=ledger,
+        )
+        check(
+            not rescored.failed and rescored.meta.get("input") == 1,
+            f"对接产物只取 status=ok 的 pose：{rescored.meta}",
+        )
+        rescore_manifest = json.loads(
+            (Path(ledger.get(rescored.meta["handle"]).path) / "manifest.json")
+            .read_text(encoding="utf-8")
+        )
+        check(
+            rescore_manifest["ligands"]["source"] == "docking"
+            and [item["id"] for item in rescore_manifest["results"]] == ["A"],
+            f"来源记成 docking：{rescore_manifest['ligands']}",
+        )
+
+        # ---- 九、缺环境：失败并给安装指引 ----
+        def no_python() -> str:
+            raise ToolError(
+                f"没有找到 DTA 的解释器。用 {affinity_module.PYTHON_ENV} 指定。"
+                f"{affinity_module.INSTALL_HINT}")
+
+        affinity_module.dta_python = no_python
+        missing = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(
+            missing.failed
+            and affinity_module.PYTHON_ENV in missing.output
+            and "DTA/README.md" in missing.output,
+            f"缺解释器时给安装指引：{missing.output}",
+        )
+        affinity_module.dta_python = lambda: "/fake/python"
+
+        # ---- 十、参数与装配 ----
+        properties = tool.spec.parameters.get("properties") or {}
+        check(
+            tool.spec.parameters.get("required") == ["receptor", "ligands"],
+            "receptor 与 ligands 是必填",
+        )
+        check("ledger" not in properties, "参数模式里不列 ledger")
+        check(
+            tool.spec.parameters.get("additionalProperties") is False,
+            "不认识的参数直接拒绝",
+        )
+        check("越高越好" in tool.spec.description, "描述第一段写清分数方向")
+        check("torch" in tool.spec.description, "描述里说明要 DTA 的独立环境")
+
+        empty = await tool.execute({}, context=ledger)
+        check(
+            empty.failed and "缺少参数 receptor" in empty.output,
+            f"空调用被拦下：{empty.output}",
+        )
+        missing_ledger = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle)},
+            context=None,
+        )
+        check(
+            missing_ledger.failed and "内核装配问题" in missing_ledger.output,
+            f"没拿到登记表时报装配问题：{missing_ledger.output}",
+        )
+        for name, value, expected in (
+            ("pocket_radius", 1.0, "3 到 20"),
+            ("limit", 0, "1 到 500"),
+            ("timeout", 1, "60 到 7200"),
+        ):
+            bad = await tool.execute(
+                {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle),
+                 name: value},
+                context=ledger,
+            )
+            check(
+                bad.failed and expected in bad.output,
+                f"{name} 越界时给出范围：{bad.output}",
+            )
+
+        from opencode_tui.core.agent.permission import DEFAULT_ASK, PLAN_DENY
+
+        check("score_affinity" in DEFAULT_ASK, "默认策略下要问一次（它会跑外部进程）")
+        check("score_affinity" in PLAN_DENY, "Plan 方式下一律拒绝")
+
+        source = (
+            ROOT / "opencode_tui" / "core" / "agent" / "domain" / "affinity.py"
+        ).read_text(encoding="utf-8")
+        check("create_subprocess_shell" not in source, "打分不拼 shell")
+        check("import torch" not in source, "主仓不 import torch（否则启动就炸）")
+    finally:
+        affinity_module.scorings_dir = original_dir
+        affinity_module.dta_python = original_python
+        affinity_module.dta_root = original_root
+        affinity_module.run_batch = original_run
+        shutil.rmtree(work, ignore_errors=True)
+
+
 async def check_tool_context() -> None:
     """框架补口：Ctx 注入、ToolResult.meta、批量部分成功语义。"""
     injected: list[object] = []
@@ -8751,7 +9165,9 @@ def check_chemistry_gate() -> None:
     # ---- 一、AST 扫全仓：任何模块顶层都不许 import 化学依赖 ----
     # 这一条是整个守门人的前提。顶层的 import 会把「可选依赖」变成「启动前提」：
     # 没装化学依赖的人连会话都开不起来，而它们本该只影响一个工具。
-    CHEM_NAMES = {"rdkit", "meeko", "gemmi"}
+    # 除了化学栈，深度学习栈也不许进主仓顶层：torch/dgl 只存在于 DTA 自己的
+    # 解释器里（affinity 工具走子进程），顶层 import 会让应用起不来、exe 膨胀 2GB。
+    CHEM_NAMES = {"rdkit", "meeko", "gemmi", "torch", "dgl", "transformers"}
     offenders: list[str] = []
     scanned = 0
     for path in sorted((ROOT / "opencode_tui").rglob("*.py")):
@@ -10803,6 +11219,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("ligand-import", check_ligand_import),
     ("ligand-prep", check_ligand_prepare),
     ("docking", check_docking),
+    ("affinity", check_affinity),
     ("listing", check_listing_tools),
     ("plan-deny", check_plan_deny),
     ("prompt", check_prompt),

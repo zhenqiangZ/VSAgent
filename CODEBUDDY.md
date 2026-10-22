@@ -25,6 +25,17 @@ CI 只有一个 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，**
 可选化学栈：`pip install -r requirements-chem.txt`（meeko/rdkit/gemmi/numpy/scipy），
 不装也能跑，只有 `prepare_receptor` 会返回一条带安装指令的错误。
 
+**亲和力打分（`score_affinity`）另有一套环境**，在 `models/DTA/.venv`（Python 3.10 +
+torch 2.2.1 + dgl 2.1.0），装法见 `models/DTA/README.md`。主仓一行都不 import torch——
+工具是**起子进程**跑 `models/DTA/virtual_screen.py`，所以没装这套环境时应用照常启动，
+只有那一个工具返回安装指引。别把它并进 `.venv`：主仓是 3.12，`pandas==1.5.3` 没有
+cp312 轮子，且 MDAnalysis 要求 `numpy<2`。
+
+`models/DTA/` **整个目录不进版本控制**（代码 54MB + venv 1.6GB + 权重 15GB），
+`.gitignore` 里一行 `models/DTA/` 挡住。它不能放进 `opencode_tui/` 里面：
+`check_chemistry_gate` 用 `rglob("*.py")` 扫整个包，DTA 有 45 处顶层
+`import torch/rdkit`，放进去那条断言当场就红。
+
 ```bash
 # 启动应用（唯一入口，无参数解析）
 python -m opencode_tui            # 或 python __main__.py
@@ -38,8 +49,9 @@ python tests/test_agent.py --only hooks-in-loop
 python tests/dump_layout.py       # 100x30 布局快照，写到 tests/output/
 
 # 领域工具调试：唯一需要真实网络的脚本（真的打 UniProt/ChEMBL/RCSB/PubMed）
-python debug_tools.py             # 全跑 10 模块 18 工具，顺序即依赖顺序，零参数
+python debug_tools.py             # 全跑 11 模块 19 工具，顺序即依赖顺序，零参数
 # dock 需要外部 vina：PATH 里有 vina，或设置 VSA_VINA_BIN；没有时这一步照实失败
+# score_affinity 需要 models/DTA/.venv：没有时同样照实失败并给安装指引
 python debug_tools.py --list
 python debug_tools.py structure fetch_structure pdb_id=4HJO        # 显式：单工具单参数
 python debug_tools.py structure fetch_structure '{"pdb_id":"4HJO"}'
@@ -89,6 +101,10 @@ python tests/verify_modal_transparency.py  # 模态居中/半透明，聊天透�
 | `VSA_MAX_STEPS` | 一轮步数上限，写错**回落到 24 而不是抛错** |
 | `VSA_WEB_PORT` | 本地网页端口，默认 8860，不合法同样回落 |
 | `VSA_VINA_BIN` | 外部 AutoDock Vina 可执行文件；不设时从 PATH 找 `vina`，缺失时 `dock` 返回安装指引。引擎**不随 exe 打包** |
+| `VSA_DTA_PYTHON` | 跑 `models/DTA/virtual_screen.py` 的解释器；不设时依次试 `models/DTA/.venv/bin/python` 与旧布局的 `<repo>/.venv-dta/bin/python`，都没有时 `score_affinity` 返回安装指引 |
+| `VSA_DTA_ROOT` | `models/DTA`；不设时按**代码位置**定位到仓根下的 `models/DTA` |
+| `VSA_DTA_DEVICE` | `cpu`（默认）/ `cuda`，写进 DTA 的 hydra 配置 |
+| `VSA_DTA_WEIGHTS` | 预训练编码器目录，默认 `models/DTA/weights/`。可被更细的 `VSA_ESM_CHECKPOINT` / `VSA_CHEMBERTA_CHECKPOINT` 单独覆盖 |
 | `EDITOR` / `VISUAL` | `/editor` 外部编辑器往返 |
 | `VSA_FILE_READ_LOG` | 设为 `0` / `off` / `false` 关掉文件读取日志。默认写**项目根**的 `logs/file-reads.jsonl`（已 gitignore），一行一次读取：`purpose`（`tool.read` / `tool.grep` / `import.structure` / `import.ligands` / `receptor.prepare` / `prompt.file_ref` / `state.load` / `rules.load` / `tools.load` / `memory.load`）、绝对路径、字节数、`ok`，失败时带 `detail`。`app.py` 启动时按 `root` 配置目录；没有应用可问的脚本与领域工具落到当前目录的 `logs/` |
 
@@ -160,12 +176,19 @@ __main__.py → app.py ───────────────────
 - 每个登记工具的模块暴露一个模块级 `domain_tools() -> list[Tool]`，文件末尾带
   `if __name__ == "__main__": from debug_tools import main` 块。
 - `all_tools.py:domain_tools()` 按**浏览 → 检索 → 改动**的顺序拼装
-  （listing, uniprot, structure, chembl, rsearch, literature, receptor, ligand, docking, export）。
-  这个顺序同时决定了工具在请求体里的先后，靠前的更容易被模型选中——**顺序是语义，不是排版**。
+  （listing, uniprot, structure, chembl, rsearch, literature, receptor, ligand, docking,
+  affinity, export）。这个顺序同时决定了工具在请求体里的先后，靠前的更容易被模型选中
+  ——**顺序是语义，不是排版**。
 - 配体链路：`import_ligandset`（文件 → raw ligandset）→ `prepare_ligands`（ETKDGv3 +
   MMFF/UFF + Meeko → prepared ligandset）→ `dock`（Vina → docking artifact）→
-  `write_run(docking=...)`（pose 进运行目录）。`ligand.py` 与 `docking.py` 是这条链，
-  `products.py` 是两者共用的产物目录/原子写盘。
+  `score_affinity`（VCrossFormer → affinity artifact）→ `write_run(docking=...)`（pose 进运行目录）。
+  `ligand.py` 与 `docking.py` 是这条链，`products.py` 是共用的产物目录/原子写盘。
+- `affinity.py` 是**第二个调外部进程的工具**，但外面是一个 Python 解释器而不是二进制，
+  所以它比 `docking.py` 多两件事：`dta_python()` / `dta_root()` 两个环境变量入口，
+  以及**现截口袋**（受体的 `box.txt` 只给中心，模型要的是中心 10Å 内的残基）。
+  分数方向与 dock **相反**（pK 越高越好），两者不可比较——描述第一段必须写明这一句。
+  它不 import torch，也**不能**：`check_chemistry_gate` 的黑名单与
+  `test_smoke.walk_packages` 都会当场炸，PyInstaller 还会把 2GB 依赖拖进 exe。
 - 不登记工具的模块（`pockets` / `complexes` / `prankweb` / `align` / `chemistry` / `pdbtext` / `http` / `products`）
   是库层，被 `WriteRunTool` 之类调用。口袋来源因此是四层叠合：共晶配体 → 复合物 → p2rank 预测 → 先验叠合。
 - `http.py` 是**全仓唯一的网络出口**，测试整体替换的就是它。4xx → `ToolError`，

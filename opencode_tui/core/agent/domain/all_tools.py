@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from ..tools import Tool
 from . import (
+    affinity,
     chembl,
     docking,
     export,
@@ -39,5 +40,6 @@ def domain_tools() -> list[Tool]:
         *receptor.domain_tools(),
         *ligand.domain_tools(),
         *docking.domain_tools(),
+        *affinity.domain_tools(),
         *export.domain_tools(),
     ]

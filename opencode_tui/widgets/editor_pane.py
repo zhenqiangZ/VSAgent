@@ -115,7 +115,7 @@ class PromptInput(ScrollingTextArea):
         """获得焦点时不重画整块输入区。
 
         `Widget._on_focus`（`widget.py:4767`）会调一次不带区域的 `self.refresh()`，
-        把输入区整块（115 列 × 8 行）标成脏区域。输入区的样子不随焦点变化：
+        把输入区整块标成脏区域。输入区的样子不随焦点变化：
         应用自己的 tcss 里没有一条 `:focus` 规则。
         `prevent_default` 会拦住基类的同名处理函数，基类另外那两件事在这里补上。
         """
@@ -205,7 +205,7 @@ class EditorPane(Container):
                 # 键里不含这个字段，也没有清缓存的钩子。只能在构造时传。
                 yield PromptInput(id="editor-input", highlight_cursor_line=False)
                 with Horizontal(id="editor-status"):
-                    # 这四个标签画的是 Agent 名称、模型名称与提示语，取值来自 `.env`，
+                    # 这四个标签画的是 Agent 名称、模型名称与提示语，取值来自连接配置与状态文件，
                     # 关掉标签解析，模型名里带方括号时不会被当成标签吞掉。
                     yield Static(self._agent, id="editor-agent", markup=False)
                     yield Static(self._model, id="editor-model", markup=False)

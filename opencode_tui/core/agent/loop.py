@@ -99,7 +99,7 @@ def missing_tool_reason(registry: ToolRegistry, name: str) -> str:
     """
     if name in registry.disabled:
         return (
-            f"{name} 已被禁用（配置在 .opencode_tui/tools.toml 里），"
+            f"{name} 已被禁用（配置在 .opencode_tui/tools.toml 里，可在 /tools 面板里打开），"
             "本次会话不会提供这个工具，重试无用，请改用别的办法或告诉用户。"
         )
     return f"unknown tool: {name}"
@@ -215,8 +215,16 @@ class AgentLoop:
         连接参数照旧，窗口、单价、采样参数与推理能力按新模型重取。
         窗口跟着一起换：它决定上下文预算，留在旧模型的数值上会让预算算错。
         """
-        self.config = self.config.for_model(name)
-        self.context_window = self.config.context_window
+        return self.reconfigure(self.config.for_model(name))
+
+    def reconfigure(self, config: ProviderConfig) -> ProviderConfig:
+        """整套换掉连接参数：地址、密钥、模型都可能变。
+
+        `/model` 改完接口之后走这条路径。窗口跟着一起换，理由与 `switch_model`
+        相同；provider 用新的配置重建，旧的那个持有的是旧地址与旧密钥。
+        """
+        self.config = config
+        self.context_window = config.context_window
         self.provider = OpenAICompatProvider(self.config, self.provider.timeout)
         return self.config
 

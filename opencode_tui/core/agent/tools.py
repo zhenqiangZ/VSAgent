@@ -325,7 +325,8 @@ class ToolRegistry:
     工具清单里，模型看不到它。这与「装进来但调用时拒绝」是两件事——
     后者模型会一直重试，上下文里攒下一串失败记录；前者它连这个工具存在都不知道。
 
-    禁用清单的读法见 `permission.load_disabled`，配置在 `.opencode_tui/tools.toml`。
+    禁用清单的读法见 `permission.load_disabled`，配置在 `.opencode_tui/tools.toml`，
+    应用里用 `/tools` 面板改（改完由 `app.toggle_tool` 重装注册表，不必重启）。
     这里只负责一件事：把清单里那些名字挡在门外。放在注册表而不是装配处，
     是因为装配处有八次 `register` 调用，逐个加判断会漏；一个入口收口最省事。
     """

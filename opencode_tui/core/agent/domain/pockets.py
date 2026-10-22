@@ -29,7 +29,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from . import align, complexes, export, http, pdbtext, prankweb, structure
+from . import align, complexes, export, http, pdbtext, prankweb, preprocess, structure
 
 __all__ = [
     "PocketBundle",
@@ -222,12 +222,19 @@ def _clusters_from_structures(
         filtered = export.ligand_groups(
             doc, modified_names=[name for name, _count in facts.modified]
         )
-        for reason, count in filtered.counts.items():
-            excluded[reason] = excluded.get(reason, 0) + count
-
         # 只算受体那几条链（复合物里受体只是其中一条，别把配体伴侣当口袋）。
         chains = receptor_chains or tuple(facts.polymer_chains)
-        for cluster in export.cluster_ligands(filtered.kept):
+        # 名字名单之后再走一遍几何筛查：缓冲液名单永远收不全，靠「重原子太少 /
+        # 共价挂在蛋白上 / 只碰到一两个残基」把剩下的溶剂挡掉。
+        # **按复合物自己的全部聚合物链判接触**：不同条目的链号未必与受体一致，
+        # 传受体链号会把整条配体误判成「接触不足」。
+        screened = preprocess.screen_ligands(doc, filtered.kept)
+        for reason, count in filtered.counts.items():
+            excluded[reason] = excluded.get(reason, 0) + count
+        for reason, count in screened.counts.items():
+            excluded[reason] = excluded.get(reason, 0) + count
+
+        for cluster in export.cluster_ligands(screened.kept):
             residues = export.pocket_residues(doc, cluster.coords, radius, chains=chains)
             if not residues:
                 continue
@@ -394,10 +401,15 @@ def prior_pockets(
         filtered = export.ligand_groups(
             doc, modified_names=[name for name, _count in facts.modified]
         )
+        # 候选结构里的链号未必与受体一致（叠合按序列配对，不按链号），
+        # 所以这里按**它自己的全部聚合物链**判接触，不传受体链号。
+        screened = preprocess.screen_ligands(doc, filtered.kept)
         for reason, count in filtered.counts.items():
             excluded[reason] = excluded.get(reason, 0) + count
+        for reason, count in screened.counts.items():
+            excluded[reason] = excluded.get(reason, 0) + count
 
-        moved = align.moved_groups(filtered.kept, transform)
+        moved = align.moved_groups(screened.kept, transform)
         for cluster in export.cluster_ligands(moved):
             residues = export.pocket_residues(
                 receptor_doc, cluster.coords, radius, chains=chains

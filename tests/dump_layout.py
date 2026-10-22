@@ -7,6 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from textual.pilot import Pilot  # noqa: E402
+from textual.screen import ModalScreen  # noqa: E402
 from textual.widgets import Label, Static  # noqa: E402
 
 from opencode_tui.app import OpenCodeApp  # noqa: E402
@@ -38,6 +40,21 @@ def dump(app: OpenCodeApp, title: str) -> str:
     return "\n".join(lines)
 
 
+async def dismiss_modals(pilot: Pilot) -> None:
+    """把盖在聊天界面上的弹窗逐个关掉。
+
+    这一轮里模型会请求 bash 之类的工具，询问弹窗是 `ModalScreen`：一弹出来
+    `app.screen` 就变成 `PermissionDialog`，接着 `query_one(EditorPane)` 抛
+    `NoMatches`，快照只写出一部分就中断。esc 与 n 同义（拒绝），拒绝之后这一轮
+    会带着「被拒绝」的结果继续跑、可能再问下一个工具，所以循环到最上层回到普通屏幕为止。
+    """
+    for _ in range(6):
+        if not isinstance(pilot.app.screen, ModalScreen):
+            return
+        await pilot.press("escape")
+        await pilot.pause(0.5)
+
+
 async def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     state = ROOT / ".probe" / "layout_state.toml"
@@ -53,8 +70,10 @@ async def main() -> None:
         await pilot.press(*list("explain this repo"))
         await pilot.press("enter")
         await pilot.pause(3.0)
+        await dismiss_modals(pilot)
         (OUTPUT_DIR / "chat.txt").write_text(dump(app, "ChatScreen"), encoding="utf-8")
 
+        await dismiss_modals(pilot)
         editor = app.screen.query_one(EditorPane)
         editor.text = "/help"
         await pilot.pause()

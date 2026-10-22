@@ -43,8 +43,8 @@ from ..ledger import (
     fingerprint_text,
 )
 from ..tools import Tool, ToolResult, ToolSpec
-from . import products
-from .pdbtext import HeteroGroup, PdbDocument, ResidueKey, hetero_groups
+from . import pdbtext, preprocess, products, structure
+from .pdbtext import HeteroGroup, PdbDocument, ResidueKey, hetero_groups, is_heavy
 
 __all__ = [
     "BUFFER_LIKE",
@@ -134,30 +134,52 @@ BUFFER_LIKE = frozenset(
         "PG4",  # 四乙二醇
         "PGE",  # 三乙二醇
         "1PE",  # 聚乙二醇单甲醚
+        "2PE",  # 聚乙二醇（另一种聚合度）
+        "P6G",  # 六乙二醇
+        "7PE",  # 七乙二醇
+        "12P",  # 十二乙二醇
+        "15P",  # 十五乙二醇
+        "PGO",  # 丙二醇（1,2-丙二醇）
+        "PGR",  # 丙二醇（另一种写法）
         "MPD",  # 2-甲基-2,4-戊二醇，常用的抗冻剂
+        "BU3",  # 1,3-丁二醇
         # 醇 / 酮 / 酸（结晶添加剂）
         "IPA",  # 异丙醇
         "MOH",  # 甲醇
         "EOH",  # 乙醇
         "ACE",  # 乙酸根
         "ACT",  # 乙酸根（另一种写法）
+        "ACY",  # 乙酸（质子化写法）
         "FMT",  # 甲酸根
         "CIT",  # 柠檬酸根
         "TLA",  # 酒石酸根
         "MLA",  # 苹果酸根
         "MLI",  # 苹果酸根（另一种写法）
+        "SIN",  # 琥珀酸根
+        "SUC",  # 蔗糖 / 琥珀酸（常见写法）
+        "FUM",  # 富马酸根
+        "MAL",  # 麦芽糖 / 苹果酸（常见写法）
+        "LAC",  # 乳酸根
         # 缓冲液
         "TRS",  # 三羟甲基氨基甲烷（Tris）
         "EPE",  # 4-(2-羟乙基)-1-哌嗪乙磺酸（HEPES）
         "MES",  # 2-(N-吗啉)乙磺酸
         "BES",  # N,N-双(2-羟乙基)-2-氨基乙磺酸
+        "BIS",  # 双(2-羟乙基)氨基三羟甲基甲烷（Bis-Tris）
+        "IMD",  # 咪唑（镍柱洗脱残留）
+        "CAC",  # 二甲砷酸根（旧结晶条件里常见）
         "PO4",  # 磷酸根
         "SO4",  # 硫酸根，极常见
         "NO3",  # 硝酸根
         "SCN",  # 硫氰酸根
         "AZI",  # 叠氮根（防腐剂）
+        "NH4",  # 铵根
         "DMS",  # 二甲基亚砜
         "DMF",  # 二甲基甲酰胺
+        # 还原剂 / 防聚集
+        "DTT",  # 二硫苏糖醇
+        "BME",  # β-巯基乙醇
+        "TCEP",  # 三(2-羧乙基)膦
         # 糖类（糖基化修饰常挂成 HETATM，单独成组时不是配体）
         "NAG",  # N-乙酰葡糖胺，糖基化位点的标准残基
         "BMA",  # β-D-甘露糖
@@ -167,6 +189,13 @@ BUFFER_LIKE = frozenset(
         "FUC",  # 岩藻糖
         "XYP",  # 木吡喃糖
         "NDG",  # 2-脱氧-2-氨基葡萄糖
+        "NGA",  # N-乙酰半乳糖胺
+        "SIA",  # 唾液酸
+        "GLA",  # α-D-半乳糖（另一种写法）
+        "BGC",  # β-D-葡萄糖
+        # 未知/未建模原子
+        "UNX",  # 未知原子
+        "UNL",  # 未知配体
     }
 )
 """常见缓冲液 / 冷冻保护剂 / 结晶添加剂 / 糖基化残基。
@@ -187,21 +216,8 @@ class ExportGeometryError(ValueError):
 # ---------------------------------------------------------------------------
 # 重原子
 # ---------------------------------------------------------------------------
-_HYDROGEN_NAMES = frozenset({"H", "D", "T"})
-
-
-def is_heavy(atom) -> bool:
-    """这个原子是不是重原子（非氢）。
-
-    判氢优先看元素列；元素列读不到时（短行）退回按原子名首字符判。
-    **两种判法都会漏**（元素列缺失且原子名不以 H 开头的情形），但漏一个氢只是
-    让最短距离多算几个数，不会算错——而把重原子误判成氢会让它整个不参与，
-    那是错的。所以两个判据都朝「算它是重原子」这一侧让。
-    """
-    element = (getattr(atom, "element", "") or "").strip().upper()
-    if element:
-        return element not in _HYDROGEN_NAMES
-    return not (getattr(atom, "name", "") or "").strip().upper().startswith(("H", "D"))
+# `is_heavy` 的定义在 `pdbtext.py`：清洗结构与算口袋都要用它，只能有一份。
+# 这里保留导出名，是因为判据与下游一直按 `export.is_heavy` 取。
 
 
 def _heavy_coords(group: HeteroGroup) -> tuple[tuple[float, float, float], ...]:
@@ -758,6 +774,9 @@ class WriteRunTool(Tool):
             "把一个受体（与可选的对接产物）写成一个**运行目录**：`meta.json` 记目标与口袋来源、"
             "`receptor.pdb` 是坐标、`ligands/` 放对接后的最佳位姿。产出的目录登记成 artifact，"
             "网页端据此渲染结构页。\n\n"
+            "**同一个工具负责两种展示**：`view=pockets`（默认）算口袋；`view=structure` "
+            "只展示结构、不联网也不算口袋。两种模式都会先做同一套预处理"
+            "（选链、选交替构象、去水、去溶剂、去氢），页面按链配不同颜色。\n\n"
             "**给了 docking 就走对接结果这一侧**：把 `status=ok` 的 pose 复制进 `ligands/`、"
             "填 `molecules` 的分数与排名、并在 `provenance.poses` 里记下引擎与分数方向。"
             "`docking` 与 `ligands` 不能同时给——前者已经带着配体集。\n\n"
@@ -821,6 +840,16 @@ class WriteRunTool(Tool):
                         "（如 \"1M17,2ITY,4HJO\"）。给了它就走先验这一侧，"
                         "不再按 UniProt 检索复合物。每个编号都会核对编号是否存在、"
                         "链序列是不是受体序列，不通过的逐条列在返回里"
+                    ),
+                },
+                "view": {
+                    "type": "string",
+                    "enum": ["pockets", "structure"],
+                    "description": (
+                        "页面要展示什么。`pockets`（默认）算口袋并展示；"
+                        "`structure` 只展示清洗后的结构，**不联网、不算口袋**。"
+                        "两种模式写出的 `receptor.pdb` 都经过同一套预处理"
+                        "（选链、选构象、去水、去溶剂、去氢），结构页按链配色"
                     ),
                 },
             },
@@ -888,6 +917,12 @@ class WriteRunTool(Tool):
         pdb_id = _pdb_id_of(arguments.get("pdb_id"), meta)
         name = _name_of(arguments.get("name"), meta, entry)
         chains = _chains_of(meta, entry)
+        view = str(arguments.get("view") or "pockets").strip().lower()
+        if view not in ("pockets", "structure"):
+            return ToolResult(
+                output=f"view 只能是 pockets 或 structure，收到 {view!r}。",
+                failed=True,
+            )
 
         # ---- 对接产物：在写任何文件之前校验完 ----
         docking_manifest: dict[str, Any] | None = None
@@ -909,6 +944,24 @@ class WriteRunTool(Tool):
                 output=f"读受体文件失败（{type(error).__name__}：{error}）", failed=True
             )
 
+        # 受体条目没记链时（本地导入、老运行目录）从坐标本身认。不补这一步，
+        # 页面拿到空链清单，`showChains([])` 会把整份结构清空——看着像加载失败。
+        facts = structure.parse_pdb(text)
+        if not chains:
+            chains = tuple(facts.polymer_chains)
+
+        # ---- 展示用的坐标：同一套预处理，口袋与结构两种模式都走 ----
+        try:
+            display = preprocess.clean_structure(
+                text,
+                chains=chains,
+                modified_names=[name for name, _count in facts.modified],
+            )
+        except pdbtext.PdbEditError as error:
+            return ToolResult(
+                output=f"受体坐标无法按标准 PDB 列位解析：{error}", failed=True
+            )
+
         # ---- 口袋：先验清单优先，其次 P0，为空才 P1（延迟导入避免成环）----
         from . import pockets as pockets_module
 
@@ -920,7 +973,15 @@ class WriteRunTool(Tool):
         verdicts: tuple = ()
 
         candidates = _candidates_of(arguments.get("candidates"))
-        if candidates:
+        if view == "structure":
+            # 结构展示**不碰口袋来源**：不算、不联网。用户要的是「看结构」，
+            # 这时去检索几十个复合物会让一个本该秒开的动作变成几分钟的等待。
+            bundle = pockets_module.PocketBundle(
+                origin="none",
+                note="view=structure：只展示结构，未计算口袋",
+            )
+            note_parts.append(bundle.note)
+        elif candidates:
             # 给了先验清单就走这一侧，**不再按 UniProt 检索复合物**：那种检索只返回
             # 「带配体的已发布复合物」，覆盖到的口袋窄。清单覆盖面宽，代价是清单本身
             # 不可信，所以逐个核对编号与序列，逐条把结论报回去。
@@ -941,7 +1002,7 @@ class WriteRunTool(Tool):
                 note="没有 UniProt 编号，主来源无从查起（没查成）",
             )
 
-        if bundle.is_empty:
+        if view == "pockets" and bundle.is_empty:
             # 主来源为空（或没查成）才轮到预测这一侧。
             note_parts.append(bundle.note)
             predicted = pockets_module.p2rank_pockets(
@@ -995,7 +1056,9 @@ class WriteRunTool(Tool):
                 # 否则目录里留着新 meta 不认识的位姿文件。
                 for old in (target / RUN_LIGANDS).glob("pose-*.pdb"):
                     old.unlink()
-            (target / RUN_RECEPTOR).write_text(text, encoding="utf-8", newline="")
+            (target / RUN_RECEPTOR).write_text(
+                display.text, encoding="utf-8", newline=""
+            )
             if staging is not None:
                 _commit_docking_poses(target, staging)
                 poses = _poses_provenance(
@@ -1015,6 +1078,8 @@ class WriteRunTool(Tool):
                 ligands=molecules,
                 prior=verdicts,
                 poses=poses,
+                view=view,
+                preprocess_report=display.report,
             )
             _write_json(target / RUN_META, payload)
         except OSError as error:
@@ -1033,7 +1098,7 @@ class WriteRunTool(Tool):
             summary=_run_summary(name, pdb_id, chains, reference),
             fingerprint=fingerprint_text(json.dumps(payload, sort_keys=True)),
             parents=[entry.handle],
-            meta={"kind": "run", "run_id": run_id, "origin": bundle.origin},
+            meta={"kind": "run", "run_id": run_id, "origin": bundle.origin, "view": view},
         )
 
         docking_report = (
@@ -1057,10 +1122,13 @@ class WriteRunTool(Tool):
                 note_parts=note_parts,
                 prior=verdicts,
                 docking=docking_report,
+                view=view,
+                preprocess_report=display.report,
             ),
             meta={
                 "handle": str(artifact.handle),
                 "run_id": run_id,
+                "view": view,
                 "origin": bundle.origin,
                 "pockets": len(bundle.pockets),
                 "total": p0_total,
@@ -1416,13 +1484,16 @@ def _build_meta(
     ligands: list[dict[str, Any]],
     prior: Sequence[Any] = (),
     poses: dict[str, Any] | None = None,
+    view: str = "pockets",
+    preprocess_report: Any = None,
 ) -> dict[str, Any]:
     """装配 `meta.json`。
 
     顶层键与 `runs/1iep-molstar/meta.json` 一致：
     `run_id` / `target` / `structure` / `reference_ligand` / `pockets` / `molecules` / `provenance`。
     **不要加新的顶层键**——判据按「与演示数据同键」核对，多一个键就会报出来。
-    先验清单的取证结论因此挂在 `provenance.pockets.prior` 里，那是已有键的内层。
+    先验清单的取证结论因此挂在 `provenance.pockets.prior` 里，那是已有键的内层；
+    本次的 `view` 与预处理报告同理，挂在 `provenance` 下。
     """
     pockets = [dict(pocket) for pocket in bundle.pockets]
     _label_pockets(pockets)
@@ -1440,6 +1511,7 @@ def _build_meta(
         "pockets": pockets,
         "molecules": ligands,
         "provenance": {
+            "view": view,
             "pockets": {
                 "method": _origin_method(bundle.origin),
                 "origin": bundle.origin,
@@ -1450,9 +1522,11 @@ def _build_meta(
                 "sources": list(bundle.sources or []),
                 "pdb_id": pdb_id,
                 "uniprot": uniprot,
-            }
+            },
         },
     }
+    if preprocess_report is not None:
+        payload["provenance"]["preprocess"] = preprocess_report.as_dict()
     if prior:
         payload["provenance"]["pockets"]["prior"] = [
             {
@@ -1539,15 +1613,40 @@ def _run_report(
     note_parts: list[str],
     prior: Sequence[Any] = (),
     docking: dict[str, Any] | None = None,
+    view: str = "pockets",
+    preprocess_report: Any = None,
 ) -> str:
     # 延迟导入：`align` 与 `pockets` 都不在模块顶层引，避免绕回成环。
     from . import align as align_module
 
     lines = [f"已写出运行目录 {target}，登记为 {artifact.handle}。"]
-    lines.append(
-        f"  口袋来源：{bundle.origin}（{_origin_label(bundle.origin)}）"
-        f"，共 {len(bundle.pockets)} 个口袋。"
-    )
+    if view == "structure":
+        lines.append(
+            "  展示模式：只展示结构（未计算口袋、未联网）。"
+            "要口袋就把 view 改成 pockets 再写一次。"
+        )
+    else:
+        lines.append(
+            f"  口袋来源：{bundle.origin}（{_origin_label(bundle.origin)}）"
+            f"，共 {len(bundle.pockets)} 个口袋。"
+        )
+    if preprocess_report is not None:
+        lines.append("  结构预处理：" + preprocess_report.describe() + "。")
+    if view == "structure":
+        if reference:
+            lines.append(f"  参考配体：{reference}。")
+        if docking:
+            best = docking.get("best_score")
+            best_text = (
+                f"最佳 {best:.2f} kcal/mol（{docking.get('best_id') or '—'}）"
+                if isinstance(best, (int, float))
+                else "没有可比较的分数"
+            )
+            lines.append(
+                f"  对接：{docking.get('written', 0)} 个位姿写入 {RUN_LIGANDS}/，{best_text}。"
+            )
+        lines.append("  提示：用 open_viewer 打开这一份看结构。")
+        return "\n".join(lines)
     if bundle.origin == "aligned":
         lines.append(
             f"  先验清单：共 {p0_total} 个编号，通过核对并使用 **{p0_used} 个**"

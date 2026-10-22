@@ -15,15 +15,15 @@ from .core.agent.task import TaskTool
 from .core.agent.permission import (
     PermissionPolicy,
     default_permission_paths,
-    load_disabled,
     load_permissions,
+    load_tool_switches,
+    save_disabled,
+    tools_config_path,
 )
 from .core.agent.prompt import KEEP_MESSAGES
 from .core.agent.provider import (
-    BUILTIN_MODELS,
     OpenAICompatProvider,
     ProviderConfig,
-    model_names,
 )
 from .core.agent.tools import (
     BASH_TIMEOUT,
@@ -36,6 +36,7 @@ from .core.agent.tools import (
 )
 from .core.agent.trace import TraceWriter, log_directory_for
 from .core.command_registry import CommandRegistry
+from .core.connection import Connection, connection_path_for, load_connection, save_connection
 from .core.event_bus import EventBus
 from .core.file_log import PROJECT_LOG_DIRECTORY, configure as configure_file_log
 from .core.exporter import export_filename, render_session_markdown
@@ -50,19 +51,20 @@ from .core.keybind_manager import KeybindManager
 from .core.models import EFFORTS, Message
 from .core.project_scan import merge_agents_md, scan_project
 from .core.session_manager import SessionManager
-from .env import env_file, load_env
+from .env import load_env
 from .screens.chat import ChatScreen
+from .screens.connection_form import ConnectionFormScreen
 from .screens.diff_overlay import DiffOverlayScreen
 from .screens.help import HelpScreen
 from .screens.home import HomeScreen
 from .screens.message import MessageScreen
-from .screens.model_selector import ModelInfo, ModelSelectorScreen
 from .screens.session_picker import SessionPickerScreen
 from .screens.theme_selector import ThemeSelectorScreen
+from .screens.tools_panel import ToolEntry, ToolsPanelScreen
 from .widgets.toast import ToastNotification
 
 # 需要参数的命令：命令名之后那一段交给处理函数，其余命令不吃参数。
-ARGUMENT_COMMANDS = frozenset({"remember", "forget", "task"})
+ARGUMENT_COMMANDS = frozenset({"remember", "forget", "task", "model"})
 
 
 class OpenCodeApp(App[None]):
@@ -85,6 +87,10 @@ class OpenCodeApp(App[None]):
         super().__init__()
         self.root = root or Path.cwd()
         self.session_manager = SessionManager(state_path)
+        # 接口参数与状态文件同目录。没有这份文件时应用照常起来，
+        # 只是发消息之前要先用 `/model` 填一遍。
+        self.connection_path = connection_path_for(self.session_manager.state_path)
+        self._connection = load_connection(self.connection_path)
         self.command_registry = CommandRegistry()
         self.keybind_manager = KeybindManager(self.command_registry)
         self.event_bus = EventBus()
@@ -100,6 +106,9 @@ class OpenCodeApp(App[None]):
         self._policy = policy
         self._hooks = hooks
         self._disabled: frozenset[str] | None = None
+        # 全部工具的名字与说明，含被关掉的那些。只有 `/tools` 面板要得到它们，
+        # 建一次就够——工具清单在进程里是固定的。
+        self._catalog: list[tuple[str, str]] | None = None
         self._ledger: SessionLedger | None = None
         self._memory: MemoryStore | None = None
         self.web_service = self._build_web_service()
@@ -124,12 +133,13 @@ class OpenCodeApp(App[None]):
     def _build_agent(self) -> AgentLoop:
         """装配循环层。
 
-        连接参数、单价与上下文窗口都取自项目根目录的 `.env`。工作目录是项目目录：
+        连接参数取自与状态文件同目录的 `connection.toml`，由应用内的 `/model`
+        填写；计费与窗口按模型清单兜底。工作目录是项目目录：
         系统提示里写的路径与 BashTool 实际执行的位置是同一个，模型按提示读到的目录
         就是它在工具里操作的那一个。
         """
         load_env()
-        config = ProviderConfig.from_env()
+        config = self._provider_config()
         memory = self._build_memory()
         registry = self._build_registry(memory)
         return AgentLoop(
@@ -146,6 +156,29 @@ class OpenCodeApp(App[None]):
             viewer=self.web_service,
             max_steps=max_steps_from_env(),
         )
+
+    def _provider_config(self) -> ProviderConfig:
+        """由当前连接配置拼出 provider 参数。
+
+        没有配置时给一份三项全空的配置：应用照常起来，发消息那一步再拦，
+        提示用户先走 `/model`。
+        """
+        connection = self._connection
+        if connection is None:
+            return ProviderConfig(base_url="", api_key="", model="")
+        return ProviderConfig.from_values(
+            connection.base_url,
+            connection.api_key,
+            connection.model,
+            context_window=connection.context_window,
+            price_in=connection.price_in,
+            price_out=connection.price_out,
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        """模型接口的三项是否都填了。"""
+        return self.agent.config.configured
 
     def _build_ledger(self) -> SessionLedger:
         """装配登记表。
@@ -221,7 +254,7 @@ class OpenCodeApp(App[None]):
         self._memory.revalidate()
         return self._memory
 
-    def _build_registry(self, memory: MemoryStore) -> ToolRegistry:
+    def _build_registry(self, memory: MemoryStore, disabled: frozenset[str] | None = None) -> ToolRegistry:
         """装配全部工具。每个工具的工作基准都是项目目录，
         与系统提示里写出来的路径是同一个。
 
@@ -232,8 +265,13 @@ class OpenCodeApp(App[None]):
         `.opencode_tui/tools.toml` 里标了关的工具**根本不装进来**：不装进注册表就
         不会出现在请求体的 `tools` 数组里，模型连它存在都不知道。这与权限层的
         `deny` 是两件事——那一层工具照旧可见，只是调用时被拦。
+
+        `disabled` 传空集时装配一份「一个都不关」的注册表，`/tools` 面板靠它
+        拿到完整清单：面板要能列出被关掉的那些，否则关掉之后就再也打不开了。
         """
-        registry = ToolRegistry(disabled=self._disabled_tools())
+        if disabled is None:
+            disabled = self._disabled_tools()
+        registry = ToolRegistry(disabled=disabled)
         # 超时显式传进来，而不是靠 BashTool 的默认值：改这一个数字就能看见装配处跟着动，
         # 不必翻回 tools.py 猜当前生效的是哪一个。
         registry.register(BashTool(cwd=self.root, timeout=BASH_TIMEOUT))
@@ -252,11 +290,78 @@ class OpenCodeApp(App[None]):
     def _disabled_tools(self) -> frozenset[str]:
         """`.opencode_tui/tools.toml` 里关掉的工具名。
 
-        与权限配置一样只在启动时读一次，改完要重启应用。
+        启动时读一次就缓存下来：装配路径上一个会话要走几十次，每次重读文件没有必要。
+        `/tools` 面板改完会自己把缓存换掉（见 `toggle_tool`），所以不必重启。
         """
         if self._disabled is None:
-            self._disabled = load_disabled(self.root)[0]
+            self._disabled = load_tool_switches(self.root)[0]
         return self._disabled
+
+    def tool_catalog(self) -> list[tuple[str, str]]:
+        """全部工具的名字与说明，按装配顺序，**含被关掉的那些**。
+
+        拿完整清单的办法是装配一份「一个都不关」的注册表，而不是去问当前注册表：
+        当前注册表里根本没有被关掉的那些，面板要能列出它们才谈得上打开。
+        """
+        if self._catalog is None:
+            full = self._build_registry(self._build_memory(), disabled=frozenset())
+            catalog: list[tuple[str, str]] = []
+            for name in full.names():
+                tool = full.get(name)
+                if tool is not None:
+                    catalog.append((name, tool.spec.description))
+            self._catalog = catalog
+        return self._catalog
+
+    def tool_entries(self) -> list[ToolEntry]:
+        """面板要的每一行：名字、说明、开没开、关它的配置是不是项目侧那一份。"""
+        disabled, sources = load_tool_switches(self.root)
+        project = tools_config_path(self.root)
+        entries: list[ToolEntry] = []
+        for name, description in self.tool_catalog():
+            source = sources.get(name)
+            entries.append(
+                ToolEntry(
+                    name=name,
+                    description=description,
+                    enabled=name not in disabled,
+                    # 只有「用户目录那份关的」才标出来：项目侧那份就是面板自己写的，
+                    # 标一句「由项目配置关闭」等于什么都没说。
+                    origin="" if source is None or source == project else "用户配置",
+                )
+            )
+        return entries
+
+    def toggle_tool(self, name: str, enabled: bool) -> list[ToolEntry]:
+        """打开或关掉一个工具，写盘并立刻重装注册表，返回刷新后的面板数据。
+
+        重装注册表而不是只改 `disabled` 集合：工具的可见性就是注册表的成员资格，
+        只改集合的话，这一轮里的请求体仍带着旧清单，得重启才生效。
+
+        写盘之后重新读一遍再判断：用户目录那份也写了 `false` 时，本文件改成 true
+        也不管用，那时要如实说一句，而不是弹「已启用」把人骗过去。
+        """
+        disabled, sources = load_tool_switches(self.root)
+        project = tools_config_path(self.root)
+        names = {tool for tool, source in sources.items() if source == project}
+        if enabled:
+            names.discard(name)
+        else:
+            names.add(name)
+        try:
+            save_disabled(self.root, names)
+        except OSError as error:
+            self.show_toast(f"写 {tools_config_path(self.root)} 出错：{error}", "error")
+            return self.tool_entries()
+
+        self._disabled = load_tool_switches(self.root)[0]
+        self.agent.registry = self._build_registry(self._build_memory())
+        actual, sources = load_tool_switches(self.root)
+        if enabled and name in actual:
+            self.show_toast(f"{name} 仍被 {sources[name]} 关着，先把那份文件里的 false 去掉", "warning")
+        else:
+            self.show_toast(f"{name} 已{'启用' if enabled else '关闭'}", "success")
+        return self.tool_entries()
 
     def on_mount(self) -> None:
         """启动时载入状态、起本地结构页的服务，并进入启动界面。"""
@@ -265,6 +370,15 @@ class OpenCodeApp(App[None]):
             self.theme = self.session_manager.theme
         if not self.session_manager.sessions:
             self.session_manager.new_session()
+        # 会话里记着的模型是上一次选的那个：地址与密钥按连接配置走，模型名以会话为准。
+        # 不同步的话状态行写着 A、请求体里发的却是连接配置里的 B。
+        session = self.session_manager.current
+        if (
+            self.is_configured
+            and session.model_id
+            and session.model_id != self.agent.config.model
+        ):
+            self.agent.switch_model(session.model_id)
         self.trace.start()
         self.web_service.start()
         self.event_bus.subscribe("turn.done", self._on_turn_done)
@@ -281,38 +395,14 @@ class OpenCodeApp(App[None]):
         self.trace.stop()
 
     @property
-    def available_models(self) -> list[ModelInfo]:
-        """可选的模型。
-
-        内置清单里的全部模型都在选择界面上；
-        `.env` 里给出的那一个如果不在清单里也照旧列在最前面。
-        """
-        config = self.agent.config
-        models = []
-        for name in model_names():
-            spec = BUILTIN_MODELS[name]
-            models.append(ModelInfo(spec.name, spec.name, spec.provider, spec.context_window))
-        if self.current_model_label not in BUILTIN_MODELS:
-            models.insert(
-                0,
-                ModelInfo(
-                    self.current_model_label,
-                    self.current_model_label,
-                    config.provider,
-                    config.context_window,
-                ),
-            )
-        return models
-
-    @property
     def current_model_label(self) -> str:
         """当前模型的展示名。
 
         会话里选过模型就以会话为准：界面上显示的那一个，
-        与下一次请求体里 `model` 字段是同一个。
+        与下一次请求体里 `model` 字段是同一个。接口还没配置时显示占位文字。
         """
         session = self.session_manager.current
-        return session.model_id or self.agent.config.model
+        return session.model_id or self.agent.config.model or "（未配置）"
 
     @property
     def current_model_provider(self) -> str:
@@ -325,7 +415,15 @@ class OpenCodeApp(App[None]):
         return self.agent.context_window
 
     def start_chat_with(self, prompt: str) -> None:
-        """带着一句初始输入进入聊天界面，由聊天界面负责发出。"""
+        """带着一句初始输入进入聊天界面，由聊天界面负责发出。
+
+        主页面提问默认开新会话：当前会话已经有内容就新建一个，空会话直接复用，
+        免得每问一句都在列表里留下一个空壳。没配接口时不新建——这一问会被拦下，
+        建了也只是一份空记录。
+        """
+        session = self.session_manager.current
+        if self.is_configured and session.messages:
+            self.session_manager.new_session()
         self.switch_screen(ChatScreen(self.root, initial_prompt=prompt))
 
     def save_state(self) -> None:
@@ -382,9 +480,21 @@ class OpenCodeApp(App[None]):
         sessions = self.session_manager.list_sessions()
         self.push_screen(SessionPickerScreen(sessions), self._on_session_picked)
 
-    def _command_models(self) -> None:
-        """列出模型。"""
-        self.push_screen(ModelSelectorScreen(self.available_models), self._on_model_picked)
+    def _command_model(self, arguments: str) -> None:
+        """配置模型接口，或者只换模型名。
+
+        不带参数时打开表单填地址、密钥与模型名；带一个词时把它当模型名，
+        连接参数不动。带参数那条要求接口已经配好，没配会先提示去填表。
+        """
+        name = arguments.strip()
+        if name:
+            self._apply_model(name)
+            return
+        self.push_screen(ConnectionFormScreen(self._connection), self._on_connection_entered)
+
+    def _command_tools(self) -> None:
+        """打开工具管理面板。"""
+        self.push_screen(ToolsPanelScreen(self.tool_entries(), self.toggle_tool))
 
     def _command_themes(self) -> None:
         """列出主题。"""
@@ -592,16 +702,16 @@ class OpenCodeApp(App[None]):
         self.show_toast(f"已压缩，之后这一轮只带最近 {left} 条发给模型", "success")
 
     def _command_connect(self) -> None:
-        """显示当前连的是哪一家，以及密钥从哪里读。"""
+        """显示当前连的是哪一家，以及配置存在哪里。"""
         config = self.agent.config
-        path = env_file()
+        path = self.connection_path
         lines = [
             f"提供商　{config.provider or '（没写）'}",
-            f"接口　　{config.base_url}",
-            f"模型　　{config.model}",
-            f"密钥　　{'已设置' if config.api_key else '没有'}（只从环境变量读，不写进状态文件）",
+            f"接口　　{config.base_url or '（还没配置）'}",
+            f"模型　　{config.model or '（还没配置）'}",
+            f"密钥　　{'已设置' if config.api_key else '没有'}（存在配置文件里，权限 0600）",
             f"配置文件{path}",
-            f"　　　　{'存在' if path.is_file() else '还没有，建一份就能换到别的提供商'}",
+            f"　　　　{'存在' if path.is_file() else '还没有'}　用 /model 填写接口地址、密钥与模型",
         ]
         self.push_screen(MessageScreen("当前提供商", lines))
 
@@ -643,13 +753,15 @@ class OpenCodeApp(App[None]):
         session = self.session_manager.get_session(session_id)
         self.show_toast(f"已切换到 {session.title if session else session_id}", "success")
 
-    def _on_model_picked(self, model_id: str | None) -> None:
-        """切换模型。
+    def _apply_model(self, model_id: str) -> None:
+        """换模型：写进会话、换掉循环层配置、刷新界面。
 
-        会话上记下选的是哪一个，循环层跟着换配置：
         窗口、单价、采样参数与推理能力都按新模型重取，下一次请求体的 `model` 就是它。
+        连接参数（地址与密钥）不动，那是 `/model` 表单管的事。
         """
-        if not model_id:
+        if not self.is_configured:
+            # 没配接口时换模型没有意义：请求照样发不出去，还会弹一句「已切换」误导人。
+            self.show_toast("还没有配置接口，先输入 /model 填写地址与密钥", "warning")
             return
         session = self.session_manager.current
         if session.model_id == model_id:
@@ -663,6 +775,22 @@ class OpenCodeApp(App[None]):
             self.show_toast(f"模型已切换为 {config.model}", "success")
         else:
             self.show_toast(f"模型已切换为 {config.model}，窗口与单价按兜底值算", "warning")
+
+    def _on_connection_entered(self, connection: Connection | None) -> None:
+        """表单填完：写盘、重建 provider、把界面刷到新配置上。"""
+        if connection is None:
+            return
+        try:
+            save_connection(self.connection_path, connection)
+        except OSError as error:
+            self.show_toast(f"写 {self.connection_path} 出错：{error}", "error")
+            return
+        self._connection = connection
+        config = self.agent.reconfigure(self._provider_config())
+        self.session_manager.current.model_id = config.model
+        self.refresh_chat()
+        self.save_state()
+        self.show_toast(f"接口已配置：{config.model} @ {config.base_url}", "success")
 
     def _on_theme_picked(self, theme: str | None) -> None:
         """切换主题。"""

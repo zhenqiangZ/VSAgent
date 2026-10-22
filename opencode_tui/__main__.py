@@ -2,7 +2,7 @@ from opencode_tui.app import OpenCodeApp
 
 
 def main() -> None:
-    """启动 opencode TUI。密钥只从项目根目录的 `.env` 读。"""
+    """启动 opencode TUI。模型接口参数由应用内 `/model` 填写并存在 `connection.toml`。"""
     OpenCodeApp().run()
 
 

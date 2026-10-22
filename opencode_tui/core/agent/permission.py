@@ -5,10 +5,12 @@ import os
 import re
 import sys
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Iterable
 
 from ..file_log import record as log_read
 from .tools import Tool
@@ -424,6 +426,43 @@ def project_config_directory(root: Path) -> Path:
     return root / CONFIG_DIRECTORY
 
 
+def tools_config_path(root: Path) -> Path:
+    """项目侧工具开关文件的位置。`/tools` 面板写的就是这一份。"""
+    return project_config_directory(root) / TOOLS_FILE
+
+
+def load_tool_switches(root: Path) -> tuple[frozenset[str], dict[str, Path]]:
+    """读工具开关，返回「装配时不要装进来的工具名」与「每个名字来自哪一份文件」。
+
+    返回值比 `load_disabled` 多一层来源信息，是为了 `/tools` 面板：它要能说清
+    「这一条是项目配置关的，面板改得动」还是「这条来自用户目录那份，面板改了也不算」。
+    """
+    sources: dict[str, Path] = {}
+    for path in (
+        tools_config_path(root),
+        Path.home() / CONFIG_DIRECTORY / TOOLS_FILE,
+    ):
+        if not path.is_file():
+            log_read(path, purpose="tools.load", ok=False, detail="文件不存在")
+            continue
+        try:
+            with path.open("rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            # 配置文件坏了不应连累启动：当作没读到，继续走。
+            log_read(path, purpose="tools.load", ok=False, detail=f"{type(error).__name__}：{error}")
+            continue
+        log_read(path, purpose="tools.load", size=path.stat().st_size)
+        table = data.get("tools")
+        if not isinstance(table, dict):
+            continue
+        for name, value in table.items():
+            if value is False:
+                # 后读的覆盖先读的：用户目录那份写得更「远」，报来源时报它更有用。
+                sources[name] = path
+    return frozenset(sources), sources
+
+
 def load_disabled(root: Path) -> tuple[frozenset[str], Path | None]:
     """读工具开关，返回「装配时不要装进来的工具名」与它的来源文件。
 
@@ -451,28 +490,34 @@ def load_disabled(root: Path) -> tuple[frozenset[str], Path | None]:
     所以 exe 挪到哪、从哪个目录启动都一样生效。
     返回的来源文件用于启动时打一行日志，让用户知道这条是哪儿来的。
     """
-    names: set[str] = set()
-    sources: list[Path] = []
-    for path in (
-        project_config_directory(root) / TOOLS_FILE,
-        Path.home() / CONFIG_DIRECTORY / TOOLS_FILE,
-    ):
-        if not path.is_file():
-            log_read(path, purpose="tools.load", ok=False, detail="文件不存在")
-            continue
-        try:
-            with path.open("rb") as handle:
-                data = tomllib.load(handle)
-        except (OSError, tomllib.TOMLDecodeError) as error:
-            # 配置文件坏了不应连累启动：当作没读到，继续走。
-            log_read(path, purpose="tools.load", ok=False, detail=f"{type(error).__name__}：{error}")
-            continue
-        log_read(path, purpose="tools.load", size=path.stat().st_size)
-        table = data.get("tools")
-        if not isinstance(table, dict):
-            continue
-        found = [name for name, value in table.items() if value is False]
-        if found:
-            sources.append(path)
-            names.update(found)
-    return frozenset(names), (sources[0] if sources else None)
+    names, sources = load_tool_switches(root)
+    return names, next(iter(sources.values()), None)
+
+
+def save_disabled(root: Path, names: Iterable[str]) -> Path:
+    """把「关掉的工具名」写进项目侧的 `tools.toml`，返回写入路径。
+
+    只写 `false` 的条目：这份文件的语义是「关」，写出 `true` 既没用处，还会在
+    用户目录那份也写了 `false` 时给出「本文件能打开它」的错觉。
+
+    与状态文件一样先写临时文件再换名：中途断电不会留下半截 TOML，
+    而那半截会让下一次启动静默地少装几个工具。
+    """
+    path = tools_config_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# 工具开关，由 /tools 面板写入；手改也认。",
+        "#",
+        "# 值为 false 的工具不装进注册表：不在请求体的 tools 数组里，模型看不到它。",
+        "# 与 permissions.toml 是两件事——那一份管调用时放不放行，工具照旧可见。",
+        "",
+        "[tools]",
+    ]
+    lines.extend(f"{name} = false" for name in sorted(names))
+    staged = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    with staged.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(lines) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(staged, path)
+    return path

@@ -6,9 +6,35 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, ListItem, ListView, Static
+from textual.widgets import Input, ListItem, ListView, Static
 
 from ..core.models import Session
+
+# 会话列表每行两段：标题一行、元信息一行。标题前面留一个标记位，
+# 当前会话画 ▸，其余留空格——不这样对齐，标题列会随标记有无左右错开。
+CURRENT_MARK = "▸"
+EMPTY_MARK = " "
+
+
+def relative_time(stamp: float, now: float | None = None) -> str:
+    """把时间戳写成「刚刚 / 3 分钟前 / 昨天 / 09-30」这种相对时间。
+
+    列表里排的是「最近用过哪个会话」，绝对时间反而要心算；超过一周之后
+    相对时间（12 天前）已经没什么信息量，再换回日期。
+    """
+    current = time.time() if now is None else now
+    delta = max(0.0, current - stamp)
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)} 分钟前"
+    if delta < 86_400:
+        return f"{int(delta // 3600)} 小时前"
+    if delta < 172_800:
+        return "昨天"
+    if delta < 604_800:
+        return f"{int(delta // 86_400)} 天前"
+    return time.strftime("%Y-%m-%d", time.localtime(stamp))
 
 
 class ConfirmDialog(ModalScreen[bool]):
@@ -87,9 +113,9 @@ class SessionPickerScreen(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="session-picker"):
-            yield Static("Sessions", id="picker-title")
+            yield Static("会话", id="picker-title")
             yield ListView(id="session-list")
-            yield Static("enter 选择   r 重命名   d 删除   esc 关闭", id="picker-hint")
+            yield Static("enter 打开   r 重命名   d 删除   esc 关闭   ▸ 当前会话", id="picker-hint")
 
     def on_mount(self) -> None:
         """填充会话列表并聚焦。"""
@@ -97,17 +123,48 @@ class SessionPickerScreen(ModalScreen[str | None]):
         self.query_one("#session-list", ListView).focus()
 
     def refresh_list(self) -> None:
-        """重建会话列表内容。"""
+        """重建会话列表内容。
+
+        每行两段：标题与元信息。标题前留一个标记位，当前会话画 ▸，
+        其余留空格，标题列才对得齐；元信息放消息数、相对时间与模型名，
+        这些是挑会话时真正要看的，标题本身往往看不出来是哪一次。
+        """
         view = self.query_one("#session-list", ListView)
         view.clear()
         self._ids = []
+        current = self.app.session_manager.current_session_id
         for session in self.sessions:
-            stamp = time.strftime("%m-%d %H:%M", time.localtime(session.updated_at))
-            label = f"{session.title}   {len(session.messages)} 条   {stamp}"
-            view.append(ListItem(Label(label, markup=False)))
+            is_current = session.id == current
+            title = Static(
+                f"{CURRENT_MARK if is_current else EMPTY_MARK} {session.title}",
+                classes="session-row-title",
+                markup=False,
+            )
+            if is_current:
+                title.add_class("-current")
+            meta = Static(
+                f"  {len(session.messages)} 条消息 · "
+                f"{relative_time(session.updated_at)} · {self._model_text(session)}",
+                classes="session-row-meta",
+                markup=False,
+            )
+            view.append(ListItem(Vertical(title, meta, classes="session-row")))
             self._ids.append(session.id)
+        self.query_one("#picker-title", Static).update(self._title_text())
         if self._ids:
             view.index = 0
+
+    def _title_text(self) -> str:
+        """标题栏：会话总数。"""
+        return f"会话　共 {len(self.sessions)} 个"
+
+    def _model_text(self, session: Session) -> str:
+        """这一轮会话用的模型名。
+
+        旧会话上可能没记模型（`model_id` 为空），那时显示当前连接配置里的
+        那一个；连接口都还没配就显示「未配置」，不要留一段空白。
+        """
+        return session.model_id or self.app.agent.config.model or "未配置"
 
     def _current_id(self) -> str | None:
         """返回当前高亮会话的 ID。"""

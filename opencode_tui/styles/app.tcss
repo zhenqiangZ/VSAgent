@@ -136,6 +136,12 @@ ModalScreen {
     width: 1fr;
     height: 100%;
     padding: 0 1;
+    /* 滚动条取纯白，轨道与屏幕底色同色所以不显形。默认档跟随主题的 $scrollbar，
+       在纯黑底上偏暗，长会话里几乎看不出现在滚到了哪 */
+    scrollbar-background: #000000;
+    scrollbar-color: #FFFFFF;
+    scrollbar-color-hover: #FFFFFF;
+    scrollbar-color-active: #FFFFFF;
 }
 
 /* 上下文侧栏：默认隐藏，/sidebar 打开后占 30 列，消息区让出这块宽度 */
@@ -224,13 +230,16 @@ ModalScreen {
    主题换成 gruvbox 之后 `$surface` 是 #3C3836，比区块的 #1A1A1A 亮出一档，
    输入区看起来像单独铺了一块灰。
 
-   高度固定成 8 行，输入再多也不增高，多出来的行由输入框自己滚动。
-   写成 `height: auto` 的话，输入每跨过一次换行边界，输入区就多占一行，
-   区块高度从 auto 跟着长高，上边缘往上退一行，上面的消息区被压短一行，
-   提交清空之后整块又退回来。区块固定多少行，就由这里的这个数决定：
-   上界线 1 行 + 输入区 8 行 + 状态行上方 1 行间距 + 状态行 1 行 = 11 行。 */
+   高度与启动界面 `#home-input` 同一套：随内容长高，6 行封顶，再多出来的行由
+   输入框自己滚动。区别是这里给了 3 行底高：聊天界面空着的时候也常要一眼看清
+   刚打的那一行，1 行的框太窄，贴着上界线看起来像没地方输入。
+
+   区块贴着底边、高度 auto，所以长高时是上边缘往上退、消息区被压短，
+   状态栏与底边不动；提交清空后整块退回 6 行（上界线 1 + 输入 3 + 间距 1 + 状态 1）。 */
 #editor-input {
-    height: 8;
+    height: auto;
+    min-height: 3;
+    max-height: 6;
     padding: 0 1;
     border: none;
     background: #1A1A1A;
@@ -238,10 +247,12 @@ ModalScreen {
     scrollbar-size-vertical: 0;
 }
 
-/* 方块光标：亮蓝底、深色字 */
-#editor-input .text-area--cursor {
+/* 方块光标：白底、深色字。光标落在空格上时只有底色看得见，所以底色必须是白的那一层。
+   启动界面的输入框一起改，两处光标保持同一副样子 */
+#editor-input .text-area--cursor,
+#home-input .text-area--cursor {
     color: #0A0A0A;
-    background: #4A9EFF;
+    background: #FFFFFF;
 }
 
 #editor-input .text-area--placeholder {
@@ -414,12 +425,13 @@ ModalScreen {
 
 /* 会话选择器、模型、主题、帮助、Diff */
 #session-picker,
-#model-selector,
 #theme-selector,
+#tools-panel,
 #help-screen,
 #diff-overlay,
 #confirm-dialog,
 #rename-dialog,
+#connection-form,
 #permission-dialog,
 #message-dialog {
     align: center middle;
@@ -433,9 +445,10 @@ ModalScreen {
 }
 
 #picker-title,
-#model-title,
 #theme-title,
+#tools-title,
 #diff-title,
+#connection-title,
 #message-title {
     color: #4A9EFF;
     height: 1;
@@ -443,11 +456,12 @@ ModalScreen {
 }
 
 #picker-hint,
-#model-hint,
 #theme-hint,
+#tools-hint,
 #diff-hint,
 #confirm-hint,
 #rename-hint,
+#connection-hint,
 #permission-hint,
 #message-hint {
     color: #666666;
@@ -465,10 +479,69 @@ ModalScreen {
 }
 
 #session-list,
-#model-list,
-#theme-list {
+#theme-list,
+#tools-list {
     height: auto;
     max-height: 16;
+}
+
+/* 会话列表：两行一条，标题与元信息分开配色 */
+#session-list ListItem {
+    height: auto;
+    padding: 0 1;
+}
+
+/* 工具面板：同样两行一条，关掉的用灰字——一列扫下去先看见还开着哪些 */
+#tools-list ListItem {
+    height: auto;
+    padding: 0 1;
+}
+
+.tool-row {
+    height: auto;
+}
+
+.tool-row-title {
+    height: 1;
+    color: #CCCCCC;
+    text-wrap: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tool-row-title.-off {
+    color: #666666;
+}
+
+.tool-row-meta {
+    height: 1;
+    color: #666666;
+    text-wrap: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.session-row {
+    height: auto;
+}
+
+.session-row-title {
+    height: 1;
+    color: #CCCCCC;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.session-row-title.-current {
+    color: #4A9EFF;
+    text-style: bold;
+}
+
+.session-row-meta {
+    height: 1;
+    color: #666666;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 #confirm-text,
@@ -476,9 +549,32 @@ ModalScreen {
     height: 2;
 }
 
+/* /model 表单：四行输入，标签浅灰、错误行用提示色 */
+.connection-label {
+    color: #8B949E;
+    height: 1;
+}
+
+#connection-error {
+    color: #FF6B6B;
+    height: 1;
+}
+
+#connection-form Input {
+    background: #161616;
+    border: tall #30363D;
+}
+
+#connection-form Input:focus {
+    border: tall #4A9EFF;
+}
+
 /* 询问弹窗：与消息区里"询问"状态的工具卡片同一个颜色，一眼能对上 */
 #permission-dialog {
     border: tall #FFB300;
+    width: 72%;
+    max-width: 96;
+    max-height: 28;
 }
 
 #permission-title {
@@ -488,8 +584,42 @@ ModalScreen {
 }
 
 #permission-detail {
-    color: #CCCCCC;
+    color: #666666;
+    height: 1;
+}
+
+#permission-label {
+    color: #8B949E;
+    height: 1;
+    margin-top: 1;
+}
+
+/* 参数预览：命令与路径单独框起来，超过八行自己滚动，弹窗不会被撑破。
+   滚动条压到一列宽：默认两列会挤掉一行正文的右侧，读长命令时很碍事。 */
+#permission-argument {
+    background: #161616;
+    border: round #30363D;
+    padding: 0 1;
     height: auto;
+    max-height: 8;
+    scrollbar-size-vertical: 1;
+}
+
+#permission-argument-text {
+    color: #E6EDF3;
+    height: auto;
+}
+
+#permission-reason {
+    color: #FFB300;
+    height: auto;
+    margin-top: 1;
+}
+
+#permission-hint {
+    color: #8B949E;
+    height: auto;
+    margin-top: 1;
 }
 
 /* 帮助界面 */

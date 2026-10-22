@@ -1,8 +1,8 @@
-"""验证模型选择器弹窗：居中、半透明、聊天界面透出。
+"""验证 /model 接口表单弹窗：居中、半透明、聊天界面透出。
 
-在 ConPTY 里跑源码（或 exe），进聊天、发一条消息拿到回复，再打开模型选择器，
+在 ConPTY 里跑源码（或 exe），进聊天、发一条消息拿到回复，再打开接口表单，
 按 pyte 的字符网格（含前景/背景色）做三项判断：
-1. 弹窗边框在屏幕内水平、垂直都居中，且标题/列表/提示都在边框内；
+1. 弹窗边框在屏幕内水平、垂直都居中，且标题/输入框/提示都在边框内；
 2. 弹窗外侧仍看得见聊天界面的文字，说明遮罩没有把下一层完全盖住；
 3. 弹窗外侧那些文字的背景色被遮罩改暗，说明走的是半透明叠加而不是覆盖。
 
@@ -13,7 +13,8 @@
 画面写入 tests/output/。跑一次约 20 秒。
 
 子进程会用真实接口那条链路去要回复，远端模型由本脚本起在回环地址上的假服务替换，
-地址通过 `VSA_LLM_*` 交给子进程，回复内容固定，弹窗打开前后的两屏才对得上。
+地址写进子进程 HOME 下的 `connection.toml`（`/model` 表单落盘的同一份），
+回复内容固定，弹窗打开前后的两屏才对得上。
 
 pyte 与 pywinpty 装在打包环境里（requirements-pack.txt），.venv 里没有，所以要用
 `C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/opencode_tui_pack/Scripts/python.exe`
@@ -49,11 +50,36 @@ EDITOR_FIXTURE = PROJECT_ROOT / "tests" / "fixtures" / "marker_editor.cmd"
 # 与 verify_exe.py 一致：会话状态隔离到临时目录，每轮从空状态启动
 SCRATCH_HOME = PROJECT_ROOT / ".probe" / "verify-home"
 STATE_FILE = SCRATCH_HOME / ".opencode_tui" / "state.toml"
+CONNECTION_FILE = SCRATCH_HOME / ".opencode_tui" / "connection.toml"
+
+
+def write_connection(base_url: str, model: str) -> None:
+    """把接口参数写进子进程 HOME 下的 connection.toml。
+
+    应用只从这份文件读接口参数（`/model` 表单写的也是它），键名与
+    `core/connection.py` 对齐。
+    """
+    CONNECTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONNECTION_FILE.write_text(
+        "\n".join(
+            [
+                "version = 1",
+                f'base_url = "{base_url}"',
+                'api_key = "verify-key"',
+                f'model = "{model}"',
+                "context_window = 1000000",
+                "price_in = 0.5",
+                "price_out = 1.5",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 ROWS, COLS = 34, 100
 LOGO_MARK = "(_)_ __"
 REPLY_MARK = "抓帧用的回复"
-# 模型名由 `VSA_LLM_MODEL` 决定，模型列表里就这一条，抓帧等它出现。
+# 模型名写在子进程的 connection.toml 里，接口表单的「模型名」一格会预填它。
 MODEL_NAME = "verify-model"
 MODEL_MARK = MODEL_NAME
 REPLY_TEXT = "抓帧用的回复，内容固定，好让弹窗打开前后的两屏对得上。"
@@ -182,12 +208,7 @@ def run_app(command: list[str], prefix: str) -> tuple[Recorder, dict[str, object
 
     server = FakeModelServer()
     server.start()
-    child_env["VSA_LLM_BASE_URL"] = server.base_url
-    child_env["VSA_LLM_API_KEY"] = "verify-key"
-    child_env["VSA_LLM_MODEL"] = MODEL_NAME
-    child_env["VSA_LLM_CONTEXT_WINDOW"] = "1000000"
-    child_env["VSA_LLM_PRICE_INPUT"] = "0.5"
-    child_env["VSA_LLM_PRICE_OUTPUT"] = "1.5"
+    write_connection(server.base_url, MODEL_NAME)
     script_reply(server)
 
     process = PtyProcess.spawn(
@@ -225,7 +246,7 @@ def run_app(command: list[str], prefix: str) -> tuple[Recorder, dict[str, object
     shots["chat_rows"] = [recorder.row_text(y) for y in range(ROWS)]
     shots["chat_row_colors"] = [recorder.row_colors(y) for y in range(ROWS)]
 
-    process.write("/models")
+    process.write("/model")
     time.sleep(0.6)
     process.write("\r")
     wait_for(recorder, MODEL_MARK, 3.0, 3.0 + MAX_EXTRA_WAIT)
@@ -252,7 +273,7 @@ def main() -> int:
 
     failures: list[str] = []
     if MODEL_MARK not in modal:
-        failures.append(f"画面里没有出现 {MODEL_MARK!r}，模型选择器未打开")
+        failures.append(f"画面里没有出现 {MODEL_MARK!r}，接口表单未打开")
     tail = bytes(recorder.raw).decode("utf-8", "replace")
     failures.extend(f"输出里出现 {mark}" for mark in BAD_MARKS if mark in tail)
 

@@ -13,7 +13,11 @@ const fs = require("fs");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..");
-const PYTHON = path.join(ROOT, ".venv", "Scripts", "python.exe");
+// 解释器按平台找：Windows 的 venv 在 `Scripts/python.exe`，Linux/macOS 在 `bin/python`。
+// 写死一个平台的结果是另一边一上来就 ENOENT，而报错像是判据脚本坏了。
+const PYTHON = process.env.VSA_PYTHON || (process.platform === "win32"
+  ? path.join(ROOT, ".venv", "Scripts", "python.exe")
+  : path.join(ROOT, ".venv", "bin", "python"));
 const FIXTURE = path.join(ROOT, ".probe", "web-ui-runs");
 const LOG_PATH = path.join(ROOT, ".probe", "web-ui-serve.log");
 const PORT = Number(process.env.WEB_PORT || 8866);

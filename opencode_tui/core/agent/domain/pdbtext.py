@@ -42,6 +42,7 @@ __all__ = [
     "calc_box",
     "format_box",
     "hetero_groups",
+    "is_heavy",
     "keep_chains",
     "parse",
     "select_altloc",
@@ -152,6 +153,26 @@ class AtomRecord:
     @property
     def coord(self) -> tuple[float, float, float]:
         return (self.x, self.y, self.z)
+
+
+_HYDROGEN_NAMES = frozenset({"H", "D", "T"})
+
+
+def is_heavy(atom: AtomRecord) -> bool:
+    """这个原子是不是重原子（非氢）。
+
+    判氢优先看元素列；元素列读不到时（短行）退回按原子名首字符判。
+    **两种判法都会漏**（元素列缺失且原子名不以 H 开头的情形），但漏一个氢只是
+    让最短距离多算几个数，不会算错——而把重原子误判成氢会让它整个不参与，
+    那是错的。所以两个判据都朝「算它是重原子」这一侧让。
+
+    放在文本层而不是几何层，是因为「清洗结构」与「算口袋」两处都要用它；
+    各写一份的话，去氢的规则会在其中一处悄悄漂移。
+    """
+    element = (atom.element or "").strip().upper()
+    if element:
+        return element not in _HYDROGEN_NAMES
+    return not (atom.name or "").strip().upper().startswith(("H", "D"))
 
 
 @dataclass(frozen=True)

@@ -17,7 +17,8 @@ tests/fixtures/marker_editor.cmd，用它判断挂起、外部进程、恢复这
 这样两轮抓到的画面才是同一个会话长度。
 
 子进程会用真实接口那条链路去要回复，远端模型由本脚本起在回环地址上的假服务替换，
-地址通过 `VSA_LLM_*` 交给子进程，回复内容固定，画面才复现得了。
+地址写进子进程 HOME 下的 `connection.toml`（也就是 `/model` 表单落盘的同一份），
+回复内容固定，画面才复现得了。
 
 跑一次约 25 秒，画面写入 tests/output/。
 
@@ -56,6 +57,31 @@ EDITOR_FIXTURE = PROJECT_ROOT / "tests" / "fixtures" / "marker_editor.cmd"
 # 启动：不隔离的话历史会话越攒越长，源码那一轮与冻结产物那一轮看到的滚动窗口差几行。
 SCRATCH_HOME = PROJECT_ROOT / ".probe" / "verify-home"
 STATE_FILE = SCRATCH_HOME / ".opencode_tui" / "state.toml"
+CONNECTION_FILE = SCRATCH_HOME / ".opencode_tui" / "connection.toml"
+
+
+def write_connection(base_url: str, model: str) -> None:
+    """把接口参数写进子进程 HOME 下的 connection.toml。
+
+    应用只从这份文件读接口参数（`/model` 表单写的也是它），所以这里必须按
+    同一份格式写，键名与 `core/connection.py` 对齐。
+    """
+    CONNECTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONNECTION_FILE.write_text(
+        "\n".join(
+            [
+                "version = 1",
+                f'base_url = "{base_url}"',
+                'api_key = "verify-key"',
+                f'model = "{model}"',
+                "context_window = 1000000",
+                "price_in = 0.5",
+                "price_out = 1.5",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 ROWS, COLS = 34, 100
 LOGO_MARK = "(_)_ __"
@@ -67,7 +93,7 @@ BAD_MARKS = ("Traceback", "ModuleNotFoundError", "FileNotFoundError", "NoMatches
 
 # 抓帧要复现固定画面，回复内容得是固定的一段。子进程走真实接口那条链路，
 # 远端模型由回环地址上的假服务替换：脚本先把这个服务起在某个端口上，
-# 再把它的地址通过 `VSA_LLM_*` 交给子进程。每次提交一句话之前排好应答。
+# 再把它的地址写进子进程 HOME 下的 `connection.toml`。每次提交一句话之前排好应答。
 REPLY_TEXT = "抓帧用的回复，内容固定，好让源码运行与冻结产物得到同一屏。"
 
 # 每一步：写什么按键、至少等多久、抓出的画面叫什么、画面里必须出现的标记。
@@ -172,12 +198,7 @@ def main() -> int:
 
     server = FakeModelServer()
     server.start()
-    child_env["VSA_LLM_BASE_URL"] = server.base_url
-    child_env["VSA_LLM_API_KEY"] = "verify-key"
-    child_env["VSA_LLM_MODEL"] = "verify-model"
-    child_env["VSA_LLM_CONTEXT_WINDOW"] = "1000000"
-    child_env["VSA_LLM_PRICE_INPUT"] = "0.5"
-    child_env["VSA_LLM_PRICE_OUTPUT"] = "1.5"
+    write_connection(server.base_url, "verify-model")
 
     process = PtyProcess.spawn(
         command,

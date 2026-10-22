@@ -77,20 +77,23 @@ python tests/verify_modal_transparency.py  # 模态居中/半透明，聊天透�
 ## 配置
 
 `.env` 在仓库根（已 gitignore，没有 example 文件）。`env.py:load_env()` 用 `override=False`
-——已存在的真实环境变量永远压过文件里的值。密钥只从 env 读，**不写进 `state.toml`**。
+——已存在的真实环境变量永远压过文件里的值。
+
+**模型接口不走 `.env`**：地址、密钥与模型名由应用内的 `/model` 命令填写，落在与
+`state.toml` 同目录的 `connection.toml`（`core/connection.py`，权限 0600，原子替换）。
+没有这份文件时应用照常启动，发消息前提示先 `/model` 配置；`/model <名字>` 只换模型，
+连接参数不动。`VSA_LLM_*` 这一组变量已经没有了。
 
 | 变量 | 说明 |
 | --- | --- |
-| `VSA_LLM_BASE_URL` / `VSA_LLM_API_KEY` / `VSA_LLM_MODEL` | 必填，缺任一个 `ProviderConfig.from_env` 直接抛错并指名 |
-| `VSA_LLM_PROVIDER` / `_TEMPERATURE` / `_MAX_TOKENS` / `_CONTEXT_WINDOW` / `_PRICE_INPUT` / `_PRICE_OUTPUT` / `_PRICE_CACHED` | 可选，其余字段从模型目录 `lookup_model()` 兜底 |
 | `VSA_MAX_STEPS` | 一轮步数上限，写错**回落到 24 而不是抛错** |
 | `VSA_WEB_PORT` | 本地网页端口，默认 8860，不合法同样回落 |
 | `VSA_VINA_BIN` | 外部 AutoDock Vina 可执行文件；不设时从 PATH 找 `vina`，缺失时 `dock` 返回安装指引。引擎**不随 exe 打包** |
 | `EDITOR` / `VISUAL` | `/editor` 外部编辑器往返 |
 | `VSA_FILE_READ_LOG` | 设为 `0` / `off` / `false` 关掉文件读取日志。默认写**项目根**的 `logs/file-reads.jsonl`（已 gitignore），一行一次读取：`purpose`（`tool.read` / `tool.grep` / `import.structure` / `import.ligands` / `receptor.prepare` / `prompt.file_ref` / `state.load` / `rules.load` / `tools.load` / `memory.load`）、绝对路径、字节数、`ok`，失败时带 `detail`。`app.py` 启动时按 `root` 配置目录；没有应用可问的脚本与领域工具落到当前目录的 `logs/` |
 
-测试不读 `.env`：`FakeModelServer` 起在 `127.0.0.1:0`，测试进程内自己设
-`VSA_LLM_BASE_URL/API_KEY/MODEL` 指过去，**全程离线**。
+测试不读 `.env`：`FakeModelServer` 起在 `127.0.0.1:0`，测试把地址写进
+`.probe/connection.toml`（与测试用的 `state_path` 同目录），**全程离线**。
 
 ## 架构
 
@@ -131,6 +134,9 @@ __main__.py → app.py ───────────────────
 - `permission.py` — `PermissionPolicy.check` 的判定顺序是有讲究的：取消 → 用户手打 bash →
   Plan 模式 `PLAN_DENY` → 项目规则 → **越界路径检查** → 会话 allow_all → 单工具允许 → 默认
   `{write, patch, bash, dock}` 要问。越界检查刻意排在会话「全部允许」之前：**允许一个工具不等于允许整个磁盘**。
+  同模块的 `load_tool_switches` / `save_disabled` 管的是**另一件事**：`tools.toml` 里标关的工具
+  根本不进注册表，模型连它存在都不知道（权限层是「装进来但拦下来」）。改开关用 `/tools` 面板，
+  它写项目侧那份文件并当场重装注册表，不必重启。
 - `hooks.py` — `hooks.toml` 里的外部命令，stdin 收一行 JSON。退出码 2 拦截（stderr 当原因），
   0 放行，30s 超时算拦截。
 - `ledger.py` — 会话登记表，`receptor#1` / `ligandset#3` 这类 handle 的真相所在。
@@ -183,16 +189,16 @@ __main__.py → app.py ───────────────────
   滚动时裁剪/扩展。它有 `on_removed` 回调让 ChatScreen 在拆除前先退订（注释里记着一次真实的 `NoMatches` 竞态）。
   多个 handler `prevent_default()` 之后要调 `stylesheet.update_nodes([self])`，否则整棵子树重排要 2.6–3.9 秒。
 - `EditorPane` 有三种模式 `mode-chat` / `mode-command` / `mode-bash`（CSS 类切换），配三个自动补全弹窗。
-- 命令表 `core/command_registry.py` 有约 24 个斜杠命令。**命令刻意没有键位**，键位单独放
+- 命令表 `core/command_registry.py` 有 25 个斜杠命令。**命令刻意没有键位**，键位单独放
   `core/keybind_manager.py`，且那两个表只用于渲染帮助——smoke 测试会比对它们和 `HomeScreen.BINDINGS`。
 - `app.py:execute_command` 解析 `/name args`，查表，然后按约定分发到 `self._command_<name>`。
-  只有 `ARGUMENT_COMMANDS = {"remember","forget","task"}` 会拿到参数尾巴。
+  只有 `ARGUMENT_COMMANDS = {"remember","forget","task","model"}` 会拿到参数尾巴。
   命令加了但没接处理器，会显示「尚未接入」。
 
 ### 状态与持久化
 
 真相在 `~/.opencode_tui/state.toml`（`session_manager.py:default_state_path()`），TOML + `STATE_VERSION=1`。
-同目录还有 `ledgers/`（按会话 id 隔离），traces 在 `logs/`，运行产物在仓库根的 `runs/`。
+同目录还有 `connection.toml`（模型接口，权限 0600）、`ledgers/`（按会话 id 隔离），traces 在 `logs/`，运行产物在仓库根的 `runs/`。
 
 写入是**原子替换**：同目录临时文件 → flush → `os.fsync` → `_replace_with_retry`（40 次 × 5ms 重试 `PermissionError`）。
 读回来调 `sync_sequences` 把 ID 计数器推到已加载 ID 之前。网页端**每个请求都重新从磁盘读**，

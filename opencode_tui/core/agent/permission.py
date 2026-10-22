@@ -22,7 +22,7 @@ PERMISSIONS_FILE = "permissions.toml"
 # 开关管「装配时装不装进来」——后者决定工具在不在请求体的 tools 数组里。
 TOOLS_FILE = "tools.toml"
 # 默认策略下要问一次的工具：会改动文件或运行命令的那些
-DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock"})
+DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock", "score_affinity"})
 # Plan 方式下一律拒绝的工具。一条命令会不会改动看不出来，所以 bash 也算在里面
 #
 # 领域工具里只有 prepare_receptor 与 write_run 进这一档：它们会往磁盘上写一组产物
@@ -32,7 +32,8 @@ DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock"})
 # 都是读或取；取结构固然会写盘，但那是**把远端的东西拿回来**（下载缓存），
 # 与「改动用户的工程」不是一回事；把它们一并挡掉会让 Plan 方式连查资料都做不到。
 PLAN_DENY = frozenset(
-    {"write", "patch", "bash", "prepare_receptor", "prepare_ligands", "dock", "write_run"}
+    {"write", "patch", "bash", "prepare_receptor", "prepare_ligands", "dock",
+     "score_affinity", "write_run"}
 )
 
 # 收「路径类」参数的工具。这几个工具的调用会指向磁盘的某个具体位置，

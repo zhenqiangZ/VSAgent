@@ -60,6 +60,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "affinity",
     "align",
     "chembl",
     "chemistry",

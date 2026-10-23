@@ -19,7 +19,9 @@ import os
 import socket
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from .routes import SPEC, RouteSpec, WebServer
 
@@ -130,11 +132,15 @@ class WebService:
         port: int | None = None,
         spec: RouteSpec | None = None,
         corpus_root: Path | None = None,
+        ingest: Callable[[list[Path], Path], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.state_path = Path(state_path)
         self.runs_dir = Path(runs_dir)
         self.web_root = Path(web_root)
         self.corpus_root = None if corpus_root is None else Path(corpus_root)
+        # 入库要转交给**持有写权的那个进程**。应用装配时传进来；命令行壳不传，
+        # 网页上的「入库」在那里会明确回 503。
+        self.ingest = ingest
         self.preferred_port = port
         self.spec = SPEC if spec is None else spec
         self._server: WebServer | None = None
@@ -158,6 +164,7 @@ class WebService:
                 self.web_root,
                 self.spec,
                 corpus_root=self.corpus_root,
+                ingest=self.ingest,
             )
             thread = threading.Thread(
                 target=server.serve_forever,

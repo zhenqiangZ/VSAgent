@@ -26,6 +26,7 @@ import json
 import mimetypes
 import os
 import re
+import threading
 import time
 import tomllib
 from collections.abc import Callable
@@ -608,9 +609,95 @@ def _library_upload(request: "WebHandler", _rest: str) -> dict:
     return {
         "saved": saved,
         "accepted": len(accepted),
-        # 入库是 TUI 那一侧的活：网页端只投递，不建块、不碰索引。
-        "next": "文件已放进 corpus/inbox/。在 TUI 里调 import_documents 指向这个目录即可入库。",
+        # 投递与入库分两步：投递只落文件，入库（切块 + 向量）由应用那个进程做。
+        "next": "文件已放进 corpus/inbox/。在页面上点「入库」即可切块进索引"
+        "（独立运行的服务只能投递，入库要在应用里做）。",
     }
+
+
+def _inbox_selection(request: "WebHandler", payload: dict) -> list[Path]:
+    """从请求体里挑出要入库的文件。**只认 inbox 里的文件名，不认路径。**
+
+    不传 `names` 就是「inbox 里全部能导的」。传了的话逐个核对：名字必须就是
+    basename（`../../x.pdf` 压不成别的目录），而且必须已经在 inbox 里——这里
+    不拼路径、也不替用户猜他想指哪个文件。
+    """
+    inbox = request.server.corpus_root / "inbox"
+    raw = payload.get("names")
+    if raw is None:
+        return _inbox_files(request.server.corpus_root)
+    if not isinstance(raw, list):
+        raise HttpError(400, "names 要是一个数组（inbox 里的文件名）")
+    picked: list[Path] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if not name or name != Path(name).name or "\\" in name:
+            raise HttpError(400, f"不认这个文件名：{item!r}")
+        path = inbox / name
+        if not path.is_file():
+            raise HttpError(404, f"inbox 里没有 {name}")
+        picked.append(path)
+    if not picked:
+        raise HttpError(400, "没有要入库的文件")
+    return picked
+
+
+def _run_ingest(server: "WebServer", files: list[Path]) -> None:
+    """后台把一批文件入库，一条一条更新进度。异常按文件隔离。"""
+    try:
+        for position, path in enumerate(files, 1):
+            try:
+                # 语料根一起交过去：判据在临时目录上跑，入库不能写回仓根那份。
+                outcomes = server.ingest([path], server.corpus_root) if server.ingest else []
+            except Exception as error:  # noqa: BLE001 - 一个坏文件不该带走整批
+                outcomes = [
+                    {
+                        "status": "failed",
+                        "name": path.name,
+                        "reason": f"{type(error).__name__}: {error}",
+                    }
+                ]
+            with server.ingest_lock:
+                server.ingest_state["results"].extend(outcomes)
+                server.ingest_state["done"] = position
+    finally:
+        with server.ingest_lock:
+            server.ingest_state["running"] = False
+
+
+def _library_ingest(request: "WebHandler", _rest: str) -> dict:
+    """把 inbox 里的文件送进语料库。
+
+    **写索引的仍然是应用那个进程**：网页只是把「入库」这个动作转交给它，自己
+    不碰 `library.db`。「索引只有一个写者」是这条链上唯一不能破的约定——破了
+    就会有两个进程同时改 `sources` / `chunks`，级联删除互相踩。
+
+    所以独立运行的服务（`tools/serve_web.py`、`python -m opencode_tui.core.web`）
+    没有可转交的对象，直接回 503 并说清楚去哪儿做，而不是退化成自己写。
+    """
+    _guard_write(request)
+    server = request.server
+    if server.ingest is None:
+        raise HttpError(
+            503,
+            "这个进程不负责入库：用 python -m opencode_tui 启动应用之后再从网页上入库，"
+            "或者在 TUI 里让模型 import_documents。",
+        )
+    files = _inbox_selection(request, _json_body(request))
+    with server.ingest_lock:
+        if server.ingest_state["running"]:
+            raise HttpError(409, "上一批还在入库，等它结束再点")
+        server.ingest_state = {
+            "running": True,
+            "total": len(files),
+            "done": 0,
+            "results": [],
+        }
+    threading.Thread(
+        target=_run_ingest, args=(server, files), name="vsagent-ingest", daemon=True
+    ).start()
+    # 202：受理了，但切块与向量还在后台跑。页面靠轮询 `/api/library` 的 `ingest` 收结果。
+    return {"started": len(files), "names": [path.name for path in files]}, 202
 
 
 def _library_rename(request: "WebHandler", rest: str) -> dict:
@@ -750,8 +837,23 @@ def _run_list(request: "WebHandler", _rest: str) -> dict:
 
 
 def _library(request: "WebHandler", _rest: str) -> dict:
-    """语料库列表。只读：列表、待入库数、占用与开关现状。"""
-    return library_payload(request.server.corpus_root)
+    """语料库列表。只读：列表、待入库数、占用、开关现状与入库进度。
+
+    `ingest` 是**内存里的进度**，不落盘：它只描述「这一批跑到哪了」，页面靠
+    轮询这一项把按钮从「入库中」变回「入库」。服务重启后这批任务就没了，
+    而盘上的语料是完整的——进度不该被当成持久状态。
+    """
+    payload = library_payload(request.server.corpus_root)
+    state = request.server.ingest_state
+    with request.server.ingest_lock:
+        payload["ingest"] = {
+            "running": bool(state["running"]),
+            "total": int(state["total"]),
+            "done": int(state["done"]),
+            "results": list(state["results"]),
+        }
+    payload["can_ingest"] = request.server.ingest is not None
+    return payload
 
 
 def _library_item_action(request: "WebHandler", rest: str) -> dict:
@@ -774,6 +876,9 @@ SPEC = RouteSpec(
         JsonRoute("/api/runs", _run_list),
         JsonRoute("/api/library", _library),
         JsonRoute("/api/library/upload", _library_upload, method="POST"),
+        # 放在前缀路由之前：`/api/library/ingest` 也会被 `/api/library/` 前缀匹配到，
+        # 那条是给 `<kind>:<id>/<action>` 用的，顺序反了会先撞上它。
+        JsonRoute("/api/library/ingest", _library_ingest, method="POST"),
         JsonRoute("/api/library/", _library_item_action, prefix=True, method="POST"),
     )
 )
@@ -799,6 +904,7 @@ class WebServer(ThreadingHTTPServer):
         spec: RouteSpec = SPEC,
         corpus_root: Path | None = None,
         max_upload: int = MAX_UPLOAD_BYTES,
+        ingest: Callable[[list[Path], Path], list[dict[str, Any]]] | None = None,
     ) -> None:
         super().__init__(address, WebHandler)
         self.state_path = state_path
@@ -807,6 +913,17 @@ class WebServer(ThreadingHTTPServer):
         self.spec = spec
         self.corpus_root = Path(corpus_root) if corpus_root is not None else corpus.corpus_root()
         self.max_upload = max_upload
+        # 入库的**唯一写者**就在这个进程里：应用装配时把它传进来。独立运行的
+        # 服务没有这一项（None），`/api/library/ingest` 会明确回 503，而不是
+        # 自己开第二个写者。
+        self.ingest = ingest
+        self.ingest_lock = threading.Lock()
+        self.ingest_state: dict[str, Any] = {
+            "running": False,
+            "total": 0,
+            "done": 0,
+            "results": [],
+        }
 
 
 class WebHandler(BaseHTTPRequestHandler):
@@ -838,7 +955,14 @@ class WebHandler(BaseHTTPRequestHandler):
         matched = self.server.spec.match(path, method)
         if matched is not None:
             rest = path[len(matched.path):] if matched.prefix else ""
-            self.send_json(matched.handler(self, rest))
+            result = matched.handler(self, rest)
+            # 处理函数默认回 200；要别的状态码就返回 `(payload, status)`。
+            # 只有「已经受理、但活还没干完」这一类需要它（入库回 202）。
+            if isinstance(result, tuple):
+                payload, status = result
+                self.send_json(payload, int(status))
+            else:
+                self.send_json(result)
             return
         if method != "GET":
             if self.server.spec.match(path, "GET") is not None:

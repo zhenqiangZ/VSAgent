@@ -404,12 +404,25 @@ S3 实测体积与启动时间；超 +80MB 改成「exe 内不带，用户另装
 |---|---|---|
 | GET | `/api/library` | 列表（标题、类型、页数、切分方式、向量覆盖、状态、占用）+ 待入库数 |
 | POST | `/api/library/upload` | `multipart`，落 `corpus/inbox/`，**不写索引** |
+| POST | `/api/library/ingest` | 把 inbox 里的文件**转交**给应用进程入库，回 202 |
 | POST | `/api/library/<kind>:<id>/rename` | 只写 `labels.json` |
 | POST | `/api/library/<kind>:<id>/delete` | 挪进 `.trash/`，幂等 |
 
-**索引只有一个写者**：web 从不**写** `library.db`，只在列表页以 `mode=ro` 读一次
+**索引只有一个写者**：web 自己从不**写** `library.db`，只在列表页以 `mode=ro` 读一次
 （块数、向量覆盖）。删除后 `search_corpus` 对命中源做 `exists` 检查，目录没了就跳过；
 下次入库统一清悬空行。代价是删除不是"立刻从索引消失"，而是"查不到"——对用户是一样的。
+
+**「入库」是转交**：应用里网页服务就是 TUI 进程里的一个线程，`/api/library/ingest`
+把 inbox 里的文件交给装配时注入的 `ingest` 回调（应用传 `ingest_files`，与模型调
+`import_documents` 同一个入口）。它**只认 inbox 里已有的文件名**，不认路径——这个
+入口的影响面从「写一个文件」变成「改索引」，不能顺带变成「让索引读任意路径」。
+独立运行的服务（`serve_web.py`、`python -m opencode_tui.core.web`）没有回调，明确回
+503，而不是退化成第二个写者。切块 + 算向量要十几秒，所以回 202、后台线程跑，页面
+轮询 `GET /api/library` 的 `ingest` 字段收进度与结果。
+
+同进程内的两处写（模型的 `import_documents` 与网页的入库）由 `index.WRITE_LOCK`
+串行化——SQLite 只允许一个写者，靠 `timeout` 等会让其中一方白等十秒。索引库开 WAL，
+读列表不会被入库挡住。
 
 必须防的（都要进 `tools/check_web_api.py`）：
 
@@ -516,6 +529,11 @@ S0 先做：纯增量、无写入风险、当天可验收。S1 是真正的工�
   剩下 3 条组级漏检都是「中文问、英文文献答」且分数只差一点（融合名次 11–13），
   瓶颈在 384 维多语模型的跨语言能力，不在排序参数——换更大的模型是另一件事（体积、
   下载、打包），不在 S4 范围内。
+
+- 网页端入库（S4 之后补的）：`POST /api/library/ingest` 把 inbox 里的文件转交给
+  应用进程入库（回 202、后台线程、页面轮询进度），独立运行的服务回 503。入库与
+  模型调 `import_documents` 走同一个 `ingest_files`，同进程两处写由
+  `index.WRITE_LOCK` 串行化，索引库开 WAL。`tools/check_web_api.py` 50 条全过。
 
 ### 文件清单
 

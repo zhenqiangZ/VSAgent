@@ -784,6 +784,15 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
   background: var(--accent-strong);
   color: #fff;
 }
+/* 入库在跑、或者 inbox 空着时按钮是禁用的：不给悬停高亮，免得看起来还能点。 */
+.lib-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.lib-actions button:disabled:hover {
+  border-color: var(--line);
+  color: var(--text);
+}
 
 .lib-inbox {
   margin: 10px 0 0;

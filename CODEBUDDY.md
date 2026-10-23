@@ -282,12 +282,22 @@ __main__.py → app.py ───────────────────
 路径逃逸用 `resolve_within` 拒绝（403）。
 
 **S2 起网页端多了一组语料写入口**（`GET /api/library`、`POST /api/library/upload`、
-`POST /api/library/<kind>:<id>/{rename,delete}`）。章程因此从「只读」改成
-「查看只读 + 语料投递与管理」，但边界很窄：网页端只往 `corpus/inbox/` 落文件、
-只写 `labels.json` 的显示名、只把目录挪进 `corpus/.trash/`，**从不写索引、不建块、
-不改原件**。索引只以 `mode=ro` 打开，取块数与向量覆盖。本地服务不做鉴权，所以
-三个写入口都要求 `X-VSA-Request: 1`（逼出 CORS 预检）并校验 `Origin`——`multipart`
-是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 投文件。
+`POST /api/library/ingest`、`POST /api/library/<kind>:<id>/{rename,delete}`）。章程因此
+从「只读」改成「查看只读 + 语料投递与管理」：网页端自己只往 `corpus/inbox/` 落文件、
+只写 `labels.json` 的显示名、只把目录挪进 `corpus/.trash/`，**从不直接写索引**。
+索引只以 `mode=ro` 打开，取块数与向量覆盖。
+
+**「入库」是转交，不是自己写**：应用里网页服务就是 TUI 进程里的一个线程，
+`/api/library/ingest` 把 inbox 里的文件交给装配时注入的 `ingest` 回调（应用传
+`ingest_files`，与模型调 `import_documents` 同一个入口），回 202 之后在后台线程跑，
+页面轮询 `GET /api/library` 的 `ingest` 字段收进度。独立运行的服务
+（`serve_web.py`、`python -m opencode_tui.core.web`）没有这个回调，明确回 503——
+否则就有两个进程同时改 `sources` / `chunks`。同进程内两处写由 `index.WRITE_LOCK`
+串行化，索引库开 WAL，读列表不会被入库挡住。
+
+本地服务不做鉴权，所以四个写入口都要求 `X-VSA-Request: 1`（逼出 CORS 预检）并校验
+`Origin`——`multipart` 是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 投文件。
+入库还额外只认 **inbox 里已有的文件名**（不认路径），避免这个入口变成「让索引读任意路径」。
 
 `web/` 无构建步骤，`app.js` 是 hash router（`#/history`、`#/structure/<run_id>`、
 `#/library`），vendored 大包（3MB Mol\*）按页懒加载。`viz/` 是唯一装 npm 包的地方，

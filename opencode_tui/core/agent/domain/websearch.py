@@ -224,19 +224,20 @@ def _index_pages(pages: list[corpus.WebPage]) -> dict[str, Any]:
     except Exception as error:  # noqa: BLE001 - 索引坏了不该让搜索结果丢掉
         return {"indexed": 0, "vectors": 0, "error": f"{type(error).__name__}: {error}"}
     try:
-        for page in pages:
-            source_id = f"web:{page.source_id}"
-            try:
-                index.upsert_web_page(conn, source_id, page.content, page.meta)
-            except Exception:  # noqa: BLE001 - 一条切不开不影响另外九条
-                continue
-            indexed += 1
-            if config.embed and not embed.missing_reason(config.embed_model):
+        with index.writing():
+            for page in pages:
+                source_id = f"web:{page.source_id}"
                 try:
-                    result = embed.index_source(conn, source_id, config.embed_model)
-                except Exception:  # noqa: BLE001
+                    index.upsert_web_page(conn, source_id, page.content, page.meta)
+                except Exception:  # noqa: BLE001 - 一条切不开不影响另外九条
                     continue
-                vectors += int(result.get("embedded") or 0)
+                indexed += 1
+                if config.embed and not embed.missing_reason(config.embed_model):
+                    try:
+                        result = embed.index_source(conn, source_id, config.embed_model)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    vectors += int(result.get("embedded") or 0)
     finally:
         conn.close()
     return {"indexed": indexed, "vectors": vectors}

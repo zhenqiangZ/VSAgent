@@ -26,6 +26,7 @@
         <div class="lib-stats" id="lib-stats">正在读取…</div>
         <div class="lib-actions">
           <button id="lib-refresh" type="button">刷新</button>
+          <button id="lib-ingest" type="button">入库</button>
           <button id="lib-pick" type="button" class="is-primary">上传文献</button>
           <input id="lib-file" type="file" multiple accept=".pdf,.md,.txt" hidden>
         </div>
@@ -44,8 +45,9 @@
         <p class="empty-hint" id="lib-empty" hidden>语料库还是空的。上传一份文献，或在 TUI 里搜一次网。</p>
       </div>
       <p class="lib-foot">
-        删除只是挪进 <code>corpus/.trash/</code>，可以找回；上传只落进
-        <code>corpus/inbox/</code>，入库由 TUI 那一侧完成。
+        删除只是挪进 <code>corpus/.trash/</code>，可以找回。上传先落进
+        <code>corpus/inbox/</code>，点「入库」才切块、算向量；切块由应用那个进程做，
+        网页自己不写索引（独立运行的服务只能投递）。
       </p>
     </div>
 
@@ -159,15 +161,51 @@
 
     const inbox = payload.inbox || { count: 0 };
     const note = root.querySelector("#lib-inbox");
-    if (inbox.count) {
-      note.textContent =
-        `待入库 ${inbox.count} 份：${(inbox.names || []).join("、")}。` +
-        "在 TUI 里让模型 import_documents 指向 corpus/inbox/ 即可入库。";
+    const state = payload.ingest || {};
+    const button = root.querySelector("#lib-ingest");
+    const busy = Boolean(state.running);
+    button.disabled = busy || !payload.can_ingest || !inbox.count;
+    button.textContent = busy ? `入库中 ${state.done || 0}/${state.total || 0}` : "入库";
+
+    if (busy) {
+      note.textContent = `正在入库 ${state.done || 0}/${state.total || 0} 份…`;
+      note.hidden = false;
+    } else if (inbox.count) {
+      const hint = payload.can_ingest
+        ? "点「入库」就会切块进索引。"
+        : "这个服务不负责入库，用应用启动后再点「入库」。";
+      note.textContent = `待入库 ${inbox.count} 份：${(inbox.names || []).join("、")}。${hint}`;
       note.hidden = false;
     } else {
       note.textContent = "";
       note.hidden = true;
     }
+  }
+
+  function summarize(results) {
+    const counts = { new: 0, duplicate: 0, failed: 0 };
+    for (const item of results || []) {
+      const key = item.status in counts ? item.status : "failed";
+      counts[key] += 1;
+    }
+    const bits = [];
+    if (counts.new) bits.push(`新增 ${counts.new}`);
+    if (counts.duplicate) bits.push(`重复 ${counts.duplicate}`);
+    if (counts.failed) bits.push(`失败 ${counts.failed}`);
+    const first = (results || []).find((item) => item.status === "failed");
+    return bits.join("、") + (first ? `（${first.name}：${first.reason}）` : "");
+  }
+
+  async function waitForIngest() {
+    // 入库是后台跑的：一个 200 页 PDF 要十几秒。轮询列表接口既拿进度也拿结果，
+    // 页面不用为此多一条接口。
+    for (let round = 0; round < 900; round += 1) {
+      const payload = await fetchJson("/api/library");
+      render(payload);
+      if (!(payload.ingest || {}).running) return payload;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+    return null;
   }
 
   async function reload() {
@@ -274,6 +312,31 @@
         say("已刷新。");
       } catch (error) {
         say(`刷新失败：${error.message}`, "warn");
+      }
+    });
+    container.querySelector("#lib-ingest").addEventListener("click", async () => {
+      const button = container.querySelector("#lib-ingest");
+      button.disabled = true;
+      try {
+        const response = await fetch("/api/library/ingest", {
+          method: "POST",
+          headers: { ...HEADER, "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+        say(`开始入库 ${payload.started} 份，切块与算向量要一会儿…`);
+        const finished = await waitForIngest();
+        if (!finished) {
+          say("入库还在跑，刷新页面可以看结果。", "warn");
+          return;
+        }
+        const summary = summarize((finished.ingest || {}).results);
+        say(summary ? `入库结束：${summary}。` : "入库结束。", summary.includes("失败") ? "warn" : "ok");
+        await reload();
+      } catch (error) {
+        say(`入库失败：${error.message}`, "warn");
+        await reload().catch(() => {});
       }
     });
 

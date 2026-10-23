@@ -630,6 +630,112 @@ def run_library_checks(base):
     check("GET 写接口不会落到静态文件或某个默认动作", status == 404, f"{status}")
 
 
+def run_ingest_checks(base, corpus_dir):
+    """入库：网页只转交，不自己写索引；独立服务拒绝；重复投递幂等。
+
+    `base` 是**独立进程**起的服务（`-m opencode_tui.core.web`）——它没有入库
+    回调，必须回 503，而不是退化成第二个写者。真正入库那一组在这里另起一个
+    带 `ingest` 的 `WebServer`（同进程、同线程模型，与应用里一样）。
+    """
+    import threading
+
+    from opencode_tui.core.agent.domain.corpus import ingest_files
+    from opencode_tui.core.web.routes import WebServer
+
+    status, payload = post_json(f"{base}/api/library/ingest", {}, WRITE_HEADER)
+    check(
+        "独立进程不接入库：明确 503 而不是自己写索引",
+        status == 503 and "入库" in str(payload.get("error", "")),
+        f"{status} {payload.get('error', '')}",
+    )
+
+    port = free_port()
+    server = WebServer(
+        ("127.0.0.1", port),
+        STATE_COPY,
+        FIXTURE_DIR,
+        PROJECT_ROOT / "web",
+        corpus_root=corpus_dir,
+        ingest=ingest_files,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    local = f"http://127.0.0.1:{port}"
+
+    def wait_done(timeout=60.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _, state = request(f"{local}/api/library")
+            if not (state.get("ingest") or {}).get("running"):
+                return state
+            time.sleep(0.1)
+        return {}
+
+    try:
+        status, payload = post_json(
+            f"{local}/api/library/ingest", {"names": ["../doc/aaaaaaaaaa/meta.json"]}, WRITE_HEADER
+        )
+        check(
+            "入库只认 inbox 里的文件名：带 ../ 的直接拒",
+            status == 400,
+            f"{status} {payload.get('error', '')}",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/library/ingest", {"names": ["not-here.pdf"]}, WRITE_HEADER
+        )
+        check(
+            "入库只认已经在 inbox 里的文件",
+            status == 404,
+            f"{status} {payload.get('error', '')}",
+        )
+
+        # 前面的投递判据会在 inbox 里留几个文件；这一组要精确知道入了哪几份，
+        # 所以先清空——它测的是「入库」这件事，不是上一组留下的残渣。
+        inbox = corpus_dir / "inbox"
+        if inbox.exists():
+            shutil.rmtree(inbox)
+        inbox.mkdir(parents=True, exist_ok=True)
+        sample = "# 入库测试\n\nGefitinib is an EGFR inhibitor.\n"
+        (inbox / "ingest-me.md").write_text(sample, encoding="utf-8")
+        status, payload = post_json(
+            f"{local}/api/library/ingest", {"names": ["ingest-me.md"]}, WRITE_HEADER
+        )
+        check("入库请求当场返回 202，不等切块", status == 202 and payload.get("started") == 1,
+              f"{status} {payload}")
+
+        state = wait_done()
+        first = (state.get("ingest") or {}).get("results") or []
+        check(
+            "后台跑完，结果是新增",
+            first and first[0].get("status") == "new",
+            f"{first[:1]}",
+        )
+        check("入库之后 inbox 清空", (state.get("inbox") or {}).get("count") == 0,
+              f"{(state.get('inbox') or {})}")
+        # 标题取文件自己的（Markdown 没有内嵌标题）→ 退回文件名，所以是 ingest-me。
+        added = [item for item in state.get("items", []) if item.get("title") == "ingest-me"]
+        check(
+            "新的一份出现在列表里，并且有块与向量",
+            added and int(added[0].get("chunks") or 0) > 0,
+            f"{added[:1]}",
+        )
+        before = len(state.get("items", []))
+
+        (inbox / "same-again.md").write_text(sample, encoding="utf-8")
+        post_json(f"{local}/api/library/ingest", {"names": ["same-again.md"]}, WRITE_HEADER)
+        state = wait_done()
+        last = ((state.get("ingest") or {}).get("results") or [])[-1]
+        check(
+            "同样的内容再投一次是「重复」，不产生第二份",
+            last.get("status") == "duplicate" and len(state.get("items", [])) == before,
+            f"{last} / {len(state.get('items', []))} 份",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def run_concurrency_check(base, state_path, pristine):
     """一边重写状态文件一边请求接口，核对没有一次读到写了一半的内容。
 
@@ -746,6 +852,7 @@ def main():
     try:
         run_checks(base, state_path, runs_dir, link_session)
         run_library_checks(base)
+        run_ingest_checks(base, CORPUS_DIR)
         run_concurrency_check(base, state_path, pristine)
         run_broken_state_check(base, state_path, pristine)
     finally:

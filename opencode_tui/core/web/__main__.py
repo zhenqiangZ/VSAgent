@@ -28,6 +28,18 @@ def main() -> None:
     parser.add_argument("--runs", type=Path, default=root / "runs", help="结构运行目录")
     parser.add_argument("--web", type=Path, default=root / "web", help="网页文件目录")
     parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=None,
+        help="语料根目录（默认按代码位置定位到仓根下的 corpus/）",
+    )
+    parser.add_argument(
+        "--max-upload",
+        type=int,
+        default=None,
+        help="单次上传上限（字节，默认 50MB）。判据用它把「超限」测成几百字节",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
@@ -42,15 +54,21 @@ def main() -> None:
         state_path = default_state_path()
 
     port = args.port if args.port is not None else default_port()
+    extra = {}
+    if args.max_upload is not None:
+        extra["max_upload"] = args.max_upload
     server = WebServer(
         (HOST, port),
         Path(state_path).resolve(),
         args.runs.resolve(),
         args.web.resolve(),
+        corpus_root=args.corpus.resolve() if args.corpus else None,
+        **extra,
     )
     print(f"状态文件 {server.state_path}")
     print(f"运行目录 {server.runs_dir}")
     print(f"网页目录 {server.web_root}")
+    print(f"语料目录 {server.corpus_root}")
     print(f"http://{HOST}:{port}/")
     server.serve_forever()
 

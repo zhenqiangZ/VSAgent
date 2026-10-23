@@ -7,6 +7,9 @@
   - 运行标识取了 meta.json 里的 run_id，而那个值可能与目录名不一致
   - 状态文件正在被写入时读到写了一半的内容，接口报错
 
+S2 起还有一组语料库判据：上传 / 改名 / 删除，以及三类「本地无鉴权」必须挡住的东西
+——跨站 POST、路径穿越、超限。语料根指到 `.probe/web-corpus/`，不碰真实语料。
+
 **服务跑在包内**（`opencode_tui/core/web/`）。判据原先起的是 `tools/serve_web.py`
 这个独立脚本，现在起的是包内服务——那个脚本已经不发请求了，它只做命令行参数解析，
 路由全靠导入。判据要盯的是**真正被应用使用的那个实现**，否则测的是壳不是里。
@@ -29,11 +32,18 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from opencode_tui.core import index
 from opencode_tui.core.models import PartType
 from opencode_tui.core.session_manager import SessionManager, default_state_path
 
 FIXTURE_DIR = PROJECT_ROOT / ".probe" / "web-runs"
 STATE_COPY = PROJECT_ROOT / ".probe" / "web-state" / "state.toml"
+
+CORPUS_DIR = PROJECT_ROOT / ".probe" / "web-corpus"
+UPLOAD_CAP = 4096
+"""上传上限调到 4KB：这样「超限」只要发 5KB，不必真造一个 50MB 的请求。"""
+
+WRITE_HEADER = {"X-VSA-Request": "1"}
 
 # 首选的关联目标会话。这里写的是一个**期望**，实际用谁由副本状态文件决定
 # （见 `pick_link_session`）：状态文件是活的，把编号取成固定值，那个会话迟早
@@ -65,6 +75,45 @@ def request_status(url):
             return response.status
     except urllib.error.HTTPError as error:
         return error.code
+
+
+def post_json(url, payload, headers=None):
+    """发一个 JSON POST，返回 (状态码, 响应体)。"""
+    body = json.dumps(payload).encode("utf-8")
+    merged = {"Content-Type": "application/json"}
+    merged.update(headers or {})
+    request_obj = urllib.request.Request(url, data=body, headers=merged, method="POST")
+    return send(request_obj)
+
+
+def post_multipart(url, filename, data, headers=None, boundary="----vsa-boundary"):
+    """手搓一个 multipart 请求。只带一个文件，够用且不引额外依赖。"""
+    pieces = [
+        f"--{boundary}\r\n".encode("utf-8"),
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode("utf-8"),
+        b"Content-Type: application/octet-stream\r\n\r\n",
+        data,
+        f"\r\n--{boundary}--\r\n".encode("utf-8"),
+    ]
+    merged = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    merged.update(headers or {})
+    request_obj = urllib.request.Request(
+        url, data=b"".join(pieces), headers=merged, method="POST"
+    )
+    return send(request_obj)
+
+
+def send(request_obj):
+    """发出去，返回 (状态码, JSON)。4xx/5xx 也解析响应体，判据要看那句话。"""
+    try:
+        with urllib.request.urlopen(request_obj, timeout=30) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8")
+        try:
+            return error.code, json.loads(body) if body else {}
+        except ValueError:
+            return error.code, {"error": body[:200]}
 
 
 def free_port():
@@ -158,6 +207,8 @@ def start_service(state_path, runs_dir, port):
                 "-m", "opencode_tui.core.web",
                 "--state", str(state_path),
                 "--runs", str(runs_dir),
+                "--corpus", str(CORPUS_DIR),
+                "--max-upload", str(UPLOAD_CAP),
                 "--port", str(port),
             ],
             cwd=str(PROJECT_ROOT),
@@ -366,6 +417,219 @@ def run_checks(base, state_path, runs_dir, link_session):
     )
 
 
+def prepare_corpus():
+    """造一份最小语料：一份文献、一份网页、一个空 inbox，再建一次索引。
+
+    建索引这一步是**判据的一部分**：列表里的「块数」来自只读打开的那份库，
+    库不存在时页面也要能显示列表（只是没有块数），所以两条路都要能走。
+    """
+    if CORPUS_DIR.exists():
+        shutil.rmtree(CORPUS_DIR)
+
+    doc = CORPUS_DIR / "doc" / "aaaaaaaaaa"
+    doc.mkdir(parents=True)
+    (doc / "source.md").write_text("# 测试文献\n\nEpidermal growth factor receptor.\n", encoding="utf-8")
+    (doc / "text.jsonl").write_text(
+        json.dumps({"page": 1, "text": "# 测试文献\n\nEpidermal growth factor receptor."},
+                   ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (doc / "meta.json").write_text(
+        json.dumps(
+            {
+                "id": "aaaaaaaaaa", "kind": "doc", "title": "测试文献",
+                "file": "source.md", "pages": 1, "structure": "markdown",
+                "chars": 45, "depth": "full", "added_at": 1.0,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    web = CORPUS_DIR / "web" / "bbbbbbbbbb"
+    web.mkdir(parents=True)
+    (web / "content.md").write_text("# 测试网页\n\nSome web content about inhibitors.\n", encoding="utf-8")
+    (web / "meta.json").write_text(
+        json.dumps(
+            {
+                "id": "bbbbbbbbbb", "kind": "web", "title": "测试网页",
+                "url": "https://example.test/page", "depth": "full", "added_at": 2.0,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    (CORPUS_DIR / "inbox").mkdir(parents=True, exist_ok=True)
+    index.reindex(CORPUS_DIR)
+    return CORPUS_DIR
+
+
+def run_library_checks(base):
+    """语料库：列表读数、投递、改名、删除，以及三类必须挡住的东西。"""
+    origin = f"http://127.0.0.1:{base.rsplit(':', 1)[-1]}"
+    inbox = CORPUS_DIR / "inbox"
+    upload_url = f"{base}/api/library/upload"
+
+    status, payload = request(f"{base}/api/library")
+    items = payload.get("items", [])
+    check(
+        "语料列表与目录一致",
+        status == 200 and {item["id"] for item in items} == {"doc:aaaaaaaaaa", "web:bbbbbbbbbb"},
+        f"接口 {[item['id'] for item in items]}",
+    )
+    check(
+        "列表带上了块数（只读打开索引）",
+        all(item["chunks"] >= 1 for item in items),
+        f"块数 {[(item['id'], item['chunks']) for item in items]}",
+    )
+    check(
+        "开关现状是只读展示",
+        payload["config"]["indexWeb"] is True
+        and payload["config"]["embedModel"]
+        and payload["inbox"]["count"] == 0,
+        f"config={payload['config']} inbox={payload['inbox']}",
+    )
+
+    # ---- 投递 ----
+    status, saved = post_multipart(upload_url, "note.md", b"# hello\n\nbody\n", WRITE_HEADER)
+    check(
+        "上传落进 corpus/inbox/",
+        status == 200 and saved.get("accepted") == 1 and (inbox / "note.md").is_file(),
+        f"{status} {saved}",
+    )
+    status, payload = request(f"{base}/api/library")
+    check(
+        "待入库计数从 inbox 现数",
+        payload["inbox"]["count"] == 1 and payload["inbox"]["names"] == ["note.md"],
+        f"inbox={payload['inbox']}",
+    )
+
+    post_multipart(upload_url, "note.md", b"# second\n", WRITE_HEADER)
+    check(
+        "同名不覆盖，另存一份",
+        (inbox / "note.md").read_bytes() == b"# hello\n\nbody\n" and (inbox / "note-1.md").is_file(),
+        f"inbox 里的文件 {sorted(item.name for item in inbox.iterdir())}",
+    )
+
+    # ---- 跨站：本地服务不做鉴权，这两道门必须挡住 ----
+    status, body = post_multipart(upload_url, "evil.md", b"x")
+    check(
+        "不带自定义头的 POST 被拒（换个网站发不出这个头）",
+        status == 403 and "X-VSA-Request" in body.get("error", ""),
+        f"{status} {body.get('error', '')}",
+    )
+    status, body = post_multipart(
+        upload_url, "evil.md", b"x", {**WRITE_HEADER, "Origin": "http://evil.example"}
+    )
+    check("异站 Origin 被拒", status == 403, f"{status} {body.get('error', '')}")
+    status, _ = post_multipart(
+        upload_url, "same-origin.md", b"# ok\n", {**WRITE_HEADER, "Origin": origin}
+    )
+    check("同源 Origin 放行", status == 200, f"{status}")
+
+    # ---- 路径穿越：文件名里的目录要剥掉，id 里的路径根本不解析 ----
+    status, _ = post_multipart(upload_url, "../../escape.md", b"# escaped\n", WRITE_HEADER)
+    check(
+        "文件名里的路径被剥掉，落点仍在 inbox",
+        status == 200
+        and (inbox / "escape.md").is_file()
+        and not (PROJECT_ROOT / ".probe" / "escape.md").exists(),
+        f"{status}，inbox={sorted(item.name for item in inbox.iterdir())}",
+    )
+
+    status, body = post_multipart(upload_url, "sheet.csv", b"a,b\n", WRITE_HEADER)
+    check(
+        "不支持的扩展名当场拒绝",
+        status == 415 and "只收" in body.get("error", ""),
+        f"{status} {body.get('error', '')}",
+    )
+
+    status, body = post_multipart(upload_url, "big.md", b"x" * (UPLOAD_CAP + 128), WRITE_HEADER)
+    check(
+        "超过上限的请求体被拒（413）",
+        status == 413,
+        f"{status} {body.get('error', '')}",
+    )
+
+    # ---- 改名：只写 labels.json ----
+    doc_dir = CORPUS_DIR / "doc" / "aaaaaaaaaa"
+    status, renamed = post_json(
+        f"{base}/api/library/doc:aaaaaaaaaa/rename", {"title": "我改的名字"}, WRITE_HEADER
+    )
+    check(
+        "改名写进 labels.json",
+        status == 200
+        and (doc_dir / "labels.json").is_file()
+        and json.loads((doc_dir / "labels.json").read_text(encoding="utf-8"))["display_title"]
+        == "我改的名字",
+        f"{status} {renamed}",
+    )
+    check("改名不动 meta.json", json.loads((doc_dir / "meta.json").read_text(encoding="utf-8"))["title"] == "测试文献")
+
+    status, payload = request(f"{base}/api/library")
+    renamed_item = next(item for item in payload["items"] if item["id"] == "doc:aaaaaaaaaa")
+    check(
+        "列表显示改名后的标题",
+        renamed_item["title"] == "我改的名字" and renamed_item["rawTitle"] == "测试文献",
+        f"title={renamed_item['title']} raw={renamed_item['rawTitle']}",
+    )
+
+    post_json(f"{base}/api/library/doc:aaaaaaaaaa/rename", {"title": ""}, WRITE_HEADER)
+    check(
+        "空标题恢复原始标题",
+        not (doc_dir / "labels.json").exists(),
+        f"labels.json 还在：{(doc_dir / 'labels.json').is_file()}",
+    )
+
+    status, body = post_json(
+        f"{base}/api/library/doc:../../etc/rename", {"title": "x"}, WRITE_HEADER
+    )
+    check(
+        "id 里的路径不被解释",
+        status == 400 and "doc:xxxxxxxxxx" in body.get("error", ""),
+        f"{status} {body.get('error', '')}",
+    )
+
+    # ---- 删除：挪进 .trash，幂等 ----
+    web_dir = CORPUS_DIR / "web" / "bbbbbbbbbb"
+    status, deleted = post_json(
+        f"{base}/api/library/web:bbbbbbbbbb/delete", {}, WRITE_HEADER
+    )
+    check(
+        "删除挪进 .trash（原件可找回）",
+        status == 200
+        and deleted.get("deleted") is True
+        and not web_dir.exists()
+        and (CORPUS_DIR / ".trash").is_dir()
+        and any((CORPUS_DIR / ".trash").iterdir()),
+        f"{status} {deleted}",
+    )
+
+    status, again = post_json(
+        f"{base}/api/library/web:bbbbbbbbbb/delete", {}, WRITE_HEADER
+    )
+    check(
+        "删除是幂等的：第二次回 200 但没删东西",
+        status == 200 and again.get("deleted") is False,
+        f"{status} {again}",
+    )
+
+    status, payload = request(f"{base}/api/library")
+    check(
+        "删完列表就少一条",
+        all(item["id"] != "web:bbbbbbbbbb" for item in payload["items"]),
+        f"{[item['id'] for item in payload['items']]}",
+    )
+
+    # ---- 动词与路由 ----
+    status, _ = post_json(f"{base}/api/runs", {})
+    check("往只读接口 POST 回 405", status == 405, f"{status}")
+
+    status, _ = request(f"{base}/api/library/doc:aaaaaaaaaa/delete")
+    check("GET 写接口不会落到静态文件或某个默认动作", status == 404, f"{status}")
+
+
 def run_concurrency_check(base, state_path, pristine):
     """一边重写状态文件一边请求接口，核对没有一次读到写了一半的内容。
 
@@ -459,6 +723,7 @@ def main():
 
     state_path = prepare_state_copy()
     runs_dir = prepare_runs()
+    prepare_corpus()
     # 用**副本里真实存在**的某个会话当关联目标，而不是取一个固定编号。
     # 状态文件是活的：把编号取成固定值，一旦那个会话不在里面，
     # 「只有对应会话拿到了运行」就不会报出关联断掉——它只查「恰好有一个
@@ -480,6 +745,7 @@ def main():
 
     try:
         run_checks(base, state_path, runs_dir, link_session)
+        run_library_checks(base)
         run_concurrency_check(base, state_path, pristine)
         run_broken_state_check(base, state_path, pristine)
     finally:

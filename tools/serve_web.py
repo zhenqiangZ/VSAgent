@@ -9,6 +9,8 @@
 - 它是**独立进程**，用来在没有 TUI 的场合（人工查看、`tools/check_web_api.py`）起服务；
 - 它多一个 `--port` 参数，**优先级高于 `.env` 的 `VSA_WEB_PORT`**（方案稿 §7.2）。
 
+`--corpus` 也在两个入口上都有：判据要在一个临时语料根上跑，免得动到真实语料。
+
 在冻结成 exe 之后这个脚本不在磁盘上——应用里跑的是包内服务，
 它不是「另一个实现」，只是同一个实现的另一个壳。
 """
@@ -54,6 +56,12 @@ def main() -> None:
         default=None,
         help=f"监听端口（默认取 .env 的 VSA_WEB_PORT，再退到 {default_port()}）",
     )
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=None,
+        help="语料根目录（默认按代码位置定位到仓根下的 corpus/）",
+    )
     args = parser.parse_args()
 
     port = args.port if args.port is not None else default_port()
@@ -62,10 +70,12 @@ def main() -> None:
         args.state.resolve(),
         args.runs.resolve(),
         args.web.resolve(),
+        corpus_root=args.corpus.resolve() if args.corpus else None,
     )
     print(f"状态文件 {server.state_path}")
     print(f"运行目录 {server.runs_dir}")
     print(f"网页目录 {server.web_root}")
+    print(f"语料目录 {server.corpus_root}")
     print(f"http://127.0.0.1:{port}/")
     server.serve_forever()
 

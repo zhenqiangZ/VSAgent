@@ -736,3 +736,156 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
   #side { width: auto; border-left: none; border-top: 1px solid var(--line); }
   #mode-tabs { margin-left: 0; }
 }
+
+/* ---------- 语料库（S2） ---------- */
+
+.library {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 18px 20px 40px;
+  min-height: 100%;
+}
+.library.is-dragging {
+  outline: 2px dashed var(--accent);
+  outline-offset: -10px;
+  background: var(--accent-soft);
+}
+
+.lib-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+.lib-stats { color: var(--muted); font-size: 12.5px; }
+.lib-actions { display: flex; gap: 8px; }
+
+.lib-actions button, .lib-dialog-actions button {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+}
+.lib-actions button:hover, .lib-dialog-actions button:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+.lib-actions button.is-primary, .lib-dialog-actions button.is-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.lib-actions button.is-primary:hover, .lib-dialog-actions button.is-primary:hover {
+  background: var(--accent-strong);
+  color: #fff;
+}
+
+.lib-inbox {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border: 1px solid #fde68a;
+  border-radius: var(--radius-sm);
+  background: #fffbeb;
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.lib-message {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.lib-message.is-ok { border-color: #a7f3d0; background: #ecfdf5; color: var(--ok); }
+.lib-message.is-warn { border-color: #fecaca; background: #fef2f2; color: var(--hot); }
+
+.lib-table-wrap {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+.lib-table { width: 100%; border-collapse: collapse; }
+.lib-table th {
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 10px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.lib-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  font-size: 13px;
+}
+.lib-table tr:last-child td { border-bottom: none; }
+.lib-table tr:hover td { background: #fbfdff; }
+
+.lib-title { max-width: 520px; }
+.lib-title-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
+.lib-title-text { font-weight: 600; line-height: 1.5; }
+.lib-locator {
+  margin-top: 3px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 520px;
+}
+.lib-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  font-size: 11px;
+  vertical-align: 1px;
+}
+.lib-badge.is-warn { border-color: #fecaca; color: var(--hot); }
+.lib-kind, .lib-size, .lib-time { white-space: nowrap; color: var(--muted); }
+.lib-spec { color: var(--muted); font-size: 12.5px; max-width: 240px; }
+.lib-row-actions { white-space: nowrap; text-align: right; }
+.lib-row-actions button { margin-left: 6px; }
+.link-button.is-danger:hover { border-color: var(--hot); color: var(--hot); }
+
+.lib-foot { margin-top: 12px; color: var(--faint); font-size: 12px; }
+.lib-foot code { font-family: var(--mono); background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+.lib-dialog {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  min-width: 380px;
+  max-width: 560px;
+  box-shadow: var(--shadow-md);
+}
+.lib-dialog::backdrop { background: rgba(15, 23, 42, 0.28); }
+.lib-dialog h3 { margin: 0 0 8px; font-size: 15px; }
+.lib-dialog-text { margin: 0 0 12px; color: var(--muted); font-size: 12.5px; line-height: 1.7; }
+.lib-dialog input {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+.lib-dialog input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+.lib-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }

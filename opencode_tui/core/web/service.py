@@ -129,10 +129,12 @@ class WebService:
         web_root: Path,
         port: int | None = None,
         spec: RouteSpec | None = None,
+        corpus_root: Path | None = None,
     ) -> None:
         self.state_path = Path(state_path)
         self.runs_dir = Path(runs_dir)
         self.web_root = Path(web_root)
+        self.corpus_root = None if corpus_root is None else Path(corpus_root)
         self.preferred_port = port
         self.spec = SPEC if spec is None else spec
         self._server: WebServer | None = None
@@ -155,6 +157,7 @@ class WebService:
                 self.runs_dir,
                 self.web_root,
                 self.spec,
+                corpus_root=self.corpus_root,
             )
             thread = threading.Thread(
                 target=server.serve_forever,

@@ -1,0 +1,87 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R 7 0 R 9 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Length 218 >>
+stream
+BT /F1 11 Tf 72 732 Td 14 TL
+(1 Introduction) Tj T*
+(Epidermal growth factor receptor \(EGFR\) is a receptor tyrosine kinase.) Tj T*
+(Mutations such as T790M confer resistance to first generation inhibitors.) Tj T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 223 >>
+stream
+BT /F1 11 Tf 72 732 Td 14 TL
+(2 Methods) Tj T*
+(2.1 In vitro assay) Tj T*
+(Cells were cultured and treated with gefitinib at increasing doses.) Tj T*
+(IC50 values were fitted with a four parameter logistic model.) Tj T*
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+8 0 obj
+<< /Length 178 >>
+stream
+BT /F1 11 Tf 72 732 Td 14 TL
+(3 Results) Tj T*
+(Osimertinib retained activity against the T790M mutant.) Tj T*
+(The measured IC50 was 12 nM in the resistant cell line.) Tj T*
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>
+endobj
+10 0 obj
+<< /Type /Outlines /First 11 0 R /Last 14 0 R /Count 4 >>
+endobj
+11 0 obj
+<< /Title (1 Introduction) /Parent 10 0 R /Dest [5 0 R /Fit] /Next 12 0 R >>
+endobj
+12 0 obj
+<< /Title (2 Methods) /Parent 10 0 R /Dest [7 0 R /Fit] /Next 14 0 R /Prev 11 0 R /First 13 0 R /Last 13 0 R /Count 1 >>
+endobj
+13 0 obj
+<< /Title (2.1 In vitro assay) /Parent 12 0 R /Dest [7 0 R /Fit] >>
+endobj
+14 0 obj
+<< /Title (3 Results) /Parent 10 0 R /Dest [9 0 R /Fit] /Prev 12 0 R >>
+endobj
+xref
+0 15
+0000000000 65535 f 
+0000000009 00000 n 
+0000000075 00000 n 
+0000000144 00000 n 
+0000000241 00000 n 
+0000000509 00000 n 
+0000000635 00000 n 
+0000000908 00000 n 
+0000001034 00000 n 
+0000001262 00000 n 
+0000001388 00000 n 
+0000001462 00000 n 
+0000001555 00000 n 
+0000001692 00000 n 
+0000001776 00000 n 
+trailer
+<< /Size 15 /Root 1 0 R >>
+startxref
+1864
+%%EOF

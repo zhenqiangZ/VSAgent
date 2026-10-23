@@ -673,3 +673,121 @@ ModalScreen {
     background: #C62828;
     color: #FFFFFF;
 }
+
+/* ------------------------------------------------------------------ */
+/* 子 agent                                                            */
+/* ------------------------------------------------------------------ */
+
+/* 右栏的子 agent 列表。宽度沿用 #side-panel 的 30 列：
+   再宽会吃掉消息区，而标题已经按 12 格截过。 */
+#side-agents {
+    height: auto;
+    max-height: 10;
+    background: #0A0A0A;
+    border: none;
+    padding: 0;
+}
+
+#side-agents > .option-list--option {
+    height: 3;
+    padding: 0;
+    color: #DDDDDD;
+}
+
+#side-agents > .option-list--option-highlighted {
+    background: #1E3A5F;
+    color: #FFFFFF;
+}
+
+#side-agents-title {
+    height: 1;
+}
+
+/* 子 agent 界面顶部的返回栏：整条可点，颜色与右栏的分节标题一致。 */
+#subagent-banner {
+    height: 1;
+    background: #12263A;
+    color: #4A9EFF;
+    padding: 0 1;
+}
+
+#subagent-banner:hover {
+    background: #1E3A5F;
+    color: #FFFFFF;
+}
+
+/* 派发模态 */
+SpawnAgentScreen {
+    align: center middle;
+}
+
+#spawn-dialog {
+    width: 72;
+    height: auto;
+    max-height: 90%;
+    background: #141414;
+    border: solid #333333;
+    padding: 1 2;
+}
+
+#spawn-title {
+    height: 1;
+    color: #E0E0E0;
+    text-style: bold;
+}
+
+.spawn-label {
+    height: 1;
+    margin-top: 1;
+    color: #4A9EFF;
+}
+
+#spawn-range {
+    height: 3;
+}
+
+#spawn-range Input {
+    width: 8;
+}
+
+#spawn-arrow {
+    width: 3;
+    content-align: center middle;
+    color: #888888;
+}
+
+#spawn-total {
+    width: 1fr;
+    content-align: right middle;
+    color: #888888;
+}
+
+#spawn-preview {
+    height: auto;
+    color: #888888;
+    margin-top: 1;
+}
+
+#spawn-task {
+    height: 8;
+    border: solid #333333;
+}
+
+#spawn-error {
+    height: 1;
+    color: #EF5350;
+}
+
+#spawn-hint {
+    height: 2;
+    color: #666666;
+}
+
+#spawn-buttons {
+    height: 3;
+    align-horizontal: right;
+}
+
+#spawn-buttons Button {
+    margin-left: 2;
+}

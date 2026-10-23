@@ -7,8 +7,12 @@ from dataclasses import dataclass, field
 # 键位不挂在命令上：快捷键那一层由 `KeybindManager` 单独维护，两边各管各的。
 # 这么分是因为成熟的做法就是这样——快捷键只留最常按的那几个，其余全靠 /命令 记。
 COMMANDS: dict[str, dict[str, object]] = {
+    "agent": {"desc": "派发子 agent", "aliases": ["spawn"]},
+    "agents": {"desc": "打开子 agent 列表", "aliases": []},
+    "back": {"desc": "从子 agent 返回", "aliases": []},
     "compact": {"desc": "压缩当前会话", "aliases": ["summarize"]},
     "connect": {"desc": "添加提供商", "aliases": []},
+    "delete": {"desc": "删除当前会话", "aliases": ["remove"]},
     "details": {"desc": "切换工具执行详情", "aliases": []},
     "editor": {"desc": "打开外部编辑器", "aliases": []},
     "effort": {"desc": "轮换推理强度", "aliases": []},
@@ -23,6 +27,7 @@ COMMANDS: dict[str, dict[str, object]] = {
     "new": {"desc": "新会话", "aliases": ["clear"]},
     "redo": {"desc": "重做撤销的消息", "aliases": []},
     "remember": {"desc": "记住一条项目事实", "aliases": []},
+    "rename": {"desc": "重命名当前会话", "aliases": ["title"]},
     "sessions": {"desc": "列出会话", "aliases": ["resume", "continue"]},
     "share": {"desc": "分享会话", "aliases": []},
     "sidebar": {"desc": "切换上下文侧栏", "aliases": []},
@@ -72,6 +77,19 @@ class CommandRegistry:
     def all(self) -> list[Command]:
         """按命令名排序返回全部命令。"""
         return [self._commands[name] for name in sorted(self._commands)]
+
+    def filtered(self, allowed: frozenset[str] | set[str]) -> "CommandRegistry":
+        """只保留白名单里的命令，返回一个新的注册表。
+
+        子 agent 界面用它：`/agent`、`/new`、`/sessions` 这些会改动父会话
+        或再往下派发的命令根本不该出现在面板里，而不是选了之后才被拒。
+        """
+        subset = {
+            name: {"desc": command.desc, "aliases": list(command.aliases)}
+            for name, command in self._commands.items()
+            if name in allowed
+        }
+        return CommandRegistry(subset)
 
     def get(self, name: str) -> Command | None:
         """按名字或别名取命令。"""

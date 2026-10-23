@@ -464,11 +464,27 @@ class SimplePartView(Static):
             classes=f"part part-{part.type.value}",
             markup=False,
         )
+        self.part = part
         self.part_id = part.id
 
     def sync(self, part: Part) -> None:
         """刷新显示文本。"""
+        self.part = part
         self.update(self.render_part_text(part))
+
+    def on_click(self, event: events.Click) -> None:
+        """子 agent 的派发标记可以点：直接进那个子 agent。
+
+        标记里记着会话编号（`Part.text`），不靠名字反查——名字可以重命名，
+        编号不会。会话被删掉时什么都不做，标记仍然留在聊天记录里。
+        """
+        if self.part.type is not PartType.AGENT or not self.part.text:
+            return
+        session = self.app.session_manager.get_session(self.part.text)
+        if session is None:
+            return
+        event.stop()
+        self.app.open_subagent(session.id)
 
     @staticmethod
     def render_part_text(part: Part) -> str:
@@ -476,7 +492,7 @@ class SimplePartView(Static):
             preview = f"  {len(part.text.splitlines())} 行" if part.text else ""
             return f"▤ {part.file_path or part.text}{preview}"
         if part.type is PartType.AGENT:
-            return f"◆ agent: {part.agent_name}"
+            return f"◆ 子 agent: {part.agent_name}"
         if part.type is PartType.STEP_START:
             return f"── step {part.text or 'start'} " + "─" * 20
         if part.type is PartType.STEP_FINISH:

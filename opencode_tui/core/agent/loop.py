@@ -150,6 +150,7 @@ class AgentLoop:
         ledger: Any = None,
         memory: Any = None,
         viewer: Any = None,
+        spawner: Any = None,
         max_steps: int = MAX_STEPS,
     ) -> None:
         self.bus = bus
@@ -166,6 +167,10 @@ class AgentLoop:
         # 本地结构服务的状态。与记忆一样是**应用级**的：整个进程一个，
         # 不随会话切换而变，也不每轮重建。open_viewer 只从中读实际端口。
         self.viewer = viewer
+        # 子 agent 派发器。应用级对象，由 app 装配、按会话注入给 spawn_agent。
+        # 根会话的循环层拿得到它，子 agent 的注册表里没有那个工具，
+        # 所以「子 agent 不能再派发」在装配层就成立，不靠工具自己判断。
+        self.spawner = spawner
         # 本轮的按需证据（检索回来的记忆、含关键行的工具结果）。
         #
         # 它是**一轮**的：每次发问之前清空。上一轮 recall 出来的记忆，
@@ -175,6 +180,9 @@ class AgentLoop:
         self.max_steps = max_steps
         self.cancelled = False
         self.last_latency_ms = 0
+        # 这一轮为什么停下。`None` 表示模型自己说完了；其余取值见 EXIT_*。
+        # 子 agent 的状态机靠它区分 done / failed，不必再从消息的 Part 里猜。
+        self.last_exit_reason: str | None = None
         self._pending_permissions: dict[str, _PendingPermission] = {}
 
     def cancel(self) -> None:
@@ -248,6 +256,7 @@ class AgentLoop:
         用户的输入已经作为一条 user Message 写进会话，这里的 prompt 只是同一个签名的占位。
         """
         self.cancelled = False
+        self.last_exit_reason = None
         # 证据是「本步相关」的，一轮开始时清空：上一轮 recall 出来的记忆，
         # 到这一轮多半已经不相干，留着只会占掉证据层的额度。
         self.evidence.clear()
@@ -266,6 +275,7 @@ class AgentLoop:
             message, step, elapsed_ms, exit_reason = await self._run_steps(
                 session, message, workspace
             )
+            self.last_exit_reason = exit_reason
             # 收尾总结在 `_finish` 之前：它是一次真实请求，用量与耗时
             # 要算进这一轮，状态栏上的数字才对得上。
             #
@@ -292,6 +302,7 @@ class AgentLoop:
         下一轮重建模型消息时翻译层不必分辨它是哪一条路产生的。
         """
         self.cancelled = False
+        self.last_exit_reason = None
         # 与 stream_reply 一样，把这一轮算作新的起点：这一条命令的产物不该
         # 混进下一轮发问的证据里。
         self.evidence.clear()
@@ -638,7 +649,7 @@ class AgentLoop:
         notice.add_part(part)
         session.add_message(notice)
         self.bus.publish("message.add", {"message_id": notice.id, "session_id": session.id})
-        self.bus.publish("part.add", {"message_id": notice.id, "part_id": part.id})
+        self.bus.publish("part.add", {"session_id": session.id, "message_id": notice.id, "part_id": part.id})
         return notice
 
     def _start_continuation(self, session: Session) -> Message:
@@ -803,7 +814,7 @@ class AgentLoop:
             return
         part.permission = decision.note()
         part.tool_status = ToolStatus.RUNNING
-        self.bus.publish("part.update", {"message_id": message.id, "part_id": part.id})
+        self.bus.publish("part.update", {"session_id": session.id, "message_id": message.id, "part_id": part.id})
 
         def record_arguments(given: dict[str, Any]) -> None:
             """把模型实际给出来的参数记回 Part。
@@ -826,8 +837,10 @@ class AgentLoop:
                 part.tool_input,
                 context=self.ledger,
                 task_state=session.task_state,
+                session=session,
                 evidence=self.evidence,
                 viewer=self.viewer,
+                spawner=self.spawner,
                 on_arguments=record_arguments,
             )
         except ToolError as error:
@@ -843,7 +856,7 @@ class AgentLoop:
             part.tool_status = ToolStatus.FAILED
         # 提炼放在状态定稿之后：钩子可能把这一条改成失败，那时它更该进证据层。
         self.evidence.add_from_part(part)
-        self.bus.publish("part.update", {"message_id": message.id, "part_id": part.id})
+        self.bus.publish("part.update", {"session_id": session.id, "message_id": message.id, "part_id": part.id})
 
     async def _ask_permission(
         self,
@@ -856,7 +869,7 @@ class AgentLoop:
         """发一个询问事件，等界面把用户的选择交回来。"""
         part.tool_status = ToolStatus.AWAITING
         part.permission = decision.note()
-        self.bus.publish("part.update", {"message_id": message.id, "part_id": part.id})
+        self.bus.publish("part.update", {"session_id": session.id, "message_id": message.id, "part_id": part.id})
         future: asyncio.Future[PermissionDecision] = asyncio.get_running_loop().create_future()
         self._pending_permissions[part.id] = _PendingPermission(future, tool, part.tool_input)
         self.bus.publish(
@@ -872,14 +885,21 @@ class AgentLoop:
         """把工具标成失败并写明原因，这条原因会被回灌给模型。"""
         part.tool_status = ToolStatus.FAILED
         part.tool_output = reason
-        self.bus.publish("part.update", {"message_id": message.id, "part_id": part.id})
+        self.bus.publish(
+            "part.update",
+            {
+                "session_id": message.session_id,
+                "message_id": message.id,
+                "part_id": part.id,
+            },
+        )
 
     def _append_text(self, message: Message, part_type: PartType, text: str) -> None:
         """把增量接到当前这一类 Part 上，最后一个是别的类型时另起一个。"""
         last = message.parts[-1] if message.parts else None
         if last is not None and last.type is part_type:
             last.text += text
-            self.bus.publish("part.update", {"message_id": message.id, "part_id": last.id})
+            self.bus.publish("part.update", {"session_id": message.session_id, "message_id": message.id, "part_id": last.id})
             return
         self._publish(message, Part(type=part_type, text=text))
 
@@ -894,7 +914,7 @@ class AgentLoop:
     def _publish(self, message: Message, part: Part) -> Part:
         """把 Part 挂到消息上并通知界面。"""
         message.add_part(part)
-        self.bus.publish("part.add", {"message_id": message.id, "part_id": part.id})
+        self.bus.publish("part.add", {"session_id": message.session_id, "message_id": message.id, "part_id": part.id})
         return part
 
     def _finish(self, session: Session, message: Message, step: int, elapsed_ms: int) -> None:

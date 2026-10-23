@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from textual.widgets import Input  # noqa: E402
+from textual.widgets import Input, TextArea  # noqa: E402
 
 from opencode_tui.app import OpenCodeApp  # noqa: E402
 from opencode_tui.core.agent.hooks import (  # noqa: E402
@@ -28,6 +28,7 @@ from opencode_tui.core.agent.hooks import (  # noqa: E402
     HookRunner,
     load_hooks,
 )
+from opencode_tui.core.agent.host import AgentHost  # noqa: E402
 from opencode_tui.core.agent.loop import (  # noqa: E402
     MAX_RETRIES,
     MAX_STEPS,
@@ -74,6 +75,14 @@ from opencode_tui.core.agent.context import (  # noqa: E402
     ordered_degraded,
 )
 from opencode_tui.core.agent.task import TaskTool  # noqa: E402
+from opencode_tui.core.agent.spawn import (  # noqa: E402
+    AgentStatusTool,
+    SpawnAgentTool,
+    fork_messages,
+    history_end,
+    recent_start,
+    task_preamble,
+)
 from opencode_tui.core.connection import (  # noqa: E402
     Connection,
     connection_path_for,
@@ -184,8 +193,13 @@ from opencode_tui.core.models import (  # noqa: E402
     ToolStatus,
 )
 from opencode_tui.screens.chat import ChatScreen  # noqa: E402
+from opencode_tui.screens.chat import SidePanel  # noqa: E402
 from opencode_tui.screens.connection_form import ConnectionFormScreen  # noqa: E402
 from opencode_tui.screens.home import HomeScreen  # noqa: E402
+from opencode_tui.screens.permission import PermissionDialog  # noqa: E402
+from opencode_tui.screens.session_picker import ConfirmDialog, SessionPickerScreen  # noqa: E402
+from opencode_tui.screens.spawn_agent import SpawnAgentScreen  # noqa: E402
+from opencode_tui.screens.subagent import SubagentChatScreen  # noqa: E402
 
 from fake_model_server import (  # noqa: E402
     FakeModelServer,
@@ -3656,6 +3670,16 @@ async def check_home_new_session() -> None:
         """不发请求：这一组验的是会话选择，不是模型链路。"""
         return None
 
+    # 每个会话一个循环层：新会话会现建一个，所以补丁要跟着装配走，
+    # 只打在 `app.agent` 上只能盖住当前这一个。
+    build_loop = app._build_loop
+
+    def build_with_fake(session: object, ledger: object) -> AgentLoop:
+        loop = build_loop(session, ledger)  # type: ignore[arg-type]
+        loop.stream_reply = fake_stream  # type: ignore[method-assign]
+        return loop
+
+    app.host.factory = build_with_fake  # type: ignore[assignment]
     app.agent.stream_reply = fake_stream  # type: ignore[method-assign]
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
@@ -11184,6 +11208,585 @@ def check_plan_deny() -> None:
     )
 
 
+async def check_subagent() -> None:
+    """子 agent：fork 复制、深度守卫、共享登记表、重启恢复、事件带会话号。"""
+    # --- fork：区间、ID 全新、过程标记不进子会话 ---
+    parent = Session(id="ses_parent", title="父会话")
+    for index in range(3):
+        message = Message(role="user", session_id=parent.id)
+        message.add_part(Part(type=PartType.TEXT, text=f"第 {index} 条"))
+        parent.add_message(message)
+    assistant = Message(role="assistant", session_id=parent.id)
+    assistant.add_part(Part(type=PartType.STEP_START, text="1"))
+    assistant.add_part(Part(type=PartType.TEXT, text="答"))
+    parent.add_message(assistant)
+
+    child = Session(
+        id="ses_child", title="子", parent_id=parent.id, root_id=parent.id, depth=1
+    )
+    parent_ids = {message.id for message in parent.messages}
+    copied, dropped = fork_messages(parent, child, 1, 4, 10**9)
+    check(copied == 3 and dropped == 0, f"fork 复制区间内全部消息：{copied}/{dropped}")
+    check(
+        all(message.id not in parent_ids for message in child.messages),
+        "fork 出来的消息 ID 全部是新的",
+    )
+    check(
+        child.messages[0].parts[0].text == "第 1 条",
+        "fork 从起点开始，不是从 0 开始",
+    )
+    check(
+        all(
+            part.type is not PartType.STEP_START
+            for message in child.messages
+            for part in message.parts
+        ),
+        "过程标记不复制进子会话",
+    )
+    check(
+        (child.seed_start, child.seed_end) == (1, 4),
+        f"fork 记下区间：{child.seed_start}–{child.seed_end}",
+    )
+
+    # --- fork：预算不够时从最早的消息开始丢 ---
+    tiny = Session(
+        id="ses_tiny", title="子2", parent_id=parent.id, root_id=parent.id, depth=1
+    )
+    _, dropped_tiny = fork_messages(parent, tiny, 0, 4, 1)
+    check(dropped_tiny > 0, "预算不够时真的丢了消息")
+    check(
+        len(tiny.messages) < 4,
+        f"丢完之后子会话更短：{len(tiny.messages)}",
+    )
+    notice = task_preamble(parent, 0, 4, dropped_tiny)
+    check("不能再创建" in notice, "任务书里写明不能再派发")
+    check("已作为上文复制过来" in notice, f"任务书说明历史是否复制：{notice}")
+
+    # --- 派发工具：根会话能派，子 agent 不能 ---
+    class _Spawner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Session, dict[str, Any]]] = []
+
+        def spawn(self, session: Session, **kwargs: Any) -> Session:
+            self.calls.append((session, kwargs))
+            return Session(
+                id="ses_spawned",
+                title=str(kwargs["title"]),
+                parent_id=session.id,
+                root_id=session.family_id,
+                depth=1,
+            )
+
+    spawner = _Spawner()
+    tool = SpawnAgentTool()
+    root = Session(id="ses_root", title="根")
+    result = await tool.execute(
+        {"task": "查一下", "title": "调研", "history": "none"},
+        session=root,
+        spawner=spawner,
+    )
+    check(not result.failed, f"根会话派发成功：{result.output}")
+    check(
+        spawner.calls and spawner.calls[0][1]["origin"] == "agent",
+        "工具派发的来源记成 agent",
+    )
+
+    # history=recent 只复制最近一个用户轮
+    for role in ("user", "assistant", "user", "assistant"):
+        sample = Message(role=role, session_id=root.id)
+        sample.add_part(Part(type=PartType.TEXT, text=role))
+        root.add_message(sample)
+    check(recent_start(root.messages, 1) == 2, "recent_start 指向最后一个用户轮")
+    await tool.execute(
+        {"task": "接着查", "title": "最近", "history": "recent", "recent_turns": 1},
+        session=root,
+        spawner=spawner,
+    )
+    latest = spawner.calls[-1][1]
+    check(
+        latest["start"] == 2 and latest["end"] == 4,
+        f"recent 派发区间只覆盖最后一轮：{latest['start']}–{latest['end']}",
+    )
+
+    blocked = ""
+    try:
+        await tool.execute({"task": "再派一次"}, session=child, spawner=spawner)
+    except ToolError as error:
+        blocked = str(error)
+    check("子 agent 内不能再创建" in blocked, f"子 agent 派发被拦：{blocked!r}")
+
+    # --- 模型正在写的那条助手消息不该被复制 ---
+    in_flight = Message(role="assistant", session_id=parent.id)
+    in_flight.add_part(
+        Part(
+            type=PartType.TOOL,
+            tool_name="spawn_agent",
+            tool_status=ToolStatus.PENDING,
+        )
+    )
+    parent.add_message(in_flight)
+    check(
+        history_end(parent.messages) == len(parent.messages) - 1,
+        "可复制历史排除了正在写的那条派发消息",
+    )
+
+    # --- 应用装配：根有 spawn_agent，子没有；登记表共享；重启复位 ---
+    state = ROOT / ".probe" / "state_subagent.toml"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.unlink(missing_ok=True)
+    app = OpenCodeApp(root=ROOT, state_path=state)
+    root_session = app.session_manager.new_session()
+    check(
+        "spawn_agent" in app.agent.registry.names(),
+        "根会话的注册表里有 spawn_agent",
+    )
+    sub = app.host.spawn(
+        root_session, title="子任务", task="任务", start=0, end=0, prompt=False
+    )
+    check(
+        "spawn_agent" not in app.host.loop_for(sub.id).registry.names(),
+        "子 agent 的注册表里没有 spawn_agent",
+    )
+    check(
+        "agent_status" in app.agent.registry.names(),
+        "根会话的注册表里有 agent_status",
+    )
+    check(
+        "agent_status" not in app.host.loop_for(sub.id).registry.names(),
+        "子 agent 不能查询别的 agent",
+    )
+
+    # --- 父会话能取回子 agent 的报告 ---
+    status_tool = AgentStatusTool()
+    report = await status_tool.execute({}, session=root_session, spawner=app.host)
+    check("子任务" in report.output, f"报告里有子 agent 的名字：{report.output}")
+    check("空闲" in report.output, f"报告里带状态：{report.output}")
+    blocked_report = ""
+    try:
+        await status_tool.execute({}, session=sub, spawner=app.host)
+    except ToolError as error:
+        blocked_report = str(error)
+    check("不能查询其他 agent" in blocked_report, f"子 agent 查询被拦：{blocked_report!r}")
+
+    produced = Message(role="assistant", session_id=sub.id)
+    produced.add_part(Part(type=PartType.FILE, file_path="runs/x/table.csv"))
+    sub.add_message(produced)
+    report_with_files = await status_tool.execute(
+        {"session_id": sub.id}, session=root_session, spawner=app.host
+    )
+    check(
+        "table.csv" in report_with_files.output,
+        f"报告里带产出文件：{report_with_files.output}",
+    )
+
+    check(
+        app.host.ledger_for(root_session) is app.host.ledger_for(sub),
+        "父子共用同一个登记表对象",
+    )
+    family = root_session.family_id
+    app.host._set_status(sub, "running")
+    app.save_state()
+    reloaded = SessionManager(state)
+    reloaded.load_from_toml()
+    saved = reloaded.get_session(sub.id)
+    check(saved is not None, "子 agent 写进状态文件后读得回来")
+    check(
+        saved is not None and saved.parent_id == root_session.id and saved.depth == 1,
+        "父会话与深度不丢",
+    )
+    check(
+        saved is not None and saved.status == "idle",
+        f"重启后 running 复位成 idle：{saved.status if saved else '缺'}",
+    )
+    check(
+        saved is not None and "仍在运行" in saved.status_note,
+        "复位时写明原因",
+    )
+
+    # --- 删会话要连运行时一起清 ---
+    check(sub.id in app.host._loops, "删除之前子 agent 的循环层是缓存着的")
+    check(app.delete_session(root_session.id), "父会话删除成功")
+    check(app.session_manager.get_session(sub.id) is None, "子 agent 的数据一起删掉")
+    check(sub.id not in app.host._loops, "子 agent 的循环层跟着清掉")
+    check(family not in app.host._ledgers, "家族的共享登记表跟着清掉")
+    state.unlink(missing_ok=True)
+
+    # --- 事件带 session_id：父屏据此丢弃别的会话的流 ---
+    bus = EventBus()
+    seen: list[dict[str, Any]] = []
+    bus.subscribe("part.add", lambda data: seen.append(data))
+    config = ProviderConfig(base_url="http://127.0.0.1:9", api_key="x", model="m")
+    loop = AgentLoop(bus, OpenAICompatProvider(config), ToolRegistry(), config)
+    message = Message(role="assistant", session_id="ses_evt")
+    loop._publish(message, Part(type=PartType.TEXT, text="x"))
+    check(
+        seen and seen[-1].get("session_id") == "ses_evt",
+        f"part.add 带上会话号：{seen[-1] if seen else '没有事件'}",
+    )
+
+    # --- 两个会话真的同时在跑；同会话第二次发问被拒；取消落 cancelled ---
+    class _GatedLoop:
+        """卡在一个事件上的假循环层，用来验调度而不打模型。"""
+
+        context_window = 128_000
+        registry = ToolRegistry()
+        last_exit_reason = None
+
+        def __init__(self, gate: asyncio.Event) -> None:
+            self.gate = gate
+            self.cancelled = False
+
+        async def stream_reply(self, session: Session, prompt: str) -> None:
+            await self.gate.wait()
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    host_state = ROOT / ".probe" / "state_subagent_host.toml"
+    host_state.unlink(missing_ok=True)
+    manager = SessionManager(host_state)
+    first = manager.new_session("并发 A")
+    second = manager.create_session("并发 B")
+    gates = {first.id: asyncio.Event(), second.id: asyncio.Event()}
+    host = AgentHost(
+        manager,
+        lambda session, ledger: _GatedLoop(gates[session.id]),
+        EventBus(),
+        ROOT,
+    )
+    check(host.prompt(first.id, "一"), "第一个会话开始跑")
+    check(host.prompt(second.id, "二"), "第二个会话同时开始跑")
+    check(
+        not host.prompt(first.id, "再来"),
+        "同一个会话在跑时第二次发问被拒",
+    )
+    check(
+        host.is_running(first.id) and host.is_running(second.id),
+        "两个会话同时处于运行中",
+    )
+    check(
+        first.status == "running" and second.status == "running",
+        f"状态都落成 running：{first.status}/{second.status}",
+    )
+    gates[first.id].set()
+    gates[second.id].set()
+    await host.wait([first.id, second.id], 2)
+    check(
+        not host.is_running(first.id) and not host.is_running(second.id),
+        "两个会话都跑完了",
+    )
+    check(
+        first.status == "done" and second.status == "done",
+        f"正常结束落 done：{first.status}/{second.status}",
+    )
+
+    third = manager.create_session("并发 C")
+    gates[third.id] = asyncio.Event()
+    check(host.prompt(third.id, "三"), "第三个会话开始跑")
+    # 让任务真正开始等门，再中断：模拟用户在一轮中途按 esc，
+    # 而不是在 create_task 还没被调度时就取消。
+    await asyncio.sleep(0)
+    host.cancel(third.id)
+    await host.wait([third.id], 2)
+    check(third.status == "cancelled", f"中断落 cancelled：{third.status}")
+
+    # agent_status 的 wait：超时先返回运行中，跑完之后再查是完成
+    wait_parent = manager.create_session("等待父")
+    wait_child = manager.create_session(
+        "等待子",
+        parent_id=wait_parent.id,
+        root_id=wait_parent.id,
+        depth=1,
+    )
+    gates[wait_child.id] = asyncio.Event()
+    check(host.prompt(wait_child.id, "慢慢跑"), "等待用的子 agent 开始跑")
+    wait_tool = AgentStatusTool()
+    timed = await wait_tool.execute(
+        {"session_id": wait_child.id, "wait": True, "timeout": 1},
+        session=wait_parent,
+        spawner=host,
+    )
+    check("运行中" in timed.output, f"超时之后如实报运行中：{timed.output}")
+    gates[wait_child.id].set()
+    await host.wait([wait_child.id], 2)
+    finished = await wait_tool.execute(
+        {"session_id": wait_child.id}, session=wait_parent, spawner=host
+    )
+    check("完成" in finished.output, f"跑完之后报完成：{finished.output}")
+
+    host.shutdown()
+    host_state.unlink(missing_ok=True)
+
+
+async def check_subagent_ui() -> None:
+    """从界面上派发、看见右栏、进入子 agent、返回。"""
+    root = ROOT / ".probe" / "subagent_ui"
+    root.mkdir(parents=True, exist_ok=True)
+    state = root / "state.toml"
+    state.unlink(missing_ok=True)
+    # 只为了让「派发」这一个动作被放行；子 agent 真的去请求时连不上，
+    # 这一组验的是界面与状态，不是模型链路。
+    save_connection(
+        connection_path_for(state),
+        Connection("http://127.0.0.1:1/v1", "k", "subagent-ui"),
+    )
+    app = OpenCodeApp(root=ROOT, state_path=state)
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.switch_screen(ChatScreen(ROOT))
+        await pilot.pause()
+        chat = app.screen
+        check(isinstance(chat, ChatScreen), "先进入聊天界面")
+
+        app.execute_command("agent")
+        await pilot.pause()
+        modal = app.screen
+        check(isinstance(modal, SpawnAgentScreen), f"打 /agent 弹出派发模态：{modal}")
+
+        modal.query_one("#spawn-name", Input).value = "调研"
+        modal.query_one("#spawn-task", TextArea).text = "查一下 4HJO"
+        modal.action_submit()
+        await pilot.pause()
+        check(isinstance(app.screen, ChatScreen), "提交之后模态关掉，回到聊天界面")
+
+        session = app.session_manager.current
+        children = app.host.children_of(session.id)
+        check(len(children) == 1, f"父会话下多了一个子 agent：{len(children)}")
+        child = children[0]
+        check(
+            child.parent_id == session.id and child.depth == 1,
+            "子 agent 记着父会话与深度",
+        )
+
+        panel = chat.query_one(SidePanel)
+        check(panel.has_class("-visible"), "创建之后右栏自动出现")
+        await pilot.pause()
+        check(panel.region.width == 30, f"右栏保持 30 列：{panel.region.width}")
+        check(
+            panel.region.right == app.size.width,
+            "右栏贴在屏幕右边缘",
+        )
+        check(
+            chat._belongs({"session_id": session.id})
+            and not chat._belongs({"session_id": child.id}),
+            "父屏只认自己的 session_id",
+        )
+
+        # 父会话里的派发标记可点，直接进那个子 agent
+        await pilot.click(".part-agent")
+        await pilot.pause()
+        check(
+            isinstance(app.screen, SubagentChatScreen),
+            f"点派发标记进入子 agent：{app.screen}",
+        )
+        app.screen.action_back()
+        await pilot.pause()
+        check(isinstance(app.screen, ChatScreen), "从标记进去之后能返回")
+
+        listing = panel.query_one("#side-agents")
+        check(len(listing.options) == 1, f"右栏列出了子 agent：{len(listing.options)}")
+
+        # 用户派发要在父会话里留一条记录（模型派发有工具卡，用户没有）
+        marker = session.messages[-1]
+        check(
+            len(marker.parts) == 1 and marker.parts[0].type is PartType.AGENT,
+            f"父会话留下了一条 AGENT 记录：{[part.type for part in marker.parts]}",
+        )
+        check(
+            marker.parts[0].agent_name == child.title
+            and marker.parts[0].text == child.id,
+            "记录里带着子 agent 的名字与编号",
+        )
+
+        # --- 两个会话同时要权限：排队，不叠模态 ---
+        def _pending_ask(target: Session) -> tuple[Message, Part]:
+            message = Message(role="assistant", session_id=target.id)
+            part = message.add_part(
+                Part(
+                    type=PartType.TOOL,
+                    tool_name="bash",
+                    tool_status=ToolStatus.AWAITING,
+                    tool_input={"command": "echo q"},
+                )
+            )
+            target.add_message(message)
+            return message, part
+
+        root_message, root_part = _pending_ask(session)
+        child_message, child_part = _pending_ask(child)
+        app.event_bus.publish(
+            "permission.ask",
+            {
+                "session_id": session.id,
+                "message_id": root_message.id,
+                "part_id": root_part.id,
+            },
+        )
+        app.event_bus.publish(
+            "permission.ask",
+            {
+                "session_id": child.id,
+                "message_id": child_message.id,
+                "part_id": child_part.id,
+            },
+        )
+        await pilot.pause()
+        check(isinstance(app.screen, PermissionDialog), "第一条询问弹出来")
+        check(app.screen._agent_name == session.agent_name, "先弹的是先到的那个")
+        await pilot.press("y")
+        await pilot.pause()
+        check(isinstance(app.screen, PermissionDialog), "答完一个，第二个接着弹")
+        check(app.screen._agent_name == child.title, "第二个来自子 agent")
+        await pilot.press("n")
+        await pilot.pause()
+        check(not isinstance(app.screen, PermissionDialog), "答完两个之后回到聊天界面")
+        check(not app._permission_queue, "队列已经空了")
+
+        # --- 右栏显示失败原因 ---
+        child.status = "failed"
+        child.status_note = "请求出错"
+        chat.refresh_status()
+        await pilot.pause()
+        prompt = listing.get_option_at_index(0).prompt
+        text = getattr(prompt, "plain", str(prompt))
+        check("请求出错" in text, f"右栏写出了失败原因：{text}")
+        check(
+            "无父会话历史" in text and "用户派发" in text,
+            f"右栏第三行写明区间与来源：{text}",
+        )
+
+        # 后台子 agent 结束时，父会话给一句提示
+        app.event_bus.publish(
+            "agent.status",
+            {"session_id": child.id, "status": "failed", "note": "请求出错"},
+        )
+        await pilot.pause()
+        check(bool(chat.query(".toast")), "后台子 agent 失败时父会话弹出提示")
+
+        # /agents：键盘用户也能进列表
+        app.execute_command("agents")
+        await pilot.pause()
+        check(app.focused is listing, f"/agents 把焦点交给列表：{app.focused}")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(
+            app.focused is chat.editor.input,
+            f"列表里 esc 回到输入框：{app.focused}",
+        )
+
+        app.open_subagent(child.id)
+        await pilot.pause()
+        sub = app.screen
+        check(isinstance(sub, SubagentChatScreen), f"点进子 agent：{sub}")
+        banner = sub.query_one("#subagent-banner")
+        check(banner.region.height == 1, f"返回栏只有一行：{banner.region.height}")
+        check(
+            banner.region.width == app.size.width,
+            f"返回栏横贯屏幕：{banner.region.width}",
+        )
+        check(
+            "用户派发" in str(banner.render()),
+            f"返回栏写出派发来源：{banner.render()}",
+        )
+        check(
+            "第 " not in str(banner.render()),
+            f"空会话派发不写 fork 区间：{banner.render()}",
+        )
+        check(
+            "请求出错" in str(sub.query_one("#subagent-banner").render()),
+            "返回栏带着失败原因",
+        )
+        before_agent = sub.session.agent_name
+        sub.editor.focus_input()
+        await pilot.press("tab")
+        await pilot.pause()
+        check(
+            not sub.editor.agent_popup.is_open,
+            "子 agent 界面按 tab 不弹 Agent 列表",
+        )
+        check(
+            sub.session.agent_name == before_agent,
+            f"Build/Plan 没有被切走：{sub.session.agent_name}",
+        )
+        check(not sub.allows_command("agent"), "子 agent 界面不允许 /agent")
+        check(
+            "spawn_agent" not in app.host.loop_for(child.id).registry.names(),
+            "子 agent 的注册表里没有派发工具",
+        )
+        names = [command.name for command in sub.command_registry.all()]
+        check("agent" not in names, f"命令面板里没有 /agent：{names}")
+        check("back" in names, "命令面板里保留了 /back")
+
+        app.execute_command("agent")
+        await pilot.pause()
+        check(
+            isinstance(app.screen, SubagentChatScreen),
+            "在子 agent 界面执行 /agent 不会打开派发模态",
+        )
+
+        # /rename 改的是这一屏对应的子 agent，不是父会话
+        app.execute_command("rename 改过的名字")
+        await pilot.pause()
+        check(child.title == "改过的名字", f"子 agent 被重命名：{child.title}")
+        check(
+            "改过的名字" in str(sub.query_one("#subagent-banner").render()),
+            "返回栏跟着改名",
+        )
+
+        sub.action_back()
+        await pilot.pause()
+        check(
+            isinstance(app.screen, ChatScreen)
+            and not isinstance(app.screen, SubagentChatScreen),
+            "返回之后回到父会话",
+        )
+        check(
+            not app.session_manager.current.is_subagent,
+            "返回不会把当前会话切到子 agent 上",
+        )
+
+        # /delete：确认之后子 agent 消失并退回父会话
+        app.open_subagent(child.id)
+        await pilot.pause()
+        app.execute_command("delete")
+        await pilot.pause()
+        check(isinstance(app.screen, ConfirmDialog), f"删除先确认：{app.screen}")
+        await pilot.press("y")
+        await pilot.pause()
+        check(
+            isinstance(app.screen, ChatScreen)
+            and not isinstance(app.screen, SubagentChatScreen),
+            "删掉当前子 agent 后退回父会话",
+        )
+        check(
+            app.session_manager.get_session(child.id) is None,
+            "子 agent 的数据已经删掉",
+        )
+        check(
+            not app.host.children_of(session.id),
+            "右栏的数据源里也没有它了",
+        )
+
+        # --- /sessions 里只有根会话，重命名之后也不会混进子 agent ---
+        second = app.session_manager.create_session("第二个根")
+        app.execute_command("sessions")
+        await pilot.pause()
+        picker = app.screen
+        check(isinstance(picker, SessionPickerScreen), f"打开会话选择器：{picker}")
+        check(
+            all(not item.is_subagent for item in picker.sessions),
+            f"打开时只列根会话：{[item.title for item in picker.sessions]}",
+        )
+        picker._apply_rename(second.id, "改名了")
+        await pilot.pause()
+        check(
+            all(not item.is_subagent for item in picker.sessions),
+            "重命名后重新填充仍然只有根会话",
+        )
+        picker.action_dismiss()
+        await pilot.pause()
+    state.unlink(missing_ok=True)
+
+
 # 检查组：名字给 `--only` 过滤用，函数一律零参数（同步与异步混着，调用处看返回值）。
 # 名字取函数名里有意义的那一段，`--only permission` 能直接命中。
 GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
@@ -11225,6 +11828,8 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("prompt", check_prompt),
     ("memory", check_memory),
     ("task-state", check_task_state),
+    ("subagent", check_subagent),
+    ("subagent-ui", check_subagent_ui),
     ("selective-compression", check_selective_compression),
     ("evidence", check_evidence_layer),
     ("bash", check_bash_tool),

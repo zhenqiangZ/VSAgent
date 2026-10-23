@@ -1715,8 +1715,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         total = len(app.command_registry.all())
         check(listed == total, f"打一个 / 列出全部命令：列了 {listed} 条，注册表 {total} 条")
         check(
-            bool(popup.visible_items) and popup.visible_items[0].startswith("/compact"),
-            f"候选按命令名排序，头一条是 /compact：{popup.visible_items[:2]}",
+            bool(popup.visible_items) and popup.visible_items[0].startswith("/agent"),
+            f"候选按命令名排序，头一条是 /agent：{popup.visible_items[:2]}",
         )
         await type_text(pilot, "hel")
         await pilot.pause()

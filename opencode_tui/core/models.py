@@ -79,6 +79,9 @@ class ToolStatus(Enum):
 # 推理强度，输入框状态行与 /effort 命令都按这个顺序轮换。
 EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 
+# 子 agent 的运行状态。只用于展示与重启恢复，不参与模型上下文。
+AGENT_STATUSES: tuple[str, ...] = ("idle", "running", "done", "failed", "cancelled")
+
 
 @dataclass
 class Part:
@@ -388,6 +391,34 @@ class Session:
     summary_upto: int = 0
     # 结构化的任务状态：目标、用户约束、进度、阻塞。整块进上下文的 TASK 层，不参与淘汰
     task_state: TaskState = field(default_factory=TaskState)
+    # ---- 子 agent ----
+    # 父会话 id。根会话为空，这一条也是「是不是子 agent」的唯一判据。
+    parent_id: str = ""
+    # 根会话 id。根会话自己为空，取家族时用 `family_id`。
+    # 单独存一份而不是顺着 parent_id 递归：深度上限是 1，递归没有收益，
+    # 而每次取登记表都要顺着链找一遍会把一件 O(1) 的事写成 O(depth)。
+    root_id: str = ""
+    # 0=根，1=子 agent。硬上限 1 层，见 AgentHost.spawn。
+    depth: int = 0
+    # user / agent：谁派发的。模型派发的会写进父会话的 AGENT Part。
+    origin: str = "user"
+    # fork 的父会话消息区间 [seed_start, seed_end)，闭开区间，便于直接切片。
+    seed_start: int = 0
+    seed_end: int = 0
+    # idle / running / done / failed / cancelled
+    status: str = "idle"
+    status_note: str = ""
+    spawned_at: float = 0.0
+
+    @property
+    def family_id(self) -> str:
+        """同一个根会话下的所有会话共用的编号。根会话返回自己。"""
+        return self.root_id or self.id
+
+    @property
+    def is_subagent(self) -> bool:
+        """是不是子 agent。"""
+        return bool(self.parent_id) or self.depth > 0
 
     def add_message(self, message: Message) -> Message:
         """追加消息并刷新更新时间。"""
@@ -431,6 +462,15 @@ class Session:
             "summary": self.summary,
             "summary_upto": self.summary_upto,
             "task_state": self.task_state.to_dict(),
+            "parent_id": self.parent_id,
+            "root_id": self.root_id,
+            "depth": self.depth,
+            "origin": self.origin,
+            "seed_start": self.seed_start,
+            "seed_end": self.seed_end,
+            "status": self.status,
+            "status_note": self.status_note,
+            "spawned_at": self.spawned_at,
         }
 
     @classmethod
@@ -450,6 +490,15 @@ class Session:
             task_state=TaskState.from_dict(
                 data.get("task_state") if isinstance(data.get("task_state"), dict) else {}
             ),
+            parent_id=str(data.get("parent_id") or ""),
+            root_id=str(data.get("root_id") or ""),
+            depth=int(data.get("depth") or 0),
+            origin=str(data.get("origin") or "user"),
+            seed_start=int(data.get("seed_start") or 0),
+            seed_end=int(data.get("seed_end") or 0),
+            status=str(data.get("status") or "idle"),
+            status_note=str(data.get("status_note") or ""),
+            spawned_at=float(data.get("spawned_at") or 0.0),
         )
         for raw in data.get("messages") or []:
             session.messages.append(Message.from_dict(raw))

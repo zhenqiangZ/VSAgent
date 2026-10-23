@@ -255,6 +255,12 @@ class Tool(ABC):
     # （循环层持有、会话切换时换掉），任务状态挂在会话自己身上、每次调用现取。
     # 挤进同一个口子的话，取登记表的那些工具会收到一个既不是登记表也不是任务状态的东西。
     task_argument: ClassVar[str] = ""
+    # 收当前会话的参数名。只有需要知道「这是谁在调用」的工具才声明。
+    #
+    # 与 task_argument 分开：任务状态是会话上的一小块数据，这里是会话本身。
+    # 子 agent 派发要读 `depth`（判断还能不能派）与 `id`（父会话），
+    # 读任务状态拿不到这两样。
+    session_argument: ClassVar[str] = ""
     # 收证据收集器的参数名。没有这类参数时留空。
     #
     # 与上两个同样分开：收集器是循环层每轮新建的一个小盒子，工具往里放
@@ -267,6 +273,13 @@ class Tool(ABC):
     # 也不是每轮重建的。取登记表的那些工具收不到它，收它的只有一个 open_viewer。
     # 只读它的 `port` / `web_port` 属性，不认它的类型，这一层因此不必导入 web 包。
     viewer_argument: ClassVar[str] = ""
+    # 收子 agent 运行时的参数名。没有这类参数时留空。
+    #
+    # 又一个分开的口子：它是**应用级**的（整个进程一个 AgentHost），
+    # 由循环层持有、在调用时注入。派发工具用它 `spawn`，查询工具用它
+    # `children_of` / `wait`。工具只调这几个方法，不认它的类型，
+    # 这一层因此不必导入 host。
+    spawn_argument: ClassVar[str] = ""
 
     @abstractmethod
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
@@ -277,8 +290,10 @@ class Tool(ABC):
         arguments: dict[str, Any],
         context: Any = None,
         task_state: Any = None,
+        session: Any = None,
         evidence: Any = None,
         viewer: Any = None,
+        spawner: Any = None,
         on_arguments: Callable[[dict[str, Any]], None] | None = None,
     ) -> ToolResult:
         """内核唯一的调用入口：注入 context、任务状态、证据收集器与结构服务之后再走 `run`。
@@ -301,8 +316,10 @@ class Tool(ABC):
         for name, value, what in (
             (self.context_argument, context, "会话登记表"),
             (self.task_argument, task_state, "任务状态"),
+            (self.session_argument, session, "当前会话"),
             (self.evidence_argument, evidence, "证据收集器"),
             (self.viewer_argument, viewer, "本地结构服务"),
+            (self.spawn_argument, spawner, "子 agent 派发器"),
         ):
             if not name:
                 continue

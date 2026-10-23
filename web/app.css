@@ -177,8 +177,106 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 #session-list li:hover { background: var(--panel); }
 #session-list li.is-active { background: var(--accent-soft); border-color: #bfdbfe; }
 
-.session-title { font-weight: 600; }
+.session-title { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.session-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .session-meta { margin-top: 4px; font-size: 12px; color: var(--muted); }
+
+/* 树状列表的展开/收起按钮。叶子用同宽的空位占住，标题列才对得齐。 */
+.tree-toggle,
+.tree-spacer {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+}
+
+.tree-toggle {
+  appearance: none;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.tree-toggle:hover { color: var(--accent-strong); }
+
+/* 子 agent 挂在父会话下面：左边一条竖线 + 缩进，扫一眼就知道层级。
+   深度上限是 1，所以固定缩进就够；data-depth 留着给将来放宽层级。 */
+#session-list li.is-child {
+  margin-left: 14px;
+  padding-left: 20px;
+  position: relative;
+}
+
+#session-list li.is-child::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--line);
+}
+
+#session-list li.is-child.is-active::before {
+  border-left-color: var(--accent);
+}
+
+/* 子 agent 的状态点。idle 是空心圈，其余实心；运行中加一圈很淡的光晕。 */
+.agent-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-block;
+}
+
+.dot-idle { background: transparent; border: 1px solid var(--muted); }
+.dot-running { background: #2563eb; box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18); }
+.dot-done { background: #16a34a; }
+.dot-failed { background: #dc2626; }
+.dot-cancelled { background: #9ca3af; }
+
+.agent-count {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+/* 详情头部：子 agent 的来源行 */
+.head-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.agent-badge {
+  padding: 1px 8px;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 11px;
+}
+
+.head-parent { color: var(--muted); }
+.link-inline { color: var(--accent-strong); text-decoration: none; }
+.link-inline:hover { text-decoration: underline; }
 
 .run-mark {
   display: inline-block;

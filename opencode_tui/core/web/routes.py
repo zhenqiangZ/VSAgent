@@ -169,6 +169,14 @@ def session_summary(session, run_id: str | None) -> dict:
         "totalTokens": session.total_tokens(),
         "totalCost": session.total_cost(),
         "runId": run_id,
+        # 子 agent：网页端只读展示，靠这几个字段决定缩进与状态点。
+        "parentId": session.parent_id,
+        "depth": session.depth,
+        "origin": session.origin,
+        "status": session.status,
+        "statusNote": session.status_note,
+        "seedStart": session.seed_start,
+        "seedEnd": session.seed_end,
     }
 
 

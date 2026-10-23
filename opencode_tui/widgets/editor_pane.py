@@ -325,6 +325,13 @@ class EditorPane(Container):
 
     def action_agent_popup(self) -> None:
         """tab：命令补全开着时采纳当前候选，否则打开 Agent 补全弹窗。"""
+        # 子 agent 界面不允许改 Build/Plan：它的身份跟着父会话走，
+        # 否则从 Plan 派出去的 agent 能在子会话里自己切成 Build 去写文件。
+        if not getattr(self.screen, "allow_agent_switch", True):
+            self.screen.app.show_toast(
+                "子 agent 的 Build/Plan 跟着父会话走，不能切换", "warning"
+            )
+            return
         if self.command_popup.is_open:
             self._accept(self.command_popup)
             return

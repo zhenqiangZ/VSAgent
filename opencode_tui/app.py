@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 
 from textual.app import App
@@ -8,12 +9,16 @@ from .core.agent.domain.all_tools import domain_tools
 from .core.agent.domain.export import runs_dir
 from .core.web.service import WebService, web_root
 from .core.agent.hooks import HookRunner, default_hooks_paths, load_hooks
+from .core.agent.host import AgentHost
 from .core.agent.ledger import SessionLedger
 from .core.agent.loop import AgentLoop, max_steps_from_env
 from .core.agent.memory import MemoryStore, RecallTool, RememberTool
+from .core.agent.spawn import AgentStatusTool, SpawnAgentTool
 from .core.agent.task import TaskTool
 from .core.agent.permission import (
     PermissionPolicy,
+    Verdict,
+    argument_value,
     default_permission_paths,
     load_permissions,
     load_tool_switches,
@@ -48,7 +53,7 @@ from .core.external_editor import (
     write_buffer,
 )
 from .core.keybind_manager import KeybindManager
-from .core.models import EFFORTS, Message
+from .core.models import EFFORTS, Message, Session, ToolStatus
 from .core.project_scan import merge_agents_md, scan_project
 from .core.session_manager import SessionManager
 from .env import load_env
@@ -58,13 +63,16 @@ from .screens.diff_overlay import DiffOverlayScreen
 from .screens.help import HelpScreen
 from .screens.home import HomeScreen
 from .screens.message import MessageScreen
-from .screens.session_picker import SessionPickerScreen
+from .screens.permission import PermissionAnswer, PermissionDialog
+from .screens.session_picker import ConfirmDialog, SessionPickerScreen
+from .screens.spawn_agent import SpawnAgentScreen, SpawnRequest
+from .screens.subagent import SubagentChatScreen
 from .screens.theme_selector import ThemeSelectorScreen
 from .screens.tools_panel import ToolEntry, ToolsPanelScreen
 from .widgets.toast import ToastNotification
 
 # 需要参数的命令：命令名之后那一段交给处理函数，其余命令不吃参数。
-ARGUMENT_COMMANDS = frozenset({"remember", "forget", "task", "model"})
+ARGUMENT_COMMANDS = frozenset({"remember", "forget", "task", "model", "agent", "rename"})
 
 
 class OpenCodeApp(App[None]):
@@ -109,12 +117,51 @@ class OpenCodeApp(App[None]):
         # 全部工具的名字与说明，含被关掉的那些。只有 `/tools` 面板要得到它们，
         # 建一次就够——工具清单在进程里是固定的。
         self._catalog: list[tuple[str, str]] | None = None
-        self._ledger: SessionLedger | None = None
         self._memory: MemoryStore | None = None
+        # 工具注册表按「根 / 子 agent」缓存两份：两者只差一个 spawn_agent。
+        self._registries: dict[bool, ToolRegistry] = {}
+        # 判定规则读一次，每个循环层各拿一份新策略：本会话的「全部允许」
+        # 不能顺着共享对象漏到子 agent 头上。
+        self._policy_rules: tuple[dict, dict] | None = None
         self.web_service = self._build_web_service()
-        self.agent = self._build_agent()
+        # 会话运行时：每个会话一个循环层，子 agent 在后台并行跑。
+        # 循环层里那些 cancelled / evidence / 待答复判定都是会话级的，
+        # 共用一份会互相踩，所以不能再像以前那样整个应用只留一个 AgentLoop。
+        self.host = AgentHost(
+            self.session_manager,
+            self._build_loop,
+            self.event_bus,
+            self.root,
+            save_state=self.save_state,
+        )
         self._removed_message: Message | None = None
         self._removed_session_id = ""
+        # 权限询问排队。多个后台子 agent 同时要权限时，模态不能叠在一起：
+        # 用户答完一个才看得见下一个，否则最上面那个关掉之前下面那个一直灰着。
+        self._permission_queue: deque[dict[str, object]] = deque()
+        self._permission_active = False
+
+    @property
+    def agent(self) -> AgentLoop:
+        """当前会话的循环层。
+
+        保留这个名字是为了让 `/tools` 面板、权限判定与既有测试不必跟着改；
+        真正的多实例由 `host` 管，切会话时这里自然拿到另一个实例。
+        """
+        return self.host.loop_for(self.session_manager.current_session_id)
+
+    @property
+    def active_session(self) -> Session:
+        """用户正看着的那个会话。
+
+        栈顶是聊天界面就用它的会话，否则用状态里的 current。
+        `/export`、`/undo` 这类命令必须按这个取，否则在子 agent 界面里
+        操作的是父会话，而屏幕上写着子 agent 的标题。
+        """
+        top = self.screen
+        if isinstance(top, ChatScreen):
+            return top.session
+        return self.session_manager.current
 
     def _build_web_service(self) -> WebService:
         """本地结构页的服务。
@@ -130,18 +177,25 @@ class OpenCodeApp(App[None]):
             web_root=web_root(),
         )
 
-    def _build_agent(self) -> AgentLoop:
-        """装配循环层。
+    def _build_loop(self, session: Session, ledger: SessionLedger) -> AgentLoop:
+        """按会话装配一个循环层。
 
-        连接参数取自与状态文件同目录的 `connection.toml`，由应用内的 `/model`
-        填写；计费与窗口按模型清单兜底。工作目录是项目目录：
-        系统提示里写的路径与 BashTool 实际执行的位置是同一个，模型按提示读到的目录
-        就是它在工具里操作的那一个。
+        每个会话一份，不共用：循环层里的 `cancelled` / `evidence` /
+        待答复判定都是会话级状态。注册表按「根 / 子 agent」复用两份，
+        子 agent 那份**不注册 spawn_agent**——模型连这个工具存在都不知道。
         """
         load_env()
         config = self._provider_config()
+        # 会话里记着的模型是它上次用的那个。子 agent 是从某个会话分出去的，
+        # 启动恢复时不能一律拿连接配置里的默认模型顶上去。
+        if session.model_id and session.model_id != config.model:
+            config = config.for_model(session.model_id)
         memory = self._build_memory()
-        registry = self._build_registry(memory)
+        root = not session.is_subagent
+        registry = self._registries.get(root)
+        if registry is None:
+            registry = self._build_registry(memory, allow_spawn=root)
+            self._registries[root] = registry
         return AgentLoop(
             self.event_bus,
             OpenAICompatProvider(config),
@@ -149,11 +203,13 @@ class OpenCodeApp(App[None]):
             config,
             context_window=config.context_window,
             workspace_root=self.root,
-            policy=self._build_policy(),
+            policy=self._policy_for(session),
             hooks=self._build_hooks(),
-            ledger=self._build_ledger(),
+            ledger=ledger,
             memory=memory,
             viewer=self.web_service,
+            # 子 agent 拿到 None：就算历史里学过这个名字，工具本身也会拒。
+            spawner=self.host if root else None,
             max_steps=max_steps_from_env(),
         )
 
@@ -180,49 +236,25 @@ class OpenCodeApp(App[None]):
         """模型接口的三项是否都填了。"""
         return self.agent.config.configured
 
-    def _build_ledger(self) -> SessionLedger:
-        """装配登记表。
+    def _policy_for(self, session: Session) -> PermissionPolicy:
+        """每个循环层一份判定策略。
 
-        会话级状态，按当前会话编号写盘到 `~/.opencode_tui/ledgers/`，
-        与状态文件同处。会话换掉时由 `_sync_ledger` 重新载入。
-        """
-        if self._ledger is not None:
-            return self._ledger
-        self._ledger = SessionLedger(session_id=self.session_manager.current_session_id)
-        self._ledger.load()
-        return self._ledger
-
-    def _sync_ledger(self) -> None:
-        """把登记表切到当前会话。
-
-        会话切换发生在界面里（新建、选中），循环层只拿得到登记表对象本身，
-        所以在每一次发问之前校准一次——比在每个切换动作上都埋一次调用稳。
-        """
-        manager = self.session_manager
-        if self._ledger is None:
-            self._ledger = self._build_ledger()
-            self.agent.ledger = self._ledger
-            return
-        if self._ledger.session_id == manager.current_session_id:
-            return
-        self._ledger = SessionLedger(session_id=manager.current_session_id)
-        self._ledger.load()
-        self.agent.ledger = self._ledger
-
-    def _build_policy(self) -> PermissionPolicy:
-        """装配判定层。
-
-        两份配置在这里各读一次，改配置要重启应用。规则文件与状态文件不同：
-        `AGENTS.md` 是每次发问之前重新读，那一个改完立刻生效。
+        规则来自同一份配置，但「本会话全部允许」这种运行期状态必须各自一份：
+        共享对象会让父会话的一次放行悄悄作用到后台子 agent 上。
+        测试注入的那份照旧共用，它本来就是拿来断言调用的。
         """
         if self._policy is not None:
             return self._policy
-        project_path, user_path = default_permission_paths(self.root)
+        if self._policy_rules is None:
+            project_path, user_path = default_permission_paths(self.root)
+            self._policy_rules = (
+                load_permissions(project_path, "项目配置"),
+                load_permissions(user_path, "用户配置"),
+            )
+        project_rules, user_rules = self._policy_rules
         return PermissionPolicy(
-            project_rules=load_permissions(project_path, "项目配置"),
-            user_rules=load_permissions(user_path, "用户配置"),
-            # 工作目录交给判定层，它据此判「这一步是不是踩到了外面」。
-            # 与 BashTool / ReadTool 拿到的 cwd 是同一个目录，边界因此只有一处说法。
+            project_rules=project_rules,
+            user_rules=user_rules,
             workspace_root=self.root,
         )
 
@@ -254,7 +286,13 @@ class OpenCodeApp(App[None]):
         self._memory.revalidate()
         return self._memory
 
-    def _build_registry(self, memory: MemoryStore, disabled: frozenset[str] | None = None) -> ToolRegistry:
+    def _build_registry(
+        self,
+        memory: MemoryStore,
+        disabled: frozenset[str] | None = None,
+        *,
+        allow_spawn: bool = True,
+    ) -> ToolRegistry:
         """装配全部工具。每个工具的工作基准都是项目目录，
         与系统提示里写出来的路径是同一个。
 
@@ -283,6 +321,12 @@ class OpenCodeApp(App[None]):
         registry.register(RecallTool(memory))
         # 任务状态不用传东西进来：它挂在会话上，由循环层每次调用现取。
         registry.register(TaskTool())
+        # 派发子 agent 是**根会话专属**的能力。子 agent 的注册表里没有它，
+        # 请求体的 tools 数组里也就没有它，模型连这个名字都看不到。
+        if allow_spawn:
+            registry.register(SpawnAgentTool())
+            # 查询与等待是同一条能力的另一半：只派不取，派发就没有闭环。
+            registry.register(AgentStatusTool())
         for tool in domain_tools():
             registry.register(tool)
         return registry
@@ -355,7 +399,15 @@ class OpenCodeApp(App[None]):
             return self.tool_entries()
 
         self._disabled = load_tool_switches(self.root)[0]
-        self.agent.registry = self._build_registry(self._build_memory())
+        # 两份缓存都作废，再按每个会话重建：子 agent 那份不能因为重建
+        # 就把 spawn_agent 一起装回去。
+        self._registries.clear()
+        for session_id, loop in self.host.items():
+            session = self.session_manager.get_session(session_id)
+            loop.registry = self._build_registry(
+                self._build_memory(),
+                allow_spawn=not (session is not None and session.is_subagent),
+            )
         actual, sources = load_tool_switches(self.root)
         if enabled and name in actual:
             self.show_toast(f"{name} 仍被 {sources[name]} 关着，先把那份文件里的 false 去掉", "warning")
@@ -381,7 +433,9 @@ class OpenCodeApp(App[None]):
             self.agent.switch_model(session.model_id)
         self.trace.start()
         self.web_service.start()
-        self.event_bus.subscribe("turn.done", self._on_turn_done)
+        # 权限询问由应用层统一处理，而不是聊天界面：子 agent 在后台跑、
+        # 用户停在父会话时，那条询问没有屏幕认领，挂在界面上会永远等下去。
+        self.event_bus.subscribe("permission.ask", self._on_permission_ask)
         self.push_screen(HomeScreen())
 
     def on_unmount(self) -> None:
@@ -392,6 +446,7 @@ class OpenCodeApp(App[None]):
         「上次没退干净」那条路上（靠端口避让兜着，但那是兜底不是常态）。
         """
         self.web_service.stop()
+        self.host.shutdown()
         self.trace.stop()
 
     @property
@@ -463,6 +518,10 @@ class OpenCodeApp(App[None]):
         if handler is None:
             self.show_toast(f"/{command.name} 尚未接入", "warning")
             return
+        top = self.screen
+        if isinstance(top, ChatScreen) and not top.allows_command(command.name):
+            self.show_toast(f"子 agent 界面不支持 /{command.name}", "warning")
+            return
         if command.name in ARGUMENT_COMMANDS:
             handler(rest.strip())
         else:
@@ -475,9 +534,150 @@ class OpenCodeApp(App[None]):
         self.save_state()
         self.show_toast("已创建新会话", "success")
 
+    def _command_agent(self, arguments: str) -> None:
+        """派发子 agent：不带参数开模态，带一段文字就按整段历史直接派发。
+
+        `/agent <任务>` 是快捷键式的用法：常用的「把刚才这段活分出去」，
+        不必每次都过一遍范围选择。
+        """
+        top = self.screen
+        if isinstance(top, SubagentChatScreen):
+            self.show_toast("子 agent 内不能再派发新的 agent", "warning")
+            return
+        if not self.is_configured:
+            self.show_toast("还没有配置模型接口，先输入 /model 填写地址与密钥", "warning")
+            return
+        parent = self.session_manager.current
+        task = arguments.strip()
+        if task:
+            child = self.host.spawn(
+                parent,
+                title=task.splitlines()[0][:20],
+                task=task,
+                start=0,
+                end=len(parent.messages),
+                origin="user",
+            )
+            self.show_toast(f"已派发子 agent「{child.title}」", "success")
+            return
+        self.push_screen(
+            SpawnAgentScreen(
+                parent,
+                self.agent.context_window,
+                self.agent.registry.specs(),
+            ),
+            self._on_spawn_requested,
+        )
+
+    def _on_spawn_requested(self, request: "SpawnRequest | None") -> None:
+        """创建模态交回结果：建数据、开后台任务、刷新右栏。"""
+        if request is None:
+            return
+        parent = self.session_manager.get_session(request.parent_id)
+        if parent is None:
+            self.show_toast("父会话已经不在了", "error")
+            return
+        try:
+            child = self.host.spawn(
+                parent,
+                title=request.title,
+                task=request.task,
+                start=request.start,
+                end=request.end,
+                origin="user",
+            )
+        except ValueError as error:
+            self.show_toast(str(error), "warning")
+            return
+        self.show_toast(f"已派发子 agent「{child.title}」，在后台运行", "success")
+
+    def open_subagent(self, session_id: str) -> None:
+        """进入子 agent 界面。当前会话不切换，返回时父会话还在原处。
+
+        兄弟之间也是平级压栈：A → B → 父会话，返回一层退一层。
+        """
+        session = self.session_manager.get_session(session_id)
+        if session is None:
+            self.show_toast("这个子 agent 已经不在了", "warning")
+            return
+        self.push_screen(SubagentChatScreen(self.root, session_id=session_id))
+
+    def _command_back(self) -> None:
+        """从子 agent 界面返回父会话。"""
+        if isinstance(self.screen, SubagentChatScreen):
+            self.pop_screen()
+            return
+        self.show_toast("当前不在子 agent 界面", "info")
+
+    def _command_agents(self) -> None:
+        """把焦点交给右栏的子 agent 列表。
+
+        命令而不是快捷键：输入框常年拿着焦点，屏幕上的键位基本按不到；
+        `/agents` 之后 ↑↓ 选择、enter 打开、esc 回到输入框。
+        """
+        top = self.screen
+        if not isinstance(top, ChatScreen):
+            self.show_toast("请先进入聊天界面", "warning")
+            return
+        session = top.session
+        anchor = session.parent_id or session.id
+        if not self.host.children_of(anchor):
+            self.show_toast("本会话还没有子 agent，用 /agent 派发一个", "info")
+            return
+        if not top.side_panel.has_class("-visible"):
+            top.side_panel.set_class(True, "-visible")
+            top.refresh_status()
+        if top.side_panel.focus_agents():
+            self.show_toast("↑↓ 选择，enter 打开，esc 回到输入框", "info")
+
+    def _command_rename(self, arguments: str) -> None:
+        """重命名当前会话。根会话与子 agent 都走这一条。"""
+        title = arguments.strip()
+        if not title:
+            self.show_toast("用法：/rename 新名字", "warning")
+            return
+        session = self.active_session
+        if not self.session_manager.rename_session(session.id, title):
+            self.show_toast("会话已经不在了", "warning")
+            return
+        self.refresh_chat()
+        self.save_state()
+        self.show_toast(f"已重命名为「{session.title}」", "success")
+
+    def _command_delete(self) -> None:
+        """删除当前会话，先确认。
+
+        子 agent 界面删的是它自己；根会话删除会连子 agent 一起删，
+        确认文案里把这一句写出来，免得点完才发现整棵子树都没了。
+        """
+        target = self.active_session
+        children = self.session_manager.children_of(target.id)
+        if target.is_subagent:
+            question = f"删除子 agent「{target.title}」？它的对话会一起删掉。"
+        elif children:
+            question = (
+                f"删除会话「{target.title}」？"
+                f"它的 {len(children)} 个子 agent 也会一起删掉。"
+            )
+        else:
+            question = f"删除会话「{target.title}」？"
+        self.push_screen(
+            ConfirmDialog(question),
+            lambda ok: self._delete_confirmed(target, ok),
+        )
+
+    def _delete_confirmed(self, target: Session, confirmed: bool) -> None:
+        """确认之后真删，子 agent 界面删完自己退回去。"""
+        if not confirmed:
+            return
+        was_subagent = target.is_subagent
+        self.delete_session(target.id)
+        if was_subagent and isinstance(self.screen, SubagentChatScreen):
+            self.pop_screen()
+
     def _command_sessions(self) -> None:
-        """列出会话。"""
-        sessions = self.session_manager.list_sessions()
+        """列出会话。子 agent 不进这个列表，它们在右栏里。"""
+        sessions = self.session_manager.root_sessions()
         self.push_screen(SessionPickerScreen(sessions), self._on_session_picked)
 
     def _command_model(self, arguments: str) -> None:
@@ -524,7 +724,7 @@ class OpenCodeApp(App[None]):
 
     def _command_export(self) -> None:
         """把当前会话导出为 Markdown 文件。"""
-        session = self.session_manager.current
+        session = self.active_session
         if not session.messages:
             self.show_toast("当前会话还没有消息", "warning")
             return
@@ -582,7 +782,7 @@ class OpenCodeApp(App[None]):
         写的是当前会话的 `task_state`，与模型调 `task` 工具改的是同一份东西；
         两者都随状态文件写盘，重启之后还在。
         """
-        state = self.session_manager.current.task_state
+        state = self.active_session.task_state
         text = arguments.strip()
         if not text:
             if state.is_empty():
@@ -637,7 +837,7 @@ class OpenCodeApp(App[None]):
 
     def _command_effort(self) -> None:
         """按 low → medium → high 轮换推理强度。"""
-        session = self.session_manager.current
+        session = self.active_session
         index = EFFORTS.index(session.effort) if session.effort in EFFORTS else 0
         session.effort = EFFORTS[(index + 1) % len(EFFORTS)]
         self.refresh_chat()
@@ -663,7 +863,7 @@ class OpenCodeApp(App[None]):
 
     def _command_undo(self) -> None:
         """撤销最后一条消息。"""
-        session = self.session_manager.current
+        session = self.active_session
         if not session.messages:
             self.show_toast("没有可撤销的消息", "warning")
             return
@@ -675,10 +875,10 @@ class OpenCodeApp(App[None]):
 
     def _command_redo(self) -> None:
         """恢复被撤销的消息。"""
-        if self._removed_message is None or self._removed_session_id != self.session_manager.current_session_id:
+        if self._removed_message is None or self._removed_session_id != self.active_session.id:
             self.show_toast("没有可重做的消息", "warning")
             return
-        session = self.session_manager.current
+        session = self.active_session
         session.messages.append(self._removed_message)
         session.touch()
         self._removed_message = None
@@ -688,12 +888,12 @@ class OpenCodeApp(App[None]):
 
     def _command_compact(self) -> None:
         """把当前会话前面的一段压掉。"""
-        session = self.session_manager.current
+        session = self.active_session
         if len(session.messages) <= KEEP_MESSAGES:
             self.show_toast(f"消息不足 {KEEP_MESSAGES} 条，不用压缩", "info")
             return
         before = session.compact_upto
-        left = self.agent.compact_session(session)
+        left = self.host.loop_for(session.id).compact_session(session)
         self.save_state()
         if session.compact_upto == before:
             self.show_toast("这一段已经压过了", "info")
@@ -729,9 +929,68 @@ class OpenCodeApp(App[None]):
         action = "更新" if existed else "创建"
         self.show_toast(f"已{action} {target.name}，扫到 {summary.file_count} 个文件", "success")
 
-    def _on_turn_done(self, data: dict[str, object]) -> None:
-        """一轮生成结束后持久化状态。"""
-        self.save_state()
+    def _on_permission_ask(self, data: dict[str, object]) -> None:
+        """某个会话的工具调用需要用户答复。
+
+        排在应用层而不是聊天界面，是为了让后台子 agent 的询问也能弹出来：
+        用户可能正停在父会话，屏幕上没有那个子 agent 的任何东西。
+
+        **排队而不是直接弹**：两个子 agent 同时要权限时，两个模态会叠在一起，
+        下面那个在用户关掉上面那个之前一直看不见也点不到。这里按到达顺序
+        依次弹，答完一个再弹下一个。
+        """
+        self._permission_queue.append(dict(data))
+        self._show_next_permission()
+
+    def _show_next_permission(self) -> None:
+        """弹队列里的下一个询问。已经失效的条目直接跳过。"""
+        if self._permission_active:
+            return
+        while self._permission_queue:
+            data = self._permission_queue.popleft()
+            session_id = str(data.get("session_id", ""))
+            session = self.session_manager.get_session(session_id)
+            if session is None:
+                continue
+            message_id = str(data.get("message_id", ""))
+            part_id = str(data.get("part_id", ""))
+            message = next(
+                (item for item in session.messages if item.id == message_id), None
+            )
+            part = message.part_by_id(part_id) if message is not None else None
+            # 会话被删、工具已经被中断或拒绝：这条询问已经没有对象了。
+            if part is None or part.tool_status is not ToolStatus.AWAITING:
+                continue
+            loop = self.host.loop_for(session_id)
+            tool = loop.registry.get(part.tool_name)
+            argument = (
+                argument_value(tool, part.tool_input) if tool is not None else ""
+            )
+            label = session.title if session.is_subagent else session.agent_name
+            self._permission_active = True
+            self.push_screen(
+                PermissionDialog(part.tool_name, argument, label, part.permission),
+                lambda answer, sid=session_id, pid=part_id: self._answer_permission(
+                    sid, pid, answer
+                ),
+            )
+            return
+
+    def _answer_permission(
+        self,
+        session_id: str,
+        part_id: str,
+        answer: PermissionAnswer | None,
+    ) -> None:
+        """把弹窗的答复交回**发起询问的那个会话**，然后弹下一个。"""
+        loop = self.host.loop_for(session_id)
+        if answer is None:
+            loop.resolve_permission(part_id, Verdict.DENY)
+        else:
+            loop.resolve_permission(part_id, answer.verdict, answer.remember)
+        self._permission_active = False
+        # 等这一帧的卸屏动作走完再挂下一个，否则两个模态会在同一帧里交接。
+        self.call_after_refresh(self._show_next_permission)
 
     def _command_log(self) -> None:
         """显示当前会话的事件日志路径。"""
@@ -743,12 +1002,37 @@ class OpenCodeApp(App[None]):
             state = "还没有内容，发起一轮生成就会出现"
         self.push_screen(MessageScreen("事件日志", [f"日志文件　{path}", f"状态　　　{state}"]))
 
+    def delete_session(self, session_id: str) -> bool:
+        """删掉一个会话，连它的子 agent 与运行时一起清。
+
+        只调 `session_manager.delete_session` 是不够的：循环层、后台任务与
+        共享登记表都还留在 `host` 里。正在跑的子 agent 会在数据已经不在
+        manager 之后继续写，右栏也会继续列一个已经不存在的会话。
+        """
+        session = self.session_manager.get_session(session_id)
+        if session is None:
+            return False
+        doomed = [session_id]
+        doomed.extend(child.id for child in self.session_manager.children_of(session_id))
+        family = session.family_id
+        was_current = self.session_manager.current_session_id in doomed
+        if not self.session_manager.delete_session(session_id):
+            return False
+        for sid in doomed:
+            self.host.forget(sid)
+        self.host.drop_family(family)
+        self.save_state()
+        if was_current:
+            self.refresh_chat()
+        return True
+
     def _on_session_picked(self, session_id: str | None) -> None:
         """切换会话。"""
         if not session_id:
             return
         self.session_manager.switch_session(session_id)
-        self.agent.policy.clear_session()
+        if self._policy is not None:
+            self._policy.clear_session()
         self._ensure_chat_screen()
         session = self.session_manager.get_session(session_id)
         self.show_toast(f"已切换到 {session.title if session else session_id}", "success")
@@ -763,12 +1047,18 @@ class OpenCodeApp(App[None]):
             # 没配接口时换模型没有意义：请求照样发不出去，还会弹一句「已切换」误导人。
             self.show_toast("还没有配置接口，先输入 /model 填写地址与密钥", "warning")
             return
-        session = self.session_manager.current
+        session = self.active_session
         if session.model_id == model_id:
             self.show_toast(f"当前已经在用 {model_id}", "info")
             return
         session.model_id = model_id
-        config = self.agent.switch_model(model_id)
+        current = self.host.loop_for(session.id)
+        config = current.switch_model(model_id)
+        # 其余已经建过的循环层也一起换：子 agent 不换的话，父会话用新模型、
+        # 后台子 agent 还在打旧模型，两边看到的历史窗口与单价都对不上。
+        for loop in self.host.loops():
+            if loop is not current:
+                loop.reconfigure(config)
         self.refresh_chat()
         self.save_state()
         if config.known:
@@ -786,7 +1076,11 @@ class OpenCodeApp(App[None]):
             self.show_toast(f"写 {self.connection_path} 出错：{error}", "error")
             return
         self._connection = connection
-        config = self.agent.reconfigure(self._provider_config())
+        current = self.host.loop_for(self.session_manager.current_session_id)
+        config = current.reconfigure(self._provider_config())
+        for loop in self.host.loops():
+            if loop is not current:
+                loop.reconfigure(config)
         self.session_manager.current.model_id = config.model
         self.refresh_chat()
         self.save_state()

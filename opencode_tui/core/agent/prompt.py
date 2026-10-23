@@ -270,9 +270,19 @@ MEMORY_DISCIPLINE = (
 )
 
 
+# 子 agent 的身份补充。排在身份段之后、工作纪律之前。
+#
+# 这里只写「不能做什么」与「怎么交结果」：任务本身在第一条用户消息里，
+# 写进前缀会让同一段任务书每一步都跟着，白占额度。
+SUBAGENT_DISCIPLINE = (
+    "你是从父会话分出的子 agent，只做交给你的这一件事。"
+    "**你不能再创建新的子 agent**；确实需要拆分时，把建议写进结论。"
+    "你与父会话共享工作目录、runs/ 与登记表，父会话登记过的 handle 可以直接引用。"
+    "结束时给出：结论、产出文件路径、未完成项。"
+)
+
 # 工作纪律。稳定前缀的第二段，紧跟身份。
-WORK_DISCIPLINE = (
-    "用户交办的事情需要动文件或跑程序时，调用工具完成，不要凭猜测写出结果。\n"
+WORK_DISCIPLINE = (    "用户交办的事情需要动文件或跑程序时，调用工具完成，不要凭猜测写出结果。\n"
     "工具给出的失败原因是你下一轮的输入：参数被拒就改参数，命令报错就看报错内容。\n"
     "工具输出里的行号是文件中的绝对行号，定位参数按同一个基准。\n"
     "生成的中间文件与结果表写进工作目录，报告里说明每一项使用了什么参数。"
@@ -295,6 +305,10 @@ def stable_prefix(workspace: Workspace, session: Session) -> str:
         LEDGER_DISCIPLINE,
         MEMORY_DISCIPLINE,
     ]
+    if session.depth > 0:
+        # 子 agent 的身份段。**不放时间、不放父会话标题**：它们会让前缀在
+        # 子会话里每次请求都变一次，prompt cache 永远命中不了。
+        blocks.insert(1, SUBAGENT_DISCIPLINE)
     rules = project_rules(rules_directory(workspace.root))
     if rules:
         blocks.append(f"这个项目的规则，每一条都必须遵守：\n\n{rules}")

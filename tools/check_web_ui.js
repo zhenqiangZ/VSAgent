@@ -33,6 +33,15 @@ const STATUS_TEXT = {
   failed: "失败",
 };
 
+// 与 history.js 里的子 agent 状态词一致。
+const AGENT_STATUS_TEXT = {
+  idle: "空闲",
+  running: "运行中",
+  done: "完成",
+  failed: "失败",
+  cancelled: "已中断",
+};
+
 // 口袋来源徽标的三态与结构页里的文字一致。核对「有没有挂」与「挂的是不是这一个」，
 // 光看页面有没有出现某个字认不出「配体来源的写了预测」这一类错配。
 const POCKET_SOURCE_TEXT = {
@@ -132,19 +141,63 @@ function startServer() {
 }
 
 // 挑一个只命中一部分会话的过滤词。全都命中时看不出过滤有没有生效。
+// 列表的实际顺序：根会话按接口给的顺序，各自的子 agent 紧跟在下面、
+// 按创建时间升序。接口本身是按 updatedAt 倒序的平铺数组，直接拿它比会错位。
+function treeOrder(sessions) {
+  const byId = new Map(sessions.map((item) => [item.id, item]));
+  const children = new Map();
+  const roots = [];
+  for (const item of sessions) {
+    if (item.parentId && byId.has(item.parentId)) {
+      if (!children.has(item.parentId)) children.set(item.parentId, []);
+      children.get(item.parentId).push(item);
+    } else {
+      roots.push(item);
+    }
+  }
+  for (const list of children.values()) {
+    list.sort((left, right) => left.createdAt - right.createdAt);
+  }
+  const ordered = [];
+  const walk = (node) => {
+    ordered.push(node);
+    for (const child of children.get(node.id) || []) walk(child);
+  };
+  for (const node of roots) walk(node);
+  return ordered.map((item) => item.id);
+}
+
 function pickNeedle(sessions) {
   const titles = sessions.map((item) => item.title);
+  const byId = new Map(sessions.map((item) => [item.id, item]));
   for (let length = 2; length <= 8; length++) {
     for (const title of titles) {
       const needle = title.slice(0, length).trim();
       if (!needle) continue;
-      const hits = titles.filter((item) => item.toLowerCase().includes(needle.toLowerCase())).length;
-      if (hits > 0 && hits < titles.length) return { needle, expected: hits };
+      const hits = sessions.filter((item) =>
+        (item.title || "").toLowerCase().includes(needle.toLowerCase())
+      );
+      if (!hits.length || hits.length === sessions.length) continue;
+      // 子 agent 命中时父会话会作为上下文一起画出来，期望条数要把它算进去。
+      const shown = new Set(hits.map((item) => item.id));
+      for (const hit of hits) {
+        let parent = byId.get(hit.parentId);
+        while (parent && !shown.has(parent.id)) {
+          shown.add(parent.id);
+          parent = byId.get(parent.parentId);
+        }
+      }
+      if (shown.size === sessions.length) continue;
+      const hitIds = new Set(hits.map((item) => item.id));
+      const contextTitles = [...shown]
+        .filter((id) => !hitIds.has(id))
+        .map((id) => byId.get(id).title);
+      return { needle, expected: shown.size, contextTitles };
     }
   }
   // 标题全都一样时挑不出部分命中的词，换一个命中不到的词，
   // 期望列表里出现「没有匹配的会话」。
-  return { needle: "zzz-没有这个标题-zzz", expected: 0 };
+  return { needle: "zzz-没有这个标题-zzz", expected: 0, contextTitles: [] };
 }
 
 // 把三维视图切成 8x8 的网格，数出「含有结构」的格子。
@@ -216,12 +269,61 @@ async function checkHistoryPage(page, listing, biggestId) {
     ids.length === listing.sessions.length,
     `列表 ${ids.length} 条，接口 ${listing.sessions.length} 条`
   );
-  const expectedIds = listing.sessions.map((item) => item.id);
+  const expectedIds = treeOrder(listing.sessions);
   check(
-    "列表顺序与接口一致",
+    "列表顺序与接口一致（子 agent 紧跟父会话）",
     JSON.stringify(ids) === JSON.stringify(expectedIds),
     `列表前三条 ${ids.slice(0, 3).join("/")}`
   );
+
+  // 有子 agent 时，逐条核对缩进、状态点与父行位置。
+  const childSessions = listing.sessions.filter(
+    (item) => item.parentId && listing.sessions.some((other) => other.id === item.parentId)
+  );
+  if (childSessions.length) {
+    const child = childSessions[0];
+    const row = await page
+      .locator(`#session-list li[data-session-id="${child.id}"]`)
+      .evaluate((node) => ({
+        child: node.classList.contains("is-child"),
+        depth: node.dataset.depth,
+        dot: node.querySelector(".agent-dot")?.className || "",
+        meta: node.querySelector(".session-meta")?.textContent || "",
+      }));
+    check("子 agent 缩进挂在父会话下", row.child && row.depth === "1", JSON.stringify(row));
+    check(
+      "子 agent 有状态点且与状态对应",
+      row.dot.includes(`dot-${child.status || "idle"}`),
+      `状态点是 ${row.dot}，状态是 ${child.status}`
+    );
+    check(
+      "子 agent 的元信息写出状态",
+      row.meta.includes(AGENT_STATUS_TEXT[child.status] || child.status || "空闲"),
+      row.meta
+    );
+    check(
+      "父会话排在子 agent 前面",
+      ids.indexOf(child.parentId) >= 0 && ids.indexOf(child.parentId) < ids.indexOf(child.id),
+      `父在 ${ids.indexOf(child.parentId)}，子在 ${ids.indexOf(child.id)}`
+    );
+
+    // 折叠按钮：收起之后子行消失，再点回来。
+    const toggle = page.locator(
+      `#session-list li[data-session-id="${child.parentId}"] .tree-toggle`
+    );
+    if (await toggle.count()) {
+      await toggle.click();
+      await page.waitForTimeout(150);
+      const hidden = await page.locator(`#session-list li[data-session-id="${child.id}"]`).count();
+      const expanded = await toggle.getAttribute("aria-expanded");
+      check("收起父会话之后子 agent 不再显示", hidden === 0, `还剩 ${hidden} 行`);
+      check("收起后 aria-expanded 为 false", expanded === "false", `是 ${expanded}`);
+      await toggle.click();
+      await page.waitForTimeout(150);
+      const shownAgain = await page.locator(`#session-list li[data-session-id="${child.id}"]`).count();
+      check("再点一次子 agent 回来", shownAgain === 1, `回来 ${shownAgain} 行`);
+    }
+  }
 
   await page.locator(`#session-list li[data-session-id="${biggestId}"]`).click();
   const detail = await getJson(`/api/sessions/${biggestId}`);
@@ -327,20 +429,24 @@ async function checkHistoryPage(page, listing, biggestId) {
   );
 
   // 过滤：列表条数要跟着变，并且剩下的都含这个词。
-  const { needle, expected } = pickNeedle(listing.sessions);
+  const { needle, expected, contextTitles } = pickNeedle(listing.sessions);
   await page.fill("#session-search", needle);
   await page.waitForTimeout(300);
   const filtered = await page
     .locator("#session-list li[data-session-id]")
-    .evaluateAll((nodes) => nodes.map((node) => node.querySelector(".session-title").textContent));
+    .evaluateAll((nodes) => nodes.map((node) => node.querySelector(".session-name").textContent));
   check(
-    "过滤之后列表条数与接口一致",
+    "过滤之后列表条数与接口一致（含作为上下文的父会话）",
     filtered.length === expected,
-    `用「${needle}」过滤出 ${filtered.length} 条，接口里含这个词的有 ${expected} 条`
+    `用「${needle}」过滤出 ${filtered.length} 条，接口里应当有 ${expected} 条`
   );
   check(
-    "过滤之后剩下的都含这个词",
-    filtered.every((title) => title.toLowerCase().includes(needle.toLowerCase())),
+    "过滤之后剩下的都含这个词，或者是命中项的父会话",
+    filtered.every(
+      (title) =>
+        title.toLowerCase().includes(needle.toLowerCase()) ||
+        contextTitles.includes(title)
+    ),
     `${filtered.length} 条全部核对`
   );
   await page.fill("#session-search", "");

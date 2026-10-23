@@ -11,7 +11,7 @@ import tomli_w
 from .file_log import record as log_read
 from .models import Session, new_session_id, sync_sequences
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 # 换名在目标文件正被别的进程打开时会被系统拒绝，隔几毫秒重试。
 # 读的人打开文件的时间只有几毫秒，几次之内就能换过去。
@@ -42,12 +42,58 @@ class SessionManager:
 
     def new_session(self, title: str = "New Session") -> Session:
         """创建新会话并切换为当前会话。"""
+        session = self.create_session(title)
+        self.current_session_id = session.id
+        return session
+
+    def create_session(
+        self,
+        title: str = "New Session",
+        *,
+        parent_id: str = "",
+        root_id: str = "",
+        depth: int = 0,
+        origin: str = "user",
+        seed_start: int = 0,
+        seed_end: int = 0,
+        status: str = "idle",
+        spawned_at: float = 0.0,
+    ) -> Session:
+        """创建一个会话，**不切换**当前会话。
+
+        子 agent 必须走这一条：切换 current 会让根会话界面在下次重建时读到子会话，
+        而子 agent 是后台跑的另一条线，跟用户正看着哪一屏没有关系。
+        """
         session = Session(id=new_session_id(), title=title)
         session.model_id = self.last_model_id
         session.agent_name = self.last_agent
+        session.parent_id = parent_id
+        session.root_id = root_id
+        session.depth = depth
+        session.origin = origin
+        session.seed_start = seed_start
+        session.seed_end = seed_end
+        session.status = status
+        session.spawned_at = spawned_at
         self.sessions[session.id] = session
-        self.current_session_id = session.id
         return session
+
+    def children_of(self, session_id: str) -> list[Session]:
+        """某个会话的直接子 agent，按创建时间升序。"""
+        children = [
+            session
+            for session in self.sessions.values()
+            if session.parent_id == session_id
+        ]
+        return sorted(children, key=lambda item: item.created_at)
+
+    def root_sessions(self) -> list[Session]:
+        """根会话列表，按更新时间倒序。子 agent 不进会话选择器。"""
+        return [
+            session
+            for session in self.list_sessions()
+            if not session.parent_id and session.depth == 0
+        ]
 
     def get_session(self, session_id: str) -> Session | None:
         """按 ID 取会话。"""
@@ -74,12 +120,23 @@ class SessionManager:
         return True
 
     def delete_session(self, session_id: str) -> bool:
-        """删除会话，删掉当前会话时自动切到最近的会话。"""
+        """删除会话，删掉当前会话时自动切到最近的根会话。
+
+        删根会话要连它的子 agent 一起删：子 agent 的 `parent_id` 指向一个
+        已经不存在的会话时，右栏永远列不出来，状态文件里却还留着它们的消息。
+        """
         if session_id not in self.sessions:
             return False
-        del self.sessions[session_id]
-        if self.current_session_id == session_id:
-            remaining = self.list_sessions()
+        doomed = {session_id}
+        doomed.update(
+            session.id
+            for session in self.sessions.values()
+            if session.parent_id == session_id
+        )
+        for sid in doomed:
+            del self.sessions[sid]
+        if self.current_session_id in doomed:
+            remaining = self.root_sessions() or self.list_sessions()
             self.current_session_id = remaining[0].id if remaining else ""
         return True
 
@@ -154,6 +211,11 @@ class SessionManager:
         self.sessions = {}
         for raw in state.get("sessions") or []:
             session = Session.from_dict(raw)
+            # 上次退出时还在跑的，进程已经不在了。留着 running 会让右栏显示
+            # 一个永远转圈的子 agent，而它其实没有任何任务在跑。
+            if session.status == "running":
+                session.status = "idle"
+                session.status_note = "上次退出时仍在运行"
             self.sessions[session.id] = session
         self.current_session_id = str(state.get("current_session_id", ""))
         if self.current_session_id not in self.sessions:

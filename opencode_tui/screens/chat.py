@@ -1,40 +1,93 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
+
+from rich.cells import cell_len
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.message import Message as TextualMessage
 from textual.reactive import Reactive
 from textual.screen import Screen
 from textual.selection import SelectState
 from textual.widget import Widget
-from textual.widgets import Static
-from textual.worker import Worker
+from textual.widgets import OptionList, Static
+from textual.widgets.option_list import Option
 
-from ..core.agent.permission import Verdict, argument_value
-from ..core.file_refs import resolve_file_refs
 from ..core.models import Message, Part, PartType, Session, ToolStatus
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import EditorPane
 from ..widgets.messages_pane import STATUS_ICON, MessagesPane
 from ..widgets.status_bar import StatusBar, format_tokens
-from .permission import PermissionAnswer, PermissionDialog
+
+
+def _short(text: str, width: int) -> str:
+    """按显示格数截断标题。超长补省略号，避免一行被挤成两行。
+
+    不能用 `len()`：一个汉字占两格，12 个汉字就是 24 格，
+    在 30 列宽的右栏里会把状态行顶到下一行。
+    """
+    text = text.strip()
+    if cell_len(text) <= width:
+        return text
+    while text and cell_len(text) + 1 > width:
+        text = text[:-1]
+    return text + "…"
+
+
+def _status_text(status: str) -> str:
+    """子 agent 状态的中文说法。"""
+    return {
+        "idle": "空闲",
+        "running": "运行中",
+        "done": "完成",
+        "failed": "失败",
+        "cancelled": "已中断",
+    }.get(status, status)
+
+
+
+class AgentOptionList(OptionList):
+    """右栏的子 agent 列表。
+
+    单独一个类是为了给 esc 一个出口：列表拿到焦点之后，按 esc 要能回到
+    输入框。否则键盘用户只能靠鼠标点回去，而 `/agents` 的意义正是给不摸鼠标的人用。
+    """
+
+    BINDINGS = [Binding("escape", "release", "Back")]
+
+    def action_release(self) -> None:
+        """把焦点交回输入框。"""
+        screen = self.screen
+        editor = getattr(screen, "editor", None)
+        if editor is not None:
+            editor.focus_input()
 
 
 class SidePanel(Vertical):
-    """会话上下文侧栏，默认隐藏，由 /sidebar 切换。
+    """会话右栏：子 agent 列表在上，上下文信息在下。
 
-    只放消息区里看不到的东西：会话标题、消息条数与 token 用量、引用文件、工具清单。
-    模型名与 Agent 名不在这里出现，那一对已经在输入框下方的状态行上。
+    子 agent 段只在有子会话时出现；没有时不占任何高度，/sidebar 的行为与以前一致。
+    列表用 `OptionList` 而不是 `Static`：它要能点。
     """
+
+    class AgentPicked(TextualMessage):
+        """用户点了右栏里的一个子 agent。"""
+
+        def __init__(self, session_id: str) -> None:
+            super().__init__()
+            self.session_id = session_id
 
     def __init__(self, id: str | None = None) -> None:
         super().__init__(id=id)
         self._written: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
-        yield Static("上下文", classes="side-title")
+        yield Static("子 AGENT", id="side-agents-title", classes="side-section")
+        yield AgentOptionList(id="side-agents")
+        yield Static("上下文", id="side-context-title", classes="side-section")
         yield Static("", id="side-session", classes="side-line", markup=False)
         yield Static("", id="side-stats", classes="side-line", markup=False)
         yield Static("引用文件", classes="side-section")
@@ -59,6 +112,71 @@ class SidePanel(Vertical):
         self._write("#side-stats", stats)
         self._write("#side-files", self._files_text(session))
         self._write("#side-tools", self._tools_text(session))
+
+    def refresh_agents(self, children: list[Session], current_id: str) -> None:
+        """重画子 agent 列表。
+
+        这一段**不走 `_write`**：既有判据断言侧栏打开后 `_written` 恰好是
+        上下文那四个键，子 agent 列表是一组可点条目，不是几段文字。
+        """
+        if not self.has_class("-visible"):
+            return
+        title = self.query_one("#side-agents-title", Static)
+        listing = self.query_one("#side-agents", AgentOptionList)
+        visible = bool(children)
+        title.styles.display = "block" if visible else "none"
+        listing.styles.display = "block" if visible else "none"
+        if not visible:
+            listing.clear_options()
+            return
+        title.update(f"子 AGENT ({len(children)})")
+        listing.clear_options()
+        for child in children:
+            marker = {
+                "running": "●",
+                "done": "✓",
+                "failed": "✕",
+                "cancelled": "‖",
+            }.get(child.status, "○")
+            now = "（当前）" if child.id == current_id else ""
+            stamp = time.strftime("%H:%M", time.localtime(child.spawned_at or child.created_at))
+            # 有失败/中断原因就显示原因，没有就显示消息条数：
+            # 「失败」两个字不说明是请求出错还是工具没能完成，那正是用户要看的。
+            note = child.status_note.strip()
+            detail = _status_text(child.status)
+            if note:
+                detail += f" · {_short(note, 8)}"
+            else:
+                detail += f" · {len(child.messages)} 条"
+            if child.seed_end > child.seed_start:
+                span = f"第 {child.seed_start + 1}–{child.seed_end} 条"
+            else:
+                span = "无父会话历史"
+            origin = "用户派发" if child.origin == "user" else "模型派发"
+            listing.add_option(
+                Option(
+                    f"{marker} {_short(child.title, 12)}{now}\n"
+                    f"  {detail} · {stamp}\n"
+                    f"  {span} · {origin}",
+                    id=child.id,
+                )
+            )
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """点中一行：交给聊天界面去压栈。"""
+        if event.option.id:
+            self.post_message(self.AgentPicked(event.option.id))
+
+    def focus_agents(self) -> bool:
+        """把焦点交给子 agent 列表，返回有没有可选项。
+
+        `/agents` 走这里：命令才是这个项目里稳定的入口，键位只留给最常按的几个。
+        """
+        listing = self.query_one("#side-agents", AgentOptionList)
+        if not listing.options:
+            return False
+        listing.focus()
+        return True
 
     def _write(self, selector: str, text: str) -> None:
         """内容没变就不写，省掉一遍样式重算。"""
@@ -116,13 +234,53 @@ class ChatScreen(Screen):
         Binding("tab", "switch_agent", "Agent"),
     ]
 
-    def __init__(self, root: Path | None = None, initial_prompt: str = "") -> None:
+    # None 表示「不限制」；子 agent 界面按白名单过滤命令面板。
+    allowed_commands: frozenset[str] | None = None
+    # 子 agent 界面设成 False：Build/Plan 跟着父会话走，不能在这里改。
+    allow_agent_switch = True
+
+    def __init__(
+        self,
+        root: Path | None = None,
+        initial_prompt: str = "",
+        session_id: str | None = None,
+    ) -> None:
         super().__init__()
         self.root = root or Path.cwd()
         self._initial_prompt = initial_prompt
-        self._worker: Worker[object] | None = None
+        # None = 跟随 session_manager.current（根会话）；显式 id = 子 agent。
+        # 子 agent 绝不能跟随 current：用户点它的时候当前会话仍然是父会话。
+        self._session_id = session_id
         self._busy = False
         self._unsubscribes: list[object] = []
+
+    @property
+    def session(self) -> Session:
+        """这一屏正在显示的会话。"""
+        if self._session_id:
+            session = self.app.session_manager.get_session(self._session_id)
+            if session is not None:
+                return session
+        return self.app.session_manager.current
+
+    @property
+    def loop(self):
+        """这一屏对应的循环层。"""
+        return self.app.host.loop_for(self.session.id)
+
+    def allows_command(self, name: str) -> bool:
+        """这一屏能不能执行某个斜杠命令。"""
+        if self.allowed_commands is None:
+            return True
+        return name in self.allowed_commands
+
+    @property
+    def command_registry(self):
+        """命令面板与补全用的命令表。子 agent 界面按白名单过滤。"""
+        registry = self.app.command_registry
+        if self.allowed_commands is None:
+            return registry
+        return registry.filtered(self.allowed_commands)
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -139,12 +297,17 @@ class ChatScreen(Screen):
             bus.subscribe("message.add", self._on_message_add),
             bus.subscribe("part.add", self._on_part_add),
             bus.subscribe("part.update", self._on_part_update),
-            bus.subscribe("permission.ask", self._on_permission_ask),
             bus.subscribe("turn.done", self._on_turn_done),
             bus.subscribe("status.update", self._on_status_update),
+            bus.subscribe("agent.created", self._on_agent_changed),
+            bus.subscribe("agent.status", self._on_agent_changed),
         ]
         self.rebuild()
         self.editor.focus_input()
+        self.refresh_status()
+        # 后台可能已经跑完了一轮：进屏幕时按真实状态校准一次 busy，
+        # 否则会显示「空闲」，而输入框一提交就被 host 拒掉。
+        self._busy = self.app.host.is_running(self.session.id)
         self.refresh_status()
         if self._initial_prompt:
             prompt = self._initial_prompt
@@ -204,20 +367,20 @@ class ChatScreen(Screen):
 
     def rebuild(self) -> None:
         """按当前会话内容重建消息列表。"""
-        session = self.app.session_manager.current
+        session = self.session
         self.messages.rebuild(session.messages)
         self.messages.set_details(self.app.session_manager.show_details)
         self.messages.set_thinking(self.app.session_manager.show_thinking)
         self.refresh_status()
 
     def refresh_status(self) -> None:
-        """刷新状态栏、输入框状态行与侧栏的会话上下文。"""
-        session = self.app.session_manager.current
+        """刷新状态栏、输入框状态行与右栏的会话上下文。"""
+        session = self.session
         self.status.update_status(
             tokens=session.total_tokens(),
             cost=session.total_cost(),
-            latency_ms=self.app.agent.last_latency_ms,
-            context_window=self.app.context_window,
+            latency_ms=self.loop.last_latency_ms,
+            context_window=self.loop.context_window,
             busy=self._busy,
         )
         self.editor.update_context(
@@ -226,6 +389,13 @@ class ChatScreen(Screen):
             effort=session.effort,
         )
         self.side_panel.update_context(session)
+        # 在子 agent 界面里显示的是兄弟，不是它自己的子会话（它不能有子会话）。
+        # 锚点取父会话，两边看到的是同一组。
+        anchor = session.parent_id or session.id
+        self.side_panel.refresh_agents(
+            self.app.host.children_of(anchor),
+            session.id,
+        )
 
     def toggle_sidebar(self) -> bool:
         """显示或隐藏上下文侧栏，返回切换后的可见状态。
@@ -243,18 +413,22 @@ class ChatScreen(Screen):
         if event.mode == "command":
             self.app.execute_command(event.text.lstrip("/").strip())
             return
-        session = self.app.session_manager.current
+        session = self.session
         if event.mode == "bash":
             command = event.text.lstrip("!").strip()
-            message = session.add_message(Message(role="user", session_id=session.id))
-            message.add_part(Part(type=PartType.TEXT, text=event.text))
-            self.messages.add_message(message)
-            self._start(self.app.agent.run_bash(session, command))
+            if not self.app.host.run_bash(session.id, command):
+                self.app.show_toast("这个会话还在跑，先按 esc 中断", "warning")
+                return
+            self._mark_busy(True)
             return
         self._submit_prompt(event.text)
 
     def _submit_prompt(self, text: str) -> None:
-        """把一段普通文本作为用户消息发出，并启动流式回复。"""
+        """把一段普通文本作为用户消息发出，并启动流式回复。
+
+        写消息与起任务都在 `AgentHost` 里：后台派发与这里必须走同一条路，
+        否则同一种「用户说了一句话」会有两种消息形状。
+        """
         if not self.app.is_configured:
             # 把这句话放回输入框：配完接口回来按回车就能重发，不用重打一遍。
             # 同时把表单弹出来，提示不是一闪而过的 toast，而是当场能填的地方。
@@ -264,21 +438,22 @@ class ChatScreen(Screen):
             )
             self.app.execute_command("model")
             return
-        session = self.app.session_manager.current
-        self.app._sync_ledger()
-        clean_text, file_parts = resolve_file_refs(text, self.root)
-        message = session.add_message(
-            Message(role="user", session_id=session.id, model_id=session.model_id)
-        )
-        message.add_part(Part(type=PartType.TEXT, text=clean_text))
-        for part in file_parts:
-            message.add_part(part)
-        self.messages.add_message(message)
-        self._start(self.app.agent.stream_reply(session, clean_text))
+        if not self.app.host.prompt(self.session.id, text):
+            self.app.show_toast("这个会话还在跑，先按 esc 中断", "warning")
+            return
+        self._mark_busy(True)
+
+    def _mark_busy(self, busy: bool) -> None:
+        """切到生成中并刷新状态栏。"""
+        self._busy = busy
+        self.refresh_status()
 
     def on_editor_pane_agent_changed(self, event: EditorPane.AgentChanged) -> None:
-        """处理 Agent 切换。"""
-        session = self.app.session_manager.current
+        """处理 Agent 切换。子 agent 界面直接拒绝，不改身份。"""
+        if not self.allow_agent_switch:
+            self.app.show_toast("子 agent 的 Build/Plan 跟着父会话走，不能切换", "warning")
+            return
+        session = self.session
         session.agent_name = event.agent
         self.app.session_manager.last_agent = event.agent
         self.refresh_status()
@@ -292,7 +467,9 @@ class ChatScreen(Screen):
         面板选完命令之后补全照旧可用。
         """
         self.editor.command_popup.hide()
-        self.app.push_screen(CommandPalette(self.app.command_registry), self._on_palette_result)
+        self.app.push_screen(
+            CommandPalette(self.command_registry), self._on_palette_result
+        )
 
     def on_editor_pane_interrupt_requested(self) -> None:
         """输入框没有弹窗可关时按了 esc：中断当前生成。
@@ -304,11 +481,9 @@ class ChatScreen(Screen):
             self.action_interrupt()
 
     def action_interrupt(self) -> None:
-        """中断当前生成。"""
-        self.app.agent.cancel()
-        if self._worker is not None:
-            self._worker.cancel()
-        # 取消 worker 会在下一个 await 点把这个协程摘掉，循环层里"把工具标成失败"那一段
+        """中断当前生成。只中断这一屏对应的会话。"""
+        self.app.host.cancel(self.session.id)
+        # 取消后台任务会在下一个 await 点把这个协程摘掉，循环层里"把工具标成失败"那一段
         # 就再也走不到了，工具会一直停在 running。这里补上这一步，并把卡片刷成失败态。
         for part in self._unfinished_tools():
             part.tool_status = ToolStatus.FAILED
@@ -327,7 +502,7 @@ class ChatScreen(Screen):
         """
         return [
             part
-            for message in self.app.session_manager.current.messages
+            for message in self.session.messages
             for part in message.parts
             if part.type is PartType.TOOL
             and part.tool_status in (ToolStatus.PENDING, ToolStatus.AWAITING, ToolStatus.RUNNING)
@@ -341,36 +516,43 @@ class ChatScreen(Screen):
         """用 tab 打开 Agent 列表。"""
         self.editor.action_agent_popup()
 
+    def on_side_panel_agent_picked(self, event: SidePanel.AgentPicked) -> None:
+        """右栏点了一个子 agent：压栈进入它的界面。"""
+        self.app.open_subagent(event.session_id)
+
     def _on_palette_result(self, command_name: str | None) -> None:
         """命令面板选中的命令。"""
         if command_name:
             self.app.execute_command(command_name)
 
-    def _start(self, coroutine: object) -> None:
-        """启动一次生成任务。"""
-        self._busy = True
-        self.refresh_status()
-        self._worker = self.run_worker(
-            coroutine,  # type: ignore[arg-type]
-            group="agent",
-            exclusive=True,
-        )
+    def _belongs(self, data: dict[str, object]) -> bool:
+        """这条事件是不是这一屏该管的。
+
+        没有 `session_id` 的事件照旧处理（老事件与测试里的手工发布），
+        有的话必须与当前会话一致：后台子 agent 的流不能写进父会话的消息区。
+        """
+        session_id = str(data.get("session_id", ""))
+        return not session_id or session_id == self.session.id
 
     def _find_message(self, message_id: str) -> Message | None:
         """在当前会话里按 ID 找消息。"""
-        for message in self.app.session_manager.current.messages:
+        for message in self.session.messages:
             if message.id == message_id:
                 return message
         return None
 
     def _on_message_add(self, data: dict[str, object]) -> None:
         """事件总线：新增消息。"""
+        if not self._belongs(data):
+            return
         message = self._find_message(str(data.get("message_id", "")))
         if message is not None:
             self.messages.add_message(message)
 
     def _on_part_add(self, data: dict[str, object]) -> None:
         """事件总线：新增 Part。"""
+        if not self._belongs(data):
+            return
         message = self._find_message(str(data.get("message_id", "")))
         if message is None:
             return
@@ -380,6 +562,8 @@ class ChatScreen(Screen):
 
     def _on_part_update(self, data: dict[str, object]) -> None:
         """事件总线：更新 Part。"""
+        if not self._belongs(data):
+            return
         message = self._find_message(str(data.get("message_id", "")))
         if message is None:
             return
@@ -387,38 +571,10 @@ class ChatScreen(Screen):
         if part is not None:
             self.messages.update_part(part)
 
-    def _on_permission_ask(self, data: dict[str, object]) -> None:
-        """事件总线：工具调用需要用户答复。
-
-        循环层停在这个 Part 的 future 上，答复由弹窗的回调交回去。
-        弹窗在没有给出答复的情况下被关掉（应用正在退出、会话被换掉）时按拒绝处理，
-        否则这一轮的 worker 会一直停在等待上。
-        """
-        message = self._find_message(str(data.get("message_id", "")))
-        if message is None:
-            return
-        part = message.part_by_id(str(data.get("part_id", "")))
-        if part is None:
-            return
-        tool = self.app.agent.registry.get(part.tool_name)
-        argument = argument_value(tool, part.tool_input) if tool is not None else ""
-        dialog = PermissionDialog(
-            part.tool_name,
-            argument,
-            self.app.session_manager.current.agent_name,
-            part.permission,
-        )
-        self.app.push_screen(dialog, lambda answer: self._answer_permission(part.id, answer))
-
-    def _answer_permission(self, part_id: str, answer: PermissionAnswer | None) -> None:
-        """把弹窗的答复交给循环层。"""
-        if answer is None:
-            self.app.agent.resolve_permission(part_id, Verdict.DENY)
-            return
-        self.app.agent.resolve_permission(part_id, answer.verdict, answer.remember)
-
     def _on_turn_done(self, data: dict[str, object]) -> None:
         """事件总线：一轮生成结束。"""
+        if not self._belongs(data):
+            return
         self._busy = False
         self.messages.flush_text()
         self.refresh_status()
@@ -427,4 +583,32 @@ class ChatScreen(Screen):
 
     def _on_status_update(self, data: dict[str, object]) -> None:
         """事件总线：状态刷新。"""
+        if self._belongs(data):
+            self.refresh_status()
+
+    def _on_agent_changed(self, data: dict[str, object]) -> None:
+        """事件总线：子 agent 建了或状态变了。
+
+        只重画右栏：消息区与状态栏跟子 agent 的状态无关。中断状态下
+        `turn.done` 不会来，`_busy` 必须靠 `agent.status` 收回来。
+        """
+        session_id = str(data.get("session_id", ""))
+        if not session_id:
+            return
+        # 刚建出来的那一条：把右栏打开。用户不必先摸到 /sidebar 才看得到
+        # 自己刚派出去的东西——这是「创建后右侧栏就会出现」的落点。
+        if data.get("parent_id"):
+            self.side_panel.set_class(True, "-visible")
+        status = str(data.get("status", ""))
+        if session_id == self.session.id:
+            self._busy = status == "running"
+        elif status in ("done", "failed", "cancelled"):
+            # 子 agent 在后台跑完时给一句提示：右栏的状态点会变，但用户
+            # 正盯着消息区，不看右栏的话不会注意到。
+            child = self.app.session_manager.get_session(session_id)
+            anchor = self.session.parent_id or self.session.id
+            if child is not None and child.parent_id == anchor:
+                label = {"done": "完成", "failed": "失败", "cancelled": "已中断"}[status]
+                kind = "success" if status == "done" else "warning"
+                self.app.show_toast(f"子 agent「{child.title}」{label}", kind)
         self.refresh_status()

@@ -207,23 +207,23 @@ class SessionPickerScreen(ModalScreen[str | None]):
         if not title:
             return
         self.app.session_manager.rename_session(session_id, title)
-        self.sessions = self.app.session_manager.list_sessions()
+        # 重新填的时候只能填根会话：`list_sessions()` 里还有子 agent，
+        # 一次重命名就会把它们混进 /sessions，看上去像一堆普通会话。
+        self.sessions = self.app.session_manager.root_sessions()
         self.refresh_list()
         self.app.save_state()
 
     def _apply_delete(self, session_id: str, confirmed: bool) -> None:
-        """应用删除结果。"""
+        """应用删除结果。
+
+        交给 `app.delete_session`：它还要清掉循环层、后台任务与共享登记表，
+        只删数据的话正在跑的子 agent 会继续往一个已经不存在的会话上写。
+        """
         if not confirmed:
             return
-        was_current = self.app.session_manager.current_session_id == session_id
-        self.app.session_manager.delete_session(session_id)
-        self.sessions = self.app.session_manager.list_sessions()
+        self.app.delete_session(session_id)
+        self.sessions = self.app.session_manager.root_sessions()
         self.refresh_list()
-        self.app.save_state()
-        if was_current:
-            # 删掉的正是在看的那一个，会话管理器会切到最近的另一个。
-            # 列表还盖在上面，聊天界面得重建，否则显示的还是被删掉的那份对话。
-            self.app.refresh_chat()
         self.app.show_toast("会话已删除", "success")
 
     def _find(self, session_id: str) -> Session | None:

@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import corpus
@@ -28,6 +30,7 @@ from .parse import ParsedDocument, parse_markdown, parse_path
 
 __all__ = [
     "DB_NAME",
+    "WRITE_LOCK",
     "chunks_for",
     "connect",
     "ensure_schema",
@@ -40,6 +43,7 @@ __all__ = [
     "stats",
     "upsert_source",
     "upsert_web_page",
+    "writing",
 ]
 
 DB_NAME = "library.db"
@@ -51,6 +55,15 @@ SCHEMA_VERSION = 1
 # 一分不涨，只是把噪声往前推。只放大融合候选、不放深每路召回（30/50）没有这个效果
 # ——涨的是召回深度，不是候选宽度。
 CHANNEL_LIMIT = 40
+
+WRITE_LOCK = threading.RLock()
+"""同一进程内的写串行化。
+
+TUI 的 `import_documents` 与网页的「入库」现在是**同一个进程里的两个线程**，
+SQLite 只允许一个写者：不排队的话，其中一方要么白等 `timeout` 十秒，要么拿到
+「database is locked」。锁放在进程内最便宜；跨进程的并发仍由 SQLite 自己兜
+（`timeout` + WAL）。**可重入**：入库内部会再调 `embed.index_source`，那里
+不该再抢一次。"""
 
 DDL = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -151,8 +164,22 @@ def connect(root: Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     # 外键必须显式打开：SQLite 默认不执行 ON DELETE CASCADE，删源之后块会留一堆孤儿。
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL 让「网页在读列表」与「入库在写块」不互相挡：默认的 rollback journal
+    # 下，写者会把读者锁住，一次十几秒的入库足以让页面转圈到超时。
+    # 某些网络文件系统不支持 WAL，设不上就照旧用 rollback——那只是慢一点。
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
     ensure_schema(conn)
     return conn
+
+
+@contextmanager
+def writing():
+    """包住一段「会写索引」的活。同进程内的第二个写者在这里排队。"""
+    with WRITE_LOCK:
+        yield
 
 
 def open_readonly(root: Path | None = None) -> sqlite3.Connection | None:
@@ -364,38 +391,39 @@ def reindex(root: Path | None = None) -> dict[str, int]:
     换名进 `.trash/`，索引侧不需要谁去通知，下一次重建自然对账。
     """
     base = Path(root) if root is not None else corpus.corpus_root()
-    conn = connect(base)
-    try:
-        written = dropped = 0
-        seen: set[str] = set()
-        for kind in ("doc", "web"):
-            directory = base / kind
-            if not directory.is_dir():
-                continue
-            for entry in sorted(directory.iterdir()):
-                if not entry.is_dir():
+    with writing():
+        conn = connect(base)
+        try:
+            written = dropped = 0
+            seen: set[str] = set()
+            for kind in ("doc", "web"):
+                directory = base / kind
+                if not directory.is_dir():
                     continue
-                try:
-                    meta = json.loads((entry / "meta.json").read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                source_id = f"{kind}:{entry.name}"
-                try:
-                    chunks = _chunks_of(entry, kind, meta)
-                except Exception:  # noqa: BLE001 - 一份坏了不该让整批停下
-                    continue
-                if chunks is None:
-                    continue
-                upsert_source(conn, source_row(source_id, kind, entry, meta), chunks)
-                seen.add(source_id)
-                written += len(chunks)
-        for row in conn.execute("SELECT id FROM sources").fetchall():
-            if row["id"] not in seen:
-                drop_source(conn, row["id"])
-                dropped += 1
-        return {"sources": len(seen), "chunks": written, "dropped": dropped}
-    finally:
-        conn.close()
+                for entry in sorted(directory.iterdir()):
+                    if not entry.is_dir():
+                        continue
+                    try:
+                        meta = json.loads((entry / "meta.json").read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    source_id = f"{kind}:{entry.name}"
+                    try:
+                        chunks = _chunks_of(entry, kind, meta)
+                    except Exception:  # noqa: BLE001 - 一份坏了不该让整批停下
+                        continue
+                    if chunks is None:
+                        continue
+                    upsert_source(conn, source_row(source_id, kind, entry, meta), chunks)
+                    seen.add(source_id)
+                    written += len(chunks)
+            for row in conn.execute("SELECT id FROM sources").fetchall():
+                if row["id"] not in seen:
+                    drop_source(conn, row["id"])
+                    dropped += 1
+            return {"sources": len(seen), "chunks": written, "dropped": dropped}
+        finally:
+            conn.close()
 
 
 def _chunks_of(entry: Path, kind: str, meta: dict[str, object]) -> list[Chunk] | None:

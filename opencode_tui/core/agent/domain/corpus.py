@@ -37,6 +37,7 @@ __all__ = [
     "SearchCorpusTool",
     "domain_tools",
     "fuse",
+    "ingest_files",
 ]
 
 DEFAULT_LIMIT = 8
@@ -127,7 +128,7 @@ class ImportDocumentsTool(Tool):
             return ToolResult(output=f"{target} 既不是文件也不是目录", failed=True)
 
         capped = files[:MAX_IMPORTS]
-        outcomes = [_import_one(path) for path in capped]
+        outcomes = ingest_files(capped)
         return ToolResult(
             output=_render_import(outcomes, skipped=len(files) - len(capped), ignored=ignored),
             failed=not any(item["status"] != "failed" for item in outcomes),
@@ -141,18 +142,23 @@ class ImportDocumentsTool(Tool):
         )
 
 
-def _import_one(path: Path) -> dict[str, Any]:
-    """一个文件走完整条管线。**失败只影响这一个文件。**"""
+def _import_one(path: Path, root: Path | None = None) -> dict[str, Any]:
+    """一个文件走完整条管线。**失败只影响这一个文件。**
+
+    `root` 是语料根。应用里传 `None`（按代码位置定位到仓根）；网页服务有自己
+    的 `corpus_root`（判据会在临时目录上跑），这时必须传进来，否则入库会写进
+    仓根那份语料——投递到 A、入库进 B，盘上看起来像丢了一份。
+    """
     try:
         digest = _sha256(path)
     except OSError as error:
         return {"status": "failed", "name": path.name, "reason": f"读不出这个文件：{error}"}
 
     source_id = digest[:10]
-    directory = corpus.doc_dir(source_id)
+    directory = (Path(root) / "doc" / source_id) if root is not None else corpus.doc_dir(source_id)
     if (directory / corpus.META_FILE).is_file():
         # 已经在库里了，inbox 里那份同样是多余的：不清掉的话，下一次会再看见它一遍。
-        _drop_inbox(path)
+        _drop_inbox(path, root)
         return {
             "status": "duplicate",
             "name": path.name,
@@ -202,19 +208,22 @@ def _import_one(path: Path) -> dict[str, Any]:
     except OSError as error:
         return {"status": "failed", "name": path.name, "reason": f"写语料目录失败：{error}"}
 
-    conn = index.connect()
-    try:
-        index.upsert_source(
-            conn, index.source_row(f"doc:{source_id}", "doc", directory, meta), chunks
-        )
-        # 向量与词法索引分开算：没装 fastembed 时这一段返回 enabled=False，
-        # 导入本身照样成功——语义通道是可选增强，不是入库的前置条件。
-        vectors = _embed_source(conn, f"doc:{source_id}")
-    finally:
-        conn.close()
+    # 写索引这一段排队：网页端的「入库」与 TUI 里的导入是同一个进程的两个线程，
+    # 谁也不该在 SQLite 的写锁上白等十秒。
+    with index.writing():
+        conn = index.connect(root)
+        try:
+            index.upsert_source(
+                conn, index.source_row(f"doc:{source_id}", "doc", directory, meta), chunks
+            )
+            # 向量与词法索引分开算：没装 fastembed 时这一段返回 enabled=False，
+            # 导入本身照样成功——语义通道是可选增强，不是入库的前置条件。
+            vectors = _embed_source(conn, f"doc:{source_id}")
+        finally:
+            conn.close()
 
     # 从 inbox 投进来的那一份用完就删：留着的话下一次导入会再看见它一遍。
-    _drop_inbox(path)
+    _drop_inbox(path, root)
 
     return {
         "status": "new",
@@ -229,6 +238,19 @@ def _import_one(path: Path) -> dict[str, Any]:
     }
 
 
+def ingest_files(paths: list[Path], root: Path | None = None) -> list[dict[str, Any]]:
+    """把一批文件逐个走完整条入库管线，返回每个文件的结果。
+
+    **网页端的「入库」与 TUI 里的 `import_documents` 共用这一个入口**：网页那边
+    没有模型、没有会话，也不该自己再拼一遍「复制原件 → 切块 → 建索引 → 算向量」。
+    两份实现迟早有一份忘了写 `meta.json` 那个提交标记。
+
+    只做逐个调度：失败按文件隔离（`_import_one` 内部已经兜住），一个坏文件
+    不该让同批的另外九个白导。条数上限由调用方先切（`MAX_IMPORTS`）。
+    """
+    return [_import_one(path, root) for path in paths]
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -240,15 +262,16 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _drop_inbox(path: Path) -> None:
+def _drop_inbox(path: Path, root: Path | None = None) -> None:
     """投递口里的那一份用完就删。**只删 inbox 里的**：别处的文件是用户的。"""
-    if _inside_inbox(path):
+    if _inside_inbox(path, root):
         path.unlink(missing_ok=True)
 
 
-def _inside_inbox(path: Path) -> bool:
+def _inside_inbox(path: Path, root: Path | None = None) -> bool:
+    base = Path(root) if root is not None else corpus.corpus_root()
     try:
-        return (corpus.corpus_root() / "inbox").resolve() in path.resolve().parents
+        return (base / "inbox").resolve() in path.resolve().parents
     except OSError:
         return False
 

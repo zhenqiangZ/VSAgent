@@ -6,6 +6,7 @@ from pathlib import Path
 from textual.app import App
 
 from .core.agent.domain.all_tools import domain_tools
+from .core.agent.domain.corpus import ingest_files
 from .core.agent.domain.export import runs_dir
 from .core.web.service import WebService, web_root
 from .core.agent.hooks import HookRunner, default_hooks_paths, load_hooks
@@ -175,6 +176,9 @@ class OpenCodeApp(App[None]):
             state_path=self.session_manager.state_path,
             runs_dir=runs_dir(),
             web_root=web_root(),
+            # 网页上的「入库」转交到这里：写索引的仍然是这个进程，网页自己不碰库。
+            # 与模型调 `import_documents` 走的是同一个 `ingest_files`。
+            ingest=lambda files, root: ingest_files(files, root=root),
         )
 
     def _build_loop(self, session: Session, ledger: SessionLedger) -> AgentLoop:

@@ -2,3 +2,6 @@ textual==8.2.8
 tomli-w==1.2.0
 httpx==0.28.1
 python-dotenv==1.2.3
+# 语料链：解析 PDF 抽文字。纯 Python、约 1MB，缺了整条链不可用；
+# 函数体里延迟导入，缺了时 `import_documents` 返回一句带 pip install 的失败说明。
+pypdf==6.21.2

@@ -8,6 +8,10 @@ dist/
 __pycache__/
 *.pyc
 
+# 本地语料库：用户上传的文献、搜索引擎抓回来的网页、派生索引
+# （索引删了能重建，原件才是真相；原件可能有版权，不该跟着仓库走）
+corpus/
+
 # 外部模型（VCrossFormer）：代码 54MB、自带的 .venv 1.6GB、权重 15GB，全部不入库。
 # 它放在 models/ 而不是包内，是因为 check_chemistry_gate 会扫 opencode_tui/ 下所有
 # .py 的顶层 import，DTA 有 45 处 import torch/rdkit。装法见 models/DTA/README.md。

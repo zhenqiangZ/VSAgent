@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import csv
 import inspect
+import io
 import json
 import os
 import shutil
@@ -39,6 +41,7 @@ from opencode_tui.core.agent.loop import (  # noqa: E402
     missing_tool_reason,
 )
 from opencode_tui.core.agent.permission import (  # noqa: E402
+    BILLED_ASK_AFTER,
     CONFIG_DIRECTORY,
     PLAN_DENY,
     TOOLS_FILE,
@@ -1051,6 +1054,57 @@ def check_permission() -> None:
     check(
         judge(session_policy, "write", {"path": "a.txt", "content": "x"}).verdict is Verdict.ASK,
         "切换会话之后全放行也清掉了",
+    )
+
+    # ---- 计费配额：前 10 次放行，第 11 次起每次都问 ----
+    # 两个联网工具用真的（配额是照着工具名判的，名字写错就等于没拦）。
+    from opencode_tui.core.agent.domain import websearch as websearch_module
+
+    for tool in websearch_module.domain_tools():
+        registry.register(tool)
+    quota = PermissionPolicy()
+    for index in range(BILLED_ASK_AFTER):
+        decision = judge(quota, "search_web", {"query": f"q{index}"})
+        check(
+            decision.verdict is Verdict.ALLOW,
+            f"配额内的第 {index + 1} 次直接放行：{decision.note()}",
+        )
+        quota.note_tool_run("search_web")
+    check(quota.billed_runs == BILLED_ASK_AFTER, f"计数按执行次数走：{quota.billed_runs}")
+    over = judge(quota, "search_web", {"query": "q-over"})
+    check(
+        over.verdict is Verdict.ASK and "计费" in over.reason,
+        f"第 {BILLED_ASK_AFTER + 1} 次开始问，理由说的是钱：{over.reason}",
+    )
+    check(
+        judge(quota, "fetch_webpage", {"url": "https://example.com"}).verdict is Verdict.ASK,
+        "抓取与搜索共用一个配额（两种都按次计费）",
+    )
+    check(
+        judge(quota, "read", {"path": "a.py"}).verdict is Verdict.ALLOW,
+        "不花钱的工具不受配额影响",
+    )
+    # 「全部允许」放行的是工具，不是账单：按过 a 之后超过配额仍然要问。
+    quota.allow_all()
+    check(
+        judge(quota, "search_web", {"query": "q-all"}).verdict is Verdict.ASK,
+        "全放行也盖不住计费配额",
+    )
+    # 被拒的那一次不算：`check` 只判定，计数由循环层在执行前调 `note_tool_run`。
+    before = quota.billed_runs
+    check(
+        judge(quota, "search_web", {"query": "q-denied"}).verdict is Verdict.ASK,
+        "再判定一次仍然是问（没有「问过一次就放行」）",
+    )
+    check(
+        quota.billed_runs == before,
+        f"判定本身不推进计数（只有真正执行的那一次才算）：{quota.billed_runs}",
+    )
+    quota.clear_session()
+    check(quota.billed_runs == 0, "换会话把配额清零")
+    check(
+        judge(quota, "search_web", {"query": "q-new"}).verdict is Verdict.ALLOW,
+        "新会话重新从零计",
     )
 
     user = PermissionPolicy(
@@ -8087,6 +8141,605 @@ def _pubmed_xml(ids=None) -> str:
     return "<PubmedArticleSet>" + "".join(article(pid) for pid in wanted) + "</PubmedArticleSet>"
 
 
+async def check_websearch() -> None:
+    """联网搜索：凭据三档、查询归档不过期、摘要落库、抓取升全文、空结果不是失败。
+
+    全程离线：`http.post_json` 打桩，语料根与归档目录都指到临时目录。**不碰
+    `~/.opencode_tui/search/`** —— 打桩能挡住网络，却挡不住上一次真实运行留下的
+    归档命中，那会让「第二次没联网」这条断言在别人的机器上假绿。
+    """
+    import re
+    import tempfile
+    from pathlib import Path as _Path
+
+    from opencode_tui.core import corpus as corpus_module
+    from opencode_tui.core import corpus_config as corpus_config_module
+    from opencode_tui.core import search_config as search_config_module
+    from opencode_tui.core.agent.domain import http as http_module
+    from opencode_tui.core.agent.domain import rsearch as rsearch_module
+    from opencode_tui.core.agent.domain import websearch as websearch_module
+
+    root = _Path(tempfile.mkdtemp(prefix="vsa-web-"))
+    archive = root / "search"
+    store = root / "corpus"
+
+    original_search_dir = rsearch_module.search_dir
+    original_root = corpus_module.corpus_root
+    original_resolve = search_config_module.resolve
+    original_post = http_module.post_json
+    original_request = http_module.httpx.request
+    original_built = corpus_config_module.load
+    rsearch_module.search_dir = lambda: archive
+    corpus_module.corpus_root = lambda: store
+    # 入库开关按判据固定，不读仓里那份 corpus.toml：否则别人的配置会让这组假绿。
+    corpus_config_module.load = lambda root=None: corpus_config_module.CorpusConfig(
+        index_web=True, embed=False
+    )
+
+    config = search_config_module.SearchConfig(
+        base_url="https://api.deepseek.com/v1", api_key="sk-test-secret", source="test"
+    )
+    search_config_module.resolve = lambda: config
+
+    calls: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+
+    def kind(needle: str) -> int:
+        """按 URL 里的路径片断数调用了几次。"""
+        return sum(1 for url in (item[0] for item in calls) if needle in url)
+
+    def hit(url: str, title: str, *, summary: str = "摘要", authority: int = 3) -> dict[str, Any]:
+        return {
+            "rerank_score": 2.4,
+            "title": title,
+            "url": url,
+            "snippet": summary[:100],
+            "summary": summary,
+            "content": "",
+            "site_name": "Example",
+            "site_icon": "https://example.com/favicon.ico",
+            "date": "2026-06-01T00:00:00+00:00",
+            "authority": authority,
+        }
+
+    long_summary = "长摘要" * 200  # 400 字，比渲染预算（400）不短，用来验截断
+    paper_url = "https://example.com/paper-1"
+    egfr_url = "https://example.com/egfr?tab=1#section"
+    results = [
+        hit(paper_url, "EGFR paper", summary=long_summary),
+        hit("https://example.com/paper-2", "Second paper", authority=-1),
+        hit(egfr_url, "EGFR page"),
+    ]
+
+    def post_json(url: str, payload: Any, **kwargs: Any) -> Any:
+        calls.append((url, dict(payload or {}), dict(kwargs.get("headers") or {})))
+        if url.endswith("/v1/tools/search"):
+            return {"results": list(results)}
+        if url.endswith("/v1/tools/fetch"):
+            target = str((payload or {}).get("url", ""))
+            if "big" in target:
+                return {"title": "大页面", "content": "大" * 20001}
+            return {"title": "EGFR page", "content": "# EGFR\n\n" + "正文" * 400}
+        raise AssertionError(f"没预料到的 POST：{url}")
+
+    http_module.post_json = post_json
+    search = websearch_module.SearchWebTool()
+    fetch = websearch_module.FetchWebpageTool()
+    try:
+        # ---- 一、没凭据：不发请求，给三条现在就能走的路 ----
+        search_config_module.resolve = lambda: None
+        missing = await search.run({"query": "EGFR T790M"})
+        check(missing.failed, "没凭据时明确失败，不是静默返回空")
+        check(
+            "没有可用的搜索凭据" in missing.output
+            and search_config_module.SEARCH_ENV_KEY in missing.output,
+            f"说清缺什么、怎么配：{missing.output[:120]}",
+        )
+        check("search_literature" in missing.output, "给出不联网也能走的那条路")
+        check(not calls, f"没凭据时一次请求都不发：{calls}")
+        search_config_module.resolve = lambda: config
+
+        # ---- 二、query 超长：先拦下来，不花一次 400 的往返 ----
+        too_long = await search.run({"query": "x" * 129})
+        check(too_long.failed and "128" in too_long.output, f"超长 query 被拦下：{too_long.output[:80]}")
+        check(not calls, "拦下来之后也没发请求")
+
+        # ---- 三、正常搜索：请求恒发 10 条，本地按 count 切 ----
+        first = await search.run({"query": "EGFR T790M", "count": 2})
+        check(not first.failed, f"搜索跑通：{first.output[:200]}")
+        check(len(calls) == 1, f"只发了一次请求：{len(calls)}")
+        called_url, payload, headers = calls[0]
+        check(called_url == "https://api.deepseek.com/v1/tools/search",
+              f"base 带 /v1 时不拼成 /v1/v1：{called_url}")
+        check(
+            payload["count"] == 10 and payload["need_content"] is False,
+            f"请求恒发 10 条、不取正文（单价与条数无关）：{payload}",
+        )
+        check(
+            headers.get("Authorization") == "Bearer sk-test-secret",
+            f"带上了 Bearer：{headers.get('Authorization')}",
+        )
+        check(first.meta["count"] == 2, f"只列 count 条：{first.meta['count']}")
+        check(first.meta["total"] == 3, f"总数报的是返回条数：{first.meta['total']}")
+        check(len(first.meta["stored"]) == 3, f"返回的每一条都入库：{first.meta['stored']}")
+        for ref in first.meta["stored"]:
+            check(re.match(r"^web#[0-9a-f]{10}$", ref), f"引用号形状固定：{ref}")
+        check(
+            "长摘要" * 200 not in first.output and "…" in first.output,
+            "长摘要按 400 字截断，不把 800 字的整段塞进上下文",
+        )
+
+        # 落盘：content.md + meta.json，depth 是 summary
+        for ref in first.meta["stored"]:
+            source_id = ref.split("#", 1)[1]
+            page_dir = store / "web" / source_id
+            check(
+                (page_dir / "content.md").is_file() and (page_dir / "meta.json").is_file(),
+                f"两份文件都落盘了：{page_dir}",
+            )
+        egfr_id = corpus_module.web_id(egfr_url)
+        egfr_dir = store / "web" / egfr_id
+        egfr_meta = json.loads((egfr_dir / "meta.json").read_text(encoding="utf-8"))
+        check(egfr_meta["depth"] == "summary", f"搜索落的是摘要源：{egfr_meta['depth']}")
+        check(egfr_meta["queries"] == ["EGFR T790M"], f"记下是哪个 query 搜到的：{egfr_meta['queries']}")
+        check(egfr_meta["authority"] == 3, f"权威度原样存下：{egfr_meta['authority']}")
+
+        # 落盘之后必须**当场可检索**：工具说明写的是「之后免费可查」，而 S0/S1 里
+        # 这一步是漏的——要等下一次 reindex 才看得见，模型会以为刚搜到的东西丢了。
+        from opencode_tui.core import index as index_module
+
+        conn = index_module.connect()
+        try:
+            indexed = conn.execute("SELECT COUNT(*) FROM sources WHERE id LIKE 'web:%'").fetchone()[0]
+            chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        finally:
+            conn.close()
+        check(indexed == 3, f"三条搜索结果当场进索引：{indexed}")
+        check(chunks >= 3, f"索引里有块：{chunks}")
+
+        # ---- 四、归档永久有效：同一 query 再搜不联网、不计费 ----
+        again = await search.run({"query": "EGFR T790M"})
+        check(len(calls) == 1, f"第二次没发请求（归档不过期）：{len(calls)}")
+        check(again.meta["cached"] is True, "标出这次读的是档案")
+        check("没有重新联网" in again.output, f"明说这次没花钱：{again.output[:80]}")
+
+        # refresh 是唯一的绕行方式
+        await search.run({"query": "EGFR T790M", "refresh": True})
+        check(len(calls) == 2, f"refresh 会重新联网：{len(calls)}")
+
+        # ---- 四之二、index_web 关掉：退回纯查询，不给引用号 ----
+        before = sorted(path.name for path in (store / "web").iterdir())
+        corpus_config_module.load = lambda root=None: corpus_config_module.CorpusConfig(
+            index_web=False, embed=False
+        )
+        plain = await search.run({"query": "另一个 query", "refresh": True})
+        check(not plain.failed, f"关掉入库也能搜：{plain.output[:80]}")
+        check(plain.meta.get("indexed") is False, "标出这次没有入库")
+        check("web#" not in plain.output, f"没入库就不给引用号（给了也读不到）：{plain.output[:80]}")
+        check(
+            sorted(path.name for path in (store / "web").iterdir()) == before,
+            "关掉之后一条都没落盘",
+        )
+        corpus_config_module.load = lambda root=None: corpus_config_module.CorpusConfig(
+            index_web=True, embed=False
+        )
+
+        # ---- 五、抓全文：覆盖摘要、保留 labels.json ----
+        (egfr_dir / "labels.json").write_text('{"display_title": "我改过的标题"}', encoding="utf-8")
+        fetched = await fetch.run({"url": egfr_url, "max_chars": 600})
+        check(not fetched.failed, f"抓取跑通：{fetched.output[:200]}")
+        check(kind("/v1/tools/fetch") == 1, f"抓取发了一次请求：{kind('/v1/tools/fetch')}")
+        check(fetched.meta["ref"] == f"web#{egfr_id}", f"同一 URL 落回同一个源：{fetched.meta['ref']}")
+        content = (egfr_dir / "content.md").read_text(encoding="utf-8")
+        check(content.startswith("# EGFR") and "正文" in content, f"正文换成了全文：{content[:40]}")
+        upgraded = json.loads((egfr_dir / "meta.json").read_text(encoding="utf-8"))
+        check(upgraded["depth"] == "full", f"depth 升成 full：{upgraded['depth']}")
+        check(
+            (egfr_dir / "labels.json").read_text(encoding="utf-8") == '{"display_title": "我改过的标题"}',
+            "labels.json 原样保留（那是网页端唯一能写的东西）",
+        )
+
+        # 本地已有全文：不再联网、不再计费
+        local = await fetch.run({"url": "https://example.com/egfr?tab=1"})
+        check(not local.failed and local.meta["cached"] is True, "本地有全文时直接读本地")
+        check(kind("/v1/tools/fetch") == 1, f"没发新请求：{kind('/v1/tools/fetch')}")
+        check("没有联网" in local.output, f"明说这次没联网：{local.output[:60]}")
+        await fetch.run({"url": egfr_url, "refresh": True})
+        check(kind("/v1/tools/fetch") == 2, "refresh 才重新抓")
+
+        # ---- 六、搜索不能把全文打回摘要 ----
+        await search.run({"query": "EGFR T790M", "refresh": True})
+        downgraded = json.loads((egfr_dir / "meta.json").read_text(encoding="utf-8"))
+        check(downgraded["depth"] == "full", f"再搜一次仍是全文：{downgraded['depth']}")
+        check(
+            "正文" in (egfr_dir / "content.md").read_text(encoding="utf-8"),
+            "正文没被摘要覆盖掉",
+        )
+
+        # ---- 七、存不下就明说 ----
+        big = await fetch.run({"url": "https://example.com/big"})
+        check(not big.failed and big.meta["truncated"] is True, "超长页面标出截断")
+        check(
+            str(websearch_module.FETCH_STORE_CHARS) in big.output,
+            f"告诉模型存了多少：{big.output[:120]}",
+        )
+
+        # ---- 八、空结果不是失败 ----
+        def empty_search(url: str, payload: Any, **kwargs: Any) -> Any:
+            calls.append((url, dict(payload or {}), {}))
+            return {"results": []}
+
+        http_module.post_json = empty_search
+        empty = await search.run({"query": "zzz 没有这个组合"})
+        check(not empty.failed, "命中 0 条不算失败")
+        check(empty.meta["reason"] == "checked", f"reason 是「查了没有」：{empty.meta}")
+        check("确实没有" in empty.output, f"正文也这么说：{empty.output[:80]}")
+        http_module.post_json = post_json
+
+        # ---- 九、URL 归一化决定身份 ----
+        check(
+            corpus_module.normalize_url("HTTPS://Example.COM:443/a?b=1#frag")
+            == "https://example.com/a?b=1",
+            "大小写、默认端口、fragment 都归掉，query 保留",
+        )
+        check(
+            corpus_module.web_id("https://example.com/a") == corpus_module.web_id("https://EXAMPLE.com/a#x"),
+            "同一页的不同写法是同一个源",
+        )
+        check(
+            corpus_module.web_id("https://example.com/a?b=1") != corpus_module.web_id("https://example.com/a?b=2"),
+            "query 不同的地址是两个源",
+        )
+        bad = None
+        try:
+            corpus_module.normalize_url("ftp://example.com/a")
+        except ValueError as error:
+            bad = str(error)
+        check(bad is not None, f"非 http(s) 直接拒绝：{bad}")
+
+        # ---- 十、按状态码分档，且不回显 key ----
+        def status(code: int):
+            def raise_status(url: str, payload: Any, **kwargs: Any) -> Any:
+                raise http_module.ResponseError(f"接口拒绝了这次请求（HTTP {code}）", status_code=code)
+
+            return raise_status
+
+        http_module.post_json = status(401)
+        denied = await search.run({"query": "另一个 query", "refresh": True})
+        check(denied.failed and "401" in denied.output, f"401 说清是 key 的问题：{denied.output[:100]}")
+        check("sk-test-secret" not in denied.output, "错误里绝不回显 key")
+
+        http_module.post_json = status(402)
+        broke = await search.run({"query": "又一个 query", "refresh": True})
+        check(broke.failed and "余额" in broke.output, f"402 说的是余额：{broke.output[:80]}")
+
+        http_module.post_json = status(403)
+        blocked = await fetch.run({"url": "https://example.com/blocked", "refresh": True})
+        check(blocked.failed and "403" in blocked.output, f"403 说的是站点策略：{blocked.output[:80]}")
+        http_module.post_json = post_json
+
+        # ---- 十一、http 层：状态码、408 可重试、OpenAI 形状的报错 ----
+        # 这一小段要的是**真的** `post_json`（上面打的是工具层的桩），所以从
+        # 捕获下来的原件调——打桩替换的是模块属性，函数对象本身还在。
+        def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+            return http_module.httpx.Response(
+                408, json={"error": {"message": "'count' must be between 1 and 50"}}
+            )
+
+        http_module.httpx.request = fake_request
+        retried = None
+        try:
+            original_post("https://example.com/x", {}, retry_statuses=(408,))
+        except RetryableToolError as error:
+            retried = str(error)
+        check(retried is not None and "408" in retried, f"408 按可重试抛：{retried}")
+
+        refused = None
+        try:
+            original_post("https://example.com/x", {})
+        except http_module.ResponseError as error:
+            refused = error
+        check(refused is not None, "不带 retry_statuses 时仍是 4xx 的默认口径")
+        check(
+            getattr(refused, "status_code", None) == 408,
+            f"带上了状态码：{getattr(refused, 'status_code', None)}",
+        )
+        check(
+            "count" in str(refused) and "must be between" in str(refused),
+            f"OpenAI 形状的 error 里那句 message 被抠出来了：{refused}",
+        )
+        check("invalid_request_error" not in str(refused), "没有把 type 字段一起糊进上下文")
+    finally:
+        http_module.post_json = original_post
+        http_module.httpx.request = original_request
+        rsearch_module.search_dir = original_search_dir
+        corpus_module.corpus_root = original_root
+        search_config_module.resolve = original_resolve
+        corpus_config_module.load = original_built
+        shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_corpus() -> None:
+    """语料链：解析 → 结构切分 → 双词法索引 → 三个工具，以及「重建两次一致」。"""
+    import re as _re
+    import tempfile
+    from pathlib import Path as _Path
+
+    from opencode_tui.core import chunker as chunker_module
+    from opencode_tui.core import corpus as corpus_module
+    from opencode_tui.core import index as index_module
+    from opencode_tui.core import parse as parse_module
+    from opencode_tui.core.agent.domain import corpus as corpus_tools
+
+    root = _Path(tempfile.mkdtemp(prefix="vsa-corpus-"))
+    store = root / "corpus"
+    original_root = corpus_module.corpus_root
+    corpus_module.corpus_root = lambda: store
+    try:
+        # ---- 一、反转义：只认 `\` + ASCII 标点 ----
+        check(
+            parse_module.unescape_markdown(r"\# heading \- item \/path") == "# heading - item /path",
+            "抓回来的网页 Markdown 里 `\\#`、`\\-`、`\\/` 都还原",
+        )
+        check(
+            parse_module.unescape_markdown(r"C:\\temp\\alpha") == r"C:\temp\alpha",
+            "`\\\\` 还原成一个反斜杠，`\\alpha`（非标点）不动",
+        )
+        check(
+            parse_module.unescape_markdown("# 正常标题") == "# 正常标题",
+            "本来没有转义的 markdown 一个字符都不变",
+        )
+
+        # ---- 二、解析：Markdown 的结构与章节路径 ----
+        markdown = (
+            "# 受体结构\n\n"
+            "网格蛋白抑制剂结合在激酶域的 ATP 口袋。\n\n"
+            "## 方法\n\n"
+            "我们用 4HJO 做对接，IC50 由四参数模型拟合。\n"
+        )
+        parsed = parse_module.parse_markdown(markdown)
+        check(parsed.structure == "markdown", f"markdown 档：{parsed.structure}")
+        sections = [block.section for block in parsed.blocks]
+        check(
+            sections == ["受体结构", "受体结构 / 方法"],
+            f"章节路径按标题层级拼：{sections}",
+        )
+        bad = None
+        try:
+            parse_module.parse_markdown("")
+        except parse_module.ParseError as error:
+            bad = str(error)
+        check(bad is not None, f"空文件照实报错：{bad}")
+        bad = None
+        try:
+            parse_module.parse_path(_Path("no-such-file.docx"))
+        except parse_module.ParseError as error:
+            bad = str(error)
+        check(bad is not None and "不支持" in bad, f"不猜格式，直接拒绝：{bad}")
+
+        # ---- 三、PDF：书签档 / 标题正则档，两条都要能走 ----
+        outline = parse_module.parse_path(ROOT / "tests" / "fixtures" / "paper-outline.pdf")
+        check(outline.structure == "outline", f"有书签走 outline 档：{outline.structure}")
+        check(len(outline.pages) == 3, f"页数读对：{len(outline.pages)}")
+        check(
+            "2 Methods / 2.1 In vitro assay" in {block.section for block in outline.blocks},
+            f"层级来自书签嵌套，不从标题编号猜：{sorted({b.section for b in outline.blocks})}",
+        )
+        heading_lines = {
+            line.strip()
+            for block in outline.blocks
+            for line in block.text.splitlines()
+        }
+        check(
+            "2 Methods" not in heading_lines and "2.1 In vitro assay" not in heading_lines,
+            "标题行归到 section 列里，正文不再重复它",
+        )
+        flat = parse_module.parse_path(ROOT / "tests" / "fixtures" / "paper-flat.pdf")
+        check(flat.structure == "heading", f"没书签退回标题正则：{flat.structure}")
+        check(
+            any(block.section.startswith("2 Methods") for block in flat.blocks),
+            f"编号标题认出来了：{sorted({b.section for b in flat.blocks})}",
+        )
+        check(
+            any(block.page == 2 for block in flat.blocks),
+            "页码跟着块走（不是渲染时猜的）",
+        )
+
+        # ---- 四、切分：不跨节、不超硬上限、重叠是整句、可复现 ----
+        blocks = list(outline.blocks)
+        chunks = chunker_module.chunk_blocks(blocks)
+        check(len(chunks) >= 3, f"一节至少一块：{len(chunks)} 块")
+        check(
+            all(chunk.chars <= chunker_module.HARD_MAX for chunk in chunks),
+            f"没有块超过硬上限 {chunker_module.HARD_MAX}",
+        )
+        seen_sections: list[str] = []
+        for chunk in chunks:
+            if not seen_sections or seen_sections[-1] != chunk.section:
+                check(
+                    chunk.section not in seen_sections,
+                    f"同一节的块是连续的（没有跨节）：{chunk.section}",
+                )
+                seen_sections.append(chunk.section)
+        again = chunker_module.chunk_blocks(list(outline.blocks))
+        check(
+            [(c.section, c.page, c.chunk_no, c.text) for c in chunks]
+            == [(c.section, c.page, c.chunk_no, c.text) for c in again],
+            "同一份输入切两遍，块逐字相同",
+        )
+
+        # 长正文：目标区间、句末切点、重叠
+        sentence = "这一句用来把块撑长，讨论受体与配体的结合构象。" * 3
+        long_blocks = [
+            parse_module.Block(page=1, section="Long", level=1, text=f"{i}．{sentence}")
+            for i in range(40)
+        ]
+        pieces = chunker_module.chunk_blocks(long_blocks)
+        check(len(pieces) > 1, f"长正文被切成多块：{len(pieces)}")
+        check(
+            all(len(piece.text) <= chunker_module.HARD_MAX for piece in pieces),
+            f"每块都不超过硬上限：{[len(p.text) for p in pieces]}",
+        )
+        check(
+            all(piece.text.rstrip().endswith(("。", "．")) or piece.text.endswith("。")
+                for piece in pieces[:-1]),
+            "切点落在句末，不在词中间",
+        )
+        overlap = pieces[1].text.split("\n\n")[0]
+        check(
+            pieces[0].text.rstrip().endswith(overlap) and overlap != pieces[1].text,
+            f"第二块以第一块的最后一句开头（重叠不是从半句开始）：{overlap[:30]}",
+        )
+        check(
+            len(overlap) <= chunker_module.OVERLAP_MAX,
+            f"重叠不超过 {chunker_module.OVERLAP_MAX} 字：{len(overlap)}",
+        )
+
+        # 不索引的章节：正文还在，但不进块
+        ref_blocks = [
+            parse_module.Block(page=9, section="References", level=1, text="[1] someone 2020."),
+            parse_module.Block(page=9, section="参考文献", level=1, text="[1] 某人 2020。"),
+        ]
+        check(chunker_module.chunk_blocks(ref_blocks) == [], "References / 参考文献 不进检索")
+
+        # ---- 五、入库：新增 / 重复 / 失败 / 目录 ----
+        importer = corpus_tools.ImportDocumentsTool()
+        fixture = ROOT / "tests" / "fixtures" / "paper-outline.pdf"
+        first = await importer.run({"path": str(fixture)})
+        check(not first.failed, f"导入跑通：{first.output[:160]}")
+        check(first.meta["added"] == 1, f"新增一份：{first.meta}")
+        ref = first.meta["sources"][0]
+        check(_re.match(r"^doc#[0-9a-f]{10}$", ref) is not None, f"拿到引用号：{ref}")
+        source_id = ref.split("#")[1]
+        page_dir = store / "doc" / source_id
+        check((page_dir / "source.pdf").is_file(), "原件按内容寻址复制进语料")
+        check((page_dir / "text.jsonl").is_file(), "逐页原文写出来了")
+        meta = json.loads((page_dir / "meta.json").read_text(encoding="utf-8"))
+        check(meta["structure"] == "outline", f"切分方式记在 meta 里：{meta['structure']}")
+        check(meta["title"] == "paper-outline", f"没有 PDF 标题时用文件名：{meta['title']}")
+        check(meta["pages"] == 3 and meta["chunks"] >= 3, f"页数与块数：{meta}")
+
+        duplicate = await importer.run({"path": str(fixture)})
+        check(
+            duplicate.meta["duplicate"] == 1 and duplicate.meta["added"] == 0,
+            f"同一份内容导两次是重复，不产生第二个源：{duplicate.meta}",
+        )
+        check(
+            duplicate.meta["sources"] == [ref],
+            f"重复时给回的还是原来那个引用号：{duplicate.meta['sources']}",
+        )
+
+        reject = await importer.run({"path": str(ROOT / "tests" / "fixtures" / "ligands.smi")})
+        check(reject.failed and "不支持" in reject.output, f"不支持的格式照实失败：{reject.output[:120]}")
+
+        both = await importer.run({"path": str(ROOT / "tests" / "fixtures")})
+        check(both.meta["added"] >= 1, f"目录导入：新增 {both.meta['added']}（另一份 PDF）")
+        check(both.meta["failed"] == 0, f"目录里的 .pdb/.smi 是跳过，不是失败：{both.output[:200]}")
+        check("已跳过" in both.output, f"跳过了几个要明说，不能悄悄少处理：{both.output[-80:]}")
+
+        # inbox 是网页端的投递口（S2）：导完把那一份删掉，否则下一次它又被看见一遍。
+        inbox = store / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        dropped = inbox / "from-web.md"
+        dropped.write_text("# 从网页端投进来\n\n这一段只出现在这一份文件里。\n", encoding="utf-8")
+        from_inbox = await importer.run({"path": str(dropped)})
+        check(not from_inbox.failed, f"从 inbox 导入跑通：{from_inbox.output[:100]}")
+        check(from_inbox.meta["added"] == 1, "inbox 里的新文件照常入库")
+        check(not dropped.exists(), "导入成功后 inbox 里那一份被清掉")
+
+        # ---- 六、检索：英文词、中文子串、特殊字符 ----
+        searcher = corpus_tools.SearchCorpusTool()
+        found = await searcher.run({"query": "gefitinib IC50"})
+        check(not found.failed and found.meta["count"] >= 1, f"英文词命中：{found.output[:200]}")
+        check(
+            any("§2.1 In vitro assay" in ref for ref in found.meta["refs"]),
+            f"引用落到了小节与页码：{found.meta['refs']}",
+        )
+        check("组命中" in found.output, f"返回里写了命中几组：{found.output[:80]}")
+
+        chinese = root / "note.md"
+        chinese.write_text(
+            "# 网格蛋白\n\n网格蛋白抑制剂在低浓度下仍然有效。\n", encoding="utf-8"
+        )
+        await importer.run({"path": str(chinese)})
+        zh = await searcher.run({"query": "抑制剂"})
+        check(not zh.failed and zh.meta["count"] >= 1, f"中文子串命中（trigram 那一路）：{zh.output[:160]}")
+        check(
+            all("web#" not in ref for ref in zh.meta["refs"]),
+            "中文命中的是本地 md，不是网页",
+        )
+
+        odd = await searcher.run({"query": "T790M-resistant (EGFR)"})
+        check(not odd.failed, f"带 FTS 语法字符的查询不会崩：{odd.output[:120]}")
+
+        empty = await searcher.run({"query": "zzz 完全不存在的词 zzz"})
+        check(not empty.failed and empty.meta["reason"] == "empty", f"没命中不是失败：{empty.meta}")
+        check("search_web" in empty.output, "没命中时提示可以联网查（那条是计费的）")
+
+        # ---- 七、按引用号读原文 ----
+        reader = corpus_tools.ReadSourceTool()
+        page = await reader.run({"ref": ref, "page": 2})
+        check(not page.failed and "gefitinib" in page.output, f"按页读到了正文：{page.output[:120]}")
+        check(page.meta["pages"] == 3, f"报出总页数：{page.meta}")
+        beyond = await reader.run({"ref": ref, "page": 99})
+        check(beyond.failed and "3 页" in beyond.output, f"页数越界照实说：{beyond.output[:80]}")
+        bad_ref = await reader.run({"ref": "D:/data/paper.pdf"})
+        check(
+            bad_ref.failed and "不合法" in bad_ref.output and "路径" in bad_ref.output,
+            f"路径不是引用号（这一条挡住模型编造）：{bad_ref.output[:100]}",
+        )
+        missing = await reader.run({"ref": "doc#0000000000"})
+        check(missing.failed and "没有这一份" in missing.output, "不存在的引用号照实说")
+
+        # 网页源：只有摘要时要说清楚
+        web_id = "aaaaaaaaaa"
+        web_dir = store / "web" / web_id
+        web_dir.mkdir(parents=True)
+        (web_dir / "content.md").write_text("# 某网页\n\n摘要内容。\n", encoding="utf-8")
+        (web_dir / "meta.json").write_text(
+            json.dumps({"id": web_id, "kind": "web", "url": "https://example.com/a",
+                        "title": "某网页", "depth": "summary", "added_at": 1.0}),
+            encoding="utf-8",
+        )
+        web = await reader.run({"ref": f"web#{web_id}"})
+        check(not web.failed and "只有摘要" in web.output, f"摘要源直说没有全文：{web.output[:100]}")
+        check(web.meta["depth"] == "summary", "meta 里带着 depth")
+
+        # ---- 八、重建：两次一致，且能回填 S0 落的网页 ----
+        conn = index_module.connect(store)
+        try:
+            index_module.reindex(store)
+            before = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT source_id, section, page, chunk_no, text FROM chunks "
+                    "ORDER BY source_id, chunk_no"
+                )
+            ]
+            index_module.reindex(store)
+            after = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT source_id, section, page, chunk_no, text FROM chunks "
+                    "ORDER BY source_id, chunk_no"
+                )
+            ]
+            check(before and before == after, f"重建两次，块逐字相同（{len(before)} 块）")
+            readings = index_module.stats(conn, store)
+            check(readings["sources"] >= 3 and readings["chunks"] >= 3, f"读数：{readings}")
+            check(readings["bytes"] > 0, "占用按库文件算，不是估的")
+        finally:
+            conn.close()
+
+        backfill = await searcher.run({"query": "摘要内容"})
+        check(
+            any(f"web#{web_id}" in ref for ref in backfill.meta.get("refs", [])),
+            f"reindex 把 corpus/web 下的网页也收进来了：{backfill.meta.get('refs')}",
+        )
+    finally:
+        corpus_module.corpus_root = original_root
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def check_structure_parse() -> None:
     """坐标文件的就地解析：只算第一套模型、链分类、配体/修饰残基分开。"""
     facts = structure_module.parse_pdb(_pdb_fixture(), pdb_id="1M17")
@@ -8460,19 +9113,22 @@ async def check_structure_tools() -> None:
             "导入没拿到登记表时报装配问题",
         )
 
-        # 收路径的动作只有两个：其余工具的参数里不该出现 path。
+        # 收路径的动作只有三个：其余工具的参数里不该出现 path。
+        from opencode_tui.core.agent.domain import corpus as corpus_tools
+
         path_takers = [
             tool.spec.name
             for tool in (
                 *uniprot_module.domain_tools(),
                 *structure_module.domain_tools(),
                 *ligand_module.domain_tools(),
+                *corpus_tools.domain_tools(),
             )
             if "path" in (tool.spec.parameters.get("properties") or {})
         ]
         check(
-            path_takers == ["import_structure", "import_ligandset"],
-            f"全库只有 import_structure 与 import_ligandset 收路径：{path_takers}",
+            path_takers == ["import_structure", "import_ligandset", "import_documents"],
+            f"全库只有三个动作收路径（其余一律收 handle 或引用号）：{path_takers}",
         )
 
         # 纯查询/取结构的工具都收登记表，且参数模式里不列它。
@@ -10245,15 +10901,28 @@ async def check_listing_tools() -> None:
         "open_viewer",
         "search_pdb",
         "search_literature",
+        "search_web",
+        "fetch_webpage",
+        "import_documents",
+        "search_corpus",
+        "read_source",
         "import_ligandset",
         "prepare_ligands",
         "dock",
     ):
         check(expected in names, f"新工具 {expected} 装上了（写了却没装，界面上完全看不出来）")
-    # 两个搜索工具是只读的：Plan 方式下必须放行（放进去就等于「查文献都做不到」）。
+    # 搜索类工具是只读的：Plan 方式下必须放行（放进去就等于「查文献都做不到」）。
     from opencode_tui.core.agent.permission import PLAN_DENY
 
-    for readonly in ("search_pdb", "search_literature", "open_viewer"):
+    for readonly in (
+        "search_pdb",
+        "search_literature",
+        "search_web",
+        "fetch_webpage",
+        "search_corpus",
+        "read_source",
+        "open_viewer",
+    ):
         check(readonly not in PLAN_DENY, f"只读工具 {readonly} 不在 PLAN_DENY 里（Plan 下要放行）")
     ledger.reset()
 
@@ -11787,6 +12456,219 @@ async def check_subagent_ui() -> None:
     state.unlink(missing_ok=True)
 
 
+async def check_embed() -> None:
+    """语义通道：可用性判定、缺模型时降级、余弦下限、矩阵缓存按版本失效、三路融合。
+
+    **不依赖真模型**：编码器整个打桩成四维词袋，模型目录指到临时目录。这组判据
+    要抓的是「缓存拿旧 id 配新块」「没模型时把 30 条 0.2 分当命中」这类错误——
+    它们与模型准不准无关，用真模型反而更难复现。
+    """
+    import tempfile
+    from pathlib import Path as _Path
+
+    from opencode_tui.core import corpus as corpus_module
+    from opencode_tui.core import corpus_config as corpus_config_module
+    from opencode_tui.core import embed as embed_module
+    from opencode_tui.core import index as index_module
+    from opencode_tui.core.agent.domain import corpus as corpus_tools
+
+    root = _Path(tempfile.mkdtemp(prefix="vsa-embed-"))
+    model = "fake/model"
+    original_root = corpus_module.corpus_root
+    original_models = embed_module.models_dir
+    original_available = embed_module.available
+    original_passages = embed_module.encode_passages
+    original_query = embed_module.encode_query
+    original_config = corpus_config_module.load
+    corpus_module.corpus_root = lambda: root
+    corpus_config_module.load = lambda root=None: corpus_config_module.CorpusConfig(
+        index_web=True, embed=True, embed_model=model
+    )
+
+    def vector(text: str) -> list[float]:
+        """四维词袋 + 一维「其它」：apple / vina / cherry / kinase 各占一维。
+
+        别的词落到第五维，与四维正交——余弦 0，正好用来验下限。给「其它」也塞进
+        第一维（比如 0.1）会被归一化放大成 1.0，下限就永远触发不了。
+        """
+        lowered = text.lower()
+        values = [1.0 if word in lowered else 0.0 for word in ("apple", "vina", "cherry", "kinase")]
+        if not any(values):
+            return [0.0, 0.0, 0.0, 0.0, 1.0]
+        norm = sum(value * value for value in values) ** 0.5
+        return [value / norm for value in values] + [0.0]
+
+    def fake_passages(texts: list[str], _model: str) -> list[list[float]]:
+        return [vector(text) for text in texts]
+
+    def fake_query(text: str, _model: str) -> list[float]:
+        return vector(text)
+
+    def store(conn: Any, source_id: str, body: str, title: str) -> int:
+        """同时写索引与目录：检索会按目录存在性对账，只写索引的话命中会被判成「已删除」。"""
+        directory = corpus_module.web_dir(source_id.split(":", 1)[1])
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / corpus_module.META_FILE).write_text(
+            json.dumps({"title": title}, ensure_ascii=False), encoding="utf-8"
+        )
+        return index_module.upsert_web_page(
+            conn, source_id, f"# {title}\n\n{body}\n", {"title": title, "added_at": 1.0}
+        )
+
+    try:
+        # ---- 一、模型不在本机：说明白、不抛、检索降级 ----
+        embed_module.models_dir = lambda: root / "models"
+        check(not embed_module.available(model), "没有模型文件时 available 为 False")
+        reason = embed_module.missing_reason(model)
+        check("语义通道未启用" in reason, f"理由说人话：{reason.splitlines()[0][:40]}")
+        check(
+            "download" in reason or "requirements-embed" in reason,
+            "理由里给出能照着做的那一步",
+        )
+        conn = index_module.connect()
+        try:
+            skipped = embed_module.index_source(conn, "web:aaaaaaaaaa", model)
+            check(
+                skipped["enabled"] is False and skipped["embedded"] == 0,
+                f"模型没下载时入库不报错，只标未启用：{skipped}",
+            )
+            check(embed_module.search(conn, "apple", model) == [], "模型没下载时检索返回空")
+        finally:
+            conn.close()
+
+        # ---- 二、装上之后：入库、检索、余弦下限 ----
+        embed_module.available = lambda _model: True
+        embed_module.encode_passages = fake_passages
+        embed_module.encode_query = fake_query
+        conn = index_module.connect()
+        try:
+            store(conn, "web:aaaaaaaaaa", "apple pie", "A")
+            store(conn, "web:bbbbbbbbbb", "vina docking", "B")
+            result = embed_module.index_source(conn, "web:aaaaaaaaaa", model)
+            check(result["embedded"] == 1, f"给缺向量的块补上：{result}")
+            embed_module.index_source(conn, "web:bbbbbbbbbb", model)
+            check(embed_module.coverage(conn, model) == 1.0, "覆盖率 100%")
+            check(
+                embed_module.coverage(conn, "another/model") == 0.0,
+                "覆盖率按模型分开算（换模型之后要从 0 重算）",
+            )
+
+            apple_id = int(
+                conn.execute("SELECT id FROM chunks WHERE text LIKE '%apple%'").fetchone()[0]
+            )
+            hits = embed_module.search(conn, "apple", model)
+            check(hits and hits[0][0] == apple_id, f"余弦把 apple 排第一：{hits}")
+            check(
+                embed_module.search(conn, "apple", model, limit=1) == hits[:1],
+                "limit 生效",
+            )
+
+            # 余弦下限：无关查询（0.1 分）不该被当成命中
+            check(
+                embed_module.search(conn, "zzz", model) == [],
+                "低于余弦下限的邻居不算命中（否则「本地没有」会变成「命中 29 组」）",
+            )
+            os.environ[embed_module.MIN_SCORE_ENV] = "-1"
+            check(
+                bool(embed_module.search(conn, "zzz", model)),
+                "下限可以用 VSA_EMBED_MIN_SCORE 覆盖",
+            )
+            os.environ[embed_module.MIN_SCORE_ENV] = "不是数字"
+            check(embed_module.min_score() == embed_module.MIN_SCORE, "写坏了回落默认值")
+            os.environ.pop(embed_module.MIN_SCORE_ENV, None)
+
+            # ---- 三、矩阵缓存按版本失效（同 id 数、不同块）----
+            before = embed_module._matrix(conn, model)[1]
+            index_module.drop_source(conn, "web:aaaaaaaaaa")
+            store(conn, "web:cccccccccc", "cherry tart", "C")
+            embed_module.index_source(conn, "web:cccccccccc", model)
+            expected = [
+                int(row[0])
+                for row in conn.execute("SELECT chunk_id FROM vectors ORDER BY chunk_id")
+            ]
+            check(
+                embed_module._matrix(conn, model)[1] == expected,
+                f"删源（级联清向量）之后矩阵缓存也要失效：{before} → {expected}",
+            )
+            check(
+                embed_module.search(conn, "cherry", model)[0][0]
+                == int(conn.execute("SELECT id FROM chunks WHERE text LIKE '%cherry%'").fetchone()[0]),
+                "失效之后查到的是新块",
+            )
+        finally:
+            conn.close()
+
+        # ---- 三之二、下载：显式端点排第一，失败自动退镜像，两个都挂给可执行的提示 ----
+        if embed_module._installed():
+            seen: list[str] = []
+
+            def fake_snapshot(endpoint: str, _model: str) -> bool:
+                seen.append(endpoint)
+                return False
+
+            original_snapshot = embed_module._snapshot
+            embed_module._snapshot = fake_snapshot
+            os.environ["HF_ENDPOINT"] = "https://example.invalid"
+            buffer = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buffer):
+                    code = embed_module.download(model)
+            finally:
+                embed_module._snapshot = original_snapshot
+                os.environ.pop("HF_ENDPOINT", None)
+            check(code == 1, "两个端点都失败时返回非零，不是假装成功")
+            check(
+                seen == ["https://example.invalid", embed_module.MIRROR_ENDPOINT],
+                f"先试显式端点、再退镜像：{seen}",
+            )
+            check(
+                "下载失败" in buffer.getvalue(),
+                f"失败时说清是下载失败：{buffer.getvalue()[:60]}",
+            )
+
+        # ---- 四、三路融合：向量与词法各自的第一名都在结果里 ----
+        fused = corpus_tools.fuse({"fts": [10, 11], "vec": [11, 12]})
+        check(
+            set(fused) == {10, 11, 12},
+            f"RRF 把三路合成一份分数表：{sorted(fused)}",
+        )
+        check(
+            fused[11] > fused[10] and fused[11] > fused[12],
+            "两路都命中的块排在单路命中之前",
+        )
+
+        # ---- 五、search_corpus 的降级与 meta ----
+        original_reason = embed_module.missing_reason
+        embed_module.missing_reason = lambda _model: "语义通道未启用：测试"
+        tool = corpus_tools.SearchCorpusTool()
+        result = await tool.run({"query": "apple"})
+        check(
+            "vec" not in (result.meta.get("channels") or {}),
+            f"模型不可用时只跑词法两路：{result.meta.get('channels')}",
+        )
+        check(result.meta.get("vector_coverage") == 0.0, "meta 里如实写 0 覆盖")
+        embed_module.missing_reason = original_reason
+
+        result = await tool.run({"query": "cherry"})
+        check(
+            "vec" in (result.meta.get("channels") or {}),
+            f"模型可用时三路都跑：{result.meta.get('channels')}",
+        )
+        check(
+            "web#" in result.output and "cherry" in result.output,
+            f"语义那一路把块捞出来了：{result.output[:80]}",
+        )
+    finally:
+        corpus_module.corpus_root = original_root
+        embed_module.models_dir = original_models
+        embed_module.available = original_available
+        embed_module.encode_passages = original_passages
+        embed_module.encode_query = original_query
+        corpus_config_module.load = original_config
+        os.environ.pop(embed_module.MIN_SCORE_ENV, None)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 # 检查组：名字给 `--only` 过滤用，函数一律零参数（同步与异步混着，调用处看返回值）。
 # 名字取函数名里有意义的那一段，`--only permission` 能直接命中。
 GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
@@ -11814,6 +12696,9 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("write-run-docking", check_write_run_docking),
     ("rsearch", check_rsearch),
     ("literature", check_literature),
+    ("websearch", check_websearch),
+    ("corpus", check_corpus),
+    ("embed", check_embed),
     ("structure-parse", check_structure_parse),
     ("structure-tools", check_structure_tools),
     ("chembl", check_chembl_tools),

@@ -21,9 +21,16 @@ CI 只有一个 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，**
 
 ## 命令
 
-依赖：`pip install -r requirements.txt`（textual / httpx / python-dotenv / tomli-w）。
+依赖：`pip install -r requirements.txt`（textual / httpx / python-dotenv / tomli-w / pypdf）。
 可选化学栈：`pip install -r requirements-chem.txt`（meeko/rdkit/gemmi/numpy/scipy），
 不装也能跑，只有 `prepare_receptor` 会返回一条带安装指令的错误。
+
+**语义检索（S3）另有一份可选依赖**：`pip install -r requirements-embed.txt`
+（fastembed + onnxruntime + tokenizers，约 78MB），再
+`python -m opencode_tui.core.embed download` 拉模型（255MB，**显式下载，不自动**）。
+不装时 `search_corpus` 只跑词法两路，其余功能一概不受影响。
+模型缓存 `~/.opencode_tui/models/`，**不进仓、不进 exe**——单模型就 255MB，
+超过方案稿 §8.4 的 +80MB 预算，所以打包走「用户另装」这条路（与 DTA 同一种处理）。
 
 **亲和力打分（`score_affinity`）另有一套环境**，在 `models/DTA/.venv`（Python 3.10 +
 torch 2.2.1 + dgl 2.1.0），装法见 `models/DTA/README.md`。主仓一行都不 import torch——
@@ -59,14 +66,21 @@ python -m opencode_tui.core.agent.domain.structure               # 单模块，�
 # 参数支持 JSON / k=v / --file -；--reset 清登记表，--raw 跳过参数校验
 # handle 写占位不写编号：{receptor:raw} / {artifact}，开跑前从登记表现取
 
-# 网页端（只读）
+# 网页端（会话与结构只读；语料可投递、改名、删除）
 python -m opencode_tui.core.web     # 包内实现的独立进程壳，--port 优先于 .env 的 VSA_WEB_PORT
-python tools/serve_web.py           # 同一个 WebServer 的 CLI 壳（--state/--runs/--web/--port）
+python tools/serve_web.py           # 同一个 WebServer 的 CLI 壳（--state/--runs/--web/--corpus/--port）
 
 # 判据脚本
-python tools/check_web_api.py       # 在副本上起服务，验 API 形状 / 并发 / 写撕裂读
+python tools/check_web_api.py       # 在副本上起服务，验 API 形状 / 并发 / 写撕裂读 / 语料读写
+python tools/check_retrieval.py     # 检索评测：词法单路 / 双词法 / 三路，三条硬门禁
+python tools/check_retrieval.py --list          # 只看评测集概况
 python tools/build_demo_data.py     # 由 RCSB 1IEP 原始 PDB 生成 runs/1iep-demo（可复现）
 python tools/check_demo_data.py     # 纯几何：口袋残基是否真的接触共晶配体（≤4.5Å、≥60%）
+
+# 本地语料（免费离线）
+python -m opencode_tui.core.index reindex        # 按盘上原件重建索引，并顺手补向量
+python -m opencode_tui.core.embed download       # 拉模型（255MB；直连不通自动走 hf-mirror）
+python -m opencode_tui.core.embed index          # 只补向量（换模型后跑这条）
 
 # 前端（viz/ 是唯一装 npm 包的地方）
 cd viz && npm install && npm run build     # esbuild → viz/build/{viewer,markdown}-lib.js
@@ -100,6 +114,11 @@ python tests/verify_modal_transparency.py  # 模态居中/半透明，聊天透�
 | --- | --- |
 | `VSA_MAX_STEPS` | 一轮步数上限，写错**回落到 24 而不是抛错** |
 | `VSA_WEB_PORT` | 本地网页端口，默认 8860，不合法同样回落 |
+| `VSA_CORPUS_INDEX_WEB` | `0/1`，`search_web` 的摘要是否自动入库（默认开）。关掉后它退回纯查询，不给引用号 |
+| `VSA_CORPUS_EMBED` | `0/1`，语义通道总开关（默认开）。关掉只跑词法两路 |
+| `VSA_EMBED_MODEL` | 嵌入模型名，默认 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`（384 维）。**换模型要整表重建**：`python -m opencode_tui.core.embed index` |
+| `VSA_EMBED_MIN_SCORE` | 余弦下限，默认 `0.30`。低于它不算命中——余弦没有「不相关」这个值，不设下限的话「本地没有」会变成「命中 29 组」 |
+| `HF_ENDPOINT` | 模型下载端点，**排第一**。不设时先试 `huggingface.co`，失败**自动退到 `hf-mirror.com`**（会打印实际用的端点，不悄悄换源）；镜像的 Xet 后端会回 401，所以下载子进程里固定 `HF_HUB_DISABLE_XET=1` |
 | `VSA_VINA_BIN` | 外部 AutoDock Vina 可执行文件；不设时从 PATH 找 `vina`，缺失时 `dock` 返回安装指引。引擎**不随 exe 打包** |
 | `VSA_DTA_PYTHON` | 跑 `models/DTA/virtual_screen.py` 的解释器；不设时依次试 `models/DTA/.venv/bin/python` 与旧布局的 `<repo>/.venv-dta/bin/python`，都没有时 `score_affinity` 返回安装指引 |
 | `VSA_DTA_ROOT` | `models/DTA`；不设时按**代码位置**定位到仓根下的 `models/DTA` |
@@ -197,9 +216,33 @@ __main__.py → app.py ───────────────────
   （`test_agent.py:check_chemistry_gate`）。装依赖后要**重启会话**，探测只在进程启动后第一次调用时做一遍。
 
 `domain/__init__.py` 顶部有**八条纪律**，是踩坑攒的而非风格偏好。新加领域工具逐条对一遍，
-其中最容易违反的三条：收 handle 不收路径（全库只 `import_structure` 与
-`import_ligandset` 收路径）、
+其中最容易违反的三条：收 handle 不收路径（全库只 `import_structure` / `import_ligandset` /
+`import_documents` 收路径）、
 纯查询不声明 `context_argument`、要算数就用代码算（RMSD / Tanimoto / 接触距离绝不交给模型心算）。
+
+### 本地语料与检索（`core/` 里的五个纯库）
+
+```
+原件  corpus/doc/<id>/  corpus/web/<id>/      ← 网页端只往 inbox/ 落文件
+  ↓ parse.py      抽取文字、认结构（outline → heading → page / markdown）、反转义
+  ↓ chunker.py    按节切块：目标 1200、硬上限 2000、重叠=上一块最后一整句
+  ↓ index.py      SQLite：chunks + 两张 FTS5（unicode61 / trigram）+ vectors
+  ↓ embed.py      fastembed + ONNX（**不依赖 torch**），向量按模型名存
+检索  lexical 两路 + 语义一路 → RRF(k=60) → 邻块 → 按「源 + 章节」聚组
+```
+
+- **解析与切块只有一条路**：`index.chunks_for`。入库与 `reindex` 各写一份的话，
+  重建出来的块跟当初写进去的不一样，而「重建两次一致」的判据正好抓不到这种漂移。
+- **网页落盘当场入索引**（`websearch._index_pages` → `index.upsert_web_page`）：
+  少了这一步，刚搜到的东西要等下一次 `reindex` 才查得到，而工具说明写的是「之后免费可查」。
+- **向量是派生物**：`vectors` 与 `kv`（版本号）都在 `library.db` 里，删掉能重建。
+  版本号由**触发器**维护，因为级联删除（删源、整源重建）也会清向量，那条路径没人会记得 bump。
+  `embed._matrix` 的缓存按 `(库, 模型, 版本)` 做键——只按行数做键会拿旧 id 配新块。
+- **可选依赖在函数体里导入**：`fastembed` 与 `pypdf` 都不在顶层。没装时应用照常起，
+  `search_corpus` 静默降级成词法两路（技术细节只进 `meta`，不进正文），`import_documents`
+  报一句带 `pip install` 的话。
+- **模型不自动下载**：`embed.missing_reason()` 给一句能照着做的话，下载要人显式跑
+  `python -m opencode_tui.core.embed download`。
 
 ### 界面（`screens/` + `widgets/`）
 
@@ -230,12 +273,22 @@ __main__.py → app.py ───────────────────
 ### 网页端
 
 `core/web/routes.py` 的 `SPEC` 是路由的**唯一真相**，包内常驻服务和 `tools/serve_web.py`
-都从它拿，别在第二处写路由。端点就三个：`GET /api/sessions`、`GET /api/sessions/<id>`、`GET /api/runs`，
-外加 `/runs/...` 静态与 `web_root` 静态。路径逃逸用 `resolve_within` 拒绝（403）。
+都从它拿，别在第二处写路由。会话与运行仍是纯 GET：`GET /api/sessions`、
+`GET /api/sessions/<id>`、`GET /api/runs`，外加 `/runs/...` 静态与 `web_root` 静态。
+路径逃逸用 `resolve_within` 拒绝（403）。
 
-`web/` 无构建步骤，`app.js` 是 hash router（`#/history`、`#/structure/<run_id>`），
-vendored 大包（3MB Mol\*）按页懒加载。`viz/` 是唯一装 npm 包的地方，用 esbuild 把 Mol\* 和 marked
-打成 IIFE 全局 `vsViewer` / `vsMarkdown`——页面代码不 import 任何 npm 包，换 3D 库只动 `viz/`。
+**S2 起网页端多了一组语料写入口**（`GET /api/library`、`POST /api/library/upload`、
+`POST /api/library/<kind>:<id>/{rename,delete}`）。章程因此从「只读」改成
+「查看只读 + 语料投递与管理」，但边界很窄：网页端只往 `corpus/inbox/` 落文件、
+只写 `labels.json` 的显示名、只把目录挪进 `corpus/.trash/`，**从不写索引、不建块、
+不改原件**。索引只以 `mode=ro` 打开，取块数与向量覆盖。本地服务不做鉴权，所以
+三个写入口都要求 `X-VSA-Request: 1`（逼出 CORS 预检）并校验 `Origin`——`multipart`
+是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 投文件。
+
+`web/` 无构建步骤，`app.js` 是 hash router（`#/history`、`#/structure/<run_id>`、
+`#/library`），vendored 大包（3MB Mol\*）按页懒加载。`viz/` 是唯一装 npm 包的地方，
+用 esbuild 把 Mol\* 和 marked 打成 IIFE 全局 `vsViewer` / `vsMarkdown`——页面代码不
+import 任何 npm 包，换 3D 库只动 `viz/`。
 
 `opencode_tui/themes/default.json` **目前没有任何代码读它**，是设计参考稿；真实颜色硬编码在
 `styles/app.tcss`，主题切换走的是 Textual 自带的 `available_themes`。

@@ -1,0 +1,67 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R 7 0 R 9 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Length 218 >>
+stream
+BT /F1 11 Tf 72 732 Td 14 TL
+(1 Introduction) Tj T*
+(Epidermal growth factor receptor \(EGFR\) is a receptor tyrosine kinase.) Tj T*
+(Mutations such as T790M confer resistance to first generation inhibitors.) Tj T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 223 >>
+stream
+BT /F1 11 Tf 72 732 Td 14 TL
+(2 Methods) Tj T*
+(2.1 In vitro assay) Tj T*
+(Cells were cultured and treated with gefitinib at increasing doses.) Tj T*
+(IC50 values were fitted with a four parameter logistic model.) Tj T*
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+8 0 obj
+<< /Length 178 >>
+stream
+BT /F1 11 Tf 72 732 Td 14 TL
+(3 Results) Tj T*
+(Osimertinib retained activity against the T790M mutant.) Tj T*
+(The measured IC50 was 12 nM in the resistant cell line.) Tj T*
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000127 00000 n 
+0000000224 00000 n 
+0000000492 00000 n 
+0000000618 00000 n 
+0000000891 00000 n 
+0000001017 00000 n 
+0000001245 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+1371
+%%EOF

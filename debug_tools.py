@@ -1,9 +1,9 @@
 """领域工具的调试入口：**直接跑，不用敲任何参数**。
 
 放在仓库根目录，不放在 `opencode_tui/core/agent/domain/` 里：它是开发期用的东西，
-不该和那 18 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
+不该和那 24 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
 
-    # 一、全跑：10 个模块、18 个工具，按依赖顺序一个接一个（不需要任何参数）
+    # 一、全跑：13 个模块、24 个工具，按依赖顺序一个接一个（不需要任何参数）
     .venv/Scripts/python.exe debug_tools.py
 
     # 二、只跑一个模块（10 个工具模块末尾的块就是这么用的）
@@ -124,6 +124,23 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("find_analogs", {"query": "CHEMBL939"}),
     ("describe_molecule", {"molecule": "CHEMBL25"}),
     ("search_literature", {"query": "EGFR inhibitor resistance", "limit": 5}),
+    # 本地语料：把仓里那份夹具文献导进去 → 检索 → 按页读。
+    # 导入会**真的写进 `corpus/doc/`**（已 gitignore），用一份小 PDF 而不是整篇论文。
+    # 同一份文件导两次是「重复」，所以重复跑这条也是绿的。
+    ("import_documents", {"path": "tests/fixtures/paper-outline.pdf"}),
+    ("search_corpus", {"query": "gefitinib IC50", "limit": 3}),
+    # 引用号是**文件内容的哈希**（`tests/fixtures/paper-outline.pdf` → 3147dcb3e1）。
+    # 夹具换了内容就要跟着换这一行——占位符救不了它，语料没有登记表。
+    ("read_source", {"ref": "doc#3147dcb3e1", "page": 2}),
+    # 联网搜索：**真花钱**（5 元 / 1000 次成功请求，这一次约 0.005 元）。
+    # 结果会落进 corpus/web/，所以跑完 `git status` 里看不到它（整个 corpus/ 已 ignore）。
+    ("search_web", {"query": "EGFR T790M resistance mechanism", "count": 3}),
+    # 抓单页正文（同样计费）。用一个稳定的公开页面，**不依赖上一条的返回**——
+    # 全跑时参数是静态的，占位只认登记表里的 handle，认不了「上一条结果里的某个 URL」。
+    ("fetch_webpage", {
+        "url": "https://en.wikipedia.org/wiki/Epidermal_growth_factor_receptor",
+        "max_chars": 800,
+    }),
     # 产物：受体 → 运行目录 → 网页地址
     ("write_run", {
         "receptor": "{receptor:prepared}",
@@ -177,7 +194,7 @@ def main(module_name: str, tools: list[Tool], argv: list[str] | None = None) -> 
 def root_main(argv: list[str] | None = None) -> int:
     """根目录那一侧的入口：第一个词是模块名就用它，是工具名就去找它在哪个模块。
 
-    不带参数时按模块表把 10 个模块、18 个工具全跑一遍。
+    不带参数时按模块表把 13 个模块、24 个工具全跑一遍。
     """
     load_env()
     args = list(sys.argv[1:] if argv is None else argv)
@@ -271,7 +288,7 @@ def _tool_modules() -> list[tuple[str, list[Tool]]]:
 
 
 def _run_batch(groups: list[tuple[str, list[Tool]]]) -> int:
-    """全跑：`CALLS` 里那 18 个工具依次跑一遍，最后给一张表。
+    """全跑：`CALLS` 里那 24 个工具依次跑一遍，最后给一张表。
 
     开跑前清空登记表：全跑的价值在于「一条链从头串到尾」，起点必须是同一份空表。
     单个工具失败不打断后面的——调试要看的正是「哪一个不行、为什么」。

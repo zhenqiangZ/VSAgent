@@ -32,6 +32,7 @@ __all__ = [
     "DEFAULT_TIMEOUT",
     "EmptyResult",
     "NotFound",
+    "ResponseError",
     "TEXT_PREVIEW",
     "USER_AGENT",
     "get_json",
@@ -46,6 +47,23 @@ USER_AGENT = "opencode-tui/0.1 (virtual screening; +https://rest.uniprot.org)"
 
 DEFAULT_TIMEOUT = 45.0
 TEXT_PREVIEW = 200
+
+
+class ResponseError(ToolError):
+    """接口回了一个 4xx，并带上状态码。
+
+    其余 4xx 原本只是 `ToolError`，调用方想知道「到底是 401 没配 key、还是 402
+    余额不足、还是 403 被站点策略拒绝」只能去正文里找那几个数字——响应体里凑巧
+    带上 `402` 三个字符就会误判。**按码分档，不做字符串匹配**：状态码是协议层
+    的事实，正文措辞会变。
+
+    404 单独走 `NotFound`（「不存在」在有些接口里是个答案），408 由调用方用
+    `retry_statuses` 转成可重试——它们在 4xx 里各有各的去处，不从这里出。
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class NotFound(ToolError):
@@ -107,12 +125,17 @@ def post_json(
     timeout: float = DEFAULT_TIMEOUT,
     headers: dict[str, str] | None = None,
     server_5xx_as_error: str = "",
+    retry_statuses: tuple[int, ...] = (),
 ) -> Any:
     """发一次 POST（JSON 请求体）并解析 JSON。
 
     RCSB 的检索与 GraphQL 都是 POST——把查询条件放在请求体里，因为它在 URL 里
     会超长（属性搜的查询串动辄几 KB）。形状与 `get_json` 完全一致：
     4xx 是 `ToolError`、429/5xx 是 `RetryableToolError`、404 另有 `NotFound`。
+
+    `retry_statuses` 把指定的 4xx **提升为可重试**。DeepSeek 的搜索接口把
+    「读请求体超时」回成 HTTP 408：它不在 429/5xx 那一档，按默认口径会变成
+    确定性失败，而它恰恰是等一会儿就能过去的。默认空元组，其余调用方行为不变。
     """
     response = _request(
         url,
@@ -122,6 +145,7 @@ def post_json(
         timeout=timeout,
         headers=headers,
         server_5xx_as_error=server_5xx_as_error,
+        retry_statuses=retry_statuses,
     )
     # 204 无内容 = 查到了、结果为空。见 `EmptyResult`：**不能**混进下面那条
     # 「返回的不是 JSON」——那句听起来像接口坏了，会把「查了没有」说成「没查成」。
@@ -198,6 +222,7 @@ def _request(
     timeout: float,
     headers: dict[str, str] | None,
     server_5xx_as_error: str = "",
+    retry_statuses: tuple[int, ...] = (),
 ) -> httpx.Response:
     """发请求并处理失败。成功时返回响应对象。"""
     merged = {"User-Agent": USER_AGENT, "Accept": "application/json"}
@@ -218,6 +243,10 @@ def _request(
             "这通常是网络或代理问题，稍后重试即可"
         ) from error
 
+    if response.status_code in retry_statuses:
+        raise RetryableToolError(
+            f"接口暂时不可用（HTTP {response.status_code}）：{_message(response)}"
+        )
     if response.status_code == 429 or response.status_code >= 500:
         if server_5xx_as_error:
             raise ToolError(
@@ -229,7 +258,10 @@ def _request(
     if response.status_code == 404:
         raise NotFound("资源不存在（HTTP 404）")
     if response.status_code >= 400:
-        raise ToolError(f"接口拒绝了这次请求（HTTP {response.status_code}）：{_message(response)}")
+        raise ResponseError(
+            f"接口拒绝了这次请求（HTTP {response.status_code}）：{_message(response)}",
+            status_code=response.status_code,
+        )
     return response
 
 
@@ -255,6 +287,10 @@ def _message(response: httpx.Response) -> str:
     （相似度阈值写成 `0.85`、分子编号写成 `gefitinib`，都是 404 加一页 HTML）。
     把那一页截一段塞进错误里，模型看到的是 `<!DOCTYPE html>` 加一串样式表，
     既读不出病因也照不了做——不如直说「这是网页，不是接口消息」。
+    **再认 OpenAI 形状。** DeepSeek 的错误是
+    `{"error": {"message": "…", "type": …, "param": null}}`——`error` 是一个对象
+    而不是字符串，只认 `str` 的写法会把整段 JSON（连同 `type` / `param` 两个
+    对调用方毫无用处的字段）糊进上下文，真正能照着改的那半句被淹掉。
     """
     content_type = (response.headers.get("content-type") or "").lower()
     raw = (response.text or "").lstrip()
@@ -271,6 +307,11 @@ def _message(response: httpx.Response) -> str:
                 return value.strip()[:TEXT_PREVIEW]
             if isinstance(value, list) and value:
                 return "；".join(str(item) for item in value)[:TEXT_PREVIEW]
+            if isinstance(value, dict):
+                # OpenAI 兼容形状：`error` 里再套一层 `message`。
+                inner = value.get("message")
+                if isinstance(inner, str) and inner.strip():
+                    return inner.strip()[:TEXT_PREVIEW]
     return json.dumps(payload, ensure_ascii=False)[:TEXT_PREVIEW]
 
 

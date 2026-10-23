@@ -36,6 +36,12 @@ PLAN_DENY = frozenset(
      "score_affinity", "write_run"}
 )
 
+# 按次计费的联网工具：5 元 / 1000 次成功请求（`docs/knowledge-plan.md` §5.1）。
+# 单次约 0.005 元，为这个价钱每一步都弹一次窗只会把人逼成条件反射按 y，
+# 所以给一个**本会话配额**：前 BILLED_ASK_AFTER 次直接放行，之后每次都问。
+BILLED_TOOLS = frozenset({"search_web", "fetch_webpage"})
+BILLED_ASK_AFTER = 10
+
 # 收「路径类」参数的工具。这几个工具的调用会指向磁盘的某个具体位置，
 # 因此可以拿它的参数去判「这一步是不是踩到了工作目录之外」。
 # 参数名参照各工具的 `primary_argument`，一个工具可能有多个可选参数。
@@ -46,6 +52,9 @@ PATH_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "grep": ("path", "pattern"),
     "import_structure": ("path",),
     "import_ligandset": ("path",),
+    # 第三个收路径的动作。少了这一行，从工作目录外导文献就不会触发越界询问——
+    # 「放行一个工具」不等于「放行整个磁盘」，这条同样适用于读别人的文件。
+    "import_documents": ("path",),
 }
 
 # 从 bash 命令里挑绝对路径用的模式。
@@ -252,6 +261,8 @@ class PermissionPolicy:
         self._session_tools: set[str] = set()
         # 本会话是否对所有工具放行（弹窗上按了 a）。
         self._allow_all = False
+        # 本会话真正执行了几次计费类工具（`BILLED_TOOLS`）。只增不减，换会话清零。
+        self._billed_runs = 0
 
     def allow_all(self) -> None:
         """本会话对所有工具放行。弹窗上按 a 走这一条。"""
@@ -292,6 +303,18 @@ class PermissionPolicy:
             return PermissionDecision(
                 Verdict.ASK,
                 reason=f"这一步会动到工作目录之外：{outside[0]}",
+            )
+        # 计费配额也排在两级「本会话放行」之前。「全部允许」放行的是**工具**，
+        # 不是「一直花钱」：超过配额之后仍然每次都问，否则按过一次 a 之后就再也
+        # 没人看着账单了——而搜索是唯一一个用户看不到单价的操作。
+        if name in BILLED_TOOLS and self._billed_runs >= BILLED_ASK_AFTER:
+            return PermissionDecision(
+                Verdict.ASK,
+                reason=(
+                    f"本会话已经联网调用 {self._billed_runs} 次"
+                    f"（每次约 0.005 元；同一 query 命中本地档案时不额外计费），"
+                    "再调会继续计费"
+                ),
             )
         if self._allow_all:
             return PermissionDecision(Verdict.ALLOW, rule="本会话已放行所有工具")
@@ -346,10 +369,25 @@ class PermissionPolicy:
         self._session_tools.add(name)
         return PermissionRule(name, "*", Verdict.ALLOW, "本会话记住")
 
+    def note_tool_run(self, name: str) -> None:
+        """记一次**真正执行**的调用。循环层在放行之后、执行之前调它。
+
+        只在放行之后记：询问被拒的那一次不是一次调用，不该让配额往前走。
+        计的是「执行了几次」，不是「模型想调几次」——钱是按执行花的。
+        """
+        if name in BILLED_TOOLS:
+            self._billed_runs += 1
+
+    @property
+    def billed_runs(self) -> int:
+        """本会话联网调用了几次。界面与判据读它。"""
+        return self._billed_runs
+
     def clear_session(self) -> None:
         """清掉本会话放行的工具与全放行标记。切换会话时调用。"""
         self._session_tools.clear()
         self._allow_all = False
+        self._billed_runs = 0
 
 
 def argument_value(tool: Tool, arguments: dict[str, object]) -> str:

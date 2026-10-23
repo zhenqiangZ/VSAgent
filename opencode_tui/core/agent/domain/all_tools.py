@@ -16,6 +16,7 @@ from ..tools import Tool
 from . import (
     affinity,
     chembl,
+    corpus,
     docking,
     export,
     ligand,
@@ -25,6 +26,7 @@ from . import (
     rsearch,
     structure,
     uniprot,
+    websearch,
 )
 
 
@@ -37,6 +39,8 @@ def domain_tools() -> list[Tool]:
         *chembl.domain_tools(),
         *rsearch.domain_tools(),
         *literature.domain_tools(),
+        *corpus.domain_tools(),
+        *websearch.domain_tools(),
         *receptor.domain_tools(),
         *ligand.domain_tools(),
         *docking.domain_tools(),

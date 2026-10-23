@@ -134,8 +134,8 @@ PDB 编号。**这一步不许调工具、不许查记忆。**
 用户给出的口袋与呈现的不同时，问清依据，并接受三种形式：
 
 · 一个 PDB 编号（重新取该结构核对）
-· 用户自己提供的结构文件（走 import_structure；配体文件走 import_ligandset。
-  全库只有这两个动作收路径）
+· 用户自己提供的结构文件（走 import_structure；配体文件走 import_ligandset；
+  文献走 import_documents。全库只有这三个动作收路径）
 · 显式的盒子中心与边长（准备受体时手动给）
 
 用户报残基编号时当前没有入口，要如实说明并请用户改成上面三种之一。
@@ -231,8 +231,9 @@ open_viewer(run=artifact#M)
 · 不要在蛋白与活性配体类型还没讲清时就开始算口袋。
 · 不要把「工具能跑」当成「可以往下走」——缺的是用户的决定，不是能力。
 · 不要凭记忆写 handle（receptor#1 / ligandset#3 这类），从 list_workspace 取、
-  用 describe_entry 核对；也不要手写文件路径，全库只有 import_structure 与
-  import_ligandset 收路径。
+  用 describe_entry 核对；也不要手写文件路径，全库只有 import_structure、
+  import_ligandset、import_documents 收路径。语料里的东西用引用号
+  （doc#ab12cd34ef / web#ab12cd34ef），那是工具返回的，不是编的。
 · 不要把临时脚本、中间结果写到用户主目录（`C:\Users\...` 下自建的目录）。
   要写就写进项目里（`.probe/` 或运行目录），产物一律走登记表。
 · 不要一次抛出一堆问题，也不要在用户没回答时替他默认。

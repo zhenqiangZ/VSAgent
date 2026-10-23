@@ -255,8 +255,8 @@ LEDGER_DISCIPLINE = (
     "会话登记表里记着你已经拿到或算出来的东西（受体、配体集、产物）。"
     "**引用它们一律用 handle，不要写文件路径**：handle 形如 `receptor#1` / `ligandset#3`，"
     "从 list_workspace 里取，用 describe_entry 查详情。\n"
-    "全库只有 import_structure 与 import_ligandset 两个动作收路径（那两下真的需要人给出文件），"
-    "其余工具收到路径一律报错。\n"
+    "全库只有 import_structure、import_ligandset、import_documents 三个动作收路径"
+    "（那三下真的需要人给出文件），其余工具收到路径一律报错。\n"
     "不要凭记忆写 handle——它编不出来但看着很合理，而登记表里没有的那个号"
     "会让后面每一步都建立在不存在的东西上。"
 )

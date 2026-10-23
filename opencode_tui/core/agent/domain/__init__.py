@@ -10,9 +10,9 @@
 这些不是风格喜好，是踩过的坑。新加领域工具时逐条对一遍：
 
 1. **收 handle，不收路径。** 模型编不出 `ligandset#3`，却编得出 `D:/data/lib.csv`——
-   后者可能不存在、可能是上一次那个文件、可能是它在上一轮编的。全库只允许两个动作
-   收路径（`import_structure` 与 `import_ligandset`，因为这两下真的需要人给出文件），
-   其余一律收登记表里的 handle。
+   后者可能不存在、可能是上一次那个文件、可能是它在上一轮编的。全库只允许三个动作
+   收路径（`import_structure`、`import_ligandset`、`import_documents`，因为这三下
+   真的需要人给出文件），其余一律收登记表里的 handle 或语料的引用号。
 2. **纯查询不声明 `context_argument`。** 查完不留东西的工具挂了登记表，会让模型以为
    它留下了什么，然后在后面的步骤里引用一个不存在的 handle。
 3. **失败返回结果，不抛异常。** `ToolResult(failed=True, output=原因)`：错误文本要能
@@ -48,6 +48,8 @@
 | `align.py` | 先验清单的取证与叠合：核序列、按 CA 把配体搬进受体参考系（不登记工具） |
 | `rsearch.py` | 搜索工具（一）：RCSB 文本/属性搜 + GraphQL 批量取配体（1 个工具） |
 | `literature.py` | 搜索工具（二）：PubMed E-utilities 文献检索（1 个工具） |
+| `websearch.py` | 搜索工具（三）：联网搜索与单页抓取（2 个工具，结果落进本地语料） |
+| `corpus.py` | 本地语料：入库 / 检索 / 按页读原文（3 个工具，免费离线；检索是三路 RRF） |
 | `receptor.py` | 准备受体（1 个工具） |
 | `ligand.py` | 导入配体集 + 准备配体（2 个工具） |
 | `listing.py` | 浏览登记表（3 个工具） |
@@ -65,6 +67,7 @@ __all__ = [
     "chembl",
     "chemistry",
     "complexes",
+    "corpus",
     "docking",
     "export",
     "http",
@@ -80,4 +83,5 @@ __all__ = [
     "rsearch",
     "structure",
     "uniprot",
+    "websearch",
 ]

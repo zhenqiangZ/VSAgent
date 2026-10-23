@@ -814,6 +814,8 @@ class AgentLoop:
             return
         part.permission = decision.note()
         part.tool_status = ToolStatus.RUNNING
+        # 配额在**放行之后**才记：被拒的那一次不是一次调用（见 `note_tool_run`）。
+        self.policy.note_tool_run(tool.spec.name)
         self.bus.publish("part.update", {"session_id": session.id, "message_id": message.id, "part_id": part.id})
 
         def record_arguments(given: dict[str, Any]) -> None:

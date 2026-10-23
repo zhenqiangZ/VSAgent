@@ -111,15 +111,20 @@ def _cache_path(kind: str, payload: Any) -> Path:
     return search_dir() / f"{kind}-{digest}.json"
 
 
-def _read_cache(path: Path) -> Any | None:
-    """读缓存。**过期或损坏都当没有**——损坏的缓存不能变成一次假结果。"""
+def _read_cache(path: Path, *, ttl: float | None = SEARCH_CACHE_TTL) -> Any | None:
+    """读缓存。**过期或损坏都当没有**——损坏的缓存不能变成一次假结果。
+
+    `ttl=None` 表示**永不过期**。联网搜索走的就是这一档：查过的 query 与服务
+    当时返回的结果，是一份档案而不是加速用的缓存（方案稿 §4.4），过期后重查
+    要再付一次钱，而旧结果本身还有「当时是这么返回的」这个用途。
+    """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(payload, dict) or "saved_at" not in payload:
         return None
-    if time.time() - float(payload["saved_at"]) > SEARCH_CACHE_TTL:
+    if ttl is not None and time.time() - float(payload["saved_at"]) > ttl:
         return None
     return payload.get("body")
 

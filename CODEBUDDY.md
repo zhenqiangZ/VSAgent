@@ -72,7 +72,7 @@ python tools/serve_web.py           # 同一个 WebServer 的 CLI 壳（--state/
 
 # 判据脚本
 python tools/check_web_api.py       # 在副本上起服务，验 API 形状 / 并发 / 写撕裂读 / 语料读写
-python tools/check_retrieval.py     # 检索评测：词法单路 / 双词法 / 三路，三条硬门禁
+python tools/check_retrieval.py     # 检索评测：词法单路 / 双词法 / 三路 + 组级指标，三条硬门禁
 python tools/check_retrieval.py --list          # 只看评测集概况
 python tools/build_demo_data.py     # 由 RCSB 1IEP 原始 PDB 生成 runs/1iep-demo（可复现）
 python tools/check_demo_data.py     # 纯几何：口袋残基是否真的接触共晶配体（≤4.5Å、≥60%）
@@ -228,8 +228,12 @@ __main__.py → app.py ───────────────────
   ↓ chunker.py    按节切块：目标 1200、硬上限 2000、重叠=上一块最后一整句
   ↓ index.py      SQLite：chunks + 两张 FTS5（unicode61 / trigram）+ vectors
   ↓ embed.py      fastembed + ONNX（**不依赖 torch**），向量按模型名存
-检索  lexical 两路 + 语义一路 → RRF(k=60) → 邻块 → 按「源 + 章节」聚组
+检索  lexical 两路（各 40 条）+ 语义一路 → RRF(k=60) → 邻块 → 按「源 + 章节」聚组
 ```
+
+- **每路 40 条是量出来的**（`index.CHANNEL_LIMIT`）：30 → 40 让「标注源进前 8 组」
+  从 0.927 升到 0.945、「答案在片段里」从 0.796 升到 0.815，50/80 不涨。RRF 权重、
+  k、章节加权、References 过滤、邻块范围都扫过，均无增益（见 `docs/knowledge-plan.md` §11）。
 
 - **解析与切块只有一条路**：`index.chunks_for`。入库与 `reindex` 各写一份的话，
   重建出来的块跟当初写进去的不一样，而「重建两次一致」的判据正好抓不到这种漂移。

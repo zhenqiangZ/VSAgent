@@ -50,6 +50,9 @@ TOP_K = 5
 MRR_DEPTH = 10
 """MRR@10 的深度。与线上返回的 8 组同量级。"""
 
+GROUP_LIMIT = 8
+"""线上工具默认返回 8 组（`SearchCorpusTool` 的 `DEFAULT_LIMIT`）。组级指标按这个数。"""
+
 GATE_RECALL_GAIN = 0.08
 """门禁 1：三路要比双词法高 8 个百分点。"""
 
@@ -143,6 +146,49 @@ def evaluate(conn, items: list[dict], channels_wanted: tuple[str, ...], model: s
         "mrr": reciprocal / total,
         "citation": cited / total,
         "rows": rows,
+    }
+
+
+def evaluate_groups(conn, items: list[dict], channels_wanted: tuple[str, ...], model: str) -> dict:
+    """按**工具的真实输出**再量一遍：融合 → 分组 → 600 字预算 → 前 8 组。
+
+    块级指标看「检索到没有」，组级看「模型真的看到什么」：同一篇的碎片会被并成
+    一组，片段还会被预算截断——块级命中而片段里没有答案，是真实存在的一档。
+    分组用的是线上同一个 `_group`，不另写一份。
+    """
+    hit = answer = 0
+    chars = 0
+    rows_out: list[dict] = []
+    for item in items:
+        channels: dict[str, list[int]] = {}
+        if "fts" in channels_wanted or "cjk" in channels_wanted:
+            only = tuple(name for name in channels_wanted if name in ("fts", "cjk"))
+            channels.update(index.lexical(conn, item["q"], only=only))
+        if "vec" in channels_wanted:
+            semantic = embed.search(conn, item["q"], model, limit=index.CHANNEL_LIMIT)
+            if semantic:
+                channels["vec"] = [chunk_id for chunk_id, _ in semantic]
+        fused = corpus_tools.fuse(channels)
+        order = sorted(fused, key=lambda chunk_id: (-fused[chunk_id], chunk_id))
+        candidates = [(cid, fused[cid]) for cid in order[: index.CHANNEL_LIMIT]]
+        rows = index.rows_by_id(conn, [cid for cid, _ in candidates])
+        groups = corpus_tools._group(conn, [(c, s) for c, s in candidates if c in rows], rows)
+        top = groups[: GROUP_LIMIT]
+        sources = [group["source_id"] for group in top]
+        found = any(ref in sources for ref in item["refs"])
+        hit += int(found)
+        chars += sum(len(group["text"]) for group in top)
+        must = str(item.get("must") or "").lower()
+        answered = bool(must) and any(must in group["text"].lower() for group in top)
+        answer += int(answered)
+        rows_out.append({"q": item["q"], "hit": found, "answered": answered})
+    total = len(items) or 1
+    answerable = sum(1 for item in items if str(item.get("must") or "")) or 1
+    return {
+        "recall": hit / total,
+        "answer": answer / answerable,
+        "chars": chars / total,
+        "rows": rows_out,
     }
 
 
@@ -262,6 +308,12 @@ def main(argv: list[str]) -> int:
                 continue
             results[label] = evaluate(conn, items, wanted, model)
             print(render(label, results[label]))
+        if "三路" in results:
+            grouped = evaluate_groups(conn, items, ("fts", "cjk", "vec"), model)
+            print(
+                f"  组级 top{GROUP_LIMIT}  标注源命中={grouped['recall']:.3f}  "
+                f"答案在片段里={grouped['answer']:.3f}  平均 {grouped['chars']:.0f} 字"
+            )
     finally:
         conn.close()
 

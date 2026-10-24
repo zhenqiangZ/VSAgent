@@ -11,6 +11,8 @@
   const { fetchJson, formatTime, formatNumber } = window.vsWeb;
 
   const HEADER = { "X-VSA-Request": "1" };
+  // 与服务端的 `CHUNK_PAGE` 对齐。这里只决定「一次要多少」，服务端仍会夹到上限。
+  const CHUNK_PAGE = 40;
   const KIND_TEXT = { doc: "文献", web: "网页" };
   const DEPTH_TEXT = { full: "全文", summary: "仅摘要" };
   const STRUCTURE_TEXT = {
@@ -47,7 +49,8 @@
       <p class="lib-foot">
         删除只是挪进 <code>corpus/.trash/</code>，可以找回。上传先落进
         <code>corpus/inbox/</code>，点「入库」才切块、算向量；切块由应用那个进程做，
-        网页自己不写索引（独立运行的服务只能投递）。
+        网页自己不写索引（独立运行的服务只能投递）。点「切块」可以看索引里实际
+        切出来的文本。
       </p>
     </div>
 
@@ -62,12 +65,30 @@
         </div>
       </form>
     </dialog>
+
+    <dialog id="lib-chunks" class="lib-dialog lib-chunks">
+      <div class="lib-chunks-head">
+        <h3 id="lib-chunks-title"></h3>
+        <div class="lib-chunks-tools">
+          <span class="lib-chunks-count" id="lib-chunks-count"></span>
+          <button id="lib-chunks-prev" type="button">上一页</button>
+          <button id="lib-chunks-next" type="button">下一页</button>
+          <button id="lib-chunks-close" type="button" class="is-primary">关闭</button>
+        </div>
+      </div>
+      <p class="lib-chunks-note">这里是索引里那份文本，也就是检索实际看到的东西。</p>
+      <div class="lib-chunks-body" id="lib-chunks-body"></div>
+    </dialog>
   `;
 
   let root = null;
   let items = [];
   let dialogMode = "";
   let dialogItem = null;
+  // 切块面板的分页状态。`id` 是 `doc:xxx` / `web:xxx`，为空表示面板没开。
+  let chunksState = { id: "", total: 0, offset: 0, limit: CHUNK_PAGE };
+  // 请求序号：翻页点得快、或者关掉面板时旧响应才回来，靠它丢弃过期结果。
+  let chunksSeq = 0;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -130,15 +151,96 @@
     row.appendChild(el("td", "lib-time", formatTime(item.addedAt)));
 
     const actions = el("td", "lib-row-actions");
+    const chunks = el("button", "link-button", "切块");
+    chunks.type = "button";
+    chunks.addEventListener("click", () => openChunks(item));
     const rename = el("button", "link-button", "改名");
     rename.type = "button";
     rename.addEventListener("click", () => openDialog("rename", item));
     const remove = el("button", "link-button is-danger", "删除");
     remove.type = "button";
     remove.addEventListener("click", () => openDialog("delete", item));
-    actions.append(rename, remove);
+    actions.append(chunks, rename, remove);
     row.appendChild(actions);
     return row;
+  }
+
+  // ---- 切块面板 ----------------------------------------------------------
+
+  function pageText(item) {
+    // 网页来源没有页码（page=0），这里就不占位。
+    const start = item.page || 0;
+    const end = item.pageEnd || 0;
+    if (!start) return "";
+    return end && end !== start ? `p.${start}–${end}` : `p.${start}`;
+  }
+
+  function chunkNode(item) {
+    const box = el("article", "lib-chunk");
+    const head = el("div", "lib-chunk-head");
+    head.appendChild(el("span", "lib-chunk-no", `#${item.no}`));
+    if (item.section) head.appendChild(el("span", "lib-chunk-section", item.section));
+    const page = pageText(item);
+    if (page) head.appendChild(el("span", "lib-chunk-meta", page));
+    head.appendChild(el("span", "lib-chunk-meta", `${formatNumber(item.chars)} 字`));
+    box.appendChild(head);
+    box.appendChild(el("div", "lib-chunk-text", item.text));
+    return box;
+  }
+
+  function renderChunks(payload) {
+    const body = root.querySelector("#lib-chunks-body");
+    body.innerHTML = "";
+    const list = payload.items || [];
+    chunksState.total = payload.total || 0;
+    chunksState.offset = payload.offset || 0;
+    chunksState.limit = payload.limit || CHUNK_PAGE;
+
+    const from = list.length ? chunksState.offset + 1 : 0;
+    const to = chunksState.offset + list.length;
+    root.querySelector("#lib-chunks-count").textContent = chunksState.total
+      ? `${from}–${to} / ${formatNumber(chunksState.total)} 块`
+      : "0 块";
+
+    if (!list.length) {
+      // `reason` 来自服务端：索引没建 / 读不出来。这两种都不是「这份没有内容」。
+      body.appendChild(
+        el("p", "lib-chunks-empty", payload.reason || "这一份在索引里还没有切块，点「入库」之后再看。")
+      );
+    } else {
+      for (const item of list) body.appendChild(chunkNode(item));
+    }
+
+    root.querySelector("#lib-chunks-prev").disabled = chunksState.offset <= 0;
+    root.querySelector("#lib-chunks-next").disabled = to >= chunksState.total;
+    body.scrollTop = 0;
+  }
+
+  async function loadChunks(offset) {
+    if (!chunksState.id) return;
+    const seq = ++chunksSeq;
+    const body = root.querySelector("#lib-chunks-body");
+    body.innerHTML = "";
+    body.appendChild(el("p", "lib-chunks-empty", "正在读取切块…"));
+    root.querySelector("#lib-chunks-prev").disabled = true;
+    root.querySelector("#lib-chunks-next").disabled = true;
+    try {
+      const path = `/api/library/${encodeURIComponent(chunksState.id)}/chunks`;
+      const payload = await fetchJson(`${path}?offset=${offset}&limit=${chunksState.limit}`);
+      if (seq !== chunksSeq) return;
+      renderChunks(payload);
+    } catch (error) {
+      if (seq !== chunksSeq) return;
+      body.innerHTML = "";
+      body.appendChild(el("p", "lib-chunks-empty", `读取失败：${error.message}`));
+    }
+  }
+
+  function openChunks(item) {
+    chunksState = { id: item.id, total: item.chunks || 0, offset: 0, limit: CHUNK_PAGE };
+    root.querySelector("#lib-chunks-title").textContent = `${item.title}（${item.id}）`;
+    root.querySelector("#lib-chunks").showModal();
+    loadChunks(0);
   }
 
   function render(payload) {
@@ -373,13 +475,26 @@
       dialog.close("ok");
     });
 
+    const chunksDialog = container.querySelector("#lib-chunks");
+    container.querySelector("#lib-chunks-close").addEventListener("click", () => chunksDialog.close());
+    container.querySelector("#lib-chunks-prev").addEventListener("click", () => {
+      loadChunks(Math.max(0, chunksState.offset - chunksState.limit));
+    });
+    container.querySelector("#lib-chunks-next").addEventListener("click", () => {
+      loadChunks(chunksState.offset + chunksState.limit);
+    });
+    chunksDialog.addEventListener("close", () => {
+      chunksSeq += 1; // 让还在路上的响应作废
+      chunksState = { id: "", total: 0, offset: 0, limit: CHUNK_PAGE };
+    });
+
     try {
       await reload();
     } catch (error) {
       say(`读取语料库失败：${error.message}`, "warn");
     }
 
-    return { unmount() { root = null; } };
+    return { unmount() { chunksSeq += 1; root = null; } };
   }
 
   window.vsPages.library = { mount };

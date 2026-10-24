@@ -281,11 +281,17 @@ __main__.py → app.py ───────────────────
 `GET /api/sessions/<id>`、`GET /api/runs`，外加 `/runs/...` 静态与 `web_root` 静态。
 路径逃逸用 `resolve_within` 拒绝（403）。
 
-**S2 起网页端多了一组语料写入口**（`GET /api/library`、`POST /api/library/upload`、
-`POST /api/library/ingest`、`POST /api/library/<kind>:<id>/{rename,delete}`）。章程因此
-从「只读」改成「查看只读 + 语料投递与管理」：网页端自己只往 `corpus/inbox/` 落文件、
-只写 `labels.json` 的显示名、只把目录挪进 `corpus/.trash/`，**从不直接写索引**。
-索引只以 `mode=ro` 打开，取块数与向量覆盖。
+**S2 起网页端多了一组语料入口**（`GET /api/library`、`GET /api/library/<kind>:<id>/chunks`、
+`POST /api/library/upload`、`POST /api/library/ingest`、
+`POST /api/library/<kind>:<id>/{rename,delete}`）。章程因此从「只读」改成「查看只读 +
+语料投递与管理」：网页端自己只往 `corpus/inbox/` 落文件、只写 `labels.json` 的显示名、
+只把目录挪进 `corpus/.trash/`，**从不直接写索引**。索引只以 `mode=ro` 打开，取块数、
+向量覆盖与切块正文。
+
+**切块面板给的是索引里那一份**，不是按原件重切一遍——用户要看的就是「检索实际看到的
+东西」，重切出来的那份解释不了「为什么命中了别的段落」。一份长文献几百块，所以
+`offset` / `limit` 分页（默认 40、上限 100，客户端说什么都夹到上限）；索引还没建时
+回空表加一句 `reason`，不是 500。
 
 **「入库」是转交，不是自己写**：应用里网页服务就是 TUI 进程里的一个线程，
 `/api/library/ingest` 把 inbox 里的文件交给装配时注入的 `ingest` 回调（应用传

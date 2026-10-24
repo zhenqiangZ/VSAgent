@@ -9,6 +9,8 @@
 
 S2 起还有一组语料库判据：上传 / 改名 / 删除，以及三类「本地无鉴权」必须挡住的东西
 ——跨站 POST、路径穿越、超限。语料根指到 `.probe/web-corpus/`，不碰真实语料。
+另有一组切块判据（分页接续、翻过头、`limit` 夹取、删掉的源、索引未建），
+它们排在语料组之后，因为那一组会把其中一份删掉。
 
 **服务跑在包内**（`opencode_tui/core/web/`）。判据原先起的是 `tools/serve_web.py`
 这个独立脚本，现在起的是包内服务——那个脚本已经不发请求了，它只做命令行参数解析，
@@ -460,6 +462,36 @@ def prepare_corpus():
         encoding="utf-8",
     )
 
+    # 第三份是**长文献**：45 节，切块数必然多于一页。切块面板的分页要有东西可翻，
+    # 否则「下一页」那几条判据永远只测到一张空表。
+    long_doc = CORPUS_DIR / "doc" / "cccccccccc"
+    long_doc.mkdir(parents=True)
+    sections = []
+    for section_no in range(1, 46):
+        body = " ".join(
+            f"Paragraph {section_no}.{step} discusses epidermal growth factor receptor signalling "
+            f"in non-small cell lung cancer."
+            for step in range(1, 13)
+        )
+        sections.append(f"## Section {section_no}\n\n{body}\n")
+    long_text = "# 长文献\n\n" + "\n".join(sections)
+    (long_doc / "source.md").write_text(long_text, encoding="utf-8")
+    (long_doc / "text.jsonl").write_text(
+        json.dumps({"page": 1, "text": long_text}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (long_doc / "meta.json").write_text(
+        json.dumps(
+            {
+                "id": "cccccccccc", "kind": "doc", "title": "长文献",
+                "file": "source.md", "pages": 1, "structure": "markdown",
+                "chars": len(long_text), "depth": "full", "added_at": 3.0,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
     (CORPUS_DIR / "inbox").mkdir(parents=True, exist_ok=True)
     index.reindex(CORPUS_DIR)
     return CORPUS_DIR
@@ -475,7 +507,9 @@ def run_library_checks(base):
     items = payload.get("items", [])
     check(
         "语料列表与目录一致",
-        status == 200 and {item["id"] for item in items} == {"doc:aaaaaaaaaa", "web:bbbbbbbbbb"},
+        status == 200
+        and {item["id"] for item in items}
+        == {"doc:aaaaaaaaaa", "web:bbbbbbbbbb", "doc:cccccccccc"},
         f"接口 {[item['id'] for item in items]}",
     )
     check(
@@ -628,6 +662,96 @@ def run_library_checks(base):
 
     status, _ = request(f"{base}/api/library/doc:aaaaaaaaaa/delete")
     check("GET 写接口不会落到静态文件或某个默认动作", status == 404, f"{status}")
+
+
+def run_chunk_checks(base):
+    """切块面板：分页、边界、非法标识，以及「索引没建时给空表」。
+
+    这一组在 `run_library_checks` **之后**跑：那一组会把 `web:bbbbbbbbbb` 删掉，
+    正好用来核对「删掉的源查不到切块」——切块与列表必须同时消失，否则页面上
+    点得进一个已经不在的源。
+    """
+    from opencode_tui.core.web.routes import CHUNK_PAGE, CHUNK_PAGE_MAX, chunks_payload
+
+    status, payload = request(f"{base}/api/library/doc:cccccccccc/chunks")
+    items = payload.get("items") or []
+    check(
+        "切块默认给一页，并带上总块数",
+        status == 200
+        and payload.get("total", 0) > CHUNK_PAGE
+        and len(items) == CHUNK_PAGE
+        and payload.get("offset") == 0
+        and payload.get("limit") == CHUNK_PAGE,
+        f"{status} total={payload.get('total')} 本页 {len(items)} 块",
+    )
+    check(
+        "每块都有编号、正文，字数与正文一致",
+        all(
+            item["no"] >= 1 and item["text"] and item["chars"] == len(item["text"])
+            for item in items
+        ),
+        f"首块 #{items[0]['no']} {items[0]['chars']} 字" if items else "一块都没有",
+    )
+    check(
+        "块按原文顺序排（编号从 1 连续递增）",
+        [item["no"] for item in items] == list(range(1, len(items) + 1)),
+        f"{[item['no'] for item in items][:5]}…",
+    )
+
+    status, second = request(f"{base}/api/library/doc:cccccccccc/chunks?offset={CHUNK_PAGE}")
+    tail = second.get("items") or []
+    check(
+        "第二页从上一页之后接着排，不重不漏",
+        status == 200
+        and bool(tail)
+        and tail[0]["no"] == CHUNK_PAGE + 1
+        and second.get("total") == payload.get("total"),
+        f"{status} 首块 #{tail[0]['no'] if tail else '—'} total={second.get('total')}",
+    )
+
+    status, beyond = request(f"{base}/api/library/doc:cccccccccc/chunks?offset=100000")
+    check(
+        "翻过头给空表而不是报错，总数照旧",
+        status == 200
+        and beyond.get("items") == []
+        and beyond.get("total") == payload.get("total"),
+        f"{status} items={beyond.get('items')} total={beyond.get('total')}",
+    )
+
+    status, capped = request(f"{base}/api/library/doc:cccccccccc/chunks?limit=100000")
+    check(
+        "limit 被夹到上限，不按客户端说的给",
+        status == 200 and capped.get("limit") == CHUNK_PAGE_MAX,
+        f"{status} limit={capped.get('limit')}",
+    )
+
+    status, body = request(f"{base}/api/library/doc:ZZZ/chunks")
+    check(
+        "切块接口的 id 也不解释路径（形状不对就是 400）",
+        status == 400 and "doc:xxxxxxxxxx" in body.get("error", ""),
+        f"{status} {body.get('error', '')}",
+    )
+
+    status, body = request(f"{base}/api/library/web:bbbbbbbbbb/chunks")
+    check(
+        "删掉的源查不到切块（列表与切块同时消失）",
+        status == 404,
+        f"{status} {body.get('error', '')}",
+    )
+
+    # 索引还没建：`open_readonly` 返回 None，这一层要给空表加一句原因，而不是 500。
+    empty = PROJECT_ROOT / ".probe" / "web-corpus-empty"
+    shutil.rmtree(empty, ignore_errors=True)
+    empty.mkdir(parents=True)
+    try:
+        payload = chunks_payload(empty, "doc", "aaaaaaaaaa")
+        check(
+            "索引还没建时给空表并说明原因",
+            payload["items"] == [] and payload["total"] == 0 and "索引" in payload.get("reason", ""),
+            f"{payload}",
+        )
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
 
 
 def run_ingest_checks(base, corpus_dir):
@@ -852,6 +976,7 @@ def main():
     try:
         run_checks(base, state_path, runs_dir, link_session)
         run_library_checks(base)
+        run_chunk_checks(base)
         run_ingest_checks(base, CORPUS_DIR)
         run_concurrency_check(base, state_path, pristine)
         run_broken_state_check(base, state_path, pristine)

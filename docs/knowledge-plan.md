@@ -37,7 +37,7 @@
 | torch | 主仓一行不能 import（`check_chemistry_gate` 会炸） | `tests/` |
 | 本地向量 | fastembed 0.9（onnxruntime + tokenizers，无 torch）**清单里没有** `intfloat/multilingual-e5-small`；改用 `paraphrase-multilingual-MiniLM-L12-v2`（384d，255MB） | fastembed 清单 + 实测 |
 | 前缀 | 默认模型**不需要**前缀；E5 系列要 `passage: ` / `query: `，漏了不报错只掉点（`embed._prefixes` 按模型名自动加） | 模型文档 |
-| 目录定位 | `runs_dir()` 按**代码位置**定位到仓根，不按启动目录 | `domain/export.py:717` |
+| 目录定位 | `corpus/` 与 `runs/` 的根由 `core/paths.py:project_root()` 定：源码运行时是仓根，打包后是**启动目录**（不能按 `__file__` 算，冻结后那是解包临时目录） | `core/paths.py` |
 
 前两条决定了"必须自己维护语料"，第四条决定了"向量只能用本地模型"。
 

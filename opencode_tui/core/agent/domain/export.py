@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ...paths import project_root
 from ..ledger import (
     ArtifactHandle,
     LigandSetHandle,
@@ -715,7 +716,7 @@ PORT_TRIES = 20
 
 
 def runs_dir() -> Path:
-    """运行目录的根：**仓根**下的 `runs/`，与服务的默认扫描位置一致。
+    """运行目录的根：**项目根**下的 `runs/`，与服务的默认扫描位置一致。
 
     **两边必须指向同一个地方**：服务按目录名扫描，写在这里的目录它才看得到；
     换一处，网页上就是空的，而写盘那一步又是「成功」的——用户看到的是
@@ -729,13 +730,11 @@ def runs_dir() -> Path:
 
     定案用仓根：仓库里已有的两个演示运行（`runs/1iep-demo`、`runs/1iep-molstar`）
     在那，服务的默认值也在那，要改的只有这一处。
+
+    打包后这个根跟着可执行文件走（`paths.project_root()`），与 `corpus/` 同一个
+    判断：按 `__file__` 算会落到解包临时目录里，导出的运行重启即消失。
     """
-    return _repo_root() / "runs"
-
-
-def _repo_root() -> Path:
-    """仓根：`export.py` 位于 `<repo>/opencode_tui/core/agent/domain/` 下。"""
-    return Path(__file__).resolve().parents[4]
+    return project_root() / "runs"
 
 
 def _slug(text: str, *, fallback: str = "run") -> str:

@@ -1,6 +1,7 @@
 """本地语料库的目录与落盘（S0：只落原件，不建索引）。
 
-语料放在**仓根**的 `corpus/` 下，按代码位置定位而不是启动目录——与 `runs/` 同一种
+语料放在**项目根**的 `corpus/` 下（见 `paths.project_root()`：源码运行时是仓根，
+打包后是可执行文件所在目录），按代码位置定位而不是启动目录——与 `runs/` 同一种
 做法。从别的目录启动应用时，语料仍然是同一份；换成启动目录定位的话，用户会看到
 「昨天存的文献今天不见了」，而盘上其实还在。
 
@@ -28,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from .paths import project_root
 
 __all__ = [
     "CONTENT_FILE",
@@ -87,12 +90,13 @@ class WebPage:
 
 
 def corpus_root() -> Path:
-    """仓根下的 `corpus/`。
+    """项目根下的 `corpus/`。
 
-    `core/corpus.py` 位于 `<repo>/opencode_tui/core/`，`parents[2]` 就是仓根。
-    与 `domain/export.py:_repo_root()` 指向同一个地方，只是层级不同。
+    根的判断在 `paths.project_root()`：源码运行时是仓根，打包后是可执行文件所在
+    目录。**打包那一支不能按 `__file__` 算**——冻结后它指向解包出来的临时目录，
+    写进去的文献与索引在退出时一起消失（见该函数的说明）。
     """
-    return Path(__file__).resolve().parents[2] / "corpus"
+    return project_root() / "corpus"
 
 
 def web_dir(source_id: str) -> Path:

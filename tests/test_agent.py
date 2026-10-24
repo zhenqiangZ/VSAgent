@@ -12669,6 +12669,47 @@ async def check_embed() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_paths() -> None:
+    """数据目录的根：源码运行时是仓根，打包后跟启动目录走。
+
+    这一条防的是「打包后写进解包临时目录」：那种错每一步都成功——文献落了盘、
+    索引也建了、网页上当场能查——只有重启之后才发现 `corpus/` 与 `runs/` 空
+    了（onefile 退出即删）。原先 `corpus_root()` / `runs_dir()` 都按 `__file__`
+    算，正好落在这里面。
+    """
+    from opencode_tui.core.agent.domain.export import runs_dir
+    from opencode_tui.core.corpus import corpus_root
+    from opencode_tui.core.paths import project_root
+
+    check(project_root() == ROOT, f"源码运行时项目根是仓根：{project_root()}")
+    check(corpus_root() == ROOT / "corpus", f"语料根：{corpus_root()}")
+    check(runs_dir() == ROOT / "runs", f"运行目录根：{runs_dir()}")
+
+    frozen_cwd = Path(tempfile.mkdtemp(prefix="vsa-paths-")).resolve()
+    had_frozen = hasattr(sys, "frozen")
+    old_frozen = getattr(sys, "frozen", None)
+    old_executable = sys.executable
+    old_cwd = os.getcwd()
+    sys.frozen = True
+    sys.executable = "/opt/vsagent/bin/opencode-tui"
+    os.chdir(frozen_cwd)
+    try:
+        check(
+            project_root() == frozen_cwd,
+            f"打包后项目根是启动目录：{project_root()}",
+        )
+        check(corpus_root() == frozen_cwd / "corpus", f"语料跟着这个根：{corpus_root()}")
+        check(runs_dir() == frozen_cwd / "runs", f"运行目录也跟着：{runs_dir()}")
+    finally:
+        os.chdir(old_cwd)
+        if had_frozen:
+            sys.frozen = old_frozen
+        else:
+            del sys.frozen
+        sys.executable = old_executable
+        shutil.rmtree(frozen_cwd, ignore_errors=True)
+
+
 # 检查组：名字给 `--only` 过滤用，函数一律零参数（同步与异步混着，调用处看返回值）。
 # 名字取函数名里有意义的那一段，`--only permission` 能直接命中。
 GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
@@ -12681,6 +12722,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("hooks-config", check_hook_config),
     ("hooks-runner", check_hook_runner),
     ("workspace", check_workspace),
+    ("paths", check_paths),
     ("ledger", check_ledger),
     ("products", check_products),
     ("tool-context", check_tool_context),

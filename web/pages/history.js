@@ -300,8 +300,26 @@
     for (const node of roots) appendNode(node, 0);
 
     if (!shown) {
-      list.appendChild(el("li", "empty-hint", "没有匹配的会话。"));
+      // 两种空不是一回事：一个是「这个库里确实没有」，一个是「服务没答上来」。
+      // 后者由 `showListError` 画，这里只负责前者。
+      list.appendChild(
+        el("li", "empty-hint", needle ? "没有匹配的会话。" : "还没有会话。")
+      );
     }
+  }
+
+  function showListError(message) {
+    // 读失败时列表不能只是空白：空白和「确实没有会话」看起来一模一样，
+    // 用户会以为是历史丢了。
+    const list = root.querySelector("#session-list");
+    list.innerHTML = "";
+    const item = el("li", "empty-hint", `读取会话失败：${message}`);
+    const retry = el("button", "link-button", "重试");
+    retry.type = "button";
+    retry.addEventListener("click", () => loadSessions());
+    item.appendChild(document.createElement("br"));
+    item.appendChild(retry);
+    list.appendChild(item);
   }
 
   function renderHead(session) {
@@ -383,15 +401,26 @@
     const body = root.querySelector("#session-body");
     body.innerHTML = "";
     body.appendChild(el("p", "empty-hint", "正在读取会话…"));
-    const session = await fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}`);
-    if (activeId !== sessionId) return;
-    renderDetail(session);
+    try {
+      const session = await fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}`);
+      if (activeId !== sessionId) return;
+      renderDetail(session);
+    } catch (error) {
+      if (activeId !== sessionId) return;
+      body.innerHTML = "";
+      body.appendChild(el("p", "empty-hint", `读取这个会话失败：${error.message}`));
+    }
   }
 
   async function loadSessions() {
-    const payload = await fetchJson("/api/sessions");
-    sessions = payload.sessions;
-    renderList();
+    try {
+      const payload = await fetchJson("/api/sessions");
+      sessions = payload.sessions || [];
+      renderList();
+    } catch (error) {
+      sessions = [];
+      showListError(error.message);
+    }
   }
 
   async function mount(container, param) {

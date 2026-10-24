@@ -761,7 +761,7 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 .lib-stats { color: var(--muted); font-size: 12.5px; }
 .lib-actions { display: flex; gap: 8px; }
 
-.lib-actions button, .lib-dialog-actions button {
+.lib-actions button, .lib-dialog-actions button, .lib-chunks-tools button {
   padding: 6px 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
@@ -771,25 +771,25 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
   cursor: pointer;
   box-shadow: var(--shadow-sm);
 }
-.lib-actions button:hover, .lib-dialog-actions button:hover {
+.lib-actions button:hover, .lib-dialog-actions button:hover, .lib-chunks-tools button:hover {
   border-color: var(--accent);
   color: var(--accent-strong);
 }
-.lib-actions button.is-primary, .lib-dialog-actions button.is-primary {
+.lib-actions button.is-primary, .lib-dialog-actions button.is-primary, .lib-chunks-tools button.is-primary {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
 }
-.lib-actions button.is-primary:hover, .lib-dialog-actions button.is-primary:hover {
+.lib-actions button.is-primary:hover, .lib-dialog-actions button.is-primary:hover, .lib-chunks-tools button.is-primary:hover {
   background: var(--accent-strong);
   color: #fff;
 }
 /* 入库在跑、或者 inbox 空着时按钮是禁用的：不给悬停高亮，免得看起来还能点。 */
-.lib-actions button:disabled {
+.lib-actions button:disabled, .lib-chunks-tools button:disabled {
   opacity: 0.5;
   cursor: default;
 }
-.lib-actions button:disabled:hover {
+.lib-actions button:disabled:hover, .lib-chunks-tools button:disabled:hover {
   border-color: var(--line);
   color: var(--text);
 }
@@ -898,3 +898,51 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 }
 .lib-dialog input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 .lib-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ---------- 切块面板 ---------- */
+/* 比改名对话框宽：一块最多 2000 字，窄了读不动。正文自己滚，标题与翻页固定。 */
+.lib-chunks[open] {
+  display: flex;
+  flex-direction: column;
+  /* 窄屏上 92vw 会小于 `.lib-dialog` 的 min-width，这里放开，别撑出屏幕。 */
+  min-width: 0;
+  width: min(920px, 92vw);
+  max-width: 920px;
+  max-height: 84vh;
+  padding: 16px 20px 18px;
+}
+.lib-chunks-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.lib-chunks-head h3 { margin: 0; font-size: 15px; line-height: 1.5; word-break: break-word; }
+.lib-chunks-tools { display: flex; align-items: center; gap: 8px; }
+.lib-chunks-count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.lib-chunks-note { margin: 6px 0 10px; color: var(--faint); font-size: 12px; }
+.lib-chunks-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.lib-chunk { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.lib-chunk:last-child { border-bottom: none; }
+.lib-chunk-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 5px; }
+.lib-chunk-no { font-family: var(--mono); font-size: 11.5px; color: var(--accent-strong); }
+.lib-chunk-section { font-size: 12.5px; font-weight: 600; }
+.lib-chunk-meta { font-size: 11.5px; color: var(--faint); }
+.lib-chunk-text {
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--muted);
+  /* 切块保留原件的换行：这里给的是索引里那份原文，重排会看不出段落边界。 */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.lib-chunks-empty { padding: 18px 0; color: var(--faint); font-size: 12.5px; text-align: center; }

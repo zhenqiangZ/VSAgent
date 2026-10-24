@@ -35,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tomllib import TOMLDecodeError
 from typing import Any
-from urllib.parse import unquote, urlsplit, urlparse
+from urllib.parse import parse_qs, unquote, urlsplit, urlparse
 
 from .. import corpus, corpus_config, index
 from ..session_manager import SessionManager
@@ -62,6 +62,13 @@ REQUEST_HEADER = "X-VSA-Request"
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 """一次上传请求体的上限（含所有文件）。单文件 50MB 对文献够用；再多请分批。"""
+
+CHUNK_PAGE = 40
+"""切块列表一页多少块。一个 200 页的 PDF 可能有几百块，整包发出去是几 MB 的
+JSON；40 块约一屏半，翻页也不费事。"""
+
+CHUNK_PAGE_MAX = 100
+"""一页最多给多少块。再大就回到「一次几 MB」，而页面也读不完。"""
 
 MAX_JSON_BYTES = 64 * 1024
 """改名这类 JSON 请求体的上限。给得宽是因为标题可能很长，但没必要无上限。"""
@@ -320,6 +327,51 @@ def library_payload(root: Path) -> dict:
             # 浏览器里只显示，不能改：改配置是写操作（方案稿 §10）。
             "source": settings.source,
         },
+    }
+
+
+def chunks_payload(
+    root: Path, kind: str, source_id: str, *, offset: int = 0, limit: int = CHUNK_PAGE
+) -> dict:
+    """一份源的切块。**只读**：索引以 `mode=ro` 打开，取不到就给空表。
+
+    给的是**索引里那一份**，不是按原件重新切一遍：用户要看的就是「检索看到的
+    东西」。重新切会得到另一份（哪怕这次逐字相同），而两边的差异恰恰是最该被
+    看见的——重切出来的那份不会解释为什么检索命中了别的段落。
+    """
+    source = f"{kind}:{source_id}"
+    conn = index.open_readonly(root)
+    if conn is None:
+        return {"items": [], "total": 0, "offset": offset, "limit": limit, "reason": "索引还没建"}
+    try:
+        total = int(
+            conn.execute("SELECT COUNT(*) FROM chunks WHERE source_id = ?", (source,)).fetchone()[0]
+        )
+        rows = conn.execute(
+            "SELECT chunk_no, section, level, page, page_end, chars, text FROM chunks "
+            "WHERE source_id = ? ORDER BY chunk_no LIMIT ? OFFSET ?",
+            (source, limit, offset),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - 库坏了不该让整页 500
+        return {"items": [], "total": 0, "offset": offset, "limit": limit, "reason": "索引读不出来"}
+    finally:
+        conn.close()
+    return {
+        "items": [
+            {
+                "no": int(row["chunk_no"]),
+                "section": str(row["section"] or ""),
+                "level": int(row["level"]),
+                "page": int(row["page"]),
+                "pageEnd": int(row["page_end"]),
+                "chars": int(row["chars"]),
+                "text": str(row["text"]),
+            }
+            for row in rows
+        ],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
     }
 
 
@@ -856,6 +908,36 @@ def _library(request: "WebHandler", _rest: str) -> dict:
     return payload
 
 
+def _query_int(query: dict, name: str, default: int, low: int, high: int) -> int:
+    """从查询串里取一个整数并夹取。写错就当没给——分页参数不该让请求失败。"""
+    raw = (query.get(name) or [""])[0]
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(value, high))
+
+
+def _library_chunks(request: "WebHandler", rest: str) -> dict:
+    """`<kind>:<id>/chunks?offset=&limit=`：只读地把切块列出来。
+
+    给的是索引里那份文本（检索看到的就是它），不是按原件重切一遍。分页是为了
+    不让一次响应变成几 MB——切块本身没有大小上限，一份长文献几百块很正常。
+    """
+    kind, source_id = _item_identity(rest, "chunks")
+    directory = _source_directory(request.server.corpus_root, kind, source_id)
+    if not (directory / corpus.META_FILE).is_file():
+        raise HttpError(404, f"没有这一份：{kind}#{source_id}")
+    query = parse_qs(urlsplit(request.path).query)
+    offset = _query_int(query, "offset", 0, 0, 1_000_000)
+    limit = _query_int(query, "limit", CHUNK_PAGE, 1, CHUNK_PAGE_MAX)
+    payload = chunks_payload(
+        request.server.corpus_root, kind, source_id, offset=offset, limit=limit
+    )
+    payload["id"] = f"{kind}:{source_id}"
+    return payload
+
+
 def _library_item_action(request: "WebHandler", rest: str) -> dict:
     """`<kind>:<id>/rename` 与 `<kind>:<id>/delete` 的分发。
 
@@ -879,6 +961,7 @@ SPEC = RouteSpec(
         # 放在前缀路由之前：`/api/library/ingest` 也会被 `/api/library/` 前缀匹配到，
         # 那条是给 `<kind>:<id>/<action>` 用的，顺序反了会先撞上它。
         JsonRoute("/api/library/ingest", _library_ingest, method="POST"),
+        JsonRoute("/api/library/", _library_chunks, prefix=True, method="GET"),
         JsonRoute("/api/library/", _library_item_action, prefix=True, method="POST"),
     )
 )

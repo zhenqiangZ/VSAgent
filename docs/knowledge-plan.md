@@ -403,6 +403,7 @@ S3 实测体积与启动时间；超 +80MB 改成「exe 内不带，用户另装
 | 方法 | 路径 | 作用 |
 |---|---|---|
 | GET | `/api/library` | 列表（标题、类型、页数、切分方式、向量覆盖、状态、占用）+ 待入库数 |
+| GET | `/api/library/<kind>:<id>/chunks` | 一份源的切块，分页（`offset` / `limit`），**只读** |
 | POST | `/api/library/upload` | `multipart`，落 `corpus/inbox/`，**不写索引** |
 | POST | `/api/library/ingest` | 把 inbox 里的文件**转交**给应用进程入库，回 202 |
 | POST | `/api/library/<kind>:<id>/rename` | 只写 `labels.json` |
@@ -423,6 +424,12 @@ S3 实测体积与启动时间；超 +80MB 改成「exe 内不带，用户另装
 同进程内的两处写（模型的 `import_documents` 与网页的入库）由 `index.WRITE_LOCK`
 串行化——SQLite 只允许一个写者，靠 `timeout` 等会让其中一方白等十秒。索引库开 WAL，
 读列表不会被入库挡住。
+
+**切块面板给的是索引里那一份**，不是按原件重切一遍：用户要看的就是「检索实际看到的
+东西」。重切会得到另一份，而两边的差异恰恰是最该被看见的——重切出来的那份解释不了
+「为什么检索命中了别的段落」。一份长文献几百块，整包发出去是几 MB 的 JSON，所以
+`offset` / `limit` 分页，默认 40、上限 100（客户端说什么都夹到上限）。索引还没建时
+给空表加一句 `reason`，不是 500。
 
 必须防的（都要进 `tools/check_web_api.py`）：
 
@@ -534,6 +541,9 @@ S0 先做：纯增量、无写入风险、当天可验收。S1 是真正的工�
   应用进程入库（回 202、后台线程、页面轮询进度），独立运行的服务回 503。入库与
   模型调 `import_documents` 走同一个 `ingest_files`，同进程两处写由
   `index.WRITE_LOCK` 串行化，索引库开 WAL。`tools/check_web_api.py` 50 条全过。
+- 网页端看切块（同上）：`GET /api/library/<kind>:<id>/chunks` 只读列出索引里那份切块，
+  行内「切块」按钮打开面板，一页 40 块、上一页/下一页。判据补到 59 条（分页接续、
+  翻过头、`limit` 夹取、非法 id、删掉的源、索引未建）。
 
 ### 文件清单
 

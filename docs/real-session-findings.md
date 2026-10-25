@@ -95,13 +95,29 @@ load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出�
 **易变区**：日期进了 `PREFIX` 就每天击穿一次缓存，还会红掉
 「PREFIX 连续两步字节相等」那条判据。
 
-## 未复现的怀疑（别当成证据用）
+## 已修 · 重试语义一直没接线
 
-`rsearch.py:253` / `:320`、`complexes.py:241` / `:332` 四处 `except Exception`
-会把 `http.RetryableToolError` 吞成 `SearchError`，循环层的重试因此不启动。
-写法本身可疑（瞬时失败被当成永久失败），但**这两次会话里没有证据**触发过它——
-第一次记的「瞬时失败」是误判，见 F1。要动它得连 `SearchError` 那条
-「不重试到底」的设计一起改，先留着。
+`RetryableToolError` 的 docstring 写着「与 `ToolError` 分开，是为了让重试逻辑只重试
+这一类」，但 `loop.py` 的 `_execute_tool` 用 `except ToolError` 把它一起接住了——
+**工具层一次都不重试**，那个标签等于白写。四处 `except Exception`
+（`rsearch.py:253` / `:320`、`complexes.py:241` / `:332`）连标签都吃掉。
+这两次会话里没有证据触发过它，但它与 F1 是同一个病：**说好要重试的东西没人重试**。
+
+2026-10-25 接上：
+
+- 循环层加 `except RetryableToolError`，重试 `MAX_TOOL_RETRIES = 1` 次，间隔用已有的
+  `RETRY_DELAYS[0]`，界面发 `PartType.RETRY`（与模型请求重试同一个类型）。
+- **只重试 `execute`**，不重跑权限与钩子：那两步是本地判定，用户已经点过允许，
+  重跑只会把同一个问题问第二遍。
+- 四处 `except Exception` 前补 `except RetryableToolError: raise`。
+- 重试用尽的文案写明「不是参数错、不要用 bash 自己实现、不要换数据源绕过」——
+  最后半句正是第 1 次会话缺的那句。
+- 判据：`tests/test_agent.py --only tool-retry`，13 条，含「普通 `ToolError` 不重试」
+  与「可重试错误能穿出 domain 层」。
+
+为什么工具层只重试 1 次而不是 2 次（模型请求那层是 2）：一次工具调用的超时本身就有
+几十秒，重试两次等于把一次网络抖动拖成三倍等待；工具失败之后模型还有别的路可走，
+一次就够把「抖了一下」与「真的不通」分开。
 
 ## 不需要改的（正面证据）
 
@@ -118,6 +134,7 @@ load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出�
 
 | 顺序 | 修什么 | 依据 | 风险 |
 | --- | --- | --- | --- |
+| — | 重试接线（**已做**，见上一节） | 说好要重试的东西没人重试 | 已补 `tool-retry` 判据 |
 | 1 | F1-1 `load_tools` 减去禁用清单 | 它在**主动说谎**，模型只是信了 | 要加一个注入通道；判据可确定性写 |
 | 2 | F1-2 禁用文案不再教绕道 | 20 步里至少一半是「请改用别的办法」买来的 | 纯文案，但有 3 个工具受影响，要一起看 |
 | 3 | F3 产物索引 | 猜错 handle 是可复现的 | 无；纯增一层渲染 |

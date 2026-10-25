@@ -161,7 +161,12 @@ __main__.py → app.py ───────────────────
 
 - `loop.py` — `AgentLoop` 是唯一的驱动，界面只认它的 `stream_reply / run_bash / cancel`。
   它**不维护第二份历史**：每一步从 `Session` 现场重建模型消息。硬上限
-  `MAX_STEPS=24` / `MAX_STOP_RETRIES=2` / `MAX_RETRIES=2` / `MAX_FAILED_STREAK=3`。
+  `MAX_STEPS=24` / `MAX_STOP_RETRIES=2` / `MAX_RETRIES=2` / `MAX_TOOL_RETRIES=1` /
+  `MAX_FAILED_STREAK=3`。**`RetryableToolError` 只在工具层重试 1 次**（模型请求那层是 2）：
+  一次调用的超时就有几十秒，重试两次会把一次抖动拖成三倍等待。重试只包 `execute`，
+  不重跑权限与钩子；重试用尽的文案要写清「不是参数错、不要用 bash 自己实现」——
+  否则模型会绕道自建客户端（实测一次误判烧掉 20 步）。domain 层不许用
+  `except Exception` 把它包成永久失败，`tool-retry` 组盯着这一条。
 - `tools.py` — `Tool` ABC + `ToolRegistry` + 五个内核文件工具（bash/read/write/patch/grep）
   + `read_turn`（按 `turn N` 取回被归档/被移出的原文，会话由内核注入）
   与 `ToolSpec` / `ToolResult` / `ToolError` / `RetryableToolError` / `argument_error` 校验器。

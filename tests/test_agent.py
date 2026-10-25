@@ -12354,6 +12354,151 @@ async def check_tool_family() -> None:
     )
 
 
+class FlakyTool(Tool):
+    """前几次抛可重试故障，之后成功。验循环层的重试，不必连网。"""
+
+    spec = ToolSpec(
+        name="flaky",
+        description="前几次抛可重试故障",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise RetryableToolError("连接失败（ConnectError）")
+        return ToolResult(output="第二次成了")
+
+
+class BrokenTool(Tool):
+    """总是抛普通 `ToolError`（参数写错、依赖没装那类），用来验「不该重试」。"""
+
+    spec = ToolSpec(
+        name="broken",
+        description="总是报错",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        raise ToolError("参数写错了")
+
+
+async def check_tool_retry() -> None:
+    """瞬时故障自动重试一次；重试用尽要说清「不是参数错」，并且拦住绕道。
+
+    `RetryableToolError` 的 docstring 一直写着「为了让重试逻辑只重试这一类」，
+    但循环层原先用 `except ToolError` 把它一起接住了——工具层一次都不重试，
+    那个标签等于白写。这一组盯的就是这条：分档要真的分档。
+    """
+    from opencode_tui.core.agent.domain import complexes as complexes_module  # noqa: E402
+    from opencode_tui.core.agent.domain import http as http_module  # noqa: E402
+    from opencode_tui.core.agent.domain import rsearch as rsearch_module  # noqa: E402
+
+    config = ProviderConfig(base_url="http://127.0.0.1:1", api_key="x", model="fake")
+    bus = EventBus()
+
+    async def run_once(tool: Tool) -> tuple[Message, Part]:
+        registry = ToolRegistry()
+        registry.register(tool)
+        loop = AgentLoop(
+            bus,
+            SilentProvider(),  # type: ignore[arg-type]
+            registry,
+            config,
+            context_window=200_000,
+            workspace_root=WORKSPACE_FIXTURE,
+            policy=PermissionPolicy(default_ask=frozenset()),
+        )
+        session = Session(title="重试")
+        session.add_message(
+            Message(role="user", parts=[Part(type=PartType.TEXT, text="跑一下")])
+        )
+        answer = Message(role="assistant", session_id=session.id)
+        session.add_message(answer)
+        call = Part(
+            type=PartType.TOOL,
+            tool_name=tool.spec.name,
+            tool_status=ToolStatus.PENDING,
+            tool_input={},
+        )
+        answer.add_part(call)
+        await loop._execute_tool(session, answer, call)
+        return answer, call
+
+    # ---- 一、抖一下就好的那种：重试一次就过，界面上看得见 ----
+    flaky = FlakyTool(failures=1)
+    answer, call = await run_once(flaky)
+    check(flaky.calls == 2, f"瞬时故障重试了一次：调了 {flaky.calls} 次")
+    check(call.tool_status is ToolStatus.COMPLETED, f"重试之后算成功：{call.tool_status}")
+    check(call.tool_output == "第二次成了", f"用的是重试那一次的结果：{call.tool_output}")
+    check(
+        any(part.type is PartType.RETRY for part in answer.parts),
+        "重试在界面上留痕（与模型请求重试同一个 Part 类型）",
+    )
+
+    # ---- 二、一直不通：只重试一次，然后失败，并且拦着它自己造一个 ----
+    dead = FlakyTool(failures=99)
+    answer, call = await run_once(dead)
+    check(dead.calls == 2, f"重试有上限，不是无限重试：调了 {dead.calls} 次")
+    check(call.tool_status is ToolStatus.FAILED, f"重试用尽算失败：{call.tool_status}")
+    check("瞬时故障" in call.tool_output, f"说清是瞬时故障而不是参数错：{call.tool_output[:80]}")
+    check(
+        "bash" in call.tool_output and "不要" in call.tool_output,
+        "明确拦住「用 bash 自己实现一遍」这条路（实测那次烧了 20 步）",
+    )
+
+    # ---- 三、参数错这类不许重试：重试多少次都一样，白等 ----
+    broken = BrokenTool()
+    _, call = await run_once(broken)
+    check(broken.calls == 1, f"普通 ToolError 不重试：调了 {broken.calls} 次")
+    check("参数写错了" in call.tool_output, f"原文回给模型：{call.tool_output}")
+
+    # ---- 四、domain 层不许把「可重试」包成「这次没搜成」 ----
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RetryableToolError("接口暂时不可用（HTTP 503）")
+
+    def raises_retryable(call_it: Any) -> str:
+        try:
+            call_it()
+        except RetryableToolError as error:
+            return f"ok {error}"
+        except Exception as error:  # noqa: BLE001 - 包成 SearchError / ComplexError 就算失败
+            return f"WRAPPED {type(error).__name__}: {error}"
+        return "NO ERROR"
+
+    original_post = http_module.post_json
+    http_module.post_json = boom
+    try:
+        search = raises_retryable(
+            lambda: rsearch_module.search_entries({"query": {}}, use_cache=False)
+        )
+        check(not search.startswith("WRAPPED"), f"检索的可重试错误穿得出去：{search}")
+        complexes = raises_retryable(
+            lambda: complexes_module.list_complexes("P00533", use_cache=False)
+        )
+        check(not complexes.startswith("WRAPPED"), f"复合物检索同样穿得出去：{complexes}")
+    finally:
+        http_module.post_json = original_post
+
+    original_get = http_module.get_text
+    http_module.get_text = boom
+    try:
+        download = raises_retryable(
+            lambda: complexes_module.download_entry("4HJO", force=True)
+        )
+        check(not download.startswith("WRAPPED"), f"下载同样穿得出去：{download}")
+    finally:
+        http_module.get_text = original_get
+
+
 def _event_fixture(steps: int) -> Session:
     """铺一份「用户说一句、助手跑一次 dock」的会话：每一步两条消息。"""
     session = Session(id=f"ses_evt{steps}", title="事件")
@@ -13774,6 +13919,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("evidence-dedupe", check_evidence_dedupe),
     ("tool-clear", check_tool_clear),
     ("tool-family", check_tool_family),
+    ("tool-retry", check_tool_retry),
     ("event-log", check_event_log),
     ("evidence", check_evidence_layer),
     ("bash", check_bash_tool),

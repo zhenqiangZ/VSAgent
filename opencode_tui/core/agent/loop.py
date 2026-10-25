@@ -26,7 +26,7 @@ from .provider import (
     ProviderError,
     ProviderEventType,
 )
-from .tools import Tool, ToolError, ToolRegistry, argument_error
+from .tools import RetryableToolError, Tool, ToolError, ToolRegistry, argument_error
 from .workspace import Workspace
 
 # 一轮里最多问模型这么多次，防止模型在工具之间来回不收敛
@@ -35,6 +35,12 @@ MAX_STEPS = 24
 MAX_STOP_RETRIES = 2
 # 可以重试的错误最多重发这么多次
 MAX_RETRIES = 2
+# 工具执行遇到可重试故障时最多再试这么多次。
+#
+# 比模型请求那层少（那里是 2）：一次工具调用的超时本身就有几十秒，重试两次
+# 等于把一次网络抖动拖成三倍等待，而工具失败之后模型还有别的路可走。
+# 一次就够把「抖了一下」与「真的不通」分开。
+MAX_TOOL_RETRIES = 1
 # 连着这么多步「整步工具全失败」就判成卡住，停下来并写收尾总结
 MAX_FAILED_STREAK = 3
 # 权限询问最多等多久（秒）。等不到按拒绝处理。
@@ -1048,21 +1054,49 @@ class AgentLoop:
                 return
             part.tool_input = given
 
-        try:
-            result = await tool.execute(
-                part.tool_input,
-                context=self.ledger,
-                task_state=session.task_state,
-                session=session,
-                evidence=self.evidence,
-                viewer=self.viewer,
-                spawner=self.spawner,
-                event_runtime=self._event_runtime(session, message),
-                on_arguments=record_arguments,
-            )
-        except ToolError as error:
-            self._fail_tool(message, part, str(error))
-            return
+        # 可重试的瞬时故障在这里重试，**不重跑权限与钩子**：那两步是本地判定，
+        # 用户已经点过允许，重跑只会把同一个问题问第二遍，还会让钩子看见两次调用。
+        attempt = 0
+        while True:
+            try:
+                result = await tool.execute(
+                    part.tool_input,
+                    context=self.ledger,
+                    task_state=session.task_state,
+                    session=session,
+                    evidence=self.evidence,
+                    viewer=self.viewer,
+                    spawner=self.spawner,
+                    event_runtime=self._event_runtime(session, message),
+                    on_arguments=record_arguments,
+                )
+                break
+            except RetryableToolError as error:
+                if attempt >= MAX_TOOL_RETRIES:
+                    # 重试用尽也要说清「这是瞬时故障」：模型分不清「工具坏了」与
+                    # 「刚才网络抖了一下」时，最省事的做法是绕道 bash 自己实现一遍
+                    # （实测一次这样的误判烧掉 20 步）。所以这里连「别绕」一起说。
+                    self._fail_tool(
+                        message,
+                        part,
+                        f"{tool.spec.name} 连续 {attempt + 1} 次都是瞬时故障（{error}）。\n"
+                        "这不是参数写错，也不是这个工具不可用，是网络或接口那一侧的问题。\n"
+                        "不要用 bash 自己实现它，也不要换数据源绕过：把情况告诉用户，"
+                        "按用户的指示决定稍后再试还是换方案。",
+                    )
+                    return
+                attempt += 1
+                self._publish(
+                    message,
+                    Part(
+                        type=PartType.RETRY,
+                        text=f"{tool.spec.name} 瞬时故障，重试第 {attempt} 次：{error}",
+                    ),
+                )
+                await asyncio.sleep(RETRY_DELAYS[attempt - 1])
+            except ToolError as error:
+                self._fail_tool(message, part, str(error))
+                return
         part.tool_output = result.output
         part.patch_added = result.added
         part.patch_removed = result.removed

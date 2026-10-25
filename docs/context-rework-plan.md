@@ -130,12 +130,11 @@
 > 6.5K 命中），下一步回到 95.9%。一次装族多付约 11K，每步省 6–9K——一轮两步就回本。
 >
 > 两次同一组问题，输入 442K 与 135K，差 3.3 倍。差别不在装配层，在**工具**：
-> 第一次 `search_pdb(query="P00533")` 失败了一次（同一条命令事后手动重跑是成功的，
-> 391 条命中，所以那是瞬时失败），模型随即不信这个工具，转去 bash + urllib 自己拉
-> RCSB，把 24 步上限用满；第二次它叫的是 `search_pdb({})` 空参数、当场被挡下，
-> 反而没绕。**根因在 `rsearch.search_entries`**：那里的 `except Exception` 把
-> `RetryableToolError` 也归成了「这次没搜成」，循环层的重试因此被绕过——一次网络
-> 抖动变成了「这个工具坏了」。工具说明再准，也救不回一个被判死的工具。
+> 第一次模型装完 `rsearch` 族（`load_tools` 回「已装入：search_pdb」），下一步调
+> `search_pdb` 却撞上 `tools.toml` 里的禁用——`load_tools` 列的是 `catalog()` 里的
+> 名字，不是真正装进注册表的名字。它随后不信这一族，转去 bash + urllib 自己拉 RCSB，
+> 把 24 步上限用满；第二次同一个工具它一步没绕。**`load_tools` 在主动说谎**，
+> 这比工具说明写得准不准重要得多。
 >
 > 这两次会话里看到的失败模式（重试被吞、平台猜错、handle 猜错、不知道状态目录在哪）
 > 逐条记在 [`docs/real-session-findings.md`](real-session-findings.md)，含代价与修法排序。

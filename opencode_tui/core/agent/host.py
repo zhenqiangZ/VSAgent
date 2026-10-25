@@ -173,10 +173,16 @@ class AgentHost:
         child.agent_name = parent.agent_name
         child.model_id = parent.model_id
         child.effort = parent.effort
+        # 装过的工具族一起继承：子 agent 接着干同一件事，父会话为了这件事
+        # 装过哪几族，它就得有哪几族。不继承的话它得自己再 load 一遍，
+        # 而它看到的任务说明里并没有「先装工具」这一步。
+        child.tool_families = list(parent.tool_families)
 
         loop = self.loop_for(parent.id)
+        # 按**父会话的实际清单**算：子会话刚继承过族，两者一致；用全量算会把
+        # 可用额度说小一半，塞进去的历史比实际能放下的少。
         budget = int(
-            ContextAssembler(loop.context_window).available(loop.registry.specs())
+            ContextAssembler(loop.context_window).available(loop.tool_specs(parent))
             * SEED_RATIO
         )
         copied, dropped = fork_messages(parent, child, start, end, max(1, budget))

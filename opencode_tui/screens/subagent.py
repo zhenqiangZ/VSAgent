@@ -28,6 +28,7 @@ ALLOWED_COMMANDS = frozenset(
         "details",
         "editor",
         "effort",
+        "events",
         "exit",
         "export",
         "forget",

@@ -5,7 +5,10 @@ from pathlib import Path
 
 from textual.app import App
 
+from .core.agent.context import event_line
 from .core.agent.domain.all_tools import domain_tools
+from .core.agent.event_log import domain_tools as event_tools
+from .core.agent.event_log import render_event_detail
 from .core.agent.domain.corpus import ingest_files
 from .core.agent.domain.export import runs_dir
 from .core.web.service import WebService, web_root
@@ -37,9 +40,11 @@ from .core.agent.tools import (
     GrepTool,
     PatchTool,
     ReadTool,
+    ReadTurnTool,
     ToolRegistry,
     WriteTool,
 )
+from .core.agent.toolset import LoadToolsTool
 from .core.agent.trace import TraceWriter, log_directory_for
 from .core.command_registry import CommandRegistry
 from .core.connection import Connection, connection_path_for, load_connection, save_connection
@@ -70,10 +75,13 @@ from .screens.spawn_agent import SpawnAgentScreen, SpawnRequest
 from .screens.subagent import SubagentChatScreen
 from .screens.theme_selector import ThemeSelectorScreen
 from .screens.tools_panel import ToolEntry, ToolsPanelScreen
+from .widgets.status_bar import format_tokens
 from .widgets.toast import ToastNotification
 
 # 需要参数的命令：命令名之后那一段交给处理函数，其余命令不吃参数。
-ARGUMENT_COMMANDS = frozenset({"remember", "forget", "task", "model", "agent", "rename"})
+ARGUMENT_COMMANDS = frozenset(
+    {"remember", "forget", "task", "model", "agent", "rename", "events", "memory"}
+)
 
 
 class OpenCodeApp(App[None]):
@@ -325,6 +333,13 @@ class OpenCodeApp(App[None]):
         registry.register(RecallTool(memory))
         # 任务状态不用传东西进来：它挂在会话上，由循环层每次调用现取。
         registry.register(TaskTool())
+        # 取回被归档/被移出的原文。与任务状态同理：会话由内核注入。
+        registry.register(ReadTurnTool())
+        # 事件收口与召回：把做完的一段压成标题 + 摘要，需要细节再按编号取回。
+        for tool in event_tools():
+            registry.register(tool)
+        # 按族加载领域工具：核心那一批常驻，其余由模型自己装。
+        registry.register(LoadToolsTool())
         # 派发子 agent 是**根会话专属**的能力。子 agent 的注册表里没有它，
         # 请求体的 tools 数组里也就没有它，模型连这个名字都看不到。
         if allow_spawn:
@@ -568,7 +583,9 @@ class OpenCodeApp(App[None]):
             SpawnAgentScreen(
                 parent,
                 self.agent.context_window,
-                self.agent.registry.specs(),
+                # 子 agent 继承父会话装过的族，所以预览要按父会话的实际清单算：
+                # 拿全量算会把可用额度说小一半，用户填的范围看着「放不下」。
+                self.agent.tool_specs(parent),
             ),
             self._on_spawn_requested,
         )
@@ -736,14 +753,24 @@ class OpenCodeApp(App[None]):
         target.write_text(render_session_markdown(session), encoding="utf-8")
         self.show_toast(f"已导出到 {target}", "success")
 
-    def _command_memory(self) -> None:
-        """列出项目记忆。"""
+    def _command_memory(self, arguments: str) -> None:
+        """列出项目记忆；`/memory --all` 连已经被取代的一起列。
+
+        默认只列还生效的：失效的条目留在盘上是给审计与回滚用的，
+        混在日常列表里只会让人以为「这条还算数」。
+        """
         store = self._build_memory()
-        entries = store.recall("")
+        # 长会话里文件可能已经被重新生成过：列之前对一次账，
+        # 「引用文件已变更」这类提醒才是当下的，不是启动那一刻的。
+        store.revalidate()
+        show_all = arguments.strip() in ("--all", "all")
+        entries = store.all_entries(include_revoked=show_all)
         if not entries:
             self.show_toast("项目记忆还是空的", "info")
             return
-        lines = [store.render_line(entry) for entry in entries]
+        lines: list[str] = []
+        for entry in entries:
+            lines.extend(store.describe_line(entry).splitlines())
         self.push_screen(MessageScreen("项目记忆", lines))
 
     def _command_remember(self, arguments: str) -> None:
@@ -873,6 +900,9 @@ class OpenCodeApp(App[None]):
             return
         self._removed_message = session.messages.pop()
         self._removed_session_id = session.id
+        # 事件是按下标覆盖消息的，删掉一条之后覆盖范围可能越界。
+        # 这里立刻裁一次，别等装配时才发现事件指向了一条不存在的消息。
+        session.sanitize_events()
         self.refresh_chat()
         self.save_state()
         self.show_toast("已撤销最后一条消息", "success")
@@ -885,6 +915,7 @@ class OpenCodeApp(App[None]):
         session = self.active_session
         session.messages.append(self._removed_message)
         session.touch()
+        session.sanitize_events()
         self._removed_message = None
         self.refresh_chat()
         self.save_state()
@@ -1005,6 +1036,71 @@ class OpenCodeApp(App[None]):
         else:
             state = "还没有内容，发起一轮生成就会出现"
         self.push_screen(MessageScreen("事件日志", [f"日志文件　{path}", f"状态　　　{state}"]))
+
+    def _command_context(self) -> None:
+        """显示最近几步的上下文用量。
+
+        每步两行：第一行是实际用量（服务端记账的那一份，含缓存命中），
+        第二行是装配器的估算分层。两行并排看才回答得了「估得准不准」——
+        只看估算会把「额度分给谁」当成「真的花了多少」。
+        """
+        loop = self.agent
+        history = loop.context_history[-10:]
+        if not history:
+            self.show_toast("还没有上下文度量，发起一轮生成后就有了", "info")
+            return
+        latest = history[-1]
+        lines = [
+            f"窗口 {format_tokens(int(latest['window']))}"
+            f"　可用 {format_tokens(int(latest['available']))}"
+            f"　工具定义 {format_tokens(int(latest['tools']))}"
+            f"　输出预留 {format_tokens(int(latest['reserve']))}"
+            "（下表「装配」不含工具定义，实际输入 = 装配 + 工具 + 协议开销）"
+        ]
+        for item in history:
+            lines.append(
+                f"第 {item['step']} 步　实际输入 {format_tokens(int(item['input']))}"
+                f"（缓存 {format_tokens(int(item['cached']))}"
+                f" · {float(item['cache_hit']) * 100:.1f}%）"
+                f"　占窗口 {float(item['window_used']) * 100:.1f}%"
+                f"　装配 {format_tokens(int(item['total']))}"
+            )
+            usage = item.get("usage") or {}
+            layers = [
+                f"{name} {format_tokens(int(tokens))}"
+                for name, tokens in usage.items()
+                if tokens
+            ]
+            lines.append("　　" + (" · ".join(layers) if layers else "（没有内容）"))
+            if item.get("degraded") or item.get("dropped"):
+                lowered = "、".join(str(level) for level in item.get("degraded") or [])
+                lines.append(
+                    f"　　削过：{lowered or '无'}　移出 {int(item.get('dropped', 0))} 组"
+                )
+        self.push_screen(MessageScreen("上下文用量", lines))
+
+    def _command_events(self, arguments: str) -> None:
+        """列出本会话的事件；带编号时看详情。
+
+        事件是「已经收口的阶段」：原文不再进上下文，这里看得到它被压成了什么。
+        想看原文用 `/events <编号>` 或让模型调 `recall_event`。
+        """
+        session = self.active_session
+        if not session.events:
+            self.show_toast("这份会话还没有事件", "info")
+            return
+        wanted = arguments.strip()
+        if not wanted:
+            lines = [event_line(event) for event in session.events]
+            self.push_screen(MessageScreen("会话事件", lines))
+            return
+        event = next((item for item in session.events if item.id == wanted), None)
+        if event is None:
+            available = "、".join(item.id for item in session.events)
+            self.show_toast(f"没有 {wanted}；可用：{available}", "warning")
+            return
+        detail = render_event_detail(session, event)
+        self.push_screen(MessageScreen(event.id, detail.splitlines()))
 
     def delete_session(self, session_id: str) -> bool:
         """删掉一个会话，连它的子 agent 与运行时一起清。

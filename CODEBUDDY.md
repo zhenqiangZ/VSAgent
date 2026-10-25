@@ -77,6 +77,14 @@ python tools/check_retrieval.py --list          # 只看评测集概况
 python tools/build_demo_data.py     # 由 RCSB 1IEP 原始 PDB 生成 runs/1iep-demo（可复现）
 python tools/check_demo_data.py     # 纯几何：口袋残基是否真的接触共晶配体（≤4.5Å、≥60%）
 
+# 上下文 / 记忆探针（手动，不进 CI）
+python tools/eval_context.py --session ses_xxx   # 逐个截断点看装配估算与降级
+python tools/eval_context.py --sweep             # 同一份会话扫多个窗口：前缀命中 / 清理 / 丢组
+python tools/eval_context.py --sweep --families structure,receptor,ligand,docking
+                                                 # 按已装族算工具定义（默认只发核心那 14 个）
+python tools/eval_memory.py                      # 记忆台账健康度（重复、失效、常驻占用）
+python tools/eval_memory.py --cases x.jsonl      # 人工标注集的 recall@k 与 stale 比例
+
 # 本地语料（免费离线）
 python -m opencode_tui.core.index reindex        # 按盘上原件重建索引，并顺手补向量
 python -m opencode_tui.core.embed download       # 拉模型（255MB；直连不通自动走 hf-mirror）
@@ -155,20 +163,44 @@ __main__.py → app.py ───────────────────
   它**不维护第二份历史**：每一步从 `Session` 现场重建模型消息。硬上限
   `MAX_STEPS=24` / `MAX_STOP_RETRIES=2` / `MAX_RETRIES=2` / `MAX_FAILED_STREAK=3`。
 - `tools.py` — `Tool` ABC + `ToolRegistry` + 五个内核文件工具（bash/read/write/patch/grep）
+  + `read_turn`（按 `turn N` 取回被归档/被移出的原文，会话由内核注入）
   与 `ToolSpec` / `ToolResult` / `ToolError` / `RetryableToolError` / `argument_error` 校验器。
   **依赖注入是声明式的**：工具在类属性上写 `primary_argument`（权限匹配用）、
-  `context_argument`（登记表）、`task_argument`、`evidence_argument`、`viewer_argument`，
+  `context_argument`（登记表）、`task_argument`、`evidence_argument`、`viewer_argument`、
+  `event_argument`（事件运行时），
   `Tool.execute` 在 `on_arguments` 记下模型原始参数之后注入它们；声明了却收到 `None`
   直接返回「内核装配问题」，不抛。
-- `context.py` — `ContextAssembler.build` 按 `PREFIX → MEMORY → TASK → RECENT → EVIDENCE → HISTORY`
-  分层装配。`PREFIX` 与 `TASK` 是 `pinned`，压缩时永不驱逐（用户的约束必须活过压缩）；
-  `RECENT` 整 `Turn` 搬移，`tool_call` 与它的结果永远不拆散。装不下就抛
+- `context.py` — `ContextAssembler.build` 按
+  `PREFIX → MEMORY → TASK → EVENT → RECENT → EVIDENCE → HISTORY` 分层装配。
+  `PREFIX` 与 `TASK` 是 `pinned`，压缩时永不驱逐（用户的约束必须活过压缩）；
+  预算**水填**：摘要/证据只封顶（3000 / 6000），剩下的全给 `RECENT`；
+  `RECENT` 整 `Turn` 搬移，`tool_call` 与它的结果永远不拆散。装不下时先清旧工具正文
+  （`_take_recent` 里，最近 4 条与失败的除外），清不动才整组移出；清掉的原文用
+  `read_turn` 取回。降级顺序
+  `evidence_detail → history_summary → recent_tool_clear → event_layer → memory →
+  recent_turns → recent_reasoning → recent_output`。装不下就抛
   `ContextAssemblyError` 明说，**不静默截断**。
+- `event_log.py` — 事件层：把做完的一段压成「标题 + 摘要」，原文让位但仍可
+  `recall_event` 取回。三条不变式（连续覆盖、边界排除当前消息、本地兜底不花请求）
+  见 [`docs/event-log-design.md`](docs/event-log-design.md)。溢出时 `_run_steps`
+  补一条 `auto` 本地事件，此时 `_summarize` 停用（摘要与事件不重叠）。
+- `toolset.py` — 按族加载领域工具。38 个工具的完整定义 12.3K token，每一步都要发；
+  核心 14 个（文件、登记表、任务、事件、记忆、`load_tools`）常驻，24 个领域工具分成
+  13 族由 `load_tools` 现装现用，装过之后每步只发 3.1K。**族记在
+  `Session.tool_families` 上，不记在注册表上**（注册表按根 / 子 agent 共享两份，
+  记在那里会让一个会话装过的工具漏到另一个）；子 agent 从父会话继承。
+  `hidden_names(session)` 给的是**排除集**而不是允许清单：没登记族的工具默认常驻，
+  新工具忘了登记时坏处只是白占额度，不会「写了却没装、模型看不见」。
 - `prompt.py` — `stable_prefix` 组装身份 + 工作纪律 + 项目规则。**前缀里不放时间不放进度**，
   否则每步都击穿 prompt cache。`project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`，32KB 上限）。
+  摘要指令是八段（目标 / 改动 / 待办 / 约束 / 决定 / 错误 / 当前 / 关键数字），
+  `summary_messages` 只喂 `[summary_upto, upto)` 新段 + 旧摘要，不再整段重喂。
 - `permission.py` — `PermissionPolicy.check` 的判定顺序是有讲究的：取消 → 用户手打 bash →
   Plan 模式 `PLAN_DENY` → 项目规则 → **越界路径检查** → 会话 allow_all → 单工具允许 → 默认
   `{write, patch, bash, dock}` 要问。越界检查刻意排在会话「全部允许」之前：**允许一个工具不等于允许整个磁盘**。
+  询问那一步有两条兜底（`loop._ask_permission`）：`permission.ask` 没有任何订阅者时立刻拒绝
+  （无人值守运行，等下去是等一个没人回答的 future），以及 300 秒无人答复时拒绝。两处都按
+  **拒绝**处理——没人答复不等于用户同意。
   同模块的 `load_tool_switches` / `save_disabled` 管的是**另一件事**：`tools.toml` 里标关的工具
   根本不进注册表，模型连它存在都不知道（权限层是「装进来但拦下来」）。改开关用 `/tools` 面板，
   它写项目侧那份文件并当场重装注册表，不必重启。
@@ -176,6 +208,10 @@ __main__.py → app.py ───────────────────
   0 放行，30s 超时算拦截。
 - `ledger.py` — 会话登记表，`receptor#1` / `ligandset#3` 这类 handle 的真相所在。
 - `memory.py` — 跨会话项目记忆 `.vsmemory/`。记忆里写**文件路径不写 handle**（handle 只在本次会话有效）。
+  写入做三件事：精确去重、同 refs + 更新词时把旧条目标 `superseded_by`（不硬删）、
+  agent 的引用必须存在（用户写入可不存在，标 `unverified` 排在后面）。
+  常驻注入是「核心 / 相关 / 最近」三段，1200 token，其余用 `recall` 取；`recall` 按
+  字段权重 × 90 天衰减打分。详见 [`docs/memory-design.md`](docs/memory-design.md) §13。
 - `provider.py` — 只实现了一种协议：`OpenAICompatProvider`，OpenAI 兼容的 SSE。
   模型**名字**决定 context window / 价格 / 是否支持 reasoning；`switch_model` 会连带重算上下文窗口。
 - `trace.py` — 订阅 EventBus 的 `"*"`，把事件落成 `~/.opencode_tui/logs/<session>.jsonl`。
@@ -187,6 +223,10 @@ __main__.py → app.py ───────────────────
 连续 3 步整步全失败则 `EXIT_TOOL_FAILED`。任何非正常退出都会触发一次**不带工具的收尾总结**
 （模型写，失败则本地兜底）。
 
+装配发现这一步新挤出了交互组时：没有事件 → 让模型写摘要；**已经有事件 → 补一条本地
+`auto` 事件**（零请求），摘要从此冻结。上下文装不下时先强压一次再重试，
+摘要连续失败 3 次熔断到下一轮。
+
 ### 领域工具（`core/agent/domain/`）
 
 分界线按「需要知道什么」划，不按「做什么」划：知道 UniProt 编号长什么样、口袋残基怎么算
@@ -197,7 +237,9 @@ __main__.py → app.py ───────────────────
 - `all_tools.py:domain_tools()` 按**浏览 → 检索 → 改动**的顺序拼装
   （listing, uniprot, structure, chembl, rsearch, literature, receptor, ligand, docking,
   affinity, export）。这个顺序同时决定了工具在请求体里的先后，靠前的更容易被模型选中
-  ——**顺序是语义，不是排版**。
+  ——**顺序是语义，不是排版**。同一个文件的 `FAMILIES` 是**按族加载的唯一真相**：
+  族名、给人看的一句话、模块；`catalog()` 展开成「族 → 工具名」，`load_tools` 与
+  `hidden_names` 都从它取。
 - 配体链路：`import_ligandset`（文件 → raw ligandset）→ `prepare_ligands`（ETKDGv3 +
   MMFF/UFF + Meeko → prepared ligandset）→ `dock`（Vina → docking artifact）→
   `score_affinity`（VCrossFormer → affinity artifact）→ `write_run(docking=...)`（pose 进运行目录）。
@@ -264,7 +306,7 @@ __main__.py → app.py ───────────────────
   滚动时裁剪/扩展。它有 `on_removed` 回调让 ChatScreen 在拆除前先退订（注释里记着一次真实的 `NoMatches` 竞态）。
   多个 handler `prevent_default()` 之后要调 `stylesheet.update_nodes([self])`，否则整棵子树重排要 2.6–3.9 秒。
 - `EditorPane` 有三种模式 `mode-chat` / `mode-command` / `mode-bash`（CSS 类切换），配三个自动补全弹窗。
-- 命令表 `core/command_registry.py` 有 25 个斜杠命令。**命令刻意没有键位**，键位单独放
+- 命令表 `core/command_registry.py` 有 32 个斜杠命令。**命令刻意没有键位**，键位单独放
   `core/keybind_manager.py`，且那两个表只用于渲染帮助——smoke 测试会比对它们和 `HomeScreen.BINDINGS`。
 - `app.py:execute_command` 解析 `/name args`，查表，然后按约定分发到 `self._command_<name>`。
   只有 `ARGUMENT_COMMANDS = {"remember","forget","task","model"}` 会拿到参数尾巴。
@@ -321,9 +363,10 @@ import 任何 npm 包，换 3D 库只动 `viz/`。
 ## 约定
 
 - **新增领域工具**：在模块里加 `domain_tools()` 返回值 → 需要的话在 `domain/__init__.py` 的
-  `__all__` 补名字 → 在 `domain/all_tools.py` 按浏览/检索/改动定位插入 → 在 `debug_tools.py`
-  的 `CALLS` 补一行（顺序是依赖顺序）→ 过一遍 `domain/__init__.py` 的八条纪律。
-  漏了 `all_tools.py` 那一处，现象是「工具写了但模型看不见」，且各处判据都还是绿的。
+  `__all__` 补名字 → 在 `domain/all_tools.py` 的 `FAMILIES` 里归族（`catalog()` 从那里展开）
+  → 在 `debug_tools.py` 的 `CALLS` 补一行（顺序是依赖顺序）→ 过一遍 `domain/__init__.py`
+  的八条纪律。漏了 `FAMILIES` 那一处，工具会**常驻**而不是装不进来：坏处是每步多几百
+  token，好处是不会出现「写了却看不见」，所以判据抓不到——但别忘了归族。
 - **依赖注入通道是声明式的**：工具靠 `Tool` 的类属性声明要什么，不要在 `run()` 里
   `assert ledger is not None` 然后自己抛——内核统一返回「内核装配问题」。
 - **失败返回 `ToolResult(failed=True)`，不抛异常**：错误文本要能回灌给模型自纠。

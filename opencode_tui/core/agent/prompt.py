@@ -38,19 +38,43 @@ RULES_LIMIT = 32 * 1024
 SUMMARY_NOTICE = "（以下是本次对话早前部分的摘要）"
 # 常驻记忆插在系统提示之后、摘要之前
 MEMORY_NOTICE = "（以下是本项目已知的事实，来自跨会话记忆）"
-# 摘要指令。四段固定，最后一段是关键：用户早前给出的约束不能因为丢弃就没了
+# 事件块（已经收口的阶段）插在摘要之后、最近交互之前
+EVENT_NOTICE = "（以下是已经收口的阶段，原文不再逐条列出；要细节用 recall_event <编号> 取回）"
+# 摘要指令。八段固定。前四段回答「这件事是什么」，后四段回答「为什么走到这里」——
+# 后者是长会话里最容易丢、又最影响下一步判断的东西：
+# 被否掉的方案会让人走回头路，报错与修复会让人重复踩坑。
 SUMMARY_INSTRUCTION = (
-    "把下面这段对话收成一份摘要，只写四段，每段一个小标题：\n"
+    "把下面这段对话收成一份摘要，只写八段，每段一个小标题：\n"
     "一、用户的目标与意图\n"
     "二、已经完成的改动与涉及的文件\n"
     "三、待办的下一步\n"
     "四、用户明确给出的约束与要求\n"
+    "五、做过的决定与被否掉的方案（为什么否掉）\n"
+    "六、错误与修复（哪一步失败过、怎么绕过去的）\n"
+    "七、当前正在做的那一步\n"
+    "八、关键数字与标识（handle、编号、分数、路径）\n"
     "第四段一条都不能漏：那些要求对之后的每一步都生效，漏掉之后会被当成没说过。\n"
+    "如果上面还给了一份「已有摘要」，把它与新内容**合并**成一份：旧事实不要丢，"
+    "被新内容推翻的就直接改写，不要两份并列。\n"
     "只写摘要本身，不要寒暄，不要复述这段指令。"
 )
 # 摘要那一次请求最多喂进去这么多字符。按字符卡住是个上界：汉字大约一字一个 token，
 # 其余字符更少，所以字符数不超，token 数就不会超。
 SUMMARY_INPUT_LIMIT = 60_000
+
+# 事件摘要的指令。与摘要的四段刻意错开：摘要写「整段对话的结论」，
+# 事件写「这一段做了什么、留下了什么」，所以产物与未决项必须单列。
+# 第一行固定成 `标题：…`：调用方按这一行切标题与正文，省掉一次额外请求。
+EVENT_TITLE_INSTRUCTION = "第一行只写标题，格式是「标题：不超过 40 字」，不要加引号。\n"
+EVENT_INSTRUCTION = (
+    "把下面这段对话收口成一条事件，第一行写标题，其余写四段，每段一个小标题：\n"
+    "一、这一段做了什么（按顺序写清用了什么工具）\n"
+    "二、结果与产物（handle、文件路径、关键数字；写不准就写「未产出」，不要编）\n"
+    "三、遇到的问题（失败原因、被否掉的方案）\n"
+    "四、留给下一步（还有什么没做）\n"
+    f"{EVENT_TITLE_INSTRUCTION}"
+    "总共不超过 600 字。只写内容，不要寒暄，不要复述这段指令，不要调用工具。"
+)
 
 # bash 工具的执行方式说明。
 #
@@ -269,6 +293,16 @@ MEMORY_DISCIPLINE = (
     "handle 只在本次会话有效，写进去下次就指向别的东西了。"
 )
 
+# 事件层的使用纪律。不给这一句的话，模型不知道有 record_event 这个东西，
+# 事件层就只能靠溢出时的本地兜底，而本地兜底只写得出「调用过哪些工具」。
+EVENT_DISCIPLINE = (
+    "一件工作告一段落、准备换下一件时，用 record_event 把它收口成一条事件："
+    "标题写「这一段做了什么」，摘要写结果、产物与未决。收口之后那一段原文不再逐条发给你，"
+    "只留一行索引；需要细节时用 recall_event 按编号取回原文。\n"
+    "不要把还在进行中的那一步收口——收口的位置是「这条消息之前」，"
+    "当前正在写的这一步本来就不在范围内。"
+)
+
 
 # 子 agent 的身份补充。排在身份段之后、工作纪律之前。
 #
@@ -288,6 +322,17 @@ WORK_DISCIPLINE = (    "用户交办的事情需要动文件或跑程序时，�
     "生成的中间文件与结果表写进工作目录，报告里说明每一项使用了什么参数。"
 )
 
+# 工具清单是**按族发**的：领域工具不常驻，要先装。这句话必须在前缀里，
+# 因为模型看不到清单里没有的工具时，最容易做的是「凭记忆写参数」或者
+# 「改用 bash 直接跑脚本」——两条都会把一次本来简单的调用变成一串失败。
+TOOL_DISCIPLINE = (
+    "工具按族加载：文件、登记表、任务、事件、记忆这些一直在；"
+    "领域工具（查靶点、取结构、查活性、准备受体与配体、对接、打分、写运行目录……）"
+    "分成若干族，要先用 load_tools 装那一族，**下一步起**它才出现在工具清单里。\n"
+    "清单里没有某个领域工具时，先 load_tools 把对应的族装进来，"
+    "不要凭记忆写参数，也不要绕道 bash 去调等价的东西。"
+)
+
 
 def stable_prefix(workspace: Workspace, session: Session) -> str:
     """稳定前缀（`PREFIX` 层）：身份、工作纪律、项目规则。
@@ -301,9 +346,11 @@ def stable_prefix(workspace: Workspace, session: Session) -> str:
     blocks = [
         _identity(session.agent_name),
         WORK_DISCIPLINE,
+        TOOL_DISCIPLINE,
         SHELL_DISCIPLINE,
         LEDGER_DISCIPLINE,
         MEMORY_DISCIPLINE,
+        EVENT_DISCIPLINE,
     ]
     if session.depth > 0:
         # 子 agent 的身份段。**不放时间、不放父会话标题**：它们会让前缀在
@@ -338,24 +385,53 @@ def _identity(agent_name: str) -> str:
 
 
 def summary_messages(session: Session, upto: int) -> list[dict[str, Any]]:
-    """造一次摘要请求的消息：把前 upto 条消息的原文交给模型。
+    """造一次摘要请求的消息：只喂**新露出来的那一段**，并把旧摘要带上。
+
+    先前每次从第 0 条重喂整段历史：一是每次压缩都要重读一遍早已收过的内容，
+    二是模型看到的是「原始对话」，它会把旧结论重新组织一遍，`summary_upto`
+    之前的事实于是每次都可能变形。现在只喂 `[summary_upto, upto)`，
+    旧摘要作为「已有摘要」交给它合并。
 
     原文按翻译层翻出来再铺成文字，所以摘要看到的是模型当时看到的那一份，
     包括工具调用与工具结果，不包括界面上那些标记。
     """
-    transcript = _transcript(session, upto)
+    start = session.summary_upto if session.summary else 0
+    transcript = _transcript(session, upto, start)
+    if len(transcript) > SUMMARY_INPUT_LIMIT:
+        # 正常不会走到这里：一次压缩只推进几步。只有单条消息本身超长时才会，
+        # 那时保留开头与结尾仍然好过整份发不出去。
+        transcript = _cut_middle(transcript, SUMMARY_INPUT_LIMIT // 2)
+    messages: list[dict[str, Any]] = [{"role": "system", "content": SUMMARY_INSTRUCTION}]
+    if session.summary:
+        messages.append(
+            {
+                "role": "user",
+                "content": f"已有摘要（把它与新内容合并成一份，不要丢已有的事实）：\n{session.summary}",
+            }
+        )
+    messages.append({"role": "user", "content": transcript})
+    return messages
+
+
+def event_messages(session: Session, start: int, end: int) -> list[dict[str, Any]]:
+    """造一次事件摘要请求的消息：只喂 `[start, end)` 这一段。"""
+    transcript = _transcript(session, end, start)
     if len(transcript) > SUMMARY_INPUT_LIMIT:
         transcript = _cut_middle(transcript, SUMMARY_INPUT_LIMIT // 2)
     return [
-        {"role": "system", "content": SUMMARY_INSTRUCTION},
+        {"role": "system", "content": EVENT_INSTRUCTION},
         {"role": "user", "content": transcript},
     ]
 
 
-def _transcript(session: Session, upto: int) -> str:
-    """把前 upto 条消息铺成一段纯文本。"""
+def _transcript(session: Session, upto: int, start: int = 0) -> str:
+    """把 `[start, upto)` 这几条消息铺成一段纯文本。
+
+    `start` 是给事件用的：事件只收口**新露出来的那一段**，把它前面
+    已经收过的内容再喂一遍，既费额度又会让模型把旧事重新写进新事件。
+    """
     blocks: list[str] = []
-    for message in session.messages[:upto]:
+    for message in session.messages[start:upto]:
         for item in translate_message(message):
             role = item["role"]
             if role == "tool":

@@ -918,17 +918,14 @@ class PrepareReceptorTool(Tool):
     spec = ToolSpec(
         name="prepare_receptor",
         description=(
-            "在用户没有充分了解受体以及确认结构前，不可调用。"
-            "把一套实验坐标准备成**可以直接对接的受体**：选链、去水去杂、取出共晶配体、"
-            "算盒子，再做按残基的模板匹配与 PDBQT 参数化。产物是一个目录（规整后的 "
-            "receptor.pdb、受体 receptor.pdbqt、共晶配体 ligand.pdb、盒子 box.txt、"
-            "参数 params.json、体检报告 report.json），并登记成一条**状态为 prepared "
-            "的受体**。默认只做**预演**：把「会删掉哪些水与杂原子、盒子算在哪、哪些残基"
-            "匹配不上」摆出来，什么都不写盘；确认之后再用 confirm=true 重来一次。"
-            "**严格起步**：匹配不上的残基会被拒绝并列出具体是哪些，由你决定要不要用 "
-            "relax=true 丢掉；交替构象也必须显式选（altloc）。这个工具**只出刚性受体**，"
-            "也不生成 3D 坐标、不指派质子化态——它做的是模板匹配。"
-            "上游要先用 fetch_structure 或 import_structure 拿到状态为原始结构的受体。"
+            "在用户确认受体结构之前不要调用。把一套实验坐标准备成**可以直接对接的受体**："
+            "选链、去水去杂、取共晶配体、算盒子、模板匹配与 PDBQT 参数化。"
+            "产物是一个目录，并登记成一条**状态为 prepared 的受体**。\n"
+            "默认只**预演**（列出会删掉哪些水与杂原子、盒子在哪、哪些残基匹配不上），"
+            "什么都不写盘；`confirm=true` 才真正写盘与登记。\n"
+            "**严格起步**：匹配不上的残基会被拒绝并列出来，要不要用 `relax=true` 丢掉由你决定；"
+            "交替构象必须显式选 `altloc`。只出刚性受体，不生成 3D 坐标、不指派质子化态。"
+            "上游先用 fetch_structure 或 import_structure 拿到 raw 结构。"
             f"{CHEM_TOOL_DESCRIPTION_NOTE}"
         ),
         parameters={
@@ -936,11 +933,11 @@ class PrepareReceptorTool(Tool):
             "properties": {
                 "structure": {
                     "type": "string",
-                    "description": "原始结构的 handle（状态 raw 的受体），例如 receptor#1",
+                    "description": "raw 状态的受体 handle，例如 receptor#1",
                 },
                 "chain": {
                     "type": "string",
-                    "description": "留哪条链：一个字母 / 逗号分隔的多个 / all；单链结构可留空",
+                    "description": "留哪条链：单字母 / 逗号分隔 / all；单链结构可留空",
                 },
                 "ligand": {
                     "type": "string",
@@ -956,11 +953,11 @@ class PrepareReceptorTool(Tool):
                 },
                 "padding": {
                     "type": "number",
-                    "description": f"由配体算盒子时四周各留多少埃，默认 {DEFAULT_PADDING:g}，上限 {MAX_PADDING:g}",
+                    "description": f"由配体算盒子时四周留多少埃，默认 {DEFAULT_PADDING:g}，上限 {MAX_PADDING:g}",
                 },
                 "altloc": {
                     "type": "string",
-                    "description": "交替构象取哪一个，单个字符（通常是 A）；留空则在有交替构象时拒绝",
+                    "description": "交替构象取哪个（通常是 A）；留空时遇到交替构象会拒绝",
                 },
                 "keep_hetero": {
                     "type": "string",

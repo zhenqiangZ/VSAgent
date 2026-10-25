@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -16,10 +18,24 @@ from .tools import Tool, ToolError, ToolResult, ToolSpec
 
 # 项目级记忆目录名，挂在项目根下。
 MEMORY_DIR_NAME = ".vsmemory"
-# 常驻注入的 token 上限。超限时先砍旧条目，只保留装得下的那几条。
-RESIDENT_LIMIT = 2000
+# 常驻注入的 token 上限。超限时先砍旧的，再按相关度补。
+#
+# 从 2000 降到 1200：常驻的那一段每一步都要发，而「相关的几条」比「全部旧条目」
+# 更有用。其余的仍然可以用 `recall` 取到，不是删了。
+RESIDENT_LIMIT = 1200
 # 快照格式版本。
 SNAPSHOT_VERSION = 1
+# 单条记忆的字数上限。超了拒绝并让调用方拆条：
+# 一条几百字的记忆会挤掉好几条短事实，而它本身又常常只是「一份流程」。
+MEMORY_TEXT_LIMIT = 500
+# 磁盘上最多保留多少条，超出的归档到 `archive.json`（不再注入，`/memory --all` 可查）。
+MAX_ENTRIES = 500
+# 用户写入时引用可以不存在（那时标 unverified，注入时排在后面）；
+# agent 写入时引用必须存在——它有能力先确认路径，写错就是它的问题。
+# 出现这些词时认为新值在**更新**同一主题：同 refs 的旧条目因此失效。
+SUPERSEDE_MARKERS: tuple[str, ...] = ("改为", "改成", "现在", "不再", "替换", "已经换")
+# 时间衰减的半衰期（天）。三个月前的事实不是错，只是没那么该先看到。
+DECAY_DAYS = 90.0
 
 # 换名在目标文件正被别的进程打开时会被系统拒绝，隔几毫秒重试。
 REPLACE_ATTEMPTS = 40
@@ -80,6 +96,26 @@ def _reject_handle(ref: str) -> None:
     )
 
 
+def _terms(query: str) -> list[str]:
+    """把查询切成可比的关键词：英文按词，中文按 bigram。
+
+    中文不分词的话，「受体文件」整句只能整句匹配，换个语序就查不到；
+    bigram 不引入词典，代价是极短查询切不出来，所以两个字以内按整词留。
+    """
+    terms: list[str] = []
+    for token in re.split(r"[\s,，。;；:：/()（）]+", query):
+        if not token:
+            continue
+        terms.extend(re.findall(r"[a-z0-9_.\-]+", token))
+        cjk = "".join(char for char in token if not char.isascii())
+        if len(cjk) <= 2:
+            if cjk:
+                terms.append(cjk)
+        else:
+            terms.extend(cjk[index : index + 2] for index in range(len(cjk) - 1))
+    return list(dict.fromkeys(terms))
+
+
 @dataclass
 class MemoryEntry:
     """一条记忆。
@@ -99,15 +135,35 @@ class MemoryEntry:
     updated_at: float = 0.0
     expires_at: float = 0.0
     state: str = "ok"
+    # ---- 版本与来源 ----
+    #
+    # 记忆是「项目已知什么」，而项目会变：换了受体、改了参数之后，旧那条不是错的，
+    # 只是不再有效。硬删会让审计与回滚断掉，所以用 valid_to / superseded_by 标失效，
+    # 条目本身留着。
+    supersedes: list[str] = field(default_factory=list)  # 新条目取代了哪些旧条目
+    superseded_by: str = ""                              # 被哪条取代；非空即不再生效
+    valid_from: float = 0.0
+    valid_to: float = 0.0
+    # 最近一次被显式 `recall` 命中的时间，用来判断「核心事实」。
+    last_used_at: float = 0.0
+    # 用户写入但引用不存在的条目：可以留着，但注入时排在后面。
+    unverified: bool = False
+    confidence: float = 1.0
+    session_id: str = ""
+    turn: int = 0
 
     def is_live(self, now: float | None = None) -> bool:
-        """还没过期、且引用没有丢失时才算可用。
+        """还没过期、引用没丢、也没被新版本取代时才算可用。
 
         `stale`（文件变了）仍然算可用：变化本身是个信号，不是作废的理由，
         注入时带一行提醒交给模型判断。`missing` 才算不可用。
         """
         stamp = time.time() if now is None else now
         if self.expires_at and self.expires_at <= stamp:
+            return False
+        if self.superseded_by:
+            return False
+        if self.valid_to and self.valid_to <= stamp:
             return False
         return self.state != "missing"
 
@@ -124,6 +180,15 @@ class MemoryEntry:
             "updated_at": self.updated_at,
             "expires_at": self.expires_at,
             "state": self.state,
+            "supersedes": list(self.supersedes),
+            "superseded_by": self.superseded_by,
+            "valid_from": self.valid_from,
+            "valid_to": self.valid_to,
+            "last_used_at": self.last_used_at,
+            "unverified": self.unverified,
+            "confidence": self.confidence,
+            "session_id": self.session_id,
+            "turn": self.turn,
         }
 
     @classmethod
@@ -138,6 +203,12 @@ class MemoryEntry:
             state = "ok"
         raw_refs = data.get("refs")
         refs = [str(item) for item in raw_refs] if isinstance(raw_refs, list) else []
+        raw_supersedes = data.get("supersedes")
+        supersedes = (
+            [str(item) for item in raw_supersedes]
+            if isinstance(raw_supersedes, list)
+            else []
+        )
         return cls(
             id=str(data.get("id") or new_memory_id()),
             kind=kind,
@@ -149,6 +220,15 @@ class MemoryEntry:
             updated_at=float(data.get("updated_at") or 0.0),
             expires_at=float(data.get("expires_at") or 0.0),
             state=state,
+            supersedes=supersedes,
+            superseded_by=str(data.get("superseded_by") or ""),
+            valid_from=float(data.get("valid_from") or 0.0),
+            valid_to=float(data.get("valid_to") or 0.0),
+            last_used_at=float(data.get("last_used_at") or 0.0),
+            unverified=bool(data.get("unverified")),
+            confidence=float(data.get("confidence") or 1.0),
+            session_id=str(data.get("session_id") or ""),
+            turn=int(data.get("turn") or 0),
         )
 
 
@@ -174,6 +254,11 @@ class MemoryStore:
     def memory_path(self) -> Path:
         """记忆正文，给人看、给人改的那一份。"""
         return self.root / "memory.md"
+
+    @property
+    def archive_path(self) -> Path:
+        """超出容量之后归档到的那一份。不注入，`/memory --all` 才看。"""
+        return self.root / "archive.json"
 
     # ------------------------------------------------------------------
     # 读
@@ -225,15 +310,61 @@ class MemoryStore:
         *,
         source: str = "agent",
         expires_at: float = 0.0,
+        supersedes: list[str] | None = None,
+        session_id: str = "",
+        turn: int = 0,
+        ttl_days: float = 0.0,
     ) -> MemoryEntry:
-        """写入一条记忆并写盘，返回写进去的那一条。"""
-        cleaned = text.strip()
+        """写入一条记忆并写盘，返回写进去的那一条。
+
+        写入不是「追加一行」那么简单，四道处理按顺序来：
+
+        1. **精确去重**：同一句话再写一次只更新时间，不新建 id。模型读到自己
+           刚写过的内容又"想起来"时很常见，不去重的话台账很快就全是重复。
+        2. **引用校验**：agent 写入的引用必须存在；用户写入的允许不存在（标
+           `unverified`，注入时排在后面）。能先确认路径的一方就该先确认。
+        3. **同主题失效**：显式给了 `supersedes`，或新文本带「改为 / 不再 / 替换」
+           这类更新词且与旧条目共用引用时，旧条目标 `valid_to`，不硬删。
+        4. **容量**：超过 `MAX_ENTRIES` 时把最旧、已失效的挪进归档文件。
+        """
+        cleaned = " ".join(text.split())
         if not cleaned:
             raise MemoryError("记忆内容不能为空")
-        cleaned_refs = [str(item) for item in (refs or [])]
+        if len(cleaned) > MEMORY_TEXT_LIMIT:
+            raise MemoryError(
+                f"一条记忆最多 {MEMORY_TEXT_LIMIT} 字，当前 {len(cleaned)} 字；"
+                "请拆成几条各自成立的事实"
+            )
+        cleaned_refs = [str(item).strip() for item in (refs or []) if str(item).strip()]
         for ref in cleaned_refs:
             _reject_handle(ref)
         now = time.time()
+        if ttl_days > 0 and not expires_at:
+            expires_at = now + ttl_days * 86400
+
+        existing = next(
+            (item for item in self.entries.values() if item.text == cleaned), None
+        )
+        if existing is not None and existing.is_live(now):
+            existing.updated_at = now
+            for ref in cleaned_refs:
+                if ref not in existing.refs:
+                    existing.refs.append(ref)
+            existing.fingerprint = self._fingerprint_for(existing.refs)
+            self.save()
+            return existing
+
+        missing = [ref for ref in cleaned_refs if self._first_existing([ref]) is None]
+        unverified = False
+        if missing:
+            if source != "user":
+                raise MemoryError(
+                    "引用的文件不存在：" + "、".join(missing) + "。请写真实存在的路径，"
+                    "或者不写引用。"
+                )
+            unverified = True
+
+        targets = self._supersede_targets(cleaned, cleaned_refs, supersedes, now)
         entry = MemoryEntry(
             id=new_memory_id(cleaned),
             kind=MemoryKind.FACT,
@@ -244,10 +375,49 @@ class MemoryStore:
             created_at=now,
             updated_at=now,
             expires_at=expires_at,
+            supersedes=[item.id for item in targets],
+            valid_from=now,
+            unverified=unverified,
+            confidence=0.5 if unverified else 1.0,
+            session_id=session_id,
+            turn=turn,
         )
+        for target in targets:
+            target.valid_to = now
+            target.superseded_by = entry.id
         self.entries[entry.id] = entry
+        self._archive_overflow()
         self.save()
         return entry
+
+    def _supersede_targets(
+        self,
+        text: str,
+        refs: list[str],
+        supersedes: list[str] | None,
+        now: float,
+    ) -> list[MemoryEntry]:
+        """这次写入要取代哪些旧条目。
+
+        - 显式给了编号：就按编号来，模型自己判断过哪条旧了。
+        - 否则看「同主题」：新文本带更新词，且与旧条目共用引用。
+          只共用引用还不够——同一份受体上可以同时有多条互不相干的事实，
+          见到共用的引用就判失效会把它们一起清掉。
+        """
+        if supersedes:
+            return [
+                self.entries[item]
+                for item in supersedes
+                if item in self.entries and self.entries[item].is_live(now)
+            ]
+        if not refs or not any(marker in text for marker in SUPERSEDE_MARKERS):
+            return []
+        shared = set(refs)
+        return [
+            item
+            for item in self.entries.values()
+            if item.is_live(now) and item.refs and shared & set(item.refs)
+        ]
 
     def forget(self, entry_id: str) -> bool:
         """删掉一条记忆并写盘，返回是否删掉了。"""
@@ -278,31 +448,97 @@ class MemoryStore:
             "entries": [self.entries[key].to_dict() for key in sorted(self.entries)],
         }
 
+    def _archive_overflow(self) -> int:
+        """超过上限时把最该淘汰的挪进归档文件，返回挪了几条。
+
+        先淘汰已失效的（被取代 / 过期 / 引用丢了），再淘汰最旧的活条目。
+        归档不删：`/memory --all` 还能查，审计与回滚都不断。
+        """
+        overflow = len(self.entries) - MAX_ENTRIES
+        if overflow <= 0:
+            return 0
+        ordered = sorted(
+            self.entries.values(),
+            key=lambda item: (item.is_live(), item.updated_at),
+        )
+        archive = self._read_archive()
+        for entry in ordered[:overflow]:
+            del self.entries[entry.id]
+            archive.append(entry.to_dict())
+        self._atomic_write(
+            self.archive_path,
+            json.dumps({"entries": archive}, ensure_ascii=False, indent=2),
+        )
+        return overflow
+
+    def _read_archive(self) -> list[dict[str, Any]]:
+        """读归档文件；不存在或读不出来时当空。"""
+        target = self.archive_path
+        if not target.is_file():
+            return []
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        raw = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, dict)]
+
     # ------------------------------------------------------------------
     # 检索
     # ------------------------------------------------------------------
-    def recall(self, query: str = "", *, limit: int = 20) -> list[MemoryEntry]:
-        """按关键词检索，命中正文或引用的算命中；空查询返回全部。
+    def recall(
+        self,
+        query: str = "",
+        *,
+        limit: int = 20,
+        touch: bool = False,
+    ) -> list[MemoryEntry]:
+        """按关键词检索，命中正文或引用的算命中；空查询按更新时间排。
 
-        不引向量库：条目量级是几十到几百，关键词加时间排序足够用。
+        打分 = 字段权重 × 时间衰减：正文命中 2 分、引用命中 1 分，
+        每 90 天衰减一半。不做全库向量——条目量级是几十到几百，
+        中文 bigram 加时间衰减已经够用，而向量要额外的模型与索引。
+
+        `touch` 只有**显式 recall** 才打开：常驻注入内部也会调它，
+        那条路径如果也算「用过」，所有条目都会永远算「最近用过」。
         """
         needle = query.strip().lower()
-        hits: list[MemoryEntry] = []
-        for entry in self._ordered():
-            if not entry.is_live():
+        terms = _terms(needle)
+        now = time.time()
+        scored: list[tuple[float, MemoryEntry]] = []
+        for entry in self.entries.values():
+            if not entry.is_live(now):
                 continue
-            if needle and not self._matches(entry, needle):
+            score = self._score(entry, terms, now)
+            if terms and score <= 0:
                 continue
-            hits.append(entry)
-            if len(hits) >= limit:
-                break
+            scored.append((score, entry))
+        scored.sort(key=lambda pair: (-pair[0], -pair[1].updated_at))
+        hits = [entry for _, entry in scored[:limit]]
+        if touch:
+            for entry in hits:
+                entry.last_used_at = now
         return hits
 
-    def _matches(self, entry: MemoryEntry, needle: str) -> bool:
-        """正文或任一引用里含关键词就算命中。"""
-        if needle in entry.text.lower():
-            return True
-        return any(needle in ref.lower() for ref in entry.refs)
+    def _score(self, entry: MemoryEntry, terms: list[str], now: float) -> float:
+        """一条记忆对这次查询的得分。空查询不打分，一律 1。"""
+        if not terms:
+            return 1.0
+        text = entry.text.lower()
+        refs = [ref.lower() for ref in entry.refs]
+        score = 0.0
+        for term in terms:
+            if term in text:
+                score += 2.0
+            if any(term in ref for ref in refs):
+                score += 1.0
+        if entry.unverified:
+            # 用户写进来但引用不存在的：可能对，但排在有凭据的后面。
+            score *= 0.5
+        age_days = max(0.0, (now - entry.updated_at) / 86400)
+        return score * math.exp(-age_days / DECAY_DAYS)
 
     def _ordered(self) -> list[MemoryEntry]:
         """按更新时间倒序，最近的排前面。"""
@@ -347,20 +583,55 @@ class MemoryStore:
     # ------------------------------------------------------------------
     # 注入
     # ------------------------------------------------------------------
-    def resident_text(self, limit: int = RESIDENT_LIMIT) -> str:
-        """常驻注入的正文：核心事实，按 token 上限裁剪。
+    def resident_text(self, limit: int = RESIDENT_LIMIT, query: str = "") -> str:
+        """常驻注入的正文：核心事实 + 与当前问题相关的 + 最近更新的。
 
-        排序把「有引用的」放前面：引用指向项目里真实存在的产物，
-        比一句没有凭据的陈述更值得占用常驻额度。同优先级按更新时间倒序，
-        超限时先砍旧的。
+        三段按优先级拼，按 id 去重，填满 `limit` 为止：
+
+        1. core：有引用、且近 30 天被显式 `recall` 命中过，最多 5 条；
+        2. relevant：用当前问题检索出来的，最多 5 条；
+        3. recent：最近更新的，最多 3 条；
+        4. 还有余量就按「有引用优先、新的先」继续填。
+
+        先前是「全部活条目按更新时间排，装不下就跳过」：内容一多，注入的永远是
+        最近改过的那几条，与当前问题无关。相关度优先之后，同样 1200 token
+        能命中的东西多得多；没被选中的仍可用 `recall` 取到。
         """
-        live = [entry for entry in self.entries.values() if entry.is_live()]
+        now = time.time()
+        live = [entry for entry in self.entries.values() if entry.is_live(now)]
         if not live:
             return ""
-        ordered = sorted(live, key=lambda item: (not item.refs, -item.updated_at))
+        picked: list[MemoryEntry] = []
+        seen: set[str] = set()
+
+        def take(entries: list[MemoryEntry], cap: int) -> None:
+            count = 0
+            for entry in entries:
+                if count >= cap:
+                    break
+                if entry.id in seen:
+                    continue
+                seen.add(entry.id)
+                picked.append(entry)
+                count += 1
+
+        recent_window = 30 * 86400
+        core = [
+            entry
+            for entry in sorted(live, key=lambda item: -item.last_used_at)
+            if entry.refs and entry.last_used_at and now - entry.last_used_at <= recent_window
+        ]
+        take(core, 5)
+        if query.strip():
+            take(self.recall(query, limit=10), 5)
+        # 最近更新的那几条，有引用的优先：引用指向项目里真实存在的产物，
+        # 比一句没有凭据的陈述更值得占常驻额度。
+        take(sorted(live, key=lambda item: (not item.refs, -item.updated_at)), 3)
+        take(sorted(live, key=lambda item: (not item.refs, -item.updated_at)), len(live))
+
         lines: list[str] = []
         used = 0
-        for entry in ordered:
+        for entry in picked:
             line = self.render_line(entry)
             cost = estimate_tokens(line)
             if used + cost > limit:
@@ -379,7 +650,39 @@ class MemoryStore:
             line += f"（{entry.refs[0]}）"
         if entry.state == "stale":
             line += "（引用文件已变更，可能过期）"
+        elif entry.state == "missing":
+            line += "（引用的文件不在了）"
+        if entry.unverified:
+            line += "（引用未确认）"
+        if entry.superseded_by:
+            line += f"（已被 {entry.superseded_by} 取代）"
         return line
+
+    def describe_line(self, entry: MemoryEntry) -> str:
+        """`/memory` 用的两行：正文那一行 + 来源、时间与状态。"""
+        stamp = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(entry.updated_at or entry.created_at)
+        )
+        bits = [f"来源 {entry.source or '未知'}", f"更新 {stamp}"]
+        if entry.refs:
+            bits.append("引用 " + "、".join(entry.refs))
+        bits.append(FILE_STATE_NOTES.get(entry.state, entry.state))
+        if entry.superseded_by:
+            bits.append(f"已失效（被 {entry.superseded_by} 取代）")
+        elif entry.expires_at:
+            bits.append(
+                "到期 " + time.strftime("%Y-%m-%d", time.localtime(entry.expires_at))
+            )
+        return self.render_line(entry) + "\n　　" + "　".join(bits)
+
+    def all_entries(self, include_revoked: bool = False) -> list[MemoryEntry]:
+        """全部条目，按更新时间倒序；`include_revoked` 为真时连失效的一起给。"""
+        now = time.time()
+        return [
+            entry
+            for entry in self._ordered()
+            if include_revoked or entry.is_live(now)
+        ]
 
     def render_markdown(self) -> str:
         """memory.md 的正文。给人看、给人改；真相仍以条目文件为准。"""
@@ -489,6 +792,10 @@ class RememberTool(Tool):
                     "items": {"type": "string"},
                     "description": "这条事实引用的文件路径，可以给多个；不给也行",
                 },
+                "ttl_days": {
+                    "type": "number",
+                    "description": "多少天后自动过期；不给就是长期有效。适合会变的临时结论",
+                },
             },
             "required": ["text"],
             "additionalProperties": False,
@@ -510,8 +817,13 @@ class RememberTool(Tool):
             refs = [str(item) for item in raw_refs if str(item).strip()]
         else:
             raise ToolError("参数 refs 应当是字符串数组")
+        raw_ttl = arguments.get("ttl_days") or 0
+        if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, (int, float)):
+            raise ToolError("参数 ttl_days 应当是数字")
         try:
-            entry = self.store.remember(text, refs, source="agent")
+            entry = self.store.remember(
+                text, refs, source="agent", ttl_days=float(raw_ttl)
+            )
         except MemoryError as error:
             raise ToolError(str(error)) from error
         return ToolResult(output=f"已记住（{entry.id}）：{entry.text}")
@@ -554,9 +866,15 @@ class RecallTool(Tool):
         """检索记忆。"""
         raw = arguments.get("query")
         query = raw if isinstance(raw, str) else ""
-        hits = self.store.recall(query)
+        # 检索之前对一次账：上一轮可能刚重新准备过受体，
+        # 引用变了的那条要带着提醒交出去，而不是等下一次启动才发现。
+        self.store.revalidate()
+        hits = self.store.recall(query, touch=True)
         if not hits:
             return ToolResult(output="没有匹配的记忆。")
+        # 记下「这几条被用过」：常驻注入据此判断哪些是核心事实。
+        # 这是唯一会写盘的地方，常驻注入内部那次 recall 不算。
+        self.store.save()
         self._collect(arguments.get("evidence"), hits)
         return ToolResult(
             output="\n".join(self.store.render_line(entry) for entry in hits)

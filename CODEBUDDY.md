@@ -191,6 +191,8 @@ __main__.py → app.py ───────────────────
   记在那里会让一个会话装过的工具漏到另一个）；子 agent 从父会话继承。
   `hidden_names(session)` 给的是**排除集**而不是允许清单：没登记族的工具默认常驻，
   新工具忘了登记时坏处只是白占额度，不会「写了却没装、模型看不见」。
+  模型看不见某个工具时最容易直接叫它的名字，所以 `loop.missing_tool_reason` 会认族：
+  回的是「属于 docking 族，先 `load_tools family=docking`」，不是 `unknown tool`。
 - `prompt.py` — `stable_prefix` 组装身份 + 工作纪律 + 项目规则。**前缀里不放时间不放进度**，
   否则每步都击穿 prompt cache。`project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`，32KB 上限）。
   摘要指令是八段（目标 / 改动 / 待办 / 约束 / 决定 / 错误 / 当前 / 关键数字），

@@ -206,7 +206,11 @@ from opencode_tui.core.agent.domain import align as align_module  # noqa: E402
 from opencode_tui.core.agent.domain import products as products_module  # noqa: E402
 from opencode_tui.core.agent.domain.all_tools import catalog, families, tool_family  # noqa: E402
 from opencode_tui.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
-from opencode_tui.core.agent.toolset import LoadToolsTool, hidden_names  # noqa: E402
+from opencode_tui.core.agent.toolset import (  # noqa: E402
+    LoadToolsTool,
+    family_of,
+    hidden_names,
+)
 from opencode_tui.core.agent.trace import TraceWriter, log_directory_for  # noqa: E402
 from opencode_tui.core.event_bus import EventBus  # noqa: E402
 from opencode_tui.core.models import (  # noqa: E402
@@ -12321,6 +12325,33 @@ async def check_tool_family() -> None:
         f"族跟着会话存盘走：{restored_session.tool_families}",
     )
     check("dock" in hidden_names(Session.from_dict({"id": "ses_x"})), "没存过族时按全藏处理")
+
+    # 模型看不见 dock 时会直接叫它（它记不住清单里有什么）。那一句话必须告诉它
+    # 「去装哪一族」——只说 unknown tool 的话，它下一步多半是绕 bash 或编参数。
+    check(family_of("dock") == "docking" and family_of("bash") == "", "family_of 与 tool_family 一致")
+    unloaded = Session(id="ses_family2")
+    hint = missing_tool_reason(registry, "dock", unloaded)
+    check(
+        "docking" in hint and "load_tools" in hint,
+        f"没装的族要说清装哪一族：{hint}",
+    )
+    check("unknown tool" not in hint, "这一句不是「没有这个工具」，是「还没装」")
+    check(
+        "unknown tool" in missing_tool_reason(registry, "dock"),
+        "不给会话时退回旧文案（调用方没改的地方行为不变）",
+    )
+    check(
+        "unknown tool" in missing_tool_reason(registry, "dock", session),
+        "装过的族不再提示去装（否则模型会来回 load 同一族）",
+    )
+    check(
+        "已被禁用" in missing_tool_reason(ToolRegistry(disabled={"dock"}), "dock", unloaded),
+        "禁用排在按族加载之前：关掉的工具装进来也没用，不能叫它去 load",
+    )
+    check(
+        "unknown tool" in missing_tool_reason(registry, "nonexistent_thing", unloaded),
+        "真不存在的工具不编一个族出来",
+    )
 
 
 def _event_fixture(steps: int) -> Session:

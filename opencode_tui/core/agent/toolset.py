@@ -35,6 +35,18 @@ def hidden_names(session: Session) -> frozenset[str]:
     return frozenset(hidden)
 
 
+def family_of(name: str) -> str:
+    """工具名属于哪一族；常驻工具返回空串。
+
+    给「模型叫了一个看不见的工具」那一句提示用：它看不见 `dock` 多半是因为
+    `docking` 族还没装，而不是这个工具不存在——两句话该让模型做的事不一样。
+    """
+    for family, names in catalog().items():
+        if name in names:
+            return family
+    return ""
+
+
 class LoadToolsTool(Tool):
     """把一族领域工具装进本会话的工具清单。"""
 

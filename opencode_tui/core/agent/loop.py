@@ -15,7 +15,7 @@ from .context import (
     EvidenceStore,
 )
 from .event_log import EventRuntime, event_boundary, record_local_event
-from .toolset import hidden_names
+from .toolset import family_of, hidden_names
 from .hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from .permission import PermissionDecision, PermissionPolicy, Verdict
 from .prompt import KEEP_MESSAGES, event_messages, stable_prefix, summary_messages
@@ -97,25 +97,37 @@ EXIT_LABELS: dict[str, str] = {
 }
 
 
-def missing_tool_reason(registry: ToolRegistry, name: str) -> str:
+def missing_tool_reason(
+    registry: ToolRegistry, name: str, session: Session | None = None
+) -> str:
     """模型叫了一个不在注册表里的工具时，回给它的一句话。
 
-    两种情形要说成两种话，因为模型该做的事不同：
+    三种情形要说成三种话，因为模型该做的事不同：
 
     - 在禁用清单里 → 这个工具是被人为关掉的，**重试无用**，也不该换个方式绕。
+    - 属于一个还没装的族 → 装那一族就好，这是按需加载唯一的真实失败路径。
+      不说清楚的话，模型最可能做的是绕道 bash 或凭记忆写参数，两条都是错的。
     - 真的没有 → 报名字，让它自己改。
 
     分开还有个用处：模型偶尔会凭训练印象叫一个我们从来没有的工具
     （历史现场：`unknown tool: read`，当时注册表里确实只有 bash），
     那句话与「被你关掉了」混在一起会让用户以为是自己配错了。
 
-    模块级函数而不是循环层的方法：它只看注册表上的禁用清单，是纯的，
-    测试直接调它验这一句话即可，不必为此起一整层循环、配总线与模型。
+    模块级函数而不是循环层的方法：它只读注册表的禁用清单与会话装过哪几族，
+    是纯的，测试直接调它验这一句话即可，不必为此起一整层循环、配总线与模型。
+    `session` 留成可选：不给时按「真的没有」处理，与按需加载之前的行为一致。
     """
     if name in registry.disabled:
         return (
             f"{name} 已被禁用（配置在 .opencode_tui/tools.toml 里，可在 /tools 面板里打开），"
             "本次会话不会提供这个工具，重试无用，请改用别的办法或告诉用户。"
+        )
+    family = family_of(name)
+    if family and session is not None and family not in session.tool_families:
+        return (
+            f"{name} 还没装进来：它属于 {family} 族。"
+            f"先调 load_tools family={family}，下一步起它就在清单里；"
+            "不要绕道 bash 去调等价的东西，也不要凭记忆写参数。"
         )
     return f"unknown tool: {name}"
 
@@ -988,7 +1000,11 @@ class AgentLoop:
         """
         tool = self.registry.get(part.tool_name)
         if tool is None:
-            self._fail_tool(message, part, missing_tool_reason(self.registry, part.tool_name))
+            self._fail_tool(
+                message,
+                part,
+                missing_tool_reason(self.registry, part.tool_name, session),
+            )
             return
         error = argument_error(tool.spec, part.tool_input)
         if error:

@@ -136,6 +136,9 @@
 > 反而没绕。**根因在 `rsearch.search_entries`**：那里的 `except Exception` 把
 > `RetryableToolError` 也归成了「这次没搜成」，循环层的重试因此被绕过——一次网络
 > 抖动变成了「这个工具坏了」。工具说明再准，也救不回一个被判死的工具。
+>
+> 这两次会话里看到的失败模式（重试被吞、平台猜错、handle 猜错、不知道状态目录在哪）
+> 逐条记在 [`docs/real-session-findings.md`](real-session-findings.md)，含代价与修法排序。
 
 ---
 

@@ -770,86 +770,56 @@ class WriteRunTool(Tool):
     spec = ToolSpec(
         name="write_run",
         description=(
-            "把一个受体（与可选的对接产物）写成一个**运行目录**：`meta.json` 记目标与口袋来源、"
-            "`receptor.pdb` 是坐标、`ligands/` 放对接后的最佳位姿。产出的目录登记成 artifact，"
-            "网页端据此渲染结构页。\n\n"
-            "**同一个工具负责两种展示**：`view=pockets`（默认）算口袋；`view=structure` "
-            "只展示结构、不联网也不算口袋。两种模式都会先做同一套预处理"
-            "（选链、选交替构象、去水、去溶剂、去氢），页面按链配不同颜色。\n\n"
-            "**给了 docking 就走对接结果这一侧**：把 `status=ok` 的 pose 复制进 `ligands/`、"
-            "填 `molecules` 的分数与排名、并在 `provenance.poses` 里记下引擎与分数方向。"
-            "`docking` 与 `ligands` 不能同时给——前者已经带着配体集。\n\n"
-            "**口袋来源按优先级自动选，两条路二选一**：\n"
-            "  · 给了 candidates（你自己给出的 PDB 编号清单）就走**先验这一侧**："
-            "逐个取回来核对（编号是否存在、链序列是不是受体序列），通过的按 CA 原子"
-            "叠合到受体上，再用叠合后的共晶配体圈口袋（`source=ligand`，带 `rmsd`）。"
-            "**这一侧不再按 UniProt 检索复合物**——检索只返回带配体的已发布复合物，"
-            "覆盖到的口袋窄。核对不通过的编号逐条列在返回里。\n"
-            "  · 没给 candidates 就按老路：先查该蛋白在 RCSB 里所有带配体的复合物，"
-            "一个都没有才转 prankweb 的 p2rank 预测（`source=p2rank`）。\n"
-            "两条路都拿不到就写空口袋数组并说明原因。\n\n"
-            "**uniprot 与 pdb_id 不是一回事**：uniprot 是一个蛋白（如 P00519），"
-            "它名下可能对应几十上百个 PDB 条目——只给 pdb_id 会让主来源退化成"
-            "「只看手上这一份结构」。给出 uniprot 才能让工具去搜全部复合物。\n\n"
-            "不要自己编 center / score / min_distance：这些一律现算或向接口取。"
+            "把一个受体（可选的对接产物）写成**运行目录**（`meta.json` / `receptor.pdb` / `ligands/`），"
+            "登记成 artifact，网页端据此渲染结构页。\n"
+            "`view=pockets`（默认）算口袋；`view=structure` 只展示结构、不联网。"
+            "两者都先做同一套预处理（选链与构象、去水去溶剂去氢）。\n"
+            "给了 `docking` 就写对接结果（位姿、分数、`provenance.poses`），不要再传 `ligands`。\n"
+            "口袋来源二选一：给了 `candidates` 就走先验（核对编号与链序列，按 CA 叠合后用共晶配体"
+            "圈口袋，`source=ligand`）；没给就搜该蛋白的带配体复合物，一个都没有才转 p2rank。"
+            "两路都拿不到就写空口袋并说明原因。\n"
+            "`uniprot` 是蛋白编号（如 P00519），**不是** PDB 编号；只给 `pdb_id` 会让主来源"
+            "只剩手上这一份结构。center / score / min_distance 一律现算，不要自己编。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "receptor": {
                     "type": "string",
-                    "description": "受体条目引用，例如 receptor#1。**不要传文件路径**",
+                    "description": "受体条目，例如 receptor#1",
                 },
                 "ligands": {
                     "type": "string",
-                    "description": (
-                        "配体集合条目引用，例如 ligandset#2。没有对接结果时可选；"
-                        "**给了 docking 就不要传它**"
-                    ),
+                    "description": "配体集条目，例如 ligandset#2；给了 docking 就别传",
                 },
                 "docking": {
                     "type": "string",
-                    "description": (
-                        "对接产物 handle，例如 artifact#4。给了它就把最佳 pose 写进 "
-                        "`ligands/` 并填 `molecules`；不要再传 ligands"
-                    ),
+                    "description": "对接产物 handle，例如 artifact#4；会写入最佳位姿与分数",
                 },
                 "run_id": {
                     "type": "string",
-                    "description": "运行目录名（字母数字与 . _ -）。留空时按受体的 pdb_id 生成",
+                    "description": "运行目录名（字母数字与 . _ -），留空按 pdb_id 生成",
                 },
                 "uniprot": {
                     "type": "string",
-                    "description": (
-                        "该蛋白的 UniProt 编号（如 P00519），主来源据此搜全部复合物。"
-                        "**不是 PDB 编号**。留空时从受体条目的 meta 里找"
-                    ),
+                    "description": "蛋白的 UniProt 编号（如 P00519），主来源据此搜全部复合物",
                 },
                 "pdb_id": {
                     "type": "string",
-                    "description": (
-                        "PDB 条目号（如 1IEP），**只在主来源为空时**用于查预测。留空时从 meta 里找"
-                    ),
+                    "description": "PDB 条目号（如 1IEP），只在主来源为空时查预测",
                 },
-                "name": {"type": "string", "description": "运行显示名，进了界面标题"},
+                "name": {"type": "string", "description": "运行显示名"},
                 "candidates": {
                     "type": "string",
                     "description": (
-                        "先验清单：你自己给出的 PDB 编号，逗号或空格分隔"
-                        "（如 \"1M17,2ITY,4HJO\"）。给了它就走先验这一侧，"
-                        "不再按 UniProt 检索复合物。每个编号都会核对编号是否存在、"
-                        "链序列是不是受体序列，不通过的逐条列在返回里"
+                        "先验清单：PDB 编号，逗号或空格分隔（如 \"1M17,2ITY,4HJO\"）。"
+                        "给了它就不再按 UniProt 检索复合物"
                     ),
                 },
                 "view": {
                     "type": "string",
                     "enum": ["pockets", "structure"],
-                    "description": (
-                        "页面要展示什么。`pockets`（默认）算口袋并展示；"
-                        "`structure` 只展示清洗后的结构，**不联网、不算口袋**。"
-                        "两种模式写出的 `receptor.pdb` 都经过同一套预处理"
-                        "（选链、选构象、去水、去溶剂、去氢），结构页按链配色"
-                    ),
+                    "description": "pockets（默认）算口袋；structure 只展示结构，不联网",
                 },
             },
             "required": ["receptor"],

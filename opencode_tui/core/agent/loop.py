@@ -14,9 +14,11 @@ from .context import (
     ContextBundle,
     EvidenceStore,
 )
+from .event_log import EventRuntime, event_boundary, record_local_event
+from .toolset import hidden_names
 from .hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from .permission import PermissionDecision, PermissionPolicy, Verdict
-from .prompt import KEEP_MESSAGES, stable_prefix, summary_messages
+from .prompt import KEEP_MESSAGES, event_messages, stable_prefix, summary_messages
 from .provider import (
     ChatProvider,
     OpenAICompatProvider,
@@ -35,8 +37,21 @@ MAX_STOP_RETRIES = 2
 MAX_RETRIES = 2
 # 连着这么多步「整步工具全失败」就判成卡住，停下来并写收尾总结
 MAX_FAILED_STREAK = 3
+# 权限询问最多等多久（秒）。等不到按拒绝处理。
+#
+# 300 秒是「人去倒杯水再回来」的量级；再长就没有意义了——真没人看窗口的话，
+# 多等十分钟只是让这一轮白占着。界面正常时会在这个时间之内答复。
+PERMISSION_TIMEOUT = 300.0
+# 摘要连续失败这么多次就熔断：后面不再试，这一段直接按丢弃处理。
+#
+# 熔断比「每步都试一次」好：摘要失败通常是接口或模型那一侧的问题，
+# 每一步重试一次只是在每一步都多等一个超时。
+MAX_SUMMARY_FAILURES = 3
 # 用环境变量覆盖步数上限时的名字
 MAX_STEPS_ENV = "VSA_MAX_STEPS"
+# 留着多少步的上下文度量。`/context` 只显示最近 10 步，留 40 步是为了
+# 一倍于显示窗口的余量：用户翻看时前面几步不会刚好已经被挤掉。
+CONTEXT_HISTORY_LIMIT = 40
 
 
 def max_steps_from_env(environ: dict[str, str] | None = None) -> int:
@@ -180,6 +195,17 @@ class AgentLoop:
         self.max_steps = max_steps
         self.cancelled = False
         self.last_latency_ms = 0
+        # 最近几步的上下文度量。每步一条，`/context` 与主动压缩都读它。
+        #
+        # 一轮开始时清空：跨轮攒下来的数字分不清是哪件事的步骤，
+        # 而用户按 `/context` 想知道的是「这一轮把窗口花在哪了」。
+        self.context_history: list[dict[str, Any]] = []
+        # 上一步实际发给模型的输入 token（含重试）。主动压缩的阈值看**实际值**，
+        # 不看装配器的估算：估算回答的是「额度分给了谁」，服务端记账的是另一份。
+        self.last_input_tokens = 0
+        self.last_cached_tokens = 0
+        # 摘要连续失败几次。到 `MAX_SUMMARY_FAILURES` 就熔断到下一轮。
+        self._summary_failures = 0
         # 这一轮为什么停下。`None` 表示模型自己说完了；其余取值见 EXIT_*。
         # 子 agent 的状态机靠它区分 done / failed，不必再从消息的 Part 里猜。
         self.last_exit_reason: str | None = None
@@ -242,11 +268,18 @@ class AgentLoop:
         这里只推位置，不在这里生成摘要：摘要是给下一次发问用的，
         而下一次发问会自己按 `dropped` 判据跑一遍。自动压缩是窗口装不下时才发生，
         这一条是用户按出来的，两种触发的产物因此长得一样。
+
+        已经有事件时，被推掉的那一段先用**本地事件**盖住：事件必须连续，
+        中间留缝的话那一段原文就既不在事件里、也不在 RECENT 里。
         """
         total = len(session.messages)
         if total <= keep:
             return total
-        session.compact_upto = max(session.compact_upto, total - keep)
+        target = max(session.compact_upto, total - keep)
+        if session.events and target > session.event_end:
+            record_local_event(session, target, "local")
+        session.compact_upto = max(session.compact_upto, target)
+        session.sanitize_events()
         self.bus.publish("status.update", {"session_id": session.id})
         return keep
 
@@ -260,6 +293,11 @@ class AgentLoop:
         # 证据是「本步相关」的，一轮开始时清空：上一轮 recall 出来的记忆，
         # 到这一轮多半已经不相干，留着只会占掉证据层的额度。
         self.evidence.clear()
+        # 度量同理按轮清空：这一轮的每一步各记一条，上一轮的不混进来。
+        self.context_history.clear()
+        self.last_input_tokens = 0
+        self.last_cached_tokens = 0
+        self._summary_failures = 0
         started = time.time()
         message = Message(
             role="assistant",
@@ -361,15 +399,94 @@ class AgentLoop:
             },
         )
 
-    def _memory_text(self) -> str:
+    def _record_step_metrics(
+        self,
+        session: Session,
+        step: int,
+        context: ContextBundle,
+        input_tokens: int,
+        cached_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """把这一步的装配估算与实际用量合成一条记录。
+
+        估算（`context.metrics`）回答「额度分给了谁」，实际值回答「真的花了多少」。
+        两者分开留着，`/context` 才能看出估算准不准；合成一个数就再也分不开了。
+
+        `input_tokens` 是这一步**所有**请求之和（重试也算）：重试的每一次都重新
+        发了整份上下文，把它们漏掉会让「窗口快满了」这件事晚一步才被发现。
+        """
+        metrics = dict(context.metrics)
+        metrics.update(
+            {
+                "step": step,
+                "input": input_tokens,
+                "cached": cached_tokens,
+                "output": output_tokens,
+                # 分母为零时不给 0/0：写成 0.0，读的人一眼知道「这一步没有输入」，
+                # 而不是「一次都没命中缓存」。
+                "cache_hit": (cached_tokens / input_tokens) if input_tokens else 0.0,
+                "window_used": (input_tokens / self.context_window) if self.context_window else 0.0,
+            }
+        )
+        self.context_history.append(metrics)
+        if len(self.context_history) > CONTEXT_HISTORY_LIMIT:
+            del self.context_history[: len(self.context_history) - CONTEXT_HISTORY_LIMIT]
+        self.last_input_tokens = input_tokens
+        self.last_cached_tokens = cached_tokens
+        self.bus.publish("context.metrics", {"session_id": session.id, **metrics})
+
+    def _event_runtime(self, session: Session, message: Message) -> EventRuntime:
+        """造一份事件运行时：收口位置、摘要请求与取消状态。
+
+        摘要请求借用 `_ask_summary`，用量因此记在这一轮的消息上——收口花的钱
+        与这一轮的其他花费记在同一处，状态栏上的数字才对得上。
+        """
+        return EventRuntime(
+            session=session,
+            # 当前正在写的那条 assistant 消息，收口必须停在它前面。
+            current_index=max(0, len(session.messages) - 1),
+            summarize=lambda target, start, end: self._ask_summary(
+                message, event_messages(target, start, end)
+            ),
+            is_cancelled=lambda: self.cancelled,
+        )
+
+    def _memory_text(self, session: Session) -> str:
         """常驻注入的记忆正文；没装配记忆时是空串。
 
         每次发问都现取一次：记忆可能在会话中途被 remember 改过，
         缓存一份的话要额外记得在哪里失效，不如现取。
+
+        带查询词是这一期的新东西：1200 token 装不下全部记忆，装「与当前问题
+        相关的那几条」比装「最近改过的那几条」有用得多。
         """
         if self.memory is None:
             return ""
-        return self.memory.resident_text()
+        return self.memory.resident_text(query=self._memory_query(session))
+
+    @staticmethod
+    def _memory_query(session: Session) -> str:
+        """检索词：最后一条用户消息 + 任务目标。
+
+        只看最后一条：更早的用户消息已经由 RECENT 或事件代表，
+        而记忆要回答的是「现在这件事需要知道什么」。
+        """
+        pieces: list[str] = []
+        for message in reversed(session.messages):
+            if message.role != "user":
+                continue
+            text = " ".join(
+                part.text
+                for part in message.parts
+                if part.type is PartType.TEXT and part.text
+            )
+            if text.strip():
+                pieces.append(text.strip())
+                break
+        if session.task_state.goal:
+            pieces.append(session.task_state.goal)
+        return " ".join(pieces)
 
     @staticmethod
     def _task_text(session: Session) -> str:
@@ -381,6 +498,15 @@ class AgentLoop:
         """
         state = session.task_state
         return "" if state.is_empty() else state.render()
+
+    def tool_specs(self, session: Session) -> list[dict[str, Any]]:
+        """这一步该发出去的工具定义：全部减去还没 `load_tools` 装过的族。
+
+        按族加载把 34 个工具的 11.3K 定义压到核心那 10 个（约 2.1K），没装的
+        那几族连名字都不出现——模型不会去调它不存在的东西。用排除而不是允许
+        清单：新工具忘了登记族时它仍然每步都在（白占额度），而不是悄悄消失。
+        """
+        return self.registry.specs(exclude=hidden_names(session))
 
     def _assemble(self, session: Session, prefix: str, with_tools: bool = True) -> ContextBundle:
         """按分层装配这一步发给模型的消息。
@@ -394,8 +520,8 @@ class AgentLoop:
         return ContextAssembler(self.context_window).build(
             session,
             prefix,
-            tools=self.registry.specs() if with_tools else [],
-            memory_text=self._memory_text(),
+            tools=self.tool_specs(session) if with_tools else [],
+            memory_text=self._memory_text(session),
             task_text=self._task_text(session),
             evidence=self.evidence.items(),
         )
@@ -421,6 +547,7 @@ class AgentLoop:
         stop_retries = 0
         failed_streak = 0
         exit_reason: str | None = None
+        recovered = False
         while True:
             if self.cancelled:
                 exit_reason = EXIT_CANCELLED
@@ -436,14 +563,47 @@ class AgentLoop:
             except ContextAssemblyError as error:
                 # 装不下就明说，不静默截断：模型在缺了材料的情况下继续往下做，
                 # 比停下来让用户知道「要腾地方」糟得多。
+                #
+                # 但先救一次：把压缩位置往前推一段再装一遍。一次失败就放弃，
+                # 等于把一个明明能救的场景直接变成错误——这是长会话最常见的死法。
+                if not recovered and self._recover_context(session):
+                    recovered = True
+                    continue
                 self._publish(message, Part(type=PartType.ERROR, text=f"上下文装不下：{error}"))
                 exit_reason = EXIT_ERROR
                 break
             if context.dropped:
+                if session.events or session.summary_upto > 0:
+                    # 已经有一份摘要（或已有事件）时，新的溢出交给事件，摘要冻结：
+                    # 再让摘要往前推会与事件重叠，同一段内容被说两遍。
+                    # 这一段补一条本地事件，零模型请求。
+                    boundary = event_boundary(session, max(0, len(session.messages) - 1))
+                    covered = min(context.dropped_upto, boundary)
+                    if record_local_event(session, covered, "auto"):
+                        context = self._assemble(session, prefix)
+                elif await self._summarize(session, message, context.dropped_upto):
+                    # 第一次溢出：先让模型写一份摘要，把「很久以前」压成一份结论。
+                    # 之后的溢出才交给事件——两者覆盖的区间是分开的。
+                    context = self._assemble(session, prefix)
+            elif context.dropped_upto > 0:
+                # 判据是「上下文里有没有已经不在的内容」，不是「这一步新丢了没有」：
+                # 用户手动 /compact 推的边界不在当步产生新移出，但那一段同样要摘要；
+                # 已经收进摘要的会由 `_summarize` 自己判掉，只留一条界面记录。
                 if await self._summarize(session, message, context.dropped_upto):
                     context = self._assemble(session, prefix)
             self._trace_context(session, context)
-            calls = await self._ask_model(message, context.messages, session.effort)
+            before = dict(message.tokens)
+            calls = await self._ask_model(
+                message, context.messages, self.tool_specs(session), session.effort
+            )
+            self._record_step_metrics(
+                session,
+                step,
+                context,
+                input_tokens=int(message.tokens.get("input", 0)) - int(before.get("input", 0)),
+                cached_tokens=int(message.tokens.get("cached", 0)) - int(before.get("cached", 0)),
+                output_tokens=int(message.tokens.get("output", 0)) - int(before.get("output", 0)),
+            )
             if self.cancelled:
                 exit_reason = EXIT_CANCELLED
                 break
@@ -581,6 +741,23 @@ class AgentLoop:
         lines.append("（这份总结由本地按已有记录汇编，模型那次收尾请求没有成功。）")
         return "\n".join(lines)
 
+    def _recover_context(self, session: Session) -> bool:
+        """装不下时强行腾一次地方；腾不动返回 False。
+
+        手段只有一种：把压缩位置推到会话的一半。有事件时先用本地事件把
+        那一段盖住——否则事件与 RECENT 之间会留一道缝，那一段原文两边都不在。
+        腾完由调用方再装一次；仍装不下才报错。
+        """
+        total = len(session.messages)
+        target = max(session.compact_upto, total // 2)
+        if total < 2 or target <= session.compact_upto:
+            return False
+        if session.events:
+            record_local_event(session, target, "local")
+        session.compact_upto = max(session.compact_upto, target)
+        session.sanitize_events()
+        return True
+
     async def _summarize(self, session: Session, message: Message, upto: int) -> bool:
         """丢掉的那一段还没进摘要时跑一次摘要，并把这次压缩记成一条 Part。
 
@@ -589,10 +766,24 @@ class AgentLoop:
         摘要是一次真实请求，用量累加在当前这条消息上，成本在状态栏上看得见。
         """
         upto = min(upto, len(session.messages))
+        if session.events:
+            # 事件与摘要不重叠：首条事件从 `summary_upto` 起，摘要再往前走
+            # 就会把已经被事件替代的那一段重新收一遍。
+            return False
         if upto <= session.summary_upto:
             self._publish(
                 message,
                 Part(type=PartType.COMPACTION, text=f"已丢弃 {upto} 条更早的消息"),
+            )
+            return False
+        if self._summary_failures >= MAX_SUMMARY_FAILURES:
+            # 熔断：接口或模型那一侧坏了，每一步再试一次只是每步多等一个超时。
+            self._publish(
+                message,
+                Part(
+                    type=PartType.COMPACTION,
+                    text=f"摘要连续失败 {MAX_SUMMARY_FAILURES} 次，本轮不再尝试；这一段按丢弃处理",
+                ),
             )
             return False
         failure = ""
@@ -606,6 +797,7 @@ class AgentLoop:
         if not failure and not text:
             failure = "模型没有返回内容"
         if failure:
+            self._summary_failures += 1
             self._publish(
                 message,
                 Part(
@@ -614,6 +806,7 @@ class AgentLoop:
                 ),
             )
             return False
+        self._summary_failures = 0
         session.summary = text
         session.summary_upto = upto
         self._publish(
@@ -717,6 +910,7 @@ class AgentLoop:
         self,
         message: Message,
         messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
         reasoning_effort: str = "",
     ) -> list[Part]:
         """问一次模型，返回本 step 新建的工具 Part。可以重试的错误在这里重发。
@@ -724,11 +918,14 @@ class AgentLoop:
         彻底失败时写成 `ERROR` 而不是 `TEXT`：这条内容**不是模型说出来的**，
         写成正文会让下一轮把报错当正常历史回灌（翻译层只认 TEXT 进 content）。
         界面上仍然看得见，只是带上出错标记。
+
+        `tools` 由调用方给（`tool_specs(session)`），不在这一层现算：
+        重试必须发同一份清单，否则「第几次尝试」会换一套工具。
         """
         attempt = 0
         while True:
             try:
-                return await self._consume_stream(message, messages, reasoning_effort)
+                return await self._consume_stream(message, messages, tools, reasoning_effort)
             except ProviderError as error:
                 if not error.retryable or attempt >= MAX_RETRIES:
                     self._publish(
@@ -747,11 +944,12 @@ class AgentLoop:
         self,
         message: Message,
         messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
         reasoning_effort: str = "",
     ) -> list[Part]:
         """消费一次模型响应，把内容写成 Part，返回本 step 的工具调用。"""
         calls: list[Part] = []
-        async for event in self.provider.stream(messages, self.registry.specs(), reasoning_effort):
+        async for event in self.provider.stream(messages, tools, reasoning_effort):
             if self.cancelled:
                 break
             if event.type is ProviderEventType.TEXT_DELTA:
@@ -843,6 +1041,7 @@ class AgentLoop:
                 evidence=self.evidence,
                 viewer=self.viewer,
                 spawner=self.spawner,
+                event_runtime=self._event_runtime(session, message),
                 on_arguments=record_arguments,
             )
         except ToolError as error:
@@ -851,13 +1050,16 @@ class AgentLoop:
         part.tool_output = result.output
         part.patch_added = result.added
         part.patch_removed = result.removed
+        # 结构化读数留在 Part 上：证据层据此认出「这次产出了哪个 handle」，
+        # 界面与网页端也能直接取数字，不必去正则解析中文输出。
+        part.tool_meta = dict(result.meta or {})
         part.tool_status = ToolStatus.FAILED if result.failed else ToolStatus.COMPLETED
         report = await self._run_hooks(POST_TOOL_USE, tool.spec.name, part.tool_input)
         if report.blocked:
             part.tool_output = f"{part.tool_output}\n\n{TOOL_HOOK_NOTICE}{report.reason}"
             part.tool_status = ToolStatus.FAILED
         # 提炼放在状态定稿之后：钩子可能把这一条改成失败，那时它更该进证据层。
-        self.evidence.add_from_part(part)
+        self.evidence.add_from_part(part, tool)
         self.bus.publish("part.update", {"session_id": session.id, "message_id": message.id, "part_id": part.id})
 
     async def _ask_permission(
@@ -868,18 +1070,41 @@ class AgentLoop:
         tool: Tool,
         decision: PermissionDecision,
     ) -> PermissionDecision:
-        """发一个询问事件，等界面把用户的选择交回来。"""
+        """发一个询问事件，等界面把用户的选择交回来。
+
+        两条兜底，缺一条就会有人卡死：
+
+        - **没有人订阅 `permission.ask`**：脚本、测试壳、以后可能出现的无头调用方
+          都走这条路。等下去是等一个永远不会有人回答的 future，整轮就停在那里，
+          连中断都传不进去。这时直接拒，原因写清楚给模型看。
+        - **有人订阅但一直不答**：界面排队时那一条可能已经被取消、或者窗口被关掉，
+          队列会跳过它。超时之后同样按拒绝处理，至少让这一轮走完。
+
+        两处都用 `DENY` 而不是 `ALLOW`：没人答复不等于用户同意。
+        """
         part.tool_status = ToolStatus.AWAITING
         part.permission = decision.note()
         self.bus.publish("part.update", {"session_id": session.id, "message_id": message.id, "part_id": part.id})
         future: asyncio.Future[PermissionDecision] = asyncio.get_running_loop().create_future()
         self._pending_permissions[part.id] = _PendingPermission(future, tool, part.tool_input)
-        self.bus.publish(
+        delivered = self.bus.publish(
             "permission.ask",
             {"session_id": session.id, "message_id": message.id, "part_id": part.id},
         )
+        if delivered == 0:
+            self._pending_permissions.pop(part.id, None)
+            return PermissionDecision(
+                Verdict.DENY,
+                reason="没有界面可以询问权限（无人值守运行），这次调用被拒绝；"
+                "需要放行的话请在 TUI 里手动跑，或改项目规则。",
+            )
         try:
-            return await future
+            return await asyncio.wait_for(future, timeout=PERMISSION_TIMEOUT)
+        except asyncio.TimeoutError:
+            return PermissionDecision(
+                Verdict.DENY,
+                reason=f"权限询问等了 {int(PERMISSION_TIMEOUT)} 秒没有人答复，这次调用被拒绝。",
+            )
         finally:
             self._pending_permissions.pop(part.id, None)
 

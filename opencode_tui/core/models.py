@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import count
 from typing import Any, Iterable, Literal
+
+# 一条 Part 的结构化读数最多占这么多字节。超了整份丢掉：
+# 它是提示不是账本，没必要为它把状态文件撑大。
+TOOL_META_LIMIT = 4096
 
 _SEQUENCES: dict[str, count] = {
     "part": count(1),
@@ -16,6 +21,25 @@ _SEQUENCES: dict[str, count] = {
 def _take(kind: str) -> int:
     """取某类 ID 的下一个序号。"""
     return next(_SEQUENCES[kind])
+
+
+def _clean_meta(value: Any) -> Any:
+    """把结构化读数收成 TOML 写得进去的形状。
+
+    TOML 没有 null，遇到 None 只能丢；其余非基本类型一律转成字符串——
+    宁可少一条读数，也不能因为一个枚举或 Path 让整次保存失败。
+    """
+    if isinstance(value, bool) or isinstance(value, (int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _clean_meta(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, (list, tuple)):
+        return [_clean_meta(item) for item in value if item is not None]
+    return str(value)
 
 
 def new_part_id() -> str:
@@ -31,6 +55,21 @@ def new_message_id() -> str:
 def new_session_id() -> str:
     """生成按时间顺序递增的 Session ID。"""
     return f"ses_{_take('session'):04d}"
+
+
+def _event_serial(event_id: str) -> int:
+    """从 `evt_0007` 里取出 7；格式不对时返回 0。
+
+    事件编号是**会话内**的连号，不占全局序列：两个会话各自从 evt_0001 开始，
+    这样 `/events` 里看到的编号短、也好念。
+    """
+    head, _, tail = event_id.partition("_")
+    if head != "evt":
+        return 0
+    try:
+        return int(tail)
+    except ValueError:
+        return 0
 
 
 def sync_sequences(session_ids: Iterable[str], message_ids: Iterable[str], part_ids: Iterable[str]) -> None:
@@ -95,6 +134,12 @@ class Part:
     tool_status: ToolStatus | None = None
     tool_input: dict[str, Any] = field(default_factory=dict)
     tool_output: str = ""
+    # 工具返回的结构化读数（handle、计数、引擎参数这类）。
+    #
+    # 它**不进**发给模型的正文：正文是工具自己写的那一段，模型看那个。
+    # 它有两个用处——界面/网页端取数字，以及证据层把「这次到底产出了什么」
+    # 记成一行索引。后者是它真正被需要的地方：从中文输出里认关键行并不可靠。
+    tool_meta: dict[str, Any] = field(default_factory=dict)
     file_path: str = ""
     agent_name: str = ""
     # 这次调用是按哪一条规则放行的，或为什么被拒绝
@@ -115,6 +160,7 @@ class Part:
             "tool_status": self.tool_status.value if self.tool_status else "",
             "tool_input": self.tool_input,
             "tool_output": self.tool_output,
+            "tool_meta": self.meta_for_state(),
             "file_path": self.file_path,
             "agent_name": self.agent_name,
             "permission": self.permission,
@@ -122,6 +168,26 @@ class Part:
             "patch_removed": self.patch_removed,
             "timestamp": self.timestamp,
         }
+
+    def meta_for_state(self) -> dict[str, Any]:
+        """落盘用的结构化读数；太大就整份丢掉。
+
+        它是给证据层与界面的提示，不是账本：为它把状态文件撑大（甚至因为
+        一个 TOML 写不进去的值把整次保存弄坏）不值得。丢掉之后唯一的变化是
+        证据层回落到「认关键行」，功能不受影响。
+        """
+        if not self.tool_meta:
+            return {}
+        cleaned = {
+            str(key): _clean_meta(value)
+            for key, value in self.tool_meta.items()
+            if value is not None
+        }
+        try:
+            size = len(json.dumps(cleaned, ensure_ascii=False).encode("utf-8"))
+        except (TypeError, ValueError):
+            return {}
+        return cleaned if size <= TOOL_META_LIMIT else {}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Part:
@@ -136,6 +202,13 @@ class Part:
             tool_status=ToolStatus(status) if status else None,
             tool_input=dict(data.get("tool_input") or {}),
             tool_output=data.get("tool_output", ""),
+            # 旧状态文件里没有这个字段；类型不对时当没有，不让一条坏记录
+            # 把整份状态读成空。
+            tool_meta=(
+                dict(data.get("tool_meta"))
+                if isinstance(data.get("tool_meta"), dict)
+                else {}
+            ),
             file_path=data.get("file_path", ""),
             agent_name=data.get("agent_name", ""),
             permission=data.get("permission", ""),
@@ -223,6 +296,17 @@ TASK_FIELD_ALIASES: dict[str, str] = {
 # 列表型字段，顺序即渲染顺序。goal 是单值，不在这里。
 TASK_LIST_FIELDS: tuple[str, ...] = ("constraints", "done", "todo", "blockers")
 
+# 渲染时每个列表字段最多显示多少条。
+#
+# 这一段是 pinned 的、每一步都原样进上下文，模型一直往「已完成」里追加的话，
+# 它会自己把窗口吃满。条目本身不删，只是不进这一份——`/task` 照旧能看到全部。
+TASK_RENDER_LIMITS: dict[str, int] = {
+    "constraints": 20,
+    "done": 20,
+    "todo": 10,
+    "blockers": 10,
+}
+
 
 @dataclass
 class TaskState:
@@ -251,21 +335,29 @@ class TaskState:
         )
 
     def render(self) -> str:
-        """渲染成给模型看的一段文字。空字段整段不出现。"""
+        """渲染成给模型看的一段文字。空字段整段不出现。
+
+        每个列表字段有条数上限：这一段每一步都进上下文，模型一直往「已完成」
+        里追加的话，它会自己把窗口吃满。超出的条目**不删**，只是不在这里显示，
+        `/task` 仍然看得到全部。
+        """
         blocks = ["（本会话的任务状态，随进度更新）"]
         if self.goal:
             blocks.append(f"目标：{self.goal}")
-        if self.constraints:
-            blocks.append(
-                "用户约束（每一步都生效）：\n"
-                + "\n".join(f"- {item}" for item in self.constraints)
-            )
-        if self.done:
-            blocks.append("已完成：\n" + "\n".join(f"- {item}" for item in self.done))
-        if self.todo:
-            blocks.append("待办：\n" + "\n".join(f"- {item}" for item in self.todo))
-        if self.blockers:
-            blocks.append("阻塞：\n" + "\n".join(f"- {item}" for item in self.blockers))
+        for title, name in (
+            ("用户约束（每一步都生效）", "constraints"),
+            ("已完成", "done"),
+            ("待办", "todo"),
+            ("阻塞", "blockers"),
+        ):
+            items = getattr(self, name)
+            if not items:
+                continue
+            shown = items[: TASK_RENDER_LIMITS[name]]
+            block = title + "：\n" + "\n".join(f"- {item}" for item in shown)
+            if len(items) > len(shown):
+                block += f"\n- （另有 {len(items) - len(shown)} 条未列出）"
+            blocks.append(block)
         return "\n".join(blocks)
 
     def apply(
@@ -372,6 +464,78 @@ class TaskState:
         )
 
 
+# 事件怎么来的。三种都要能读回来，区别只在「谁写的」：
+# manual 是模型主动收口，auto 是溢出时本地兜底，local 是用户 /compact 时补的。
+EVENT_KINDS: tuple[str, ...] = ("manual", "auto", "local")
+
+
+@dataclass
+class Event:
+    """一段已经收口的工作：用标题与摘要代替那段原文。
+
+    它是摘要与 RECENT 之间的那一层。摘要回答「很久以前发生过什么」，
+    事件回答「刚才那几步做了什么、留下了什么」；粒度比摘要细、比逐条消息粗。
+
+    `start` / `end` 是消息下标（闭开区间），与 `compact_upto` 同一套口径。
+    事件**连续覆盖**一段：首条从 `summary_upto` 开始，后一条接着前一条的 `end`，
+    RECENT 从最后一条的 `end` 开始。这条不变式由 `Session.sanitize_events` 保证，
+    装配层因此只需要发一段 RECENT，不必拼补。
+    """
+
+    id: str = ""
+    title: str = ""
+    summary: str = ""
+    actions: list[str] = field(default_factory=list)    # 用过的工具名
+    artifacts: list[str] = field(default_factory=list)  # 产出的文件与登记条目
+    issues: list[str] = field(default_factory=list)     # 失败项的首行
+    start: int = 0
+    end: int = 0
+    kind: str = "manual"  # manual / auto / local，见 EVENT_KINDS
+    degraded: bool = False  # 摘要来自本地汇编而不是模型
+    created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为可写入 TOML 的字典。"""
+        return {
+            "id": self.id,
+            "title": self.title,
+            "summary": self.summary,
+            "actions": list(self.actions),
+            "artifacts": list(self.artifacts),
+            "issues": list(self.issues),
+            "start": self.start,
+            "end": self.end,
+            "kind": self.kind,
+            "degraded": self.degraded,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Event:
+        """从字典还原事件。字段类型不对时当空，不让一条坏记录毁掉整份状态。"""
+
+        def strings(key: str) -> list[str]:
+            raw = data.get(key)
+            if not isinstance(raw, list):
+                return []
+            return [str(item) for item in raw if str(item).strip()]
+
+        kind = str(data.get("kind") or "manual")
+        return cls(
+            id=str(data.get("id") or ""),
+            title=str(data.get("title") or ""),
+            summary=str(data.get("summary") or ""),
+            actions=strings("actions"),
+            artifacts=strings("artifacts"),
+            issues=strings("issues"),
+            start=int(data.get("start") or 0),
+            end=int(data.get("end") or 0),
+            kind=kind if kind in EVENT_KINDS else "manual",
+            degraded=bool(data.get("degraded")),
+            created_at=float(data.get("created_at") or time.time()),
+        )
+
+
 @dataclass
 class Session:
     """一个会话，持有消息列表与元信息。"""
@@ -389,6 +553,14 @@ class Session:
     # 摘要正文，以及它覆盖到第几条消息。两者随会话写进状态文件
     summary: str = ""
     summary_upto: int = 0
+    # 事件列表：已经收口的一段消息被压成标题 + 摘要，原文不再进上下文。
+    # 连续覆盖 `[summary_upto, events[-1].end)`，RECENT 从那里往后接。
+    events: list[Event] = field(default_factory=list)
+    event_seq: int = 0
+    # 已经用 load_tools 装入的领域工具族。核心工具不受它影响，
+    # 装在会话上而不是注册表上：注册表按「根 / 子 agent」共享两份，
+    # 记在那里会让一个会话装过的工具漏到另一个会话。
+    tool_families: list[str] = field(default_factory=list)
     # 结构化的任务状态：目标、用户约束、进度、阻塞。整块进上下文的 TASK 层，不参与淘汰
     task_state: TaskState = field(default_factory=TaskState)
     # ---- 子 agent ----
@@ -427,6 +599,40 @@ class Session:
         self.touch()
         return message
 
+    def add_event(self, event: Event) -> Event:
+        """追加一条事件；没编号的按会话内序号补一个。"""
+        if not event.id:
+            self.event_seq += 1
+            event.id = f"evt_{self.event_seq:04d}"
+        self.events.append(event)
+        self.touch()
+        return event
+
+    @property
+    def event_end(self) -> int:
+        """事件覆盖到第几条消息（不含）；没有事件时是 0。"""
+        return self.events[-1].end if self.events else 0
+
+    def sanitize_events(self) -> None:
+        """丢掉越界、非连续的事件，并把 `compact_upto` 推到覆盖范围末尾。
+
+        事件必须连续：中间缺一段的话，那一段原文就既不在事件里、也不在 RECENT 里，
+        内容无声消失，而装配出来的上下文看起来完全正常。
+        所以一旦发现断点，断点之后的事件一律丢掉——保留前面能用的那一段。
+        """
+        limit = len(self.messages)
+        kept: list[Event] = []
+        cursor = self.summary_upto
+        for event in self.events:
+            if event.start != cursor or event.end <= event.start or event.end > limit:
+                break
+            kept.append(event)
+            cursor = event.end
+        self.events = kept
+        self.event_seq = max(self.event_seq, len(kept))
+        if kept:
+            self.compact_upto = max(self.compact_upto, kept[-1].end)
+
     def touch(self) -> None:
         """刷新更新时间戳。"""
         self.updated_at = time.time()
@@ -461,6 +667,9 @@ class Session:
             "compact_upto": self.compact_upto,
             "summary": self.summary,
             "summary_upto": self.summary_upto,
+            "events": [event.to_dict() for event in self.events],
+            "event_seq": self.event_seq,
+            "tool_families": list(self.tool_families),
             "task_state": self.task_state.to_dict(),
             "parent_id": self.parent_id,
             "root_id": self.root_id,
@@ -502,4 +711,18 @@ class Session:
         )
         for raw in data.get("messages") or []:
             session.messages.append(Message.from_dict(raw))
+        raw_events = data.get("events")
+        if isinstance(raw_events, list):
+            session.events = [
+                Event.from_dict(item) for item in raw_events if isinstance(item, dict)
+            ]
+        session.event_seq = int(data.get("event_seq") or 0)
+        for event in session.events:
+            session.event_seq = max(session.event_seq, _event_serial(event.id))
+        raw_families = data.get("tool_families")
+        if isinstance(raw_families, list):
+            session.tool_families = [str(item) for item in raw_families if str(item)]
+        # 读回来就校验一次：手工改过状态文件、或者旧版本写了一半的事件，
+        # 都在进装配之前被裁掉，而不是等到发请求时才露馅。
+        session.sanitize_events()
         return session

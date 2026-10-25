@@ -776,6 +776,8 @@ class DockTool(Tool):
         },
     )
     primary_argument = "receptor"
+    # 换一份配体库重跑是两次不同的调用：只按受体命名会让后一条覆盖前一条。
+    evidence_key = ("ligands",)
     context_argument = "ledger"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:

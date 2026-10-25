@@ -607,6 +607,8 @@ class ScoreAffinityTool(Tool):
         },
     )
     primary_argument = "receptor"
+    # 打分是一次「受体 × 配体集」的调用：换配体集重跑要算另一条证据。
+    evidence_key = ("ligands",)
     context_argument = "ledger"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:

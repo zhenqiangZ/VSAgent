@@ -56,6 +56,7 @@ from opencode_tui.core.agent.permission import (  # noqa: E402
 )
 from opencode_tui.core.agent.memory import (  # noqa: E402
     MEMORY_DIR_NAME,
+    RESIDENT_LIMIT,
     MemoryError,
     MemoryKind,
     MemoryStore,
@@ -64,18 +65,36 @@ from opencode_tui.core.agent.memory import (  # noqa: E402
     memory_root,
 )
 from opencode_tui.core.agent.context import (  # noqa: E402
+    CONTEXT_RATIO,
     DEGRADE_ORDER,
     EVIDENCE_LIMIT,
-    EVIDENCE_SHARE,
-    HISTORY_SHARE,
+    EVIDENCE_MAX,
+    HISTORY_MAX,
+    TOOL_ARCHIVE_MARK,
     ContextAssembler,
     ContextAssemblyError,
     Evidence,
     EvidenceStore,
     Layer,
+    event_line,
     evidence_ref,
+    evidence_ref_of,
+    memory_entry_count,
+    meta_summary,
     one_line,
     ordered_degraded,
+    render_range,
+    split_turns,
+)
+from opencode_tui.core.agent.event_log import (  # noqa: E402
+    EventRuntime,
+    RecallEventTool,
+    RecordEventTool,
+    build_local_event,
+    event_boundary,
+    parse_event_text,
+    record_local_event,
+    render_event_detail,
 )
 from opencode_tui.core.agent.task import TaskTool  # noqa: E402
 from opencode_tui.core.agent.spawn import (  # noqa: E402
@@ -138,6 +157,7 @@ from opencode_tui.core.agent.tools import (  # noqa: E402
     GrepTool,
     PatchTool,
     ReadTool,
+    ReadTurnTool,
     RetryableToolError,
     Tool,
     ToolError,
@@ -184,10 +204,13 @@ from opencode_tui.core.agent.domain import prankweb as prankweb_module  # noqa: 
 from opencode_tui.core.agent.domain import pockets as pockets_module  # noqa: E402
 from opencode_tui.core.agent.domain import align as align_module  # noqa: E402
 from opencode_tui.core.agent.domain import products as products_module  # noqa: E402
+from opencode_tui.core.agent.domain.all_tools import catalog, families, tool_family  # noqa: E402
 from opencode_tui.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
+from opencode_tui.core.agent.toolset import LoadToolsTool, hidden_names  # noqa: E402
 from opencode_tui.core.agent.trace import TraceWriter, log_directory_for  # noqa: E402
 from opencode_tui.core.event_bus import EventBus  # noqa: E402
 from opencode_tui.core.models import (  # noqa: E402
+    Event,
     Message,
     Part,
     PartType,
@@ -2840,7 +2863,11 @@ async def check_loop(server: FakeModelServer) -> None:
         str(request[1]["content"]).startswith(SUMMARY_NOTICE),
         f"摘要插在系统提示之后：{str(request[1]['content'])[:40]}",
     )
-    check("这一段收成摘要" in str(request[1]["content"]), "摘要正文进了请求体")
+    check(
+        "这一段收成摘要" in str(request[1]["content"]),
+        f"摘要正文进了请求体：{str(request[1]['content'])[:160]}",
+    )
+
     content = json.dumps([item["content"] for item in request], ensure_ascii=False)
     present = sum(1 for index in range(40) if f"第 {index} 条消息" in content)
     check(present == 40 - compact_session.summary_upto, f"摘要覆盖的那一段原文不再发出去：还剩 {present} 条")
@@ -3669,6 +3696,49 @@ async def check_permission_in_loop(server: FakeModelServer) -> None:
     check(not recorder.names("turn.done"), "等答复时中断，不发 turn.done")
     tools = [part for part in cancel_session.messages[-1].parts if part.type is PartType.TOOL]
     check(tools[0].tool_status is ToolStatus.FAILED, "中断把等着的工具标成失败")
+
+    # 没有人订阅 permission.ask：必须立刻拒绝，而不是等一个没人会回答的 future。
+    # 这一条是实测里踩到的：脚本调 bash 用绝对路径 → 越界要问 → 卡死到超时。
+    silent_bus = EventBus()
+    silent_loop = build_loop(
+        server,
+        silent_bus,
+        registry,
+        policy=PermissionPolicy(workspace_root=WORKSPACE_FIXTURE),
+    )
+    server.clear()
+    silent_session = Session(id="ses_silent", title="无人值守")
+    ask(silent_session, "跑一条命令")
+    server.script(
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[
+                        tool_call_delta(
+                            0,
+                            call_id="c9",
+                            name="bash",
+                            arguments=json.dumps({"command": "echo nobody_answers"}),
+                        )
+                    ]
+                ),
+                usage_chunk(2, 2),
+            ]
+        ),
+        Reply(chunks=[*text_chunks("没跑", size=2), usage_chunk(1, 1)]),
+    )
+    answer = await asyncio.wait_for(silent_loop.stream_reply(silent_session, ""), timeout=10)
+    tools = [part for part in answer.parts if part.type is PartType.TOOL]
+    check(bool(tools) and tools[0].tool_status is ToolStatus.FAILED, "没有人答复时直接判失败")
+    check(
+        "没有界面" in (tools[0].tool_output or ""),
+        f"失败原因写明没有人可以问：{tools[0].tool_output}",
+    )
+    check(
+        [part.text for part in answer.parts if part.type is PartType.TEXT] == ["没跑"],
+        "被拒之后这一轮照常走完",
+    )
+    check(not silent_loop._pending_permissions, "待答复的表清空了")
 
 
 def rendered_lines(widget: object) -> list[str]:
@@ -11063,6 +11133,121 @@ async def check_memory() -> None:
     shutil.rmtree(tool_root, ignore_errors=True)
 
 
+async def check_memory_supersede() -> None:
+    """记忆治理：去重、同主题失效、冲突裁决、引用校验、长度与容量。"""
+    root = PROBE / "memory_supersede"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    receptor = root / "receptor.pdb"
+    receptor.write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    store = MemoryStore(root)
+
+    first = store.remember("受体在 receptor.pdb", refs=["receptor.pdb"])
+    again = store.remember("受体在   receptor.pdb", refs=["receptor.pdb"])
+    check(again.id == first.id, "同一句话再写一次不新建条目")
+    check(len(store.entries) == 1, f"去重之后只剩一条：{len(store.entries)}")
+
+    # 同主题更新：共用引用 + 更新词 → 旧条目标失效，不硬删。
+    newer = store.remember("受体改为 receptor_v2.pdb", refs=["receptor.pdb"])
+    check(len(store.entries) == 2, "新值是新的一条，旧值留着")
+    check(not first.is_live(), "旧值不再生效")
+    check(first.superseded_by == newer.id, "旧值记着被谁取代")
+    check(newer.supersedes == [first.id], "新值记着取代了谁")
+    check(store.recall("") == [newer], "检索只返回生效的那一条")
+
+    # 只是共用引用、没有更新词：不当成同一主题，两条都留着。
+    other = store.remember("受体来自 4HJO 的 A 链", refs=["receptor.pdb"])
+    check(first.superseded_by == newer.id, "上一步的失效没有被牵连")
+    check(other.is_live() and newer.is_live(), "同一引用上的不同事实共存")
+    check(len(store.recall("")) == 2, "两条互不相干的事实都在")
+
+    # 显式 supersede：模型自己判断哪条旧了。
+    manual = store.remember(
+        "配体库换成 ligandset_v2.sdf", refs=["receptor.pdb"], supersedes=[other.id]
+    )
+    check(not other.is_live() and other.superseded_by == manual.id, "显式取代生效")
+
+    # agent 写不存在的引用 → 拒绝；用户写 → 标 unverified，排在后面。
+    rejected = None
+    try:
+        store.remember("不存在的文件", refs=["no_such.pdb"])
+    except MemoryError as error:
+        rejected = str(error)
+    check(rejected is not None and "不存在" in rejected, f"agent 写坏引用被拒：{rejected}")
+    user_entry = store.remember(
+        "用户说受体在别处", refs=["no_such.pdb"], source="user"
+    )
+    check(user_entry.unverified, "用户写的坏引用标 unverified")
+    check(user_entry.is_live(), "标了 unverified 仍然可用，只是排后面")
+
+    # 长度：超过上限拒绝，并提示拆条。
+    too_long = None
+    try:
+        store.remember("长" * 600)
+    except MemoryError as error:
+        too_long = str(error)
+    check(too_long is not None and "拆" in too_long, f"超长条目被拒并给出做法：{too_long}")
+
+    # 失效的条目写盘后还能读回来，字段不丢。
+    revived = MemoryStore(root)
+    revived.load()
+    check(revived.entries[first.id].superseded_by == newer.id, "失效关系随盘保留")
+    check(revived.entries[first.id].valid_to > 0, "valid_to 也留着")
+    check(revived.entries[user_entry.id].unverified, "unverified 随盘保留")
+    check(len(revived.all_entries(include_revoked=True)) == len(revived.entries), "--all 能看全部")
+    check(
+        len(revived.all_entries()) < len(revived.all_entries(include_revoked=True)),
+        "默认只列还生效的",
+    )
+
+    # TTL：到点之后不再生效。
+    expiring = store.remember("临时结论：今天只跑前 10 个", expires_at=time.time() - 1)
+    check(not expiring.is_live(), "过期之后不再生效")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_memory_resident() -> None:
+    """常驻注入：相关度优先、1200 上限、其余仍可 recall。"""
+    root = PROBE / "memory_resident"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    receptor = root / "receptor.pdb"
+    receptor.write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    store = MemoryStore(root)
+
+    for index in range(20):
+        store.remember(
+            f"第 {index} 条项目事实：中间记录很多，用来把常驻额度占满" + "细" * 40,
+            refs=["receptor.pdb"],
+        )
+    target = store.remember("配体库在 ligandset_v3.sdf，共 120 个分子", refs=["receptor.pdb"])
+
+    text = store.resident_text(query="配体库有多少个分子")
+    check(estimate_tokens(text) <= RESIDENT_LIMIT, f"常驻正文不超过上限：{estimate_tokens(text)}")
+    check("ligandset_v3" in text, "与问题相关的那条被选进常驻")
+    check(text.splitlines()[0].startswith("- 配体库"), "相关的那条排在最前")
+    check(len(text.splitlines()) < 20, f"不是把全部条目都塞进去：{len(text.splitlines())} 条")
+
+    rest = [entry for entry in store.recall("", limit=100) if entry.id != target.id]
+    check(len(rest) >= 10, "没进常驻的仍然在台账里")
+    check(any("第 3 条" in entry.text for entry in rest), "recall 能取到没进常驻的那些")
+
+    # 空查询不报错，仍然按「有引用优先、新的先」装。
+    plain = store.resident_text()
+    check(estimate_tokens(plain) <= RESIDENT_LIMIT, "空查询也守上限")
+    check(plain != "", "空查询仍有内容")
+
+    # unverified 排在后面：同样的相关度时，有凭据的先注入。
+    verified = store.remember("关键参数：盒子 22A，来自 receptor.pdb", refs=["receptor.pdb"])
+    guessed = store.remember("关键参数：盒子 24A（用户口述）", refs=["maybe.pdb"], source="user")
+    picked = store.recall("关键参数 盒子", limit=5)
+    check(picked and picked[0].id == verified.id, "有凭据的排在口述前面")
+    check(any(entry.id == guessed.id for entry in picked), "口述的仍然召得回来")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
 async def check_task_state() -> None:
     """任务状态：结构、更新语义、写盘往返、工具接口、装配时不丢。"""
 
@@ -11500,18 +11685,13 @@ async def check_selective_compression() -> None:
         f"调用记录一条不少：{sorted(set(source_calls) - seen_calls)}",
     )
 
-    # ---- 五、软配额真的用上了 ----
+    # ---- 五、封顶与剩余额度：摘要与证据各有限额，剩下的都归 RECENT ----
     budget = ContextAssembler(200_000).budget()
     check(budget.available == ContextAssembler(200_000).available(), "available 与 budget 是同一个口径")
-    check(
-        budget.share(Layer.EVIDENCE, 10_000) == int(10_000 * EVIDENCE_SHARE),
-        "证据层按份额拿额度",
-    )
-    check(
-        budget.share(Layer.HISTORY, 10_000) == int(10_000 * HISTORY_SHARE),
-        "历史层按份额拿额度",
-    )
-    check(budget.share(Layer.PREFIX, 10_000) == 0, "前缀不参与份额分配")
+    check(budget.cap(Layer.EVIDENCE) == EVIDENCE_MAX, "证据层有封顶")
+    check(budget.cap(Layer.HISTORY) == HISTORY_MAX, "历史层有封顶")
+    check(budget.cap(Layer.RECENT) == 0, "RECENT 不封顶：剩余额度都给它")
+    check(budget.cap(Layer.PREFIX) == 0, "前缀不参与封顶")
 
     evidence = [Evidence("receptor#1", "一行摘要", "正文" * 4000)]
     capped = ContextAssembler(12_000).build(session, prefix, evidence=evidence)
@@ -11568,6 +11748,803 @@ async def check_selective_compression() -> None:
         set(payload["usage"]) == {layer.value for layer in tight.usage},  # type: ignore[arg-type]
         "事件里的各层用量齐全",
     )
+
+
+def check_context_budget() -> None:
+    """预算口径与装配度量：算得对、字段齐全、能原样写进日志。
+
+    这一节钉住的是**当前分法的不变式**，不是某个具体数字：Phase 1 换成水填预算时
+    改的是「剩余额度怎么分」，`available` 的算式与这几个字段名都不该跟着变。
+    现在先量清楚基线，改完再拿同一组断言对一遍。
+    """
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": f"tool{index}", "description": "说明" * 20},
+        }
+        for index in range(3)
+    ]
+    assembler = ContextAssembler(128_000)
+    budget = assembler.budget(tools)
+    check(budget.available == assembler.available(tools), "available 与 budget 同口径")
+    check(
+        budget.available
+        == int(128_000 * CONTEXT_RATIO) - budget.reserve - budget.tools_tokens,
+        f"可用额度 = 窗口 × 比例 − 输出预留 − 工具定义：{budget.available}",
+    )
+    check(budget.tools_tokens > 0, f"工具定义占的额度算进来了：{budget.tools_tokens}")
+
+    session = Session(id="ses_budget", title="预算")
+    for index in range(6):
+        message = session.add_message(Message(role="user"))
+        message.add_part(Part(type=PartType.TEXT, text=f"第 {index} 条" + "内容" * 200))
+
+    built = assembler.build(
+        session,
+        "系统提示。" * 20,
+        tools=tools,
+        memory_text="- 受体在 runs/1iep/receptor.pdb",
+        evidence=[Evidence("receptor#1", "一行摘要", "正文" * 200)],
+    )
+    metrics = built.metrics
+    missing = [
+        key
+        for key in (
+            "window", "ratio", "reserve", "tools", "available", "total", "usage",
+            "dropped", "dropped_upto", "degraded", "recent_turns", "summary_tokens",
+            "memory_entries", "evidence_entries",
+        )
+        if key not in metrics
+    ]
+    check(not missing, f"度量字段齐全（缺：{missing}）")
+    check(metrics["available"] == budget.available, "度量里的可用额度与预算同口径")
+    check(metrics["tools"] == budget.tools_tokens, "度量里的工具额度与预算同口径")
+    check(metrics["total"] == sum(built.usage.values()), "total 等于各层之和")
+    check(
+        sum(built.usage.values()) <= metrics["available"],
+        f"装得下时总用量不超可用额度：{metrics['total']} / {metrics['available']}",
+    )
+    check(
+        metrics["usage"] == {layer.value: tokens for layer, tokens in built.usage.items()},
+        "度量里的分层用量与 usage 是同一份",
+    )
+    check(metrics["window"] == 128_000 and metrics["ratio"] == CONTEXT_RATIO, "窗口与比例照实写")
+    check(metrics["memory_entries"] == 1, f"记忆条数数的是「- 」行：{metrics['memory_entries']}")
+    check(metrics["evidence_entries"] == 1, "证据条数照实记")
+    check(metrics["recent_turns"] >= 1, "至少有一组最近交互")
+    check(memory_entry_count("（以下是本项目已知的事实）\n- 甲\n- 乙") == 2, "提示语不算一条记忆")
+    check(memory_entry_count("（以下是本项目已知的事实）") == 0, "只有提示语时条数为零")
+
+    # 度量要进事件总线与 trace，序列化不了会在写日志那一步炸掉。
+    json.dumps(metrics, ensure_ascii=False)
+
+    # ---- 水填：窗口还空着的时候，RECENT 不该被「份额」提前截断 ----
+    #
+    # 先前固定 50/25/25：可用 86.9k 里 RECENT 只拿 40.9k，剩下两层的额度空着也不回流。
+    # 这一节量的是「剩余额度真的归了 RECENT」，不是某个具体数字。
+    wide = Session(id="ses_water", title="水填")
+    for index in range(6):
+        message = wide.add_message(Message(role="assistant"))
+        message.add_part(Part(type=PartType.TEXT, text=f"{index}" + "甲" * 9_900))
+    filled = ContextAssembler(128_000).build(wide, "系统提示。" * 20)
+    check(
+        not filled.dropped_turns,
+        f"60k 的 RECENT 一条都不该被挤出去：{filled.dropped_turns}",
+    )
+    check(
+        filled.usage[Layer.RECENT] > 55_000,
+        f"RECENT 拿走剩余额度，而不是固定的一半：{filled.usage[Layer.RECENT]}",
+    )
+    check(
+        filled.metrics["summary_tokens"] == 0 and filled.metrics["evidence_entries"] == 0,
+        "这一份没有摘要与证据，额度确实空着",
+    )
+    check(
+        sum(filled.usage.values()) <= filled.metrics["available"],
+        "水填之后仍然不超可用额度",
+    )
+
+    # ---- 封顶：引用清单与任务状态都不能无限长 ----
+    long_session = Session(id="ses_refs", title="长清单")
+    for index in range(30):
+        message = long_session.add_message(Message(role="user"))
+        message.add_part(Part(type=PartType.TEXT, text=f"第 {index} 条"))
+    long_session.compact_upto = len(long_session.messages)
+    compacted = ContextAssembler(128_000).build(long_session, "系统提示。" * 20)
+    header = str(compacted.messages[1]["content"])
+    check("再往前还有" in header, "超过上限时写明还有多少组没列")
+    check(
+        header.count("- turn ") == 20,
+        f"引用清单只列最近 20 组：{header.count('- turn ')}",
+    )
+
+    state = TaskState()
+    state.apply(done=[f"第 {index} 步" for index in range(25)])
+    rendered = state.render()
+    check(rendered.count("- 第 ") == 20, f"已完成最多列 20 条：{rendered.count('- 第 ')}")
+    check("另有 5 条未列出" in rendered, "截断之后写明还剩多少条")
+
+
+async def check_tool_family_loop(server: FakeModelServer) -> None:
+    """按族加载真的改了请求体：没装的族不在 tools 里，装完下一步就在。"""
+    bus = EventBus()
+    registry = ToolRegistry()
+    registry.register(LoadToolsTool())
+    for tool in all_domain_tools():
+        registry.register(tool)
+    loop = build_loop(server, bus, registry)
+    session = Session(id="ses_family_loop", title="按族加载")
+    ask(session, "要跑对接，先把工具装上")
+    server.clear()
+    server.script(
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[
+                        tool_call_delta(
+                            0,
+                            call_id="c1",
+                            name="load_tools",
+                            arguments=json.dumps({"family": "docking"}),
+                        )
+                    ]
+                ),
+                usage_chunk(100, 10),
+            ]
+        ),
+        Reply(chunks=[*text_chunks("装好了"), usage_chunk(120, 10)]),
+    )
+    await loop.stream_reply(session, "")
+
+    # 这一条是整组的要害：装配算得再对，请求体没变就是白算。
+    sent = [
+        {item["function"]["name"] for item in body.get("tools") or []}
+        for body in server.requests
+    ]
+    check(len(sent) >= 2, f"一轮里至少问了两次模型：{len(sent)}")
+    check("load_tools" in sent[0], "load_tools 自己在清单里（否则装不回来）")
+    check("dock" not in sent[0], "没装的族不在请求体里")
+    check("dock" in sent[1], "装过之后下一步就出现在请求体里")
+    check("search_pdb" not in sent[1], "装一族只开一族")
+    check(session.tool_families == ["docking"], f"族记在会话上：{session.tool_families}")
+
+    # 下一轮重新问一次，装过的族仍然在：它是会话状态，不是一轮状态。
+    ask(session, "接着说")
+    server.script(Reply(chunks=[*text_chunks("好"), usage_chunk(130, 10)]))
+    await loop.stream_reply(session, "")
+    latest = {item["function"]["name"] for item in server.requests[-1].get("tools") or []}
+    check("dock" in latest, "跨轮仍然在（族是会话状态，不是一轮状态）")
+    check(
+        loop.context_history[-1]["tools"] < loop.context_history[-1]["available"],
+        "工具定义记进了度量（否则 /context 看不出清单变大了）",
+    )
+
+
+async def check_context_metrics(server: FakeModelServer) -> None:
+    """每一步的度量：实际输入、缓存命中、窗口占比，以及按轮清空。"""
+    bus = EventBus()
+    published: list[dict[str, Any]] = []
+    bus.subscribe("context.metrics", lambda data: published.append(dict(data)))
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    loop = build_loop(server, bus, registry, context_window=100_000)
+
+    session = Session(id="ses_metrics", title="度量")
+    ask(session, "先看一眼")
+    server.clear()
+    published.clear()
+    server.script(
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[
+                        tool_call_delta(
+                            0, call_id="c1", name="echo", arguments=json.dumps({"text": "片段"})
+                        )
+                    ]
+                ),
+                usage_chunk(100, 20, cached_tokens=80),
+            ]
+        ),
+        Reply(chunks=[*text_chunks("看完了"), usage_chunk(200, 30, cached_tokens=120)]),
+    )
+    await loop.stream_reply(session, "")
+
+    check(len(loop.context_history) == 2, f"两步各记一条度量：{len(loop.context_history)}")
+    first, second = loop.context_history
+    check(first["step"] == 1 and second["step"] == 2, "度量带上步号")
+    check(first["input"] == 100 and first["cached"] == 80, "第一步的实际用量照实记")
+    check(second["input"] == 200 and second["cached"] == 120, "第二步的实际用量照实记")
+    check(abs(first["cache_hit"] - 0.8) < 1e-9, f"缓存命中率 = cached / input：{first['cache_hit']}")
+    check(abs(second["cache_hit"] - 0.6) < 1e-9, f"第二步命中率：{second['cache_hit']}")
+    check(
+        abs(first["window_used"] - 100 / 100_000) < 1e-9,
+        f"窗口占比按实际输入算：{first['window_used']}",
+    )
+    check(first["output"] == 20 and second["output"] == 30, "输出用量照实记")
+    check(loop.last_input_tokens == 200, "最后一步的实际输入留在循环层上（主动压缩要读它）")
+    check(loop.last_cached_tokens == 120, "缓存命中数也留在循环层上")
+    check(len(published) == 2, f"每步发一条 context.metrics：{len(published)}")
+    check(
+        published[1]["cache_hit"] == second["cache_hit"] and published[1]["session_id"] == session.id,
+        "事件里的数字与历史一致，并带上会话编号",
+    )
+    for item in loop.context_history:
+        check(
+            item["available"] > 0 and item["tools"] > 0 and item["total"] > 0,
+            f"度量里带着装配估算：{item['available']} / {item['tools']} / {item['total']}",
+        )
+        check(isinstance(item["usage"], dict) and item["usage"], "度量里带着分层用量")
+        check(item["evidence_entries"] >= 0, "度量里带着证据条数")
+
+    # 新一轮从零开始：跨轮攒着的数字分不清是哪件事的步骤。
+    server.clear()
+    published.clear()
+    server.script(Reply(chunks=[*text_chunks("好"), usage_chunk(50, 5)]))
+    ask(session, "再来一次")
+    await loop.stream_reply(session, "")
+    check(len(loop.context_history) == 1, "新一轮开始时度量清空")
+    check(loop.context_history[0]["input"] == 50, "清空之后记的是新一轮的第一步")
+    check(len(published) == 1, "新一轮只发自己那一步的事件")
+
+    # 没有用量事件时不能让 0 变成 NaN：服务端不回 usage 是老接口的常态。
+    server.clear()
+    server.script(Reply(chunks=[*text_chunks("没有用量")]))
+    ask(session, "再来")
+    await loop.stream_reply(session, "")
+    plain = loop.context_history[-1]
+    check(plain["input"] == 0 and plain["cache_hit"] == 0.0, "没有用量时记 0，不是 NaN")
+    check(plain["window_used"] == 0.0, "没有用量时窗口占比为 0")
+
+
+def check_evidence_ref() -> None:
+    """证据引用名：不同的调用不能撞成一条，结构化读数优先于关键行。"""
+
+    class FakeTool:
+        """只需要两个类属性，`evidence_ref_of` 也只读这两个。"""
+
+        def __init__(self, primary: str = "", keys: tuple[str, ...] = ()) -> None:
+            self.primary_argument = primary
+            self.evidence_key = keys
+
+    grep = FakeTool("pattern")
+
+    def grep_part(pattern: str, path: str = "") -> Part:
+        return Part(
+            type=PartType.TOOL,
+            tool_name="grep",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"pattern": pattern, "path": path},
+            tool_output="命中一行",
+        )
+
+    first = evidence_ref_of(grep_part("class Foo"), {}, grep)
+    second = evidence_ref_of(grep_part("def bar"), {}, grep)
+    check(first != second, f"换一个正则就是另一条引用：{first} / {second}")
+    check("pattern=" in first, f"引用名带上定位参数名：{first}")
+
+    dock = FakeTool("receptor", ("ligands",))
+
+    def dock_part(receptor: str, ligands: str) -> Part:
+        return Part(
+            type=PartType.TOOL,
+            tool_name="dock",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"receptor": receptor, "ligands": ligands},
+            tool_output="docked 3",
+        )
+
+    check(
+        evidence_ref_of(dock_part("receptor#1", "ligandset#1"), {}, dock)
+        != evidence_ref_of(dock_part("receptor#1", "ligandset#2"), {}, dock),
+        "同一个受体换一份配体集是两条证据",
+    )
+    check(
+        docking_module.DockTool.evidence_key == ("ligands",),
+        "dock 真的声明了配体键（不是只有测试里那个假工具）",
+    )
+    check(
+        affinity_module.ScoreAffinityTool.evidence_key == ("ligands",),
+        "打分同理：换配体集重跑是另一次",
+    )
+
+    # 结构化读数优先：结果里的 handle 比入参更能说明「这次产出了什么」。
+    made = Part(
+        type=PartType.TOOL,
+        tool_name="prepare_receptor",
+        tool_status=ToolStatus.COMPLETED,
+        tool_input={"structure": "4HJO"},
+        tool_output="做好了",
+        tool_meta={"handle": "receptor#3", "counts": {"water": 12}},
+    )
+    check("receptor#3" in evidence_ref_of(made, made.tool_meta), "有 handle 就用 handle 做引用")
+    check(meta_summary(made.tool_meta) == "receptor#3；water 12", f"摘要取计数：{meta_summary(made.tool_meta)}")
+    composite = {"receptor": "receptor#1", "ligands": "ligandset#2"}
+    check(
+        evidence_ref_of(made, composite).endswith("receptor#1+ligandset#2"),
+        "没有 handle 时把受体与配体集拼成一个引用",
+    )
+
+    store = EvidenceStore()
+    store.add_from_part(made)
+    item = store.items()[0]
+    check(item.ref.endswith("receptor#3") and item.source == made.id, "证据的来源指向那条 Part")
+    check(item.summary.startswith("receptor#3"), "摘要来自 meta 而不是关键行")
+
+    failed = Part(
+        type=PartType.TOOL,
+        tool_name="bash",
+        tool_status=ToolStatus.FAILED,
+        tool_input={"command": "make"},
+        tool_output="缺少参数 text",
+    )
+    store.add_from_part(failed)
+    check(store.items()[-1].failed, "失败的那条标成 failed（正文优先给它）")
+    check(not item.failed, "成功的那条不标")
+
+
+def check_evidence_dedupe() -> None:
+    """证据正文：同文只出现一次、RECENT 里看得见就不重复、失败优先。"""
+    prefix = "系统提示。" * 20
+    session = Session(id="ses_ev", title="证据")
+    user = session.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="跑一下"))
+    assistant = session.add_message(Message(role="assistant"))
+    tool = Part(
+        type=PartType.TOOL,
+        tool_name="bash",
+        tool_status=ToolStatus.COMPLETED,
+        tool_input={"command": "make test"},
+        tool_output="结论：全部通过",
+    )
+    assistant.add_part(tool)
+
+    def render(evidence: list[Evidence]) -> tuple[str, Any]:
+        built = ContextAssembler(128_000).build(session, prefix, evidence=evidence)
+        body = "\n".join(str(item.get("content") or "") for item in built.messages)
+        return body, built
+
+    body, built = render(
+        [Evidence("bash make test", "结论：全部通过", "详细正文" * 20, source=tool.id)]
+    )
+    check("结论：全部通过" in body, "摘要一定给")
+    check("详细正文" not in body, "来源还在 RECENT 里时不再展开一份正文")
+    check("evidence_detail" not in built.degraded, "不展开是正常做法，不记降级")
+
+    body, _ = render(
+        [Evidence("bash make test", "结论：全部通过", "详细正文", source="prt_missing")]
+    )
+    check("详细正文" in body, "来源已经不在 RECENT 时展开正文")
+
+    body, _ = render(
+        [
+            Evidence("bash a", "同一句结论", "同一段正文", source="x"),
+            Evidence("bash b", "同一句结论", "同一段正文", source="y"),
+        ]
+    )
+    check(body.count("同一句结论") == 1, f"同文只出现一次：{body.count('同一句结论')}")
+
+    many = [
+        Evidence(
+            f"tool {index}",
+            f"摘要 {index}",
+            "补充" * 150 + f"结尾{index}",
+            failed=index == 0,
+            source=f"src{index}",
+        )
+        for index in range(30)
+    ]
+    body, _ = render(many)
+    check("结尾0" in body, "失败的正文优先展开（它是最旧的一条）")
+    check("结尾29" in body, "剩下的额度先给最新的")
+    check("结尾5" not in body, "最旧的一批普通证据拿不到正文")
+    check(15 <= body.count("结尾") < 30, f"只有一部分拿得到：{body.count('结尾')} 条")
+
+
+async def check_tool_clear() -> None:
+    """旧工具结果清理：清几条、失败不清、占位可读、原文能取回。"""
+    session = Session(id="ses_clear", title="清理")
+    parts: list[Part] = []
+    for index in range(8):
+        message = session.add_message(Message(role="user"))
+        message.add_part(Part(type=PartType.TEXT, text=f"第 {index} 步"))
+        assistant = session.add_message(Message(role="assistant"))
+        part = Part(
+            type=PartType.TOOL,
+            tool_name="bash",
+            tool_status=ToolStatus.FAILED if index == 2 else ToolStatus.COMPLETED,
+            tool_input={"command": f"cmd{index}"},
+            tool_output=f"原文标记{index}" + "输出内容" * 250,
+        )
+        assistant.add_part(part)
+        parts.append(part)
+
+    turns = split_turns(session.messages)
+    assembler = ContextAssembler(128_000)
+    # 一次清一批：清一条就返回的话，每清一条都会击穿一次缓存。
+    cleared = assembler._clear_tool_outputs(turns)
+    check(cleared == 3, f"8 条里保留最近 4 条、失败 1 条不清：清了 {cleared}")
+
+    items = [item for turn in turns for item in turn.tool_outputs()]
+    archived = [item for item in items if item["content"].startswith(TOOL_ARCHIVE_MARK)]
+    check(len(archived) == 3, f"占位条数对得上：{len(archived)}")
+    check(
+        all("read_turn turn=" in item["content"] for item in archived),
+        "占位行写明怎么取回",
+    )
+    failed_item = next(item for item in items if item["tool_call_id"] == parts[2].id)
+    check(
+        failed_item["content"].startswith("原文标记2"),
+        "失败的结果不清理：原文就是下一步的输入",
+    )
+    newest = next(item for item in items if item["tool_call_id"] == parts[-1].id)
+    check(newest["content"].startswith("原文标记7"), "最近一条不动")
+
+    target = next(
+        turn
+        for turn in turns
+        if turn.tool_outputs() and turn.tool_outputs()[0]["content"].startswith(TOOL_ARCHIVE_MARK)
+    )
+    restored = await ReadTurnTool().execute({"turn": target.index}, session=session)
+    check(not restored.failed, f"read_turn 能按序号取回：{restored.output[:40]}")
+    check("原文标记" in restored.output, "取回的是原文，不是占位")
+    check(len(restored.output) > 500, "原文长度回来了（不是只剩一行占位）")
+
+    page = await ReadTurnTool().execute(
+        {"turn": target.index, "offset": 0, "limit": 1}, session=session
+    )
+    check("还有" in page.output, f"分页时写明还剩多少行怎么继续：{page.output}")
+
+    missing = await ReadTurnTool().execute({"turn": 999}, session=session)
+    check(missing.failed and "1–" in missing.output, f"序号不存在时给出范围：{missing.output}")
+
+    # ---- 装不下时先清正文，而不是整组丢 ----
+    #
+    # 先前「整组装不下就不要」，等到降级链里的 recent_tool_clear 时那一组早就
+    # 不在了，那一步永远轮不到。现在清旧正文腾地方，能多留好几组。
+    packed = Session(id="ses_packed", title="先清后丢")
+    packed_parts: list[Part] = []
+    for index in range(8):
+        message = packed.add_message(Message(role="user"))
+        message.add_part(Part(type=PartType.TEXT, text=f"第 {index} 步"))
+        assistant = packed.add_message(Message(role="assistant"))
+        for slot in range(2):
+            part = Part(
+                type=PartType.TOOL,
+                tool_name="bash",
+                tool_status=ToolStatus.COMPLETED,
+                tool_input={"command": f"c{index}{slot}"},
+                tool_output=f"输出{index}{slot}" + "甲" * 500,
+            )
+            assistant.add_part(part)
+            packed_parts.append(part)
+
+    built = ContextAssembler(8_000).build(packed, "系统提示。" * 20)
+    check(built.dropped == 0, f"清正文之后一组都不用丢：移出 {built.dropped}")
+    check("recent_tool_clear" in built.degraded, f"降级级别里有它：{built.degraded}")
+    tool_items = {
+        item.get("tool_call_id"): item.get("content") or ""
+        for item in built.messages
+        if item.get("role") == "tool"
+    }
+    newest = [part.id for part in packed_parts[-4:]]
+    check(
+        all(not tool_items[pid].startswith(TOOL_ARCHIVE_MARK) for pid in newest),
+        "最近 4 条工具结果不动",
+    )
+    archived_count = sum(
+        1 for content in tool_items.values() if content.startswith(TOOL_ARCHIVE_MARK)
+    )
+    check(5 <= archived_count < 16, f"旧正文被收成占位：{archived_count} 条")
+    first_tool_turn = next(
+        turn
+        for turn in split_turns(packed.messages)
+        if any(part.id == packed_parts[0].id for part in turn.tool_parts)
+    )
+    restored = await ReadTurnTool().execute({"turn": first_tool_turn.index}, session=packed)
+    check("输出00" in restored.output, "被收成占位的那条仍能取回原文")
+
+
+async def check_tool_family() -> None:
+    """按族加载：目录覆盖全部领域工具、没装的族不进请求体、装完就出现。"""
+    groups = catalog()
+    check(len(groups) == len(families()), f"族目录与声明一一对应：{len(groups)}")
+    check(
+        all(names for names in groups.values()),
+        "每一族都至少有一个工具（空族会让 load_tools 装了个寂寞）",
+    )
+    # 这一条是整组的要害：领域工具漏登记族，它就永远常驻，瘦身白做；
+    # 反过来登记了一个不存在的名字，那一族装进来也不会多出任何工具。
+    covered = [name for names in groups.values() for name in names]
+    check(
+        sorted(covered) == sorted(DOMAIN_TOOL_NAMES),
+        "每个领域工具正好登记在一族里：缺 "
+        f"{sorted(set(DOMAIN_TOOL_NAMES) - set(covered))}，多 "
+        f"{sorted(set(covered) - set(DOMAIN_TOOL_NAMES))}",
+    )
+    check(len(covered) == len(set(covered)), "同一个工具不会被登记进两族")
+    check(tool_family("dock") == "docking", "tool_family 能反查")
+    check(tool_family("bash") == "", "核心工具不属于任何族")
+
+    registry = ToolRegistry()
+    for tool in (LoadToolsTool(), ReadTurnTool()):
+        registry.register(tool)
+    for tool in all_domain_tools():
+        registry.register(tool)
+
+    session = Session(id="ses_family", title="按族加载")
+    hidden = hidden_names(session)
+    check(
+        hidden == frozenset(covered),
+        f"新会话一个领域工具都不发：藏了 {len(hidden)} 个",
+    )
+    sent = {spec["function"]["name"] for spec in registry.specs(exclude=hidden)}
+    check("load_tools" in sent, "load_tools 自己永远可见（否则装不回来）")
+    check("read_turn" in sent, "核心工具不受按族加载影响")
+    check(not (sent & set(covered)), f"没装的族一个都不在请求体里：{sorted(sent)}")
+    check(
+        [spec["function"]["name"] for spec in registry.specs()] == registry.names(),
+        "不传 exclude 时照旧全量（评测脚本与 /tools 面板靠它）",
+    )
+
+    loaded = await LoadToolsTool().execute({"family": "docking"}, session=session)
+    check(not loaded.failed, f"装一族不报错：{loaded.output}")
+    check(session.tool_families == ["docking"], f"族记在会话上：{session.tool_families}")
+    check("dock" in loaded.output, "装完告诉模型这一族里有什么")
+    after = {spec["function"]["name"] for spec in registry.specs(exclude=hidden_names(session))}
+    check("dock" in after, "装过的族出现在清单里")
+    check(
+        "search_pdb" not in after,
+        "别的族不会跟着一起冒出来（装一族只开一族）",
+    )
+    check(
+        [spec["function"]["name"] for spec in registry.specs(exclude=hidden_names(session))]
+        == [name for name in registry.names() if name not in hidden_names(session)],
+        "过滤之后仍是装配顺序，不是集合顺序",
+    )
+
+    again = await LoadToolsTool().execute({"family": "docking"}, session=session)
+    check(
+        not again.failed and again.meta["already"] and session.tool_families == ["docking"],
+        "重复装同一族不重复记账",
+    )
+
+    unknown = await LoadToolsTool().execute({"family": "nope"}, session=session)
+    check(unknown.failed and "docking" in unknown.output, f"未知族列出可选项：{unknown.output}")
+    check(session.tool_families == ["docking"], "未知族不改会话状态")
+
+    # 会话存盘再读回来，装过的族要跟着回来：重开一个做过对接的会话，
+    # dock 还在，否则模型会以为自己没装过、又去 load 一次。
+    restored_session = Session.from_dict(session.to_dict())
+    check(
+        restored_session.tool_families == ["docking"],
+        f"族跟着会话存盘走：{restored_session.tool_families}",
+    )
+    check("dock" in hidden_names(Session.from_dict({"id": "ses_x"})), "没存过族时按全藏处理")
+
+
+def _event_fixture(steps: int) -> Session:
+    """铺一份「用户说一句、助手跑一次 dock」的会话：每一步两条消息。"""
+    session = Session(id=f"ses_evt{steps}", title="事件")
+    for index in range(steps):
+        user = session.add_message(Message(role="user"))
+        user.add_part(Part(type=PartType.TEXT, text=f"第 {index} 步：跑对接"))
+        assistant = session.add_message(Message(role="assistant"))
+        assistant.add_part(
+            Part(
+                type=PartType.TOOL,
+                tool_name="dock",
+                tool_status=ToolStatus.FAILED if index == 1 else ToolStatus.COMPLETED,
+                tool_input={"receptor": "receptor#1", "ligands": f"ligandset#{index}"},
+                tool_output=f"结果{index}",
+                tool_meta={"handle": f"docking#{index}"},
+            )
+        )
+    return session
+
+
+async def check_event_log() -> None:
+    """事件：本地汇编、连续覆盖、手动吞自动、写盘、装配、召回。"""
+    session = _event_fixture(4)
+    event = record_local_event(session, 8, "auto")
+    check(event is not None, "溢出时记下一条本地事件")
+    check(event.kind == "auto" and event.degraded, "自动兜底事件标成 auto / degraded")
+    check(event.actions == ["dock"], f"动作从 Part 数出来：{event.actions}")
+    check(
+        "docking#0" in event.artifacts and "docking#3" in event.artifacts,
+        f"产物取自 tool_meta：{event.artifacts}",
+    )
+    check(event.issues and "结果1" in event.issues[0], f"未决项是失败的那一条：{event.issues}")
+    check(session.compact_upto == 8, "事件把压缩位置推到了覆盖末端")
+    check(record_local_event(session, 8, "auto") is None, "同一段再收一次是 no-op")
+
+    for index in range(4, 6):
+        user = session.add_message(Message(role="user"))
+        user.add_part(Part(type=PartType.TEXT, text=f"第 {index} 步：跑对接"))
+        assistant = session.add_message(Message(role="assistant"))
+        assistant.add_part(
+            Part(
+                type=PartType.TOOL,
+                tool_name="dock",
+                tool_status=ToolStatus.COMPLETED,
+                tool_input={"receptor": "receptor#1", "ligands": f"ligandset#{index}"},
+                tool_output=f"结果{index}",
+                tool_meta={"handle": f"docking#{index}"},
+            )
+        )
+    merged = record_local_event(session, 12, "auto")
+    check(merged is not None and merged.id == event.id, "相邻的自动事件合并成一条")
+    check(merged.end == 12 and len(session.events) == 1, f"合并之后仍是一条：{len(session.events)}")
+
+    runtime = EventRuntime(session=session, current_index=len(session.messages))
+    recorded = await RecordEventTool().execute(
+        {"title": "手动收口", "summary": "这一段做完了"}, event_runtime=runtime
+    )
+    check(not recorded.failed and "evt_" in recorded.output, f"手动收口成功：{recorded.output}")
+    check(len(session.events) == 1 and session.events[0].kind == "manual", "手动事件吞掉自动事件")
+    manual = session.events[0]
+    check(manual.title == "手动收口" and manual.summary == "这一段做完了", "标题与摘要照模型给的那份")
+    check(manual.start == 0 and manual.end == 12, f"覆盖整段：{manual.start}–{manual.end}")
+
+    again = await RecordEventTool().execute({}, event_runtime=runtime)
+    check("没有可收口" in again.output, f"没有新内容时不动手：{again.output}")
+
+    built = ContextAssembler(128_000).build(session, "系统提示。" * 20)
+    body = "\n".join(str(item.get("content") or "") for item in built.messages)
+    check("手动收口" in body, "事件标题进了上下文")
+    check("第 0 步：跑对接" not in body, "被事件覆盖的原文不再发出去")
+    check(built.usage[Layer.EVENT] > 0, "事件层有用量")
+    check(built.dropped == 0, f"被事件覆盖的组不算「本次移出」：{built.dropped}")
+    check(len(built.messages) == 3, f"一个事件只多一条消息：{len(built.messages)}")
+    check(built.metrics["events"] == 1, "度量里数得到事件")
+
+    restored = Session.from_dict(session.to_dict())
+    check(
+        len(restored.events) == 1 and restored.events[0].title == "手动收口",
+        "事件随状态写盘、读回来还在",
+    )
+    check(restored.compact_upto == 12, "读回来之后压缩位置仍在")
+
+    listing = await RecallEventTool().execute({}, session=session)
+    check(manual.id in listing.output and "手动收口" in listing.output, "不带参数时列出清单")
+    detail = await RecallEventTool().execute({"event": manual.id}, session=session)
+    check("第 0 步：跑对接" in detail.output, "recall_event 取回原文")
+    check("这一段做完了" in detail.output, "摘要也在详情里")
+    missing = await RecallEventTool().execute({"event": "evt_9999"}, session=session)
+    check(missing.failed and manual.id in missing.output, f"未知编号时列出可用编号：{missing.output}")
+
+    # 越界与断点：这两类都必须在进装配之前裁掉。
+    broken = _event_fixture(2)
+    broken.events = [Event(id="evt_0001", start=0, end=99, kind="auto")]
+    broken.sanitize_events()
+    check(broken.events == [], "越界的事件被丢掉")
+    gap = _event_fixture(2)
+    gap.summary_upto = 2
+    gap.events = [Event(id="evt_0001", start=0, end=2)]
+    gap.sanitize_events()
+    check(gap.events == [], "首条不从 summary_upto 开始时丢掉")
+
+    check(parse_event_text("标题：准备受体\n摘要正文") == ("准备受体", "摘要正文"), "标题行切得出来")
+    check(parse_event_text("没有标题行") == ("", "没有标题行"), "格式不对时整段当摘要")
+
+    tail = Session(id="ses_tail")
+    tail.add_message(Message(role="assistant"))
+    tail.add_message(Message(role="user"))
+    check(event_boundary(tail, 2) == 1, "紧邻的用户消息不进事件")
+    check(event_boundary(_event_fixture(2), 4) == 4, "正常情况收到当前位置")
+    check(render_range(tail, 0, 2).count("\n") >= 0, "render_range 可用（read_turn 与 recall 共用）")
+
+
+async def check_event_summary(server: FakeModelServer) -> None:
+    """事件摘要：只喂新段、不带工具、失败落本地、取消不写、溢出零额外请求。"""
+    bus = EventBus()
+    loop = build_loop(server, bus, ToolRegistry())
+    session = _event_fixture(4)
+    session.summary_upto = 0
+    session.add_event(Event(id="evt_0001", title="前一段", summary="前一段做完了", start=0, end=4, kind="manual"))
+    session.event_seq = 1
+    session.sanitize_events()
+    message = session.add_message(Message(role="assistant", session_id=session.id))
+
+    server.clear()
+    server.script(
+        Reply(
+            chunks=[
+                *text_chunks("标题：准备受体\n这一段取了结构并准备了受体。", size=6),
+                usage_chunk(7, 9),
+            ]
+        )
+    )
+    runtime = loop._event_runtime(session, message)
+    recorded = await RecordEventTool().execute({}, event_runtime=runtime)
+    check(not recorded.failed, f"模型写得出来时照常记录：{recorded.output}")
+    check(len(server.requests) == 1, f"收口只发一次请求：{len(server.requests)}")
+    request = server.requests[0]
+    check(not request.get("tools"), "收口请求不带工具")
+    transcript = str(request["messages"][1]["content"])
+    check("第 0 步" not in transcript, "只喂新露出来的那一段")
+    check("第 2 步：跑对接" in transcript, "新段的内容在")
+    newest = session.events[-1]
+    check(newest.title == "准备受体", f"标题从模型输出里取：{newest.title}")
+    check("准备了受体" in newest.summary, "摘要从模型输出里取")
+    check(session.events[-2].id == "evt_0001", "前面那条事件没被动过")
+    check(message.tokens["input"] == 7, "收口的用量记在这一轮的消息上")
+
+    # 标题与摘要都给全时不再请求模型。换一份新会话：上一份已经被收口到最新位置，
+    # 没有新内容时工具本来就该是 no-op。
+    fresh = _event_fixture(2)
+    fresh_message = fresh.add_message(Message(role="assistant", session_id=fresh.id))
+    server.clear()
+    explicit = await RecordEventTool().execute(
+        {"title": "手工", "summary": "手工摘要"},
+        event_runtime=loop._event_runtime(fresh, fresh_message),
+    )
+    check(not explicit.failed, "显式收口成功")
+    check(len(server.requests) == 0, "显式给全时不发请求")
+    check(len(fresh.events) == 1 and fresh.events[0].title == "手工", "确实记了一条")
+
+    # 请求失败：落一条本地事件，但不算工具失败。
+    failing = _event_fixture(2)
+    failing_message = failing.add_message(Message(role="assistant", session_id=failing.id))
+    server.clear()
+    server.script(Reply(status=500, body='{"error": "boom"}'))
+    failed = await RecordEventTool().execute(
+        {}, event_runtime=loop._event_runtime(failing, failing_message)
+    )
+    check(not failed.failed, f"摘要写不出来不算工具失败：{failed.output}")
+    check(failing.events and failing.events[-1].degraded, "退化成本地汇编")
+    check(bool(failing.events[-1].actions), "本地汇编仍带动作")
+
+    # 取消：什么都不写。
+    cancelling = _event_fixture(2)
+    cancel_message = cancelling.add_message(Message(role="assistant", session_id=cancelling.id))
+    server.clear()
+    loop.cancelled = True
+    cancelled = await RecordEventTool().execute(
+        {}, event_runtime=loop._event_runtime(cancelling, cancel_message)
+    )
+    loop.cancelled = False
+    check(cancelled.failed and not cancelling.events, "中断时一条都不写")
+
+    # 已有事件时溢出：补本地事件，不额外请求模型。
+    crowded = _event_fixture(3)
+    crowded.add_event(Event(id="evt_0001", title="开头", summary="开头", start=0, end=2, kind="auto"))
+    for index in range(3, 25):
+        user = crowded.add_message(Message(role="user"))
+        user.add_part(Part(type=PartType.TEXT, text=f"第 {index} 步：" + "内容" * 100))
+        assistant = crowded.add_message(Message(role="assistant"))
+        assistant.add_part(Part(type=PartType.TEXT, text="好" + "说明" * 100))
+    server.clear()
+    server.script(Reply(chunks=[*text_chunks("好", size=1), usage_chunk(3, 3)]))
+    loop.context_window = 20_000
+    answer = await loop.stream_reply(crowded, "")
+    loop.context_window = 200_000
+    check(answer is not None, "小窗口下这一轮照常结束")
+    check(len(server.requests) == 1, f"溢出走本地事件，不多发请求：{len(server.requests)}")
+    check(crowded.events[-1].kind in ("auto", "local"), f"补上的是本地事件：{crowded.events[-1].kind}")
+    check(crowded.events[-1].end > 2, "覆盖范围往前推了")
+
+    # 已经有一份摘要、还没有事件时：新的溢出也交给事件（摘要从此冻结）。
+    # 否则事件层永远等不到第一条，长会话只会一路摘要下去。
+    switched = _event_fixture(3)
+    switched.summary = "一、目标\n早前做过的事"
+    switched.summary_upto = 2
+    switched.compact_upto = 2
+    for index in range(3, 25):
+        user = switched.add_message(Message(role="user"))
+        user.add_part(Part(type=PartType.TEXT, text=f"第 {index} 步：" + "内容" * 100))
+        assistant = switched.add_message(Message(role="assistant"))
+        assistant.add_part(Part(type=PartType.TEXT, text="好" + "说明" * 100))
+    server.clear()
+    server.script(Reply(chunks=[*text_chunks("好", size=1), usage_chunk(3, 3)]))
+    loop.context_window = 20_000
+    await loop.stream_reply(switched, "")
+    loop.context_window = 200_000
+    check(len(server.requests) == 1, f"有摘要之后不再请求摘要：{len(server.requests)}")
+    check(bool(switched.events), "补上了第一条事件")
+    check(switched.events[0].kind == "auto", "第一条是本地兜底事件")
+    check(switched.events[0].start == 2, f"事件从摘要覆盖到的位置起：{switched.events[0].start}")
+    check(switched.summary_upto == 2, "摘要冻结在原来的位置")
 
 
 async def check_evidence_layer() -> None:
@@ -11685,6 +12662,7 @@ async def check_evidence_layer() -> None:
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     (root / "receptor.pdb").write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    (root / "ligands.sdf").write_text("CCO\n", encoding="utf-8")
     mem = MemoryStore(root)
     mem.remember("受体结构在 receptor.pdb", refs=["receptor.pdb"])
     mem.remember("配体库在 ligands.sdf", refs=["ligands.sdf"])
@@ -12754,10 +13732,18 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("plan-deny", check_plan_deny),
     ("prompt", check_prompt),
     ("memory", check_memory),
+    ("memory-supersede", check_memory_supersede),
+    ("memory-resident", check_memory_resident),
     ("task-state", check_task_state),
     ("subagent", check_subagent),
     ("subagent-ui", check_subagent_ui),
     ("selective-compression", check_selective_compression),
+    ("context-budget", check_context_budget),
+    ("evidence-ref", check_evidence_ref),
+    ("evidence-dedupe", check_evidence_dedupe),
+    ("tool-clear", check_tool_clear),
+    ("tool-family", check_tool_family),
+    ("event-log", check_event_log),
     ("evidence", check_evidence_layer),
     ("bash", check_bash_tool),
     ("file-tools", check_file_tools),
@@ -12771,6 +13757,9 @@ SERVER_GROUPS: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("loop", check_loop),
     ("permission-in-loop", check_permission_in_loop),
     ("hooks-in-loop", check_hooks_in_loop),
+    ("context-metrics", check_context_metrics),
+    ("tool-family-loop", check_tool_family_loop),
+    ("event-summary", check_event_summary),
     ("summary-compaction", check_summary_compaction),
     ("live-app", check_live_app),
 )

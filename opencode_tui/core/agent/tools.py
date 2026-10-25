@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..file_log import record as log_read
+from .context import render_turn_text, split_turns, turn_at
 
 # bash 一次调用的等待上限。
 #
@@ -247,6 +248,11 @@ class Tool(ABC):
     spec: ToolSpec
     # 判定规则比对的那个参数名。没有单一定位参数的工具留空。
     primary_argument: str = ""
+    # 复合成引用名时还要一起看的参数名。
+    #
+    # 只靠 `primary_argument` 有时不够：`dock` 的主参数是受体，但换一份配体库
+    # 重跑是两次不同的调用，只按受体命名会让后一条把前一条覆盖掉。
+    evidence_key: ClassVar[tuple[str, ...]] = ()
     # 收 context 的参数名（标了 Ctx 的那个）。没有这类参数时留空。
     context_argument: ClassVar[str] = ""
     # 收任务状态的参数名。没有这类参数时留空。
@@ -280,6 +286,11 @@ class Tool(ABC):
     # `children_of` / `wait`。工具只调这几个方法，不认它的类型，
     # 这一层因此不必导入 host。
     spawn_argument: ClassVar[str] = ""
+    # 收事件运行时的参数名。只有收口事件的那个工具声明。
+    #
+    # 事件挂在会话上，收口位置要问到「这一轮写到第几条了」，所以它拿的是
+    # 会话加一个当前位置，而不是整份上下文。与上面几个口子同理，这里也不认它的类型。
+    event_argument: ClassVar[str] = ""
 
     @abstractmethod
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
@@ -294,6 +305,7 @@ class Tool(ABC):
         evidence: Any = None,
         viewer: Any = None,
         spawner: Any = None,
+        event_runtime: Any = None,
         on_arguments: Callable[[dict[str, Any]], None] | None = None,
     ) -> ToolResult:
         """内核唯一的调用入口：注入 context、任务状态、证据收集器与结构服务之后再走 `run`。
@@ -320,6 +332,7 @@ class Tool(ABC):
             (self.evidence_argument, evidence, "证据收集器"),
             (self.viewer_argument, viewer, "本地结构服务"),
             (self.spawn_argument, spawner, "子 agent 派发器"),
+            (self.event_argument, event_runtime, "事件运行时"),
         ):
             if not name:
                 continue
@@ -369,9 +382,22 @@ class ToolRegistry:
         """已装工具的名字，按装配顺序。"""
         return list(self._tools)
 
-    def specs(self) -> list[dict[str, Any]]:
-        """全部工具的参数模式，直接作为请求体的 tools 字段。"""
-        return [tool.spec.to_openai() for tool in self._tools.values()]
+    def specs(
+        self, exclude: frozenset[str] | set[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """工具的参数模式，直接作为请求体的 tools 字段。
+
+        `exclude` 是**不给模型看**的名字——按族加载靠它把还没装的几族挡在外面。
+        用排除而不是允许清单：新工具忘了登记族时仍然每步都在，坏处是白占额度，
+        好处是「写了却没装、模型看不见」这种查不出来的毛病不会发生。
+        过滤按**装配顺序**遍历：顺序影响模型选哪个工具，不能因为调用方传进来
+        一个集合就变掉。
+        """
+        return [
+            tool.spec.to_openai()
+            for name, tool in self._tools.items()
+            if not exclude or name not in exclude
+        ]
 
 
 _TYPE_CHECKS: dict[str, tuple[type, str]] = {
@@ -1004,3 +1030,84 @@ def _skip_path(path: Path, root: Path) -> bool:
         parts = path.parts
     return any(part in SKIP_DIRECTORIES for part in parts[:-1])
 
+
+
+READ_TURN_LIMIT = 200
+"""一次最多返回多少行原文。与小工具的输出量级对齐，不必让模型翻页翻很多次。"""
+
+READ_TURN_MAX = 400
+"""模型自己指定 limit 时的硬上限：一次读回几千行会把窗口一次吃满。"""
+
+
+class ReadTurnTool(Tool):
+    """按序号取回会话里某一步的原文。
+
+    两处会让原文离开上下文：旧工具结果的正文被换成了「输出已归档」占位，
+    整组交互被挤出 RECENT。两者都留了 turn 序号，这一个工具就是那条回程路。
+
+    它读的是**会话本身**（`Session.messages` 里的原 Part），不受 `compact_upto`
+    影响：已经移出上下文的内容照样取得回来。没有这条回程路的话，
+    「更早的内容已省略」就只是一句没法兑现的提示。
+    """
+
+    spec = ToolSpec(
+        name="read_turn",
+        description=(
+            "按序号取回会话里某一步的原文。工具输出被归档成一行占位、"
+            "或某个交互组已经移出上下文时，用占位行与省略清单里的 turn 序号读回完整内容。"
+            "offset / limit 按行分页，默认一次 200 行。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "turn": {"type": "integer", "description": "交互组序号（turn N 里的 N）"},
+                "offset": {"type": "integer", "description": "从第几行开始，默认 0"},
+                "limit": {
+                    "type": "integer",
+                    "description": f"最多返回多少行，默认 {READ_TURN_LIMIT}，上限 {READ_TURN_MAX}",
+                },
+            },
+            "required": ["turn"],
+            "additionalProperties": False,
+        },
+    )
+    session_argument = "session"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        """按序号取一段原文。"""
+        session = arguments.get("session")
+        index = arguments.get("turn")
+        if isinstance(index, bool) or not isinstance(index, int):
+            return ToolResult(output="参数 turn 应当是整数序号", failed=True)
+        turn = turn_at(session, index)
+        if turn is None:
+            total = len(split_turns(session.messages))
+            return ToolResult(
+                output=f"没有 turn {index}。这份会话现在有 1–{total} 个交互组。",
+                failed=True,
+            )
+        text = render_turn_text(session, turn)
+        if not text:
+            return ToolResult(output=f"turn {index} 没有可读内容。", failed=True)
+        offset = arguments.get("offset") or 0
+        limit = arguments.get("limit") or READ_TURN_LIMIT
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return ToolResult(output="参数 offset 应当是非负整数", failed=True)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return ToolResult(output="参数 limit 应当是正整数", failed=True)
+        limit = min(limit, READ_TURN_MAX)
+        lines = text.splitlines()
+        window = lines[offset : offset + limit]
+        head = f"turn {turn.index}（会话第 {turn.message_index + 1} 条消息）"
+        if not window:
+            return ToolResult(
+                output=f"{head}：offset {offset} 超出范围，共 {len(lines)} 行。",
+                failed=True,
+            )
+        remaining = len(lines) - offset - len(window)
+        note = (
+            f"\n（还有 {remaining} 行，用 offset={offset + len(window)} 继续）"
+            if remaining > 0
+            else ""
+        )
+        return ToolResult(output=f"{head}\n" + "\n".join(window) + note)

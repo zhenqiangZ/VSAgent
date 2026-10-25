@@ -17,8 +17,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from ..models import Message, Part, PartType, Session, ToolStatus
+from ..models import Event, Message, Part, PartType, Session, ToolStatus
 from .prompt import (
+    EVENT_NOTICE,
     MEMORY_NOTICE,
     OMISSION_MARK,
     OMITTED_NOTICE,
@@ -38,6 +39,7 @@ class Layer(Enum):
     PREFIX = "prefix"      # 稳定前缀：身份、工作纪律、项目规则
     MEMORY = "memory"      # 常驻记忆：核心事实（跨会话）
     TASK = "task"          # 任务状态：目标、约束、待办、阻塞
+    EVENT = "event"        # 事件：已经收口的阶段，标题 + 摘要（跨轮）
     RECENT = "recent"      # 近期执行：最近若干个完整交互组
     EVIDENCE = "evidence"  # 按需证据：本步相关的片段与检索回来的记忆
     HISTORY = "history"    # 历史：旧对话摘要与可追溯引用
@@ -48,6 +50,7 @@ LAYER_ORDER: tuple[Layer, ...] = (
     Layer.PREFIX,
     Layer.MEMORY,
     Layer.TASK,
+    Layer.EVENT,
     Layer.RECENT,
     Layer.EVIDENCE,
     Layer.HISTORY,
@@ -58,19 +61,38 @@ LAYER_POLICY: dict[Layer, str] = {
     Layer.PREFIX: "pinned",   # 永不丢
     Layer.MEMORY: "capped",   # 整块保留但受 token 上限；超限先砍旧条目
     Layer.TASK: "pinned",     # 永不丢
+    Layer.EVENT: "capped",    # 整块保留但受 token 上限；超限先砍最旧的事件
     Layer.RECENT: "atomic",   # 以完整交互组为单位进出，组内不切开
     Layer.EVIDENCE: "soft",   # 先给 summary，正文按预算展开
     Layer.HISTORY: "ref",     # 只留引用与摘要
 }
 
 # 常驻记忆（MEMORY 层）的软配额。上限与淘汰由 MemoryStore 负责，这里只做兜底。
-MEMORY_LIMIT = 2000
-# 剩余预算里分给各层的比例。PREFIX 与 TASK 不限，MEMORY 单独卡上限。
-# 这三个数在 `ContextAssembler.budget` 里汇总成一份预算，各层从同一处取，
-# 免得改一个口径要跟着改好几处。
-RECENT_SHARE = 0.5
-EVIDENCE_SHARE = 0.25
-HISTORY_SHARE = 0.25
+#
+# 与 `memory.RESIDENT_LIMIT` 同步降到 1200：那一段每一步都要发，
+# 而「与当前问题相关的几条」比「全部旧条目」更有用，其余仍可用 `recall` 取到。
+MEMORY_LIMIT = 1200
+# 摘要与证据的**上限**，不是份额。
+#
+# 先前按 50/25/25 分剩余额度，问题是空着的那两份不会回流：RECENT 明明还能装，
+# 却因为「不归它」被提前截掉，于是窗口还剩一半就开始摘要。现在只给这两层封顶，
+# 剩下的全部给 RECENT——它才是「最近发生了什么」的唯一载体。
+HISTORY_MAX = 3000
+EVIDENCE_MAX = 6000
+# 引用清单的上限：最多列这么多组、整块不超过这么多 token。
+#
+# 长会话里被移出的交互组可能有几百个，全列出来这一段自己就把窗口吃掉，
+# 而它的用处只是「告诉模型有哪些序号可取」——列最近的就够。
+REFS_TURN_LIMIT = 20
+REFS_TOKEN_LIMIT = 600
+# 摘要小于这么多 token 时不再「砍半」：省不下额度，却会把一句结论砍成半句。
+SUMMARY_SHRINK_MIN = 300
+# 事件块的上限。`min(1800, max(200, available // 6))`：窗口大时封在 1800
+# （二十来条事件），窗口很小时按六分之一给，至少 200。
+EVENT_LIMIT_MAX = 1800
+EVENT_LIMIT_MIN = 200
+# 事件摘要进索引行时的长度上限。完整的摘要留在 `recall_event` 里。
+EVENT_SUMMARY_LIMIT = 160
 # 给模型输出留的额度，以及协议本身（角色、工具调用外壳）的开销
 OUTPUT_RESERVE = 4096
 PROTOCOL_OVERHEAD = 256
@@ -90,6 +112,21 @@ EVIDENCE_LIMIT = 12
 # 一条证据的摘要与引用名各自的长度上限。两者都要塞进一行里。
 EVIDENCE_SUMMARY_LIMIT = 120
 EVIDENCE_REF_LIMIT = 60
+# 一条证据正文的 token 上限。
+#
+# 一条工具输出挑出来的关键行通常在十几行以内；给到 600 还装不下，说明那不是
+# 「关键行」而是一份完整输出——它该留在 RECENT 或工作目录里，不该挤进证据层。
+EVIDENCE_DETAIL_MAX = 600
+
+# 旧工具结果清理：保留最近这么多条不动，超过这个 token 的才换占位。
+#
+# 4 条是「模型正在用的那几步」的量级：一次调用、它的结果、紧接着的一次修正。
+# 再往前的结果，原文用 `read_turn` 一条就能取回，留着占地不如腾出来。
+RECENT_TOOL_KEEP = 4
+RECENT_TOOL_CLEAR_MIN = 400
+# 被归档的工具结果正文换成这个标记开头的一行。装配层靠它认出「这条已经清过」，
+# 证据层靠它判断「原文已经不在了，该展开正文」。
+TOOL_ARCHIVE_MARK = "（输出已归档："
 # 工具结果的引用名取哪个参数做定位。按这个顺序找第一个非空的。
 #
 # 同一个文件反复读、同一条命令反复跑，引用名相同就替换而不是堆一摞，
@@ -103,6 +140,8 @@ EVIDENCE_REF_ARGUMENTS: tuple[str, ...] = (
 DEGRADE_ORDER: tuple[str, ...] = (
     "evidence_detail",     # 证据层收掉正文，只留 ref 与摘要
     "history_summary",     # 摘要缩一档
+    "recent_tool_clear",   # 旧工具结果正文换成一行占位（可用 read_turn 取回）
+    "event_layer",         # 丢掉最旧的事件（可用 recall_event 取回）
     "memory",              # 常驻记忆缩一档
     "recent_turns",        # 整组移出最旧的交互组
     "recent_reasoning",    # 丢中间推理（REASONING 那一类）
@@ -136,6 +175,12 @@ class Turn:
     index: int
     message_index: int
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # 组内工具结果对应的源 Part，与 `messages` 里的 tool 项一一对应。
+    #
+    # 模型项是派生物，有两件事只能回到 Part 上问：这次调用**失败了吗**（失败的结果
+    # 不能清理、必须留在证据层），以及**原文还在不在**（证据层只展开 RECENT 看不见的）。
+    # 从文本里猜「是不是报错」在中文输出上并不可靠，Part 上的状态才是准的。
+    tool_parts: list[Part] = field(default_factory=list)
 
     def tokens(self) -> int:
         """估算这个交互组占多少 token。"""
@@ -144,6 +189,28 @@ class Turn:
     def tool_outputs(self) -> list[dict[str, Any]]:
         """组内所有工具结果项。压缩时只动它们的正文，不切开组。"""
         return [item for item in self.messages if item.get("role") == "tool"]
+
+    def failed_tool_ids(self) -> set[str]:
+        """组内失败的工具调用 id。清理与证据排序都要按它避开失败项。"""
+        return {
+            part.id for part in self.tool_parts if part.tool_status is ToolStatus.FAILED
+        }
+
+    def visible_tool_ids(self) -> set[str]:
+        """组内**原文还完整在 RECENT 里**的工具调用 id。
+
+        已归档的那几条要排除：它们的正文已经换成一行占位，原文只能靠
+        `read_turn` 取回。证据层如果把它们当成「还看得见」，就会连关键行
+        都不展开——那一段内容在上下文里就彻底消失了。
+        """
+        visible: set[str] = set()
+        for item in self.messages:
+            if item.get("role") != "tool" or not item.get("tool_call_id"):
+                continue
+            if (item.get("content") or "").startswith(TOOL_ARCHIVE_MARK):
+                continue
+            visible.add(item["tool_call_id"])
+        return visible
 
 
 @dataclass(frozen=True)
@@ -157,6 +224,12 @@ class Evidence:
     ref: str          # handle（receptor#1）或 路径#行号 或 URL
     summary: str      # 一行摘要，永远给模型看
     detail: str = ""  # 正文，预算允许时才展开
+    # 这条来自一次失败的调用。失败原因就是下一步的输入，所以展开正文时
+    # 它排在最新之前——先让模型看见「为什么不行」，再看「刚才跑出了什么」。
+    failed: bool = False
+    # 来自哪条 Part。空串表示不是工具结果（`recall` 取回来的记忆）。
+    # 装配时拿它与 RECENT 里还完整可见的工具结果比对，避免同一段文字发两遍。
+    source: str = ""
 
 
 def one_line(text: str, limit: int) -> str:
@@ -169,6 +242,14 @@ def one_line(text: str, limit: int) -> str:
     if len(flat) <= limit:
         return flat
     return flat[: max(1, limit - 1)] + "…"
+
+
+def event_line(event: Event) -> str:
+    """一条事件在上下文里占的一行：编号、标题、区间、摘要。"""
+    span = f"（第 {event.start + 1}–{event.end} 条）"
+    title = one_line(event.title or "（未命名）", 40)
+    summary = one_line(event.summary, EVENT_SUMMARY_LIMIT)
+    return f"- {event.id} {title}{span}：{summary}"
 
 
 def evidence_ref(tool_name: str, tool_input: Any) -> str:
@@ -185,6 +266,83 @@ def evidence_ref(tool_name: str, tool_input: Any) -> str:
         if isinstance(value, str) and value.strip():
             return f"{tool_name} {one_line(value, EVIDENCE_REF_LIMIT)}"
     return tool_name
+
+
+# 结构化读数里值得进摘要的计数键。
+#
+# 用白名单而不是「把所有数字都拼上」：meta 里还有端口、字节数、运行编号这类
+# 与「这次产出了什么」无关的数字，拼进去只会把 120 字的摘要挤满。
+META_COUNT_KEYS: tuple[str, ...] = (
+    "count", "total", "docked", "pdb", "failed", "remaining", "pages", "chars",
+)
+
+
+def meta_summary(meta: dict[str, Any]) -> str:
+    """把工具返回的结构化读数压成一行摘要；没有可说的返回空串。"""
+    if not meta:
+        return ""
+    parts: list[str] = []
+    handle = meta.get("handle")
+    if isinstance(handle, str) and handle.strip():
+        parts.append(handle.strip())
+    counts = meta.get("counts")
+    if isinstance(counts, dict):
+        pairs = [
+            f"{name} {value}"
+            for name, value in counts.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        ]
+        if pairs:
+            parts.append("，".join(pairs))
+    for key in META_COUNT_KEYS:
+        value = meta.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            parts.append(f"{key} {value}")
+    return "；".join(parts)
+
+
+def evidence_ref_of(part: Part, meta: dict[str, Any], tool: Any = None) -> str:
+    """一次工具调用在证据层里的引用名。
+
+    三档，从「最说明问题」到「最通用」：
+
+    1. 结果里的 handle —— 这次调用**产出了什么**。两个不同的入参可能产出同一个
+       产物，那时它们本该是同一条证据；反过来，换受体重跑对接会产出新 handle，
+       引用名因此不同，两条材料不会被互相覆盖。
+    2. 工具自己声明的定位参数（`primary_argument` + `evidence_key`）。
+       先前的固定六个参数名盖不住 `grep`（pattern）与 `dock`（receptor+ligands），
+       于是所有省略了 path 的 grep 共用一条 `grep`，互相替换。
+    3. 没有定位参数时只剩工具名——可接受，那意味着这次调用本身没有可区分的对象。
+    """
+    handle = meta.get("handle")
+    if isinstance(handle, str) and handle.strip():
+        return f"{part.tool_name} {one_line(handle.strip(), EVIDENCE_REF_LIMIT)}"
+    receptor = meta.get("receptor")
+    ligands = meta.get("ligands")
+    if (
+        isinstance(receptor, str)
+        and receptor.strip()
+        and isinstance(ligands, str)
+        and ligands.strip()
+    ):
+        joined = f"{receptor.strip()}+{ligands.strip()}"
+        return f"{part.tool_name} {one_line(joined, EVIDENCE_REF_LIMIT)}"
+    if tool is not None and isinstance(part.tool_input, dict):
+        names: list[str] = []
+        primary = str(getattr(tool, "primary_argument", "") or "")
+        if primary:
+            names.append(primary)
+        for key in getattr(tool, "evidence_key", ()) or ():
+            if key not in names:
+                names.append(key)
+        pieces: list[str] = []
+        for key in names:
+            value = part.tool_input.get(key)
+            if isinstance(value, str) and value.strip():
+                pieces.append(f"{key}={one_line(value.strip(), 20)}")
+        if pieces:
+            return f"{part.tool_name} {'+'.join(pieces)}"
+    return evidence_ref(part.tool_name, part.tool_input)
 
 
 @dataclass
@@ -207,7 +365,14 @@ class EvidenceStore:
     limit: int = EVIDENCE_LIMIT
     _items: list[Evidence] = field(default_factory=list)
 
-    def add(self, ref: str, summary: str, detail: str = "") -> None:
+    def add(
+        self,
+        ref: str,
+        summary: str,
+        detail: str = "",
+        failed: bool = False,
+        source: str = "",
+    ) -> None:
         """收一条证据。ref 相同则替换，并把它挪到末尾（最近用到的排在后面）。"""
         name = ref.strip()
         if not name or not summary.strip():
@@ -216,39 +381,50 @@ class EvidenceStore:
             one_line(name, EVIDENCE_REF_LIMIT),
             one_line(summary, EVIDENCE_SUMMARY_LIMIT),
             detail.strip(),
+            failed=failed,
+            source=source,
         )
         self._items = [existing for existing in self._items if existing.ref != item.ref]
         self._items.append(item)
         if len(self._items) > self.limit:
             del self._items[: len(self._items) - self.limit]
 
-    def add_from_part(self, part: Part) -> None:
+    def add_from_part(self, part: Part, tool: Any = None) -> None:
         """把一次工具调用的结果提炼成一条证据。
 
-        收的条件是「跑完了，且输出里有关键行」。**失败的那一类例外**：
+        收的条件是「跑完了，且说得清留下了什么」。**失败的那一类例外**：
         即便一行关键行都没认出来也收——失败原因就是下一步的输入，
         而它常常是短的一句（「缺少参数 text」），关键词表盖不住这种。
 
-        只收挑出来的那几行，不收整份输出：整份收进来等于把工具输出发两遍。
-        第一行放进摘要（摘要永远给），其余的行放进正文——**正文里不重复第一行**，
-        否则同一句话会在证据块里连着出现两次。
+        优先用 `Part.tool_meta`：`handle` 决定引用名，计数决定摘要。工具返回的
+        结构化读数比从中文输出里认关键行可靠得多，而「这次产出了哪个 handle」
+        正是证据层最该留的那一句。没有 meta 才回落到关键行。
         """
         if part.type is not PartType.TOOL or not part.tool_name:
             return
         if part.tool_status not in (ToolStatus.COMPLETED, ToolStatus.FAILED):
             return
+        meta = part.tool_meta if isinstance(part.tool_meta, dict) else {}
         text = (part.tool_output or "").strip()
-        if not text:
-            return
-        lines = [line.strip() for line in text.splitlines() if is_key_line(line)]
-        if not lines and part.tool_status is ToolStatus.FAILED:
+        lines = [line.strip() for line in text.splitlines() if is_key_line(line)] if text else []
+        if not lines and text and part.tool_status is ToolStatus.FAILED:
             lines = [text.splitlines()[0].strip()]
-        if not lines:
+
+        summary = meta_summary(meta)
+        if summary:
+            # 关键行里与摘要相同的那一句不再进正文：同一句话连着出现两次，
+            # 读的人会以为工具跑了两遍。
+            detail = "\n".join(line for line in lines if line != summary)
+        elif lines:
+            summary, detail = lines[0], "\n".join(lines[1:])
+        else:
             return
         self.add(
-            evidence_ref(part.tool_name, part.tool_input),
-            lines[0],
-            "\n".join(lines[1:]),
+            evidence_ref_of(part, meta, tool),
+            summary,
+            detail,
+            failed=part.tool_status is ToolStatus.FAILED,
+            source=part.id,
         )
 
     def clear(self) -> None:
@@ -265,7 +441,7 @@ class EvidenceStore:
 
 @dataclass(frozen=True)
 class Budget:
-    """一步的预算口径：可用额度、预留、工具定义，以及各层的软配额。
+    """一步的预算口径：可用额度、预留、工具定义，以及各层的封顶。
 
     额度只在这一处算。先前各处各算各的，改一次口径要跟着改好几处，
     而且很容易漏掉某一路——工具定义与输出预留就曾经漏过，那 20% 于是只是经验值。
@@ -274,11 +450,15 @@ class Budget:
     available: int
     reserve: int
     tools_tokens: int
-    shares: dict[Layer, float] = field(default_factory=dict)
+    caps: dict[Layer, int] = field(default_factory=dict)
 
-    def share(self, layer: Layer, remaining: int) -> int:
-        """某一层在剩余额度里分到多少。软配额只决定「先给谁」，超了走降级链。"""
-        return int(max(0, remaining) * self.shares.get(layer, 0.0))
+    def cap(self, layer: Layer) -> int:
+        """这一层最多能拿多少 token。
+
+        只有摘要与证据封顶。RECENT 不设上限：它拿的是「其余都归我」，
+        再给它一个上限等于把刚才省下来的额度又空在那里。
+        """
+        return max(0, self.caps.get(layer, 0))
 
 
 @dataclass
@@ -292,6 +472,11 @@ class ContextBundle:
     # 被移出的内容覆盖到第几条会话消息（不含），供摘要定位用；没移出时为 0
     dropped_upto: int = 0
     degraded: list[str] = field(default_factory=list)       # 这一轮触发的降级步骤
+    # 这一步的装配度量，给 `/context` 与 trace 用。
+    #
+    # 全是可 JSON 序列化的标量/字典：它要进事件总线、进 trace 日志，
+    # 放进来一个 Layer 枚举或 dataclass 会让写盘那一步在别处炸掉。
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 def split_turns(messages: list[Message]) -> list[Turn]:
@@ -307,6 +492,8 @@ def split_turns(messages: list[Message]) -> list[Turn]:
     turns: list[Turn] = []
     serial = 0
     for message_index, message in enumerate(messages):
+        by_id = {part.id: part for part in message.parts}
+        fresh: list[Turn] = []
         for item in translate_message(message):
             if (
                 item.get("role") == "tool"
@@ -314,15 +501,92 @@ def split_turns(messages: list[Message]) -> list[Turn]:
                 and turns[-1].message_index == message_index
             ):
                 turns[-1].messages.append(item)
+                fresh.append(turns[-1])
                 continue
             serial += 1
-            turns.append(Turn(index=serial, message_index=message_index, messages=[item]))
+            turn = Turn(index=serial, message_index=message_index, messages=[item])
+            turns.append(turn)
+            fresh.append(turn)
+        # 工具项自带 `tool_call_id`（就是 Part 的 id），照着取源 Part 即可：
+        # 翻译层已经把两边的 id 对齐了，这里不必再复述一遍它的分组规则。
+        for turn in fresh:
+            for item in turn.messages:
+                if item.get("role") != "tool":
+                    continue
+                part = by_id.get(item.get("tool_call_id"))
+                if part is not None and all(
+                    existing.id != part.id for existing in turn.tool_parts
+                ):
+                    turn.tool_parts.append(part)
     return turns
 
 
 def turns_tokens(turns: list[Turn]) -> int:
     """估算一组交互组占多少 token。"""
     return sum(turn.tokens() for turn in turns)
+
+
+def turn_at(session: Session, index: int) -> Turn | None:
+    """按 turn 序号取交互组。
+
+    序号就是 `_refs_block` 与归档占位里写的那个：`split_turns` 按模型项的
+    出现顺序给的连号。消息只会往后追加，所以已有消息的序号不会变。
+    """
+    for turn in split_turns(session.messages):
+        if turn.index == index:
+            return turn
+    return None
+
+
+def render_part(part: Part) -> str:
+    """把一个 Part 还原成给人读的一段文字。"""
+    if part.type is PartType.TEXT:
+        return part.text
+    if part.type is PartType.REASONING:
+        return f"[思考]\n{part.text}" if part.text else ""
+    if part.type is PartType.TOOL:
+        status = f"（{part.tool_status.value}）" if part.tool_status else ""
+        head = f"[工具] {part.tool_name}{status}"
+        return f"{head}\n{part.tool_output}" if part.tool_output else head
+    if part.type is PartType.FILE:
+        return f"[文件] {part.file_path}\n{part.text}".strip()
+    if part.type is PartType.PATCH:
+        return f"[改动] {part.text}"
+    if part.type is PartType.ERROR:
+        return f"[错误] {part.text}"
+    if part.type is PartType.SUMMARY:
+        return f"[总结]\n{part.text}"
+    if part.type is PartType.COMPACTION:
+        return f"[压缩] {part.text}"
+    if part.type is PartType.RETRY:
+        return f"[重试] {part.text}"
+    return ""
+
+
+def render_range(session: Session, start: int, end: int) -> str:
+    """把会话里 `[start, end)` 这几条消息的原文铺成一段文字。
+
+    `read_turn` 与 `recall_event` 共用它：两处的区别只是区间怎么来
+    （一条交互组，还是一段事件），铺开的方式必须一致，否则同一段内容
+    从两个入口读出来会是两个样子。
+    """
+    blocks: list[str] = []
+    for message in session.messages[max(0, start) : max(0, end)]:
+        for part in message.parts:
+            block = render_part(part)
+            if block:
+                blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+def render_turn_text(session: Session, turn: Turn) -> str:
+    """把一个交互组还原成可读文本。
+
+    读的是**原 Part**，不是模型项：模型项是翻译层的产物，工具输出超过
+    `MODEL_OUTPUT_LIMIT` 时早已被截过，还带着 JSON 外壳。`read_turn` 要给的
+    正是原文，所以只能回到会话本身取。
+    """
+    return render_range(session, turn.message_index, turn.message_index + 1)
 
 
 # ---- 选择性压缩 ----
@@ -376,6 +640,15 @@ def memory_block(memory_text: str) -> str:
     return f"{MEMORY_NOTICE}\n{memory_text}"
 
 
+def memory_entry_count(block: str) -> int:
+    """常驻记忆里有几条。
+
+    数的是「- 」开头的行——那是 `MemoryStore.render_line` 的格式。
+    提示语那一行也算进去的话，没记忆时会显示成 1 条，度量就成了假数字。
+    """
+    return sum(1 for line in block.splitlines() if line.startswith("- "))
+
+
 def _cap_memory(block: str) -> str:
     """常驻记忆超过上限时按行累加，最后一行截到剩余额度。
 
@@ -421,25 +694,80 @@ def _cap_text(text: str, limit: int) -> str:
     return kept
 
 
-def _cap_evidence(evidence: list[Evidence], limit: int) -> list[Evidence]:
-    """证据层按软配额展开正文：摘要永远给，正文装到限额为止。
+def _evidence_key(item: Evidence) -> tuple[str, str]:
+    """判重用的键：摘要与正文都归一化后比较。
 
-    摘要一行都不能少——它是「这里有东西可取回」的索引，收了就等于连索引也没了。
-    正文是可选展开的部分，装不下就少给几条，先给前面的。
+    同一条报错可能被两个工具各说一遍（一个说「失败：超时」，另一个把原文
+    又抄一次）。不判重的话同一句话在证据块里出现两遍，白占额度还让模型
+    以为出了两次问题。
+    """
+    return (" ".join(item.summary.split()), " ".join(item.detail.split()))
+
+
+def _dedupe_evidence(evidence: list[Evidence]) -> list[Evidence]:
+    """同文只留一条，保留第一次出现的顺序。"""
+    unique: list[Evidence] = []
+    seen: set[tuple[str, str]] = set()
+    for item in evidence:
+        key = _evidence_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _cap_evidence(
+    evidence: list[Evidence],
+    limit: int,
+    visible: set[str] | None = None,
+) -> list[Evidence]:
+    """证据层按预算展开正文：摘要永远给，正文按「值不值得看」的顺序分配。
+
+    三条规则，都是有代价换来的：
+
+    - **摘要一行都不能少**：它是「这里有东西可取回」的索引，收了索引就等于
+      连线索也没了。所以先扣掉索引行的开销，剩下的才给正文。
+    - **正文优先给失败与最新的**：按插入顺序展开的话，最早那几条过程性结果
+      会抢走额度，而模型下一步要用的是「刚才为什么失败」。
+    - **RECENT 里还看得见的不展开**：`visible` 是这一步仍在 RECENT 里、
+      且没被压缩过的工具调用 id。证据层的价值在于「原文已经看不见了，
+      这几行还在」，重复一份就等于把工具输出发两遍。
     """
     if not evidence:
         return []
-    used = estimate_tokens("\n".join(f"- {item.ref}：{item.summary}" for item in evidence))
-    kept: list[Evidence] = []
-    for item in evidence:
-        room = limit - used
-        if not item.detail or room <= 0:
-            kept.append(Evidence(item.ref, item.summary))
+    visible = visible or set()
+    unique = _dedupe_evidence(evidence)
+
+    used = estimate_tokens("\n".join(f"- {item.ref}：{item.summary}" for item in unique))
+    # 分配顺序：失败优先，其次按收进来的先后倒序（最新的先拿），其余按原顺序。
+    order = sorted(range(len(unique)), key=lambda index: (not unique[index].failed, -index))
+    details: dict[int, str] = {}
+    for index in order:
+        item = unique[index]
+        if not item.detail:
+            continue
+        if item.source and item.source in visible:
+            continue
+        room = min(limit - used, EVIDENCE_DETAIL_MAX)
+        if room <= 0:
             continue
         detail = _cap_text(item.detail, room)
-        kept.append(Evidence(item.ref, item.summary, detail))
+        if not detail:
+            continue
+        details[index] = detail
         used += estimate_tokens(detail)
-    return kept
+
+    return [
+        Evidence(
+            item.ref,
+            item.summary,
+            details.get(index, ""),
+            failed=item.failed,
+            source=item.source,
+        )
+        for index, item in enumerate(unique)
+    ]
 
 
 class ContextAssembler:
@@ -472,11 +800,7 @@ class ContextAssembler:
             available=int(self.context_window * self.ratio) - reserve - tools_tokens,
             reserve=reserve,
             tools_tokens=tools_tokens,
-            shares={
-                Layer.RECENT: RECENT_SHARE,
-                Layer.EVIDENCE: EVIDENCE_SHARE,
-                Layer.HISTORY: HISTORY_SHARE,
-            },
+            caps={Layer.HISTORY: HISTORY_MAX, Layer.EVIDENCE: EVIDENCE_MAX},
         )
 
     def available(self, tools: list[dict[str, Any]] | None = None) -> int:
@@ -511,7 +835,9 @@ class ContextAssembler:
             )
 
         turns = split_turns(session.messages)
-        compact = session.compact_upto
+        # 事件覆盖到哪儿，RECENT 就从哪儿开始。两者取大：`compact_upto` 是手动
+        # 压缩推出来的位置，事件是自动/手动收口推出来的，谁在后面听谁的。
+        compact = max(session.compact_upto, session.event_end)
         compacted = [turn for turn in turns if turn.message_index < compact]
         live = [turn for turn in turns if turn.message_index >= compact]
 
@@ -520,19 +846,41 @@ class ContextAssembler:
         # 「不是降级链那一步削的」就不算，否则 `degraded` 反映不出真实用量。
         raw_memory = memory_block(memory_text)
         memory = _cap_memory(raw_memory)
-        fixed = estimate_tokens(stable_prefix) + estimate_tokens(memory) + estimate_tokens(task_text)
+        # 事件块按可用额度的六分之一封顶：它比 RECENT 稳定，但也只是索引，
+        # 不该把「最近发生了什么」挤掉。上限 1800 是量出来的——二十来条事件。
+        event_limit = min(EVENT_LIMIT_MAX, max(EVENT_LIMIT_MIN, available // 6))
+        events, event_block = self._cap_events(list(session.events), event_limit)
+        fixed = (
+            estimate_tokens(stable_prefix)
+            + estimate_tokens(memory)
+            + estimate_tokens(task_text)
+            + estimate_tokens(event_block)
+        )
         remaining = max(0, available - fixed)
-        recent = self._take_recent(live, budget.share(Layer.RECENT, remaining))
-        summary = _cap_text(session.summary, budget.share(Layer.HISTORY, remaining))
-        evidence = _cap_evidence(raw_evidence, budget.share(Layer.EVIDENCE, remaining))
+        # 摘要与证据先按**实际需要**占额度、各自封顶，剩下的全给 RECENT。
+        # 顺序在这里有语义：先给「有多少就得放多少」的两层，再让 RECENT 消化剩余。
+        summary = _cap_text(
+            session.summary, min(estimate_tokens(session.summary), budget.cap(Layer.HISTORY))
+        )
+        # 证据先只放摘要。正文是「还有余量才展开」的东西，不参与结构决策：
+        # 让它参与的话，展开一次就可能把刚放进 RECENT 的组又挤出去，来回震荡。
+        evidence = _cap_evidence(raw_evidence, 0)
+        evidence_need = min(
+            estimate_tokens(self._evidence_block(evidence)), budget.cap(Layer.EVIDENCE)
+        )
+        recent_quota = max(0, remaining - estimate_tokens(summary) - evidence_need)
+        recent, trimmed = self._take_recent(live, recent_quota)
 
         degraded: list[str] = []
+        if trimmed:
+            # 旧工具正文在装 RECENT 时就被收成占位了：那一步同样算削过。
+            degraded.append("recent_tool_clear")
         if memory != raw_memory:
             degraded.append("memory")
         if summary != session.summary:
             degraded.append("history_summary")
-        if [item.detail for item in evidence] != [item.detail for item in raw_evidence]:
-            degraded.append("evidence_detail")
+        if len(events) < len(session.events):
+            degraded.append("event_layer")
 
         live_ids = {turn.index for turn in recent}
         moved = [turn for turn in live if turn.index not in live_ids]
@@ -543,21 +891,43 @@ class ContextAssembler:
 
         def compose() -> tuple[list[dict[str, Any]], dict[Layer, int]]:
             return self._compose(
-                stable_prefix, memory, task_text, recent, moved_out(), summary, evidence
+                stable_prefix,
+                memory,
+                task_text,
+                event_block,
+                recent,
+                moved_out(),
+                summary,
+                evidence,
+                bool(session.events),
             )
 
         messages, usage = compose()
         total = sum(usage.values())
 
         # 降级链。每一步都重算用量，装下就停。
-        if total > available and any(item.detail for item in evidence):
-            evidence = [Evidence(item.ref, item.summary) for item in evidence]
-            degraded.append("evidence_detail")
-            messages, usage = compose()
-            total = sum(usage.values())
-        if total > available and summary:
+        #
+        # 摘要要够大才值得缩：一句话的摘要砍半只省下几个 token，却把那一句
+        # 结论变成半句——省不出地方，还丢了内容。所以先看值不值得，再动手。
+        if total > available and estimate_tokens(summary) > SUMMARY_SHRINK_MIN:
             summary = _cap_text(summary, max(1, estimate_tokens(summary) // 2))
             degraded.append("history_summary")
+            messages, usage = compose()
+            total = sum(usage.values())
+        # 旧工具结果换成一行占位：**可逆**（read_turn 按序号取回原文），
+        # 比缩记忆、移出整组都便宜，所以排在它们前面。
+        while total > available:
+            if not self._clear_tool_outputs(recent):
+                break
+            degraded.append("recent_tool_clear")
+            messages, usage = compose()
+            total = sum(usage.values())
+        # 旧事件丢掉：它也「可逆」（recall_event 取回原文），但丢掉的是整段结论，
+        # 比一行占位贵，所以排在工具结果清理之后、记忆之前。
+        while total > available and events:
+            events.pop(0)
+            event_block = self._event_block(events)
+            degraded.append("event_layer")
             messages, usage = compose()
             total = sum(usage.values())
         if total > available and memory:
@@ -584,46 +954,183 @@ class ContextAssembler:
                 usage,
             )
 
+        # 结构定下来了，最后才把余量给证据正文：这时才知道哪几组留在 RECENT 里
+        # （它们的正文已经在上下文里，不必再展开一份），也才知道还剩多少额度。
+        visible = {tool_id for turn in recent for tool_id in turn.visible_tool_ids()}
+        unique_evidence = _dedupe_evidence(raw_evidence)
+        room = max(0, available - total)
+        limit = estimate_tokens(self._evidence_block(evidence)) + min(
+            room, budget.cap(Layer.EVIDENCE)
+        )
+        filled = _cap_evidence(unique_evidence, limit, visible=visible)
+        # 「因为额度不够被截」才算降级；与 RECENT 重复而不展开是正常做法，
+        # 记成降级会让每一步都平白多一条 trace。
+        if [item.detail for item in _cap_evidence(unique_evidence, limit)] != [
+            item.detail for item in unique_evidence
+        ]:
+            degraded.append("evidence_detail")
+        if filled != evidence:
+            evidence = filled
+            messages, usage = compose()
+            total = sum(usage.values())
+
         out = moved_out()
+        # `dropped` 只数**这一步新挤出去的**：被手动压缩或事件挡掉的那些早就
+        # 不在上下文里了，把它们算进来会让「这一步有没有溢出」永远为真。
+        dropped_now = len(moved)
+        dropped_upto = max((turn.message_index for turn in out), default=-1) + 1
+        levels = ordered_degraded(degraded)
         return ContextBundle(
             messages=messages,
             usage=usage,
             dropped_turns=[turn.index for turn in out],
-            dropped=len(out),
-            dropped_upto=max((turn.message_index for turn in out), default=-1) + 1,
-            degraded=ordered_degraded(degraded),
+            dropped=dropped_now,
+            dropped_upto=dropped_upto,
+            degraded=levels,
+            metrics={
+                "window": self.context_window,
+                "ratio": self.ratio,
+                "reserve": budget.reserve,
+                "tools": budget.tools_tokens,
+                "available": available,
+                "total": total,
+                "usage": {layer.value: tokens for layer, tokens in usage.items()},
+                "dropped": dropped_now,
+                "dropped_upto": dropped_upto,
+                "degraded": list(levels),
+                "recent_turns": len(recent),
+                "summary_tokens": estimate_tokens(summary),
+                "memory_entries": memory_entry_count(memory),
+                "evidence_entries": len(evidence),
+                "events": len(events),
+            },
         )
 
-    def _take_recent(self, turns: list[Turn], quota: int) -> list[Turn]:
-        """从最近往前取交互组，直到超过软配额；至少保留 `MIN_RECENT_TURNS` 组。"""
+    def _take_recent(self, turns: list[Turn], quota: int) -> tuple[list[Turn], bool]:
+        """从最近往前取交互组；装不下时先清旧工具正文，腾出地方再装。
+
+        返回取到的组，以及这一次有没有收过正文。
+
+        先前是「装不下就整组不要」：等到降级链里的 `recent_tool_clear` 时，
+        那一组早就不在 RECENT 里了，于是那一步实际上永远轮不到——实测的长会话里
+        它一次都没触发，一直在整组往外丢。
+
+        现在按「新 → 旧」一组组往下走，装不下就把「最近 keep 条之外」的旧正文
+        **一次清一批**，再算一次大小：先轮到这一组自己的（它还没进来，清完变小
+        才可能挤进来），再轮到已装下的。代价是模型看不到旧输出的原文
+        （`read_turn` 取得回来），换来的是它还知道「那一步调过什么」。
+
+        为什么成批：清掉的集合稳定下来之后，相邻两次请求只在 RECENT 边界处不同，
+        前缀命中最高（复算 82.3% 对逐条清的 74.2%）。
+
+        最近 `RECENT_TOOL_KEEP` 条工具结果始终不动：那是模型正在用的几步，
+        把眼前的输出抽走比少一组历史更糟。
+        """
         taken: list[Turn] = []
         total = 0
-        for turn in reversed(turns):
+        index = len(turns) - 1
+        while index >= 0:
+            turn = turns[index]
             size = turn.tokens()
+            if taken and total + size > quota:
+                # 一次清一批「最近 keep 条之外」的旧正文。
+                #
+                # 离线复算（同一份会话、三种策略）显示成批明显更稳：
+                # 前缀命中 82.3%，逐条清 74.2%，清不动就丢组 68.1%。
+                # 原因是从旧到新一次清完，之后每一趟装配清掉的还是同一批，
+                # 请求内容只在 RECENT 的边界处变；逐条清则「已清的边界」每步都在挪。
+                if self._clear_tool_outputs([turn, *reversed(taken)]):
+                    total = sum(item.tokens() for item in taken)
+                    size = turn.tokens()
             if taken and total + size > quota:
                 break
             taken.append(turn)
             total += size
+            index -= 1
         while len(taken) < min(MIN_RECENT_TURNS, len(turns)):
             taken.append(turns[len(turns) - len(taken) - 1])
         taken.reverse()
-        return taken
+        # 只有**最终留在 RECENT 里**的占位才算真清过：上面可能清了一个
+        # 后来又没装下的组，那是白清，不该在 `degraded` 里报成一步。
+        trimmed = any(
+            str(item.get("content") or "").startswith(TOOL_ARCHIVE_MARK)
+            for turn in taken
+            for item in turn.tool_outputs()
+        )
+        return taken, trimmed
+
+    def _archive_tool_item(self, turn: Turn, item: dict[str, Any], name: str) -> bool:
+        """把一条工具结果正文换成占位。已经换过、或者不够长时返回 False。"""
+        body = item.get("content") or ""
+        if body.startswith(TOOL_ARCHIVE_MARK):
+            return False
+        if estimate_tokens(body) <= RECENT_TOOL_CLEAR_MIN:
+            return False
+        label = name or "工具"
+        item["content"] = (
+            f"{TOOL_ARCHIVE_MARK}turn {turn.index} 的 {label}；"
+            f"原文用 read_turn turn={turn.index} 取回）"
+        )
+        return True
+
+    def _clear_tool_outputs(self, recent: list[Turn], keep: int = RECENT_TOOL_KEEP) -> int:
+        """把旧的、较大的工具输出换成一行占位，返回清掉的条数。
+
+        **一次清一批**：从旧到新，把「最近 `keep` 条之外」的正文全部换掉。
+        逐条清会让「已清的边界」每一步都往后挪一点，相邻两次请求到处都不一样；
+        一批清完之后，清掉的集合就固定了，请求只在 RECENT 的边界处变。
+        离线复算：成批 82.3% 的前缀命中，逐条 74.2%，不清 68.1%。
+
+        只清**成功**且**够长**的那些：
+
+        - 失败结果的原文就是下一步的输入，清掉等于把线索删了；
+        - 短输出清不出多少额度，反而多一行占位。
+
+        最近 `keep` 条一律不动——那是模型正在用的几步。清掉的原文仍在
+        `Session.messages` 里，`read_turn` 按 turn 序号能原样取回。
+
+        `recent` 必须是**时间顺序**：它从列表开头开始清、把末尾 `keep` 条留住。
+        """
+        entries: list[tuple[Turn, dict[str, Any], str]] = []
+        for turn in recent:
+            names = {
+                call["id"]: call["function"]["name"]
+                for item in turn.messages
+                for call in item.get("tool_calls") or []
+            }
+            failed = turn.failed_tool_ids()
+            for item in turn.tool_outputs():
+                call_id = item.get("tool_call_id") or ""
+                if call_id in failed:
+                    continue
+                entries.append((turn, item, names.get(call_id, "")))
+        cleared = 0
+        for turn, item, name in entries[: max(0, len(entries) - keep)]:
+            if self._archive_tool_item(turn, item, name):
+                cleared += 1
+        return cleared
 
     def _compose(
         self,
         stable_prefix: str,
         memory: str,
         task_text: str,
+        event_block: str,
         recent: list[Turn],
         moved: list[Turn],
         summary: str,
         evidence: list[Evidence],
+        has_events: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[Layer, int]]:
         """按固定布局把各层拼成消息，并给出每层的估算用量。"""
-        header = self._task_header(memory, task_text, moved, summary)
+        header = self._task_header(memory, task_text, moved, summary, has_events)
         messages: list[dict[str, Any]] = [{"role": "system", "content": stable_prefix}]
         if header:
             messages.append({"role": "user", "content": header})
+        # 事件单独一条消息，不并进 header：header 每一步都可能变，事件块一旦
+        # 定下来就只在新事件出现时变，分开才有机会命中前缀缓存。
+        if event_block:
+            messages.append({"role": "user", "content": event_block})
         for turn in recent:
             messages.extend(turn.messages)
         evidence_block = self._evidence_block(evidence)
@@ -634,6 +1141,7 @@ class ContextAssembler:
             Layer.PREFIX: estimate_tokens(stable_prefix),
             Layer.MEMORY: estimate_tokens(memory),
             Layer.TASK: estimate_tokens(task_text),
+            Layer.EVENT: estimate_tokens(event_block),
             Layer.RECENT: turns_tokens(recent),
             Layer.EVIDENCE: estimate_tokens(evidence_block),
             Layer.HISTORY: estimate_tokens(header) - estimate_tokens(memory) - estimate_tokens(task_text),
@@ -646,6 +1154,7 @@ class ContextAssembler:
         task_text: str,
         moved: list[Turn],
         summary: str,
+        has_events: bool = False,
     ) -> str:
         """常驻记忆 + 任务状态 + 摘要 + 引用清单，合成一条 user 头。
 
@@ -657,20 +1166,34 @@ class ContextAssembler:
             blocks.append(memory)
         if task_text.strip():
             blocks.append(task_text.strip())
-        if moved:
+        # 有事件时也要给摘要：事件只覆盖到某个位置，摘要覆盖它之前的那一段。
+        # 只判断 `moved` 的话，事件把 RECENT 之前的内容全接走时摘要会凭空消失。
+        if moved or (summary and has_events):
             if summary:
                 blocks.append(f"{SUMMARY_NOTICE}\n{summary}")
             else:
                 blocks.append(OMITTED_NOTICE)
-            blocks.append(self._refs_block(moved))
+            if moved:
+                blocks.append(self._refs_block(moved))
         return "\n\n".join(blocks)
 
     def _refs_block(self, moved: list[Turn]) -> str:
-        """被移出的交互组各占一行，之后能按引用取回。"""
-        lines = ["（更早的内容已省略，可用 list_workspace / read 按引用取回）"]
-        for turn in moved:
+        """被移出的交互组各占一行，之后能按序号取回原文。
+
+        这里只说真话：`read_turn` 确实能按下面的序号把原文取回来
+        （它读的是会话本身，不受 `compact_upto` 限制）。
+
+        只列最近的 20 组：一份长会话可能移出几百组，全列出来这一段自己就把
+        预算吃掉。更早的没有专门入口，所以宁可写清「还有多少组」也不装作列全了。
+        """
+        lines = ["（更早的内容已省略，可用 read_turn turn=<序号> 取回原文）"]
+        shown = moved[-REFS_TURN_LIMIT:]
+        hidden = len(moved) - len(shown)
+        if hidden > 0:
+            lines.append(f"（再往前还有 {hidden} 组，未列出）")
+        for turn in shown:
             lines.append(f"- turn {turn.index}：{self._turn_label(turn)}")
-        return "\n".join(lines)
+        return _cap_text("\n".join(lines), REFS_TOKEN_LIMIT)
 
     def _turn_label(self, turn: Turn) -> str:
         """给一个交互组起一行标签：调用了哪些工具，或是一句「用户消息 / 助手回复」。
@@ -687,6 +1210,29 @@ class ContextAssembler:
         if names:
             return "、".join(names)
         return "用户消息" if turn.messages[0].get("role") == "user" else "助手回复"
+
+    def _event_block(self, events: list[Event]) -> str:
+        """事件层：每个事件一行，从旧到新。空列表时是空串。"""
+        if not events:
+            return ""
+        return "\n".join([EVENT_NOTICE, *(event_line(event) for event in events)])
+
+    def _cap_events(self, events: list[Event], limit: int) -> tuple[list[Event], str]:
+        """按 token 上限保留事件，从新往旧留。
+
+        丢掉的是**最旧的**：它们离当前最远，而 `recall_event` 仍然取得回来。
+        第一条无论多大都留下——一条都不给的话，事件层就成了「说有事件却看不见」。
+        """
+        kept: list[Event] = []
+        used = 0
+        for event in reversed(events):
+            cost = estimate_tokens(event_line(event)) + 1
+            if kept and used + cost > limit:
+                break
+            kept.append(event)
+            used += cost
+        kept.reverse()
+        return kept, self._event_block(kept)
 
     def _evidence_block(self, evidence: list[Evidence]) -> str:
         """证据层：先给 summary，再按剩余额度展开 detail。"""

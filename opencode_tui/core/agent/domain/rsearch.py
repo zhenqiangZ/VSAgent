@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..tools import Tool, ToolError, ToolResult, ToolSpec
+from ..tools import RetryableToolError, Tool, ToolError, ToolResult, ToolSpec
 from . import http
 
 __all__ = [
@@ -250,7 +250,12 @@ def search_entries(
         # 以为工具坏了，换个说法反复重试（现场：`ses_0037` 第 5~9 步连试四种说法，
         # 步数就是这么烧掉的）。当成空结果往下走，正文与 `meta.reason` 会分开说。
         body = {}
-    except Exception as error:  # ToolError / RetryableToolError 都归为「这次没搜成」
+    except RetryableToolError:
+        # **瞬时故障不在这里变成永久失败。** `http` 已经按「重试还有没有意义」
+        # 分过档（429 / 5xx / 连不上是可重试），再包成 `SearchError` 就等于
+        # 告诉循环层「别重试了」——而循环层是唯一会重试的那一层。
+        raise
+    except Exception as error:  # 其余（响应形状不对、4xx）归为「这次没搜成」
         raise SearchError(f"RCSB 检索没成：{error}") from error
 
     if use_cache:
@@ -317,6 +322,9 @@ def fetch_ligands(
         if body is None:
             try:
                 body = http.post_json(RCSB_GRAPHQL_URL, payload, timeout=timeout)
+            except RetryableToolError:
+                # 同上：可重试的交给循环层，别在这里判死。
+                raise
             except Exception as error:
                 raise SearchError(f"RCSB 配体查询没成：{error}") from error
             if use_cache:

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..tools import ToolError
+from ..tools import RetryableToolError, ToolError
 from . import http
 
 __all__ = [
@@ -238,7 +238,11 @@ def list_complexes(
         if use_cache:
             _write_cache(path, empty)
         return [], empty
-    except Exception as error:  # ToolError / RetryableToolError 都归为「这一侧不可用」
+    except RetryableToolError:
+        # 429 / 5xx / 连不上是瞬时故障，交给循环层重试；包成 ComplexError 就
+        # 等于替它做了「别再试」的决定，而它并不知道网络刚刚抖了一下。
+        raise
+    except Exception as error:  # 其余（响应形状不对、4xx）归为「这一侧不可用」
         raise ComplexError(f"RCSB 检索没成：{error}") from error
 
     if use_cache:
@@ -329,6 +333,9 @@ def download_entry(
     url = f"{RCSB_DOWNLOAD_URL}/{entry_id}.pdb"
     try:
         text = http.get_text(url, timeout=timeout)
+    except RetryableToolError:
+        # 下载是最该重试的一步：一次抖动丢掉整条链，代价比再拉一次大得多。
+        raise
     except Exception as error:
         raise ComplexError(f"下载 {entry_id} 没成：{error}") from error
 

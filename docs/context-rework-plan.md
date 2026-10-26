@@ -84,12 +84,12 @@
 >
 > 文案压到 9,562 之后仍占每步 9.6K，因为 24 个领域工具**每一步都要全量重发**。
 > 改成两层：核心工具（文件、登记表、任务、事件、记忆、`load_tools`，14 个）常驻，
-> 24 个领域工具分成 13 族，由 `load_tools` 现装现用。
+> 24 个领域工具分成 12 族，由 `load_tools` 现装现用。
 >
 > | | 工具数 | 每步定义 token |
 > | --- | --- | --- |
 > | 全量 | 38 | 12,313 |
-> | 只发核心 | 14 | 3,077 |
+> | 只发核心 | 14 | 3,177 |
 > | 核心 + 4 族（structure/receptor/ligand/docking） | 20 | 5,917 |
 >
 > 同一份 24 条消息的样本、同一实现复算（`tools/eval_context.py --sweep`）：
@@ -119,6 +119,20 @@
 > `TOOL_DISCIPLINE` 说明这件事，因为模型看不到清单里没有的工具时，
 > 最容易做的是凭记忆写参数或绕道 bash。
 >
+> **族与工具那张表改为现数**（2026-10-25）：原先 `FAMILIES` 里手写「族名（有哪些工具）」
+> 一句话，三处已经和实际对不上（`structure` 多写了 `search_pdb`、`listing` 漏了
+> `switch_receptor`、`chembl` 漏了 `describe_molecule`）；而 `load_tools` 的说明
+> 只列族名，模型是照着猜的。现在说明里一族一行、由 `catalog()` 从模块现数，
+> 代价是核心工具定义 3,077 → 3,177（+100/步），换掉的是「装错族」。
+> 同一次还改了两处划分：
+>
+> - `search_pdb` 从 `rsearch` 族并进 `structure`。它原先自成一族，族里只有它一个，
+>   说明却写着「反向检索」——名不副实，模型先装 `rsearch` 才发现里面只有它。
+>   族与模块因此不再一一对应（`structure` = `rsearch` + `structure` 两个模块）。
+> - `load_tools` 的结果减去 `registry.disabled`（新增 `registry_argument` 注入通道）。
+>   对着被 `tools.toml` 关掉的工具说「已装入」，是句做不到的话；实测模型信了，
+>   下一步去调、撞上禁用文案，再被那句「请改用别的办法」引去 bash 自建客户端。
+>
 > **真实会话验证**（2026-10-25，deepseek-flash / 1M 窗口，同一组三问跑两遍）：
 > 「查 EGFR 有哪些结构 → 取 4HJO 登记成受体 → 写成运行目录」。
 >
@@ -138,6 +152,11 @@
 >
 > 这两次会话里看到的失败模式（重试被吞、平台猜错、handle 猜错、不知道状态目录在哪）
 > 逐条记在 [`docs/real-session-findings.md`](real-session-findings.md)，含代价与修法排序。
+>
+> **分类改完复测**（同日，两问：取 4HJO → 写运行目录）：7 步、43 秒、输入 79.5K、
+> 命中 89.7%。模型第一步就装 `structure`（不再先试 `rsearch`），`fetch_structure`
+> 一次成功、没有 bash 绕道；装族那一步的击穿仍在，82.6% → 76.0% → 95.1%。
+> `open_viewer({"run": "artifact#4"})` 又猜错了一次 handle——F3 第三次复现。
 
 ---
 

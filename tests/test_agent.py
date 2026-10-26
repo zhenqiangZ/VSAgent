@@ -208,6 +208,7 @@ from opencode_tui.core.agent.domain.all_tools import catalog, families, tool_fam
 from opencode_tui.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
 from opencode_tui.core.agent.toolset import (  # noqa: E402
     LoadToolsTool,
+    catalog_text,
     family_of,
     hidden_names,
 )
@@ -12269,6 +12270,34 @@ async def check_tool_family() -> None:
     check(len(covered) == len(set(covered)), "同一个工具不会被登记进两族")
     check(tool_family("dock") == "docking", "tool_family 能反查")
     check(tool_family("bash") == "", "核心工具不属于任何族")
+    # `search_pdb` 原先单独立一个 `rsearch` 族，族里只有它一个，说明还写着
+    # 「反向检索」——名不副实，模型因此先装 rsearch 才发现里面只有它。
+    check(
+        tool_family("search_pdb") == "structure",
+        f"查 PDB 条目与取坐标是同一件事：{tool_family('search_pdb')}",
+    )
+    check("rsearch" not in groups, "不再有只有一个工具的空壳族")
+
+    # 说明必须从目录现数：手写的那份已经漂过三处（多写一个、漏掉两个），
+    # 而模型正是照这句话决定装哪一族。
+    listing = catalog_text()
+    check(
+        all(name in listing for name in covered),
+        "说明里列出了每一个领域工具（漏一个就等于让模型盲装）",
+    )
+    check(
+        all(family in listing for family in groups),
+        "说明里列出了每一族",
+    )
+    description = LoadToolsTool.spec.description
+    check(
+        listing in description and "族与工具" in description,
+        "load_tools 的说明带上了族 → 工具那张表",
+    )
+    check(
+        "13 族" not in description and f"{len(groups)} 族" in description,
+        "族数是数出来的，不是写死的",
+    )
 
     registry = ToolRegistry()
     for tool in (LoadToolsTool(), ReadTurnTool()):
@@ -12291,7 +12320,7 @@ async def check_tool_family() -> None:
         "不传 exclude 时照旧全量（评测脚本与 /tools 面板靠它）",
     )
 
-    loaded = await LoadToolsTool().execute({"family": "docking"}, session=session)
+    loaded = await LoadToolsTool().execute({"family": "docking"}, session=session, registry=registry)
     check(not loaded.failed, f"装一族不报错：{loaded.output}")
     check(session.tool_families == ["docking"], f"族记在会话上：{session.tool_families}")
     check("dock" in loaded.output, "装完告诉模型这一族里有什么")
@@ -12307,15 +12336,47 @@ async def check_tool_family() -> None:
         "过滤之后仍是装配顺序，不是集合顺序",
     )
 
-    again = await LoadToolsTool().execute({"family": "docking"}, session=session)
+    again = await LoadToolsTool().execute({"family": "docking"}, session=session, registry=registry)
     check(
         not again.failed and again.meta["already"] and session.tool_families == ["docking"],
         "重复装同一族不重复记账",
     )
 
-    unknown = await LoadToolsTool().execute({"family": "nope"}, session=session)
+    unknown = await LoadToolsTool().execute(
+        {"family": "nope"}, session=session, registry=registry
+    )
     check(unknown.failed and "docking" in unknown.output, f"未知族列出可选项：{unknown.output}")
     check(session.tool_families == ["docking"], "未知族不改会话状态")
+
+    # 被关掉的工具不许报「已装入」：那句话说出去，模型下一步就会去调它，
+    # 撞上禁用文案之后转去 bash 自己实现了一遍（实测 20 步）。
+    dead = await LoadToolsTool().execute(
+        {"family": "literature"},
+        session=Session(id="ses_family_dead"),
+        registry=ToolRegistry(disabled={"search_literature"}),
+    )
+    check(dead.failed, f"整族被关掉时装它没有意义：{dead.output[:60]}")
+    check("已装入" not in dead.output, "不许说「已装入」")
+    check(
+        "关掉" in dead.output and "bash" in dead.output,
+        "说清是开关问题，并且拦住「自己实现一遍」",
+    )
+    check(dead.meta["tools"] == [], f"结构化读数里没有可用工具：{dead.meta}")
+
+    part = await LoadToolsTool().execute(
+        {"family": "structure"},
+        session=Session(id="ses_family_part"),
+        registry=ToolRegistry(disabled={"search_pdb"}),
+    )
+    check(not part.failed, f"只关掉一部分时其余照装：{part.output}")
+    check(
+        part.meta["tools"] == ["fetch_structure", "import_structure"],
+        f"装进来的只有可用的那些：{part.meta['tools']}",
+    )
+    check(
+        part.meta["disabled"] == ["search_pdb"] and "search_pdb" in part.output,
+        "被关掉的那一个要说出来，不能悄悄少一个",
+    )
 
     # 会话存盘再读回来，装过的族要跟着回来：重开一个做过对接的会话，
     # dock 还在，否则模型会以为自己没装过、又去 load 一次。
@@ -12344,10 +12405,13 @@ async def check_tool_family() -> None:
         "unknown tool" in missing_tool_reason(registry, "dock", session),
         "装过的族不再提示去装（否则模型会来回 load 同一族）",
     )
+    disabled_text = missing_tool_reason(ToolRegistry(disabled={"dock"}), "dock", unloaded)
+    check("已被禁用" in disabled_text, "禁用排在按族加载之前：关掉的工具装进来也没用，不能叫它去 load")
     check(
-        "已被禁用" in missing_tool_reason(ToolRegistry(disabled={"dock"}), "dock", unloaded),
-        "禁用排在按族加载之前：关掉的工具装进来也没用，不能叫它去 load",
+        "别的办法" not in disabled_text,
+        f"禁用文案不许教模型绕道（实测「请改用别的办法」换来 20 步 bash）：{disabled_text}",
     )
+    check("bash" in disabled_text, "明确说不许自己实现一遍")
     check(
         "unknown tool" in missing_tool_reason(registry, "nonexistent_thing", unloaded),
         "真不存在的工具不编一个族出来",

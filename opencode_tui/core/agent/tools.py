@@ -291,6 +291,12 @@ class Tool(ABC):
     # 事件挂在会话上，收口位置要问到「这一轮写到第几条了」，所以它拿的是
     # 会话加一个当前位置，而不是整份上下文。与上面几个口子同理，这里也不认它的类型。
     event_argument: ClassVar[str] = ""
+    # 收工具登记表本身的参数名。只有 `load_tools` 声明。
+    #
+    # 别的工具拿登记表是为了写条目；它拿的是**注册表**，只为读一件事：哪些工具
+    # 被 `tools.toml` 关掉了。不读这个的话，它会对着被关掉的工具说「已装入」——
+    # 实测模型照着这句话去调，撞上禁用文案后转去用 bash 自己实现了一遍。
+    registry_argument: ClassVar[str] = ""
 
     @abstractmethod
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
@@ -306,6 +312,7 @@ class Tool(ABC):
         viewer: Any = None,
         spawner: Any = None,
         event_runtime: Any = None,
+        registry: Any = None,
         on_arguments: Callable[[dict[str, Any]], None] | None = None,
     ) -> ToolResult:
         """内核唯一的调用入口：注入 context、任务状态、证据收集器与结构服务之后再走 `run`。
@@ -333,6 +340,7 @@ class Tool(ABC):
             (self.viewer_argument, viewer, "本地结构服务"),
             (self.spawn_argument, spawner, "子 agent 派发器"),
             (self.event_argument, event_runtime, "事件运行时"),
+            (self.registry_argument, registry, "工具注册表"),
         ):
             if not name:
                 continue

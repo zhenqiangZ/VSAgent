@@ -579,7 +579,7 @@ def evidence_table(window: int = EVIDENCE_WINDOW, count: int = EVIDENCE_RUNS) ->
     failures.extend(_ref_collisions(refs, specs))
 
     print(f"窗口 {window}　工具运行 {len(specs)} 次　证据层上限 {store.limit} 条")
-    print("运行　消息　证据　在RECENT　证据保住　只留摘要　让位　重复　摘要重合　artifact")
+    print("运行　消息　证据　证据tok　在RECENT　证据保住　只留摘要　让位　重复　artifact")
     duplicates = echoes = 0
     counts = {"recent": 0, "kept": 0, "summary": 0, "yield": 0}
 
@@ -638,12 +638,12 @@ def evidence_table(window: int = EVIDENCE_WINDOW, count: int = EVIDENCE_RUNS) ->
         print(
             f"{index:>4}　{len(sliced.messages):>4}"
             f"　{len(store.items()):>4}"
+            f"　{built.usage.get(Layer.EVIDENCE, 0):>6}"
             f"　{counts['recent']:>8}"
             f"　{counts['kept']:>8}"
             f"　{counts['summary']:>8}"
             f"　{counts['yield']:>4}"
             f"　{duplicates:>4}"
-            f"　{echoes:>8}"
             f"　{answerable}/{len(handles)}"
             + (f"（索引 +{by_index}）" if by_index else "")
         )

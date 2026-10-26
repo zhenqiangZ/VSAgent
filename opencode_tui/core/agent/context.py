@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
@@ -339,10 +340,31 @@ def evidence_ref_of(part: Part, meta: dict[str, Any], tool: Any = None) -> str:
         for key in names:
             value = part.tool_input.get(key)
             if isinstance(value, str) and value.strip():
-                pieces.append(f"{key}={one_line(value.strip(), 20)}")
+                pieces.append(f"{key}={ref_value(value)}")
         if pieces:
             return f"{part.tool_name} {'+'.join(pieces)}"
     return evidence_ref(part.tool_name, part.tool_input)
+
+
+# 引用里一个参数值留多少字。20 是量出来的——大多数 path / pattern 在这个长度内
+# 已经能区分开，再长就把 60 字的整条引用挤满。
+REF_VALUE_CHARS = 20
+
+
+def ref_value(value: str, width: int = REF_VALUE_CHARS) -> str:
+    """引用里的一个参数值：超长截断，**截断了就带一段指纹**。
+
+    只截断不带指纹，两条长命令的前二十个字往往一模一样（`python tools/check.py
+    --round 2` 与 `--round 7`），ref 就撞成同一条；而 `EvidenceStore.add` 是按
+    ref **替换**的，撞了等于前一条证据无声消失。实测 20 次工具运行里，4 次 bash
+    只剩最后一条的证据——这正是证据探针（`tools/eval_context.py --evidence`）
+    第一次跑就抓到的。
+    """
+    flat = " ".join(value.split())
+    if len(flat) <= width:
+        return flat
+    digest = hashlib.sha256(flat.encode("utf-8")).hexdigest()[:4]
+    return f"{one_line(flat, width)}~{digest}"
 
 
 @dataclass

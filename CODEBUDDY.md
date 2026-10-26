@@ -84,6 +84,9 @@ python tools/eval_context.py --sweep --families structure,receptor,ligand,dockin
                                                  # 按已装族算工具定义（默认只发核心那 14 个）
 python tools/eval_memory.py                      # 记忆台账健康度（重复、失效、常驻占用）
 python tools/eval_memory.py --cases x.jsonl      # 人工标注集的 recall@k 与 stale 比例
+python tools/seed_memory_eval.py                 # 造一份可复现的合成台账 + 22 条召回集（.probe/memory-eval）
+python tools/eval_memory.py --root .probe/memory-eval --cases .probe/memory-eval/cases.jsonl
+                                                 # 跑它：recall@5 100%、stale 1.3%，四类难例都在里面
 
 # 本地语料（免费离线）
 python -m opencode_tui.core.index reindex        # 按盘上原件重建索引，并顺手补向量

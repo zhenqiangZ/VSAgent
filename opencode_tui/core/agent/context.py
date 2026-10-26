@@ -38,7 +38,7 @@ class Layer(Enum):
 
     PREFIX = "prefix"      # 稳定前缀：身份、工作纪律、项目规则
     MEMORY = "memory"      # 常驻记忆：核心事实（跨会话）
-    TASK = "task"          # 任务状态：目标、约束、待办、阻塞
+    TASK = "task"          # 任务状态：目标、约束、待办、阻塞；外加工作区索引
     EVENT = "event"        # 事件：已经收口的阶段，标题 + 摘要（跨轮）
     RECENT = "recent"      # 近期执行：最近若干个完整交互组
     EVIDENCE = "evidence"  # 按需证据：本步相关的片段与检索回来的记忆
@@ -814,12 +814,14 @@ class ContextAssembler:
         tools: list[dict[str, Any]] | None = None,
         memory_text: str = "",
         task_text: str = "",
+        digest_text: str = "",
         evidence: list[Evidence] | None = None,
     ) -> ContextBundle:
         """装配这一轮发给模型的消息。
 
-        `stable_prefix` 由 `prompt.stable_prefix` 给出；`task_text` 是任务状态渲染出的一段。
-        摘要与压缩位置从 `session` 上取。
+        `stable_prefix` 由 `prompt.stable_prefix` 给出；`task_text` 是任务状态渲染出的一段，
+        `digest_text` 是工作区索引（当前受体 + 最近的产物 handle）。摘要与压缩位置从
+        `session` 上取。
 
         各层先按软配额取一份，装不下再按降级链逐级削；削到底仍装不下就报
         `ContextAssemblyError`，绝不静默截断。
@@ -854,6 +856,7 @@ class ContextAssembler:
             estimate_tokens(stable_prefix)
             + estimate_tokens(memory)
             + estimate_tokens(task_text)
+            + estimate_tokens(digest_text)
             + estimate_tokens(event_block)
         )
         remaining = max(0, available - fixed)
@@ -894,6 +897,7 @@ class ContextAssembler:
                 stable_prefix,
                 memory,
                 task_text,
+                digest_text,
                 event_block,
                 recent,
                 moved_out(),
@@ -1115,6 +1119,7 @@ class ContextAssembler:
         stable_prefix: str,
         memory: str,
         task_text: str,
+        digest_text: str,
         event_block: str,
         recent: list[Turn],
         moved: list[Turn],
@@ -1123,7 +1128,7 @@ class ContextAssembler:
         has_events: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[Layer, int]]:
         """按固定布局把各层拼成消息，并给出每层的估算用量。"""
-        header = self._task_header(memory, task_text, moved, summary, has_events)
+        header = self._task_header(memory, task_text, digest_text, moved, summary, has_events)
         messages: list[dict[str, Any]] = [{"role": "system", "content": stable_prefix}]
         if header:
             messages.append({"role": "user", "content": header})
@@ -1140,11 +1145,19 @@ class ContextAssembler:
         usage = {
             Layer.PREFIX: estimate_tokens(stable_prefix),
             Layer.MEMORY: estimate_tokens(memory),
-            Layer.TASK: estimate_tokens(task_text),
+            # 工作区索引算进 TASK 层：它与任务状态同为「这一步的工作前提」，
+            # 同样 pinned、同样每步重算。单开一层要改 `Layer` 与降级链，
+            # 而它的额度只有百来个 token，不值那一圈。
+            Layer.TASK: estimate_tokens(task_text) + estimate_tokens(digest_text),
             Layer.EVENT: estimate_tokens(event_block),
             Layer.RECENT: turns_tokens(recent),
             Layer.EVIDENCE: estimate_tokens(evidence_block),
-            Layer.HISTORY: estimate_tokens(header) - estimate_tokens(memory) - estimate_tokens(task_text),
+            Layer.HISTORY: (
+                estimate_tokens(header)
+                - estimate_tokens(memory)
+                - estimate_tokens(task_text)
+                - estimate_tokens(digest_text)
+            ),
         }
         return messages, usage
 
@@ -1152,11 +1165,12 @@ class ContextAssembler:
         self,
         memory: str,
         task_text: str,
+        digest_text: str,
         moved: list[Turn],
         summary: str,
         has_events: bool = False,
     ) -> str:
-        """常驻记忆 + 任务状态 + 摘要 + 引用清单，合成一条 user 头。
+        """常驻记忆 + 任务状态 + 工作区索引 + 摘要 + 引用清单，合成一条 user 头。
 
         放在 `system` 之后单独一条，是因为 `system` 要保持字节稳定（缓存友好），
         而这一头的内容每一步都可能变。
@@ -1166,6 +1180,10 @@ class ContextAssembler:
             blocks.append(memory)
         if task_text.strip():
             blocks.append(task_text.strip())
+        # 索引排在任务状态之后、摘要之前：它和任务状态一样是「这一步的工作前提」，
+        # 而摘要与引用清单是「前面发生过什么」，两类的读法不同，不该夹在一起。
+        if digest_text.strip():
+            blocks.append(digest_text.strip())
         # 有事件时也要给摘要：事件只覆盖到某个位置，摘要覆盖它之前的那一段。
         # 只判断 `moved` 的话，事件把 RECENT 之前的内容全接走时摘要会凭空消失。
         if moved or (summary and has_events):

@@ -37,6 +37,19 @@ _FILE_STATE_NOTES: dict[str, str] = {
 
 SNAPSHOT_VERSION = 1
 
+# 工作区索引（`SessionLedger.digest`）的限额。
+#
+# 这段每一步都要发，所以按**行数**卡死而不是按 token 估：一行一个 handle，
+# 十行够模型认出「手上现在有哪些编号」；再多就是把 RECENT 的额度挪过来。
+DIGEST_MAX_LINES = 10
+DIGEST_ARTIFACT_LIMIT = 5
+# 一行里摘要的长度上限。索引不是清单：摘要只是帮模型认出「这个是干什么的」，
+# 细节用 describe_entry 取。
+DIGEST_LINE_CHARS = 60
+# 配体集只列 handle、不列摘要，一行最多这么多个。
+DIGEST_HANDLE_LIMIT = 5
+DIGEST_NOTICE = "（工作区索引：下面是登记表里现有的 handle，照抄，不要按前几步的编号往后推）"
+
 
 class LedgerError(Exception):
     """登记表自身的错误，调用方只需要处理这一种。"""
@@ -551,6 +564,60 @@ class SessionLedger:
         with self._lock:
             return str(coerce_handle(handle)) in self._archived
 
+    def digest(self, *, artifact_limit: int = DIGEST_ARTIFACT_LIMIT) -> str:
+        """当前工作区的索引：当前受体 + 最近的几个产物，不超过 `DIGEST_MAX_LINES` 行。
+
+        为什么要有这一段：handle 只在**工具返回的那一刻**出现在上下文里，之后要么
+        进了证据层、要么随旧工具结果被清掉。模型要用的时候手里没有索引，只能按前几步
+        见过的编号往后推——实测里它就是这么写出 `artifact#2`、而登记表里只有
+        `artifact#1` 的（见 `docs/real-session-findings.md` F3）。
+
+        刻意只做三件事：报当前受体、报最近的产物、报配体集的 handle。**不调
+        `reconcile()`**：那会把登记过的每个路径都读一遍算指纹，而这段每一步都要
+        现算；`file_state` 用上一次对账的结果——不新鲜也不会把编号指错。
+
+        已搁置的条目不算（`find()` 默认就排除）：它们是切换掉的旧受体下面的东西，
+        列出来等于让模型去用一个已经被搁置的 handle。
+
+        空登记表返回空串：什么都没登记时塞一句「工作区是空的」只是白占额度。
+        """
+        with self._lock:
+            entries = self.find()
+            if not entries:
+                return ""
+            lines = [DIGEST_NOTICE]
+            current = self._current_receptor
+            if current is not None and str(current) in self._entries:
+                lines.append(_digest_line(self._entries[str(current)], "当前受体："))
+            else:
+                lines.append("当前受体：未设定（产物还没有归属，先 switch_receptor）")
+
+            ligands = [
+                str(entry.handle) for entry in entries if entry.handle.kind == "ligandset"
+            ]
+            ligand_line = ""
+            if ligands:
+                listed = "、".join(ligands[:DIGEST_HANDLE_LIMIT])
+                more = f" 等 {len(ligands)} 个" if len(ligands) > DIGEST_HANDLE_LIMIT else ""
+                ligand_line = f"配体集：{listed}{more}"
+
+            # 行数先算出来再装：产物一多要丢的是**最旧的**那几个，而不是最后
+            # 切片——切掉的可能正好是配体集或当前受体那一行。
+            room = DIGEST_MAX_LINES - len(lines) - 1 - (1 if ligand_line else 0)
+            artifacts = [entry for entry in entries if entry.handle.kind == "artifact"]
+            # `keep` 单独算出来再切：写成 `artifacts[-min(...):]` 时，限额为 0
+            # 会退化成 `artifacts[0:]`——`-0` 就是 `0`，一个不列变成全列。
+            keep = max(0, min(artifact_limit, room))
+            shown = artifacts[-keep:] if keep else []
+            if shown:
+                hidden = len(artifacts) - len(shown)
+                tail = f"，只列最近 {len(shown)} 个" if hidden else ""
+                lines.append(f"产物（共 {len(artifacts)} 个{tail}）：")
+                lines.extend(_digest_line(entry, "- ") for entry in shown)
+            if ligand_line:
+                lines.append(ligand_line)
+            return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # 受体切换
     # ------------------------------------------------------------------
@@ -844,6 +911,22 @@ class SessionLedger:
         with self._lock:
             current = str(self._current_receptor) if self._current_receptor else "未设定"
             return f"<SessionLedger entries={len(self._entries)} current={current}>"
+
+
+def _digest_line(entry: Entry, prefix: str = "") -> str:
+    """索引里的一行：前缀 + handle + 一行摘要，整行不超过 `DIGEST_LINE_CHARS`。
+
+    `prefix`（`- ` 或 `当前受体：`）算在长度里：按「摘要多长」卡的话，同一段
+    文字在两种行里会占不一样宽，而模型看到的是一列。
+
+    不复用 `Entry.brief()`：它把「来自 receptor#1」也写进去，而索引里的产物
+    几乎都来自当前受体——那半句每个产物都要重复一遍，白占额度还挤掉摘要。
+    """
+    text = f"{prefix}{entry.handle}" + (f" · {entry.summary}" if entry.summary else "")
+    if entry.file_state != "ok":
+        text += f"（{_FILE_STATE_NOTES.get(entry.file_state, entry.file_state)}）"
+    flat = " ".join(text.split())
+    return flat if len(flat) <= DIGEST_LINE_CHARS else flat[: DIGEST_LINE_CHARS - 1] + "…"
 
 
 def _meta_contains(meta: dict[str, Any], wanted: dict[str, Any] | None) -> bool:

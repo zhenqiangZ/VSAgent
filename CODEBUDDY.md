@@ -178,6 +178,9 @@ __main__.py → app.py ───────────────────
 - `context.py` — `ContextAssembler.build` 按
   `PREFIX → MEMORY → TASK → EVENT → RECENT → EVIDENCE → HISTORY` 分层装配。
   `PREFIX` 与 `TASK` 是 `pinned`，压缩时永不驱逐（用户的约束必须活过压缩）；
+  `TASK` 里除了任务状态还有**工作区索引**（`SessionLedger.digest()`，当前受体 +
+  最近 5 个产物，≤10 行）：handle 只在工具返回那一刻出现过，之后要么进证据层、
+  要么被清走，模型要用时手里没有索引就只能凭记忆推编号（实测推错过三次）。
   预算**水填**：摘要/证据只封顶（3000 / 6000），剩下的全给 `RECENT`；
   `RECENT` 整 `Turn` 搬移，`tool_call` 与它的结果永远不拆散。装不下时先清旧工具正文
   （`_take_recent` 里，最近 4 条与失败的除外），清不动才整组移出；清掉的原文用
@@ -218,6 +221,8 @@ __main__.py → app.py ───────────────────
 - `hooks.py` — `hooks.toml` 里的外部命令，stdin 收一行 JSON。退出码 2 拦截（stderr 当原因），
   0 放行，30s 超时算拦截。
 - `ledger.py` — 会话登记表，`receptor#1` / `ligandset#3` 这类 handle 的真相所在。
+  `digest()` 是给模型看的那一小段索引（当前受体 + 最近几个产物），
+  **不调 `reconcile()`**：那一步会把每个登记路径读一遍算指纹，而索引每一步都要算。
 - `memory.py` — 跨会话项目记忆 `.vsmemory/`。记忆里写**文件路径不写 handle**（handle 只在本次会话有效）。
   写入做三件事：精确去重、同 refs + 更新词时把旧条目标 `superseded_by`（不硬删）、
   agent 的引用必须存在（用户写入可不存在，标 `unverified` 排在后面）。

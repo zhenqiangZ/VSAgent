@@ -157,6 +157,13 @@
 > 命中 89.7%。模型第一步就装 `structure`（不再先试 `rsearch`），`fetch_structure`
 > 一次成功、没有 bash 绕道；装族那一步的击穿仍在，82.6% → 76.0% → 95.1%。
 > `open_viewer({"run": "artifact#4"})` 又猜错了一次 handle——F3 第三次复现。
+>
+> **F3 修完复测**（2026-10-26，干净家目录，三问：取 4HJO → 写运行目录 →
+> 在查看器里打开）：`open_viewer({"run": "artifact#1"})` 一次对上，
+> 4 步做完前两问，总命中率 94.9%。索引进的是那条易变的 user 头，`system`
+> 前缀不动——缓存因此没有额外代价。同一轮里模型在「服务没在监听」之后
+> 自己起了 `serve_web.py`（10 步），那是回执给的下一步太含糊，不是索引的问题，
+> 记在 findings 里没改。
 
 ---
 
@@ -460,7 +467,7 @@ turn: int = 0              # 来源消息下标
 | --- | --- | --- |
 | ENV 块 | 时间/工作目录/平台放进 HEADER（不放 PREFIX） | `PREFIX` 连续两步字节相等；模型能答出当天日期 |
 | FOCUS 复述 | 最后一条 user 前置「目标/约束/下一步」，取 `TaskState`，≤300 token | 最后一条 user 含 goal；长 RECENT 下不漂 |
-| 产物索引 | `SessionLedger.render_digest()` 当前受体 + 最近 5 个产物，≤10 行 | 不调 `list_workspace` 也知道当前受体 |
+| 产物索引（**已做** 2026-10-26） | `SessionLedger.digest()` 当前受体 + 最近 5 个产物，≤10 行，排进 TASK 层（易变头，不进 PREFIX） | 不调 `list_workspace` 也知道当前受体；`ledger-digest` 组 18 条 |
 | 工具瘦身 | 先压 schema 文案（11.1k → ~6k）；再评估「核心工具 + load_tools」按需加载 | `/context` 工具 token ≤6k；脚本任务每族只加载一次 |
 | 子代理 | `spawn_agent` 增加 `mode=fork/fresh`；`fresh` 只给任务书 + handle，回报 ≤1500 token | 父会话只多 1 条消息 |
 | HEADER 后移（可选） | 只有 metrics 证明缓存失配严重才做 | 搬前/搬后 cache_hit 对比 |

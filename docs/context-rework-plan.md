@@ -478,7 +478,7 @@ turn: int = 0              # 来源消息下标
 | 项 | 做法 | 判据 |
 | --- | --- | --- |
 | ENV 块（**已做** 2026-10-26） | 日期/工作目录/状态目录进 HEADER；**平台进 PREFIX**——它是本机常量，进前缀不伤缓存，而且原来那句写死「这套环境是 Windows」在 Linux 上就是在教模型写错命令（F2 的真因） | `env-block` 组 19 条；模型能答出当天日期；bash 里不再出现 `dir` / `findstr` |
-| FOCUS 复述 | 最后一条 user 前置「目标/约束/下一步」，取 `TaskState`，≤300 token | 最后一条 user 含 goal；长 RECENT 下不漂 |
+| FOCUS 复述（**已做** 2026-10-26） | 最后一条 user 前面插一条 user 消息：目标 / 前三条约束 / 下一步（没有待办用阻塞顶上），取 `TaskState`，上限 300 token | `focus` 组 17 条：只插一条、贴着最后一条用户消息、`system` 逐字节不变；实测 66 token |
 | 产物索引（**已做** 2026-10-26） | `SessionLedger.digest()` 当前受体 + 最近 5 个产物，≤10 行，排进 TASK 层（易变头，不进 PREFIX） | 不调 `list_workspace` 也知道当前受体；`ledger-digest` 组 18 条 |
 | 工具瘦身 | 先压 schema 文案（11.1k → ~6k）；再评估「核心工具 + load_tools」按需加载 | `/context` 工具 token ≤6k；脚本任务每族只加载一次 |
 | 子代理 | `spawn_agent` 增加 `mode=fork/fresh`；`fresh` 只给任务书 + handle，回报 ≤1500 token | 父会话只多 1 条消息 |

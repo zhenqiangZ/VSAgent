@@ -70,6 +70,8 @@ from opencode_tui.core.agent.context import (  # noqa: E402
     EVIDENCE_LIMIT,
     EVIDENCE_MAX,
     EVIDENCE_REF_LIMIT,
+    FOCUS_CONSTRAINTS,
+    FOCUS_LIMIT,
     HISTORY_MAX,
     TOOL_ARCHIVE_MARK,
     ContextAssembler,
@@ -4445,6 +4447,106 @@ async def check_env_block() -> None:
         f"应用把状态目录交给了循环层：{wired.state_dir}",
     )
     shutil.rmtree(root, ignore_errors=True)
+
+
+def check_focus() -> None:
+    """FOCUS 复述：只在有任务状态时出现、只插在最后一条用户消息前、三样都带上。"""
+    prefix = "稳定前缀" * 10
+
+    def session_with(state: bool, rounds: int = 1) -> Session:
+        session = Session(title="复述")
+        if state:
+            session.task_state.apply(
+                goal="对 EGFR 做一轮虚拟筛选",
+                add_constraints=["受体必须用 4HJO", "打分只用 Vina"],
+            )
+            session.task_state.apply(todo=["准备受体", "跑一遍对接"])
+        for index in range(rounds):
+            user = session.add_message(Message(role="user"))
+            user.add_part(Part(type=PartType.TEXT, text=f"第 {index + 1} 轮：继续"))
+            assistant = session.add_message(Message(role="assistant"))
+            assistant.add_part(
+                Part(
+                    type=PartType.TOOL,
+                    tool_name="bash",
+                    tool_status=ToolStatus.COMPLETED,
+                    tool_input={"command": f"cmd{index}"},
+                    tool_output="ok",
+                )
+            )
+        return session
+
+    def build(session: Session):
+        return ContextAssembler(200_000).build(session, prefix)
+
+    empty = build(session_with(False))
+    check(
+        "当前任务复述" not in "\n".join(str(item.get("content") or "") for item in empty.messages),
+        "没有任务状态时不凭空造一段复述",
+    )
+
+    filled = build(session_with(True))
+    texts = [str(item.get("content") or "") for item in filled.messages]
+    check(
+        any("当前任务复述" in text for text in texts),
+        "有任务状态时插入复述",
+    )
+    focus_at = next(index for index, text in enumerate(texts) if "当前任务复述" in text)
+    check(
+        texts[focus_at + 1].startswith("第 1 轮"),
+        f"复述紧挨在最后一条用户消息前面：{texts[focus_at + 1][:10]}",
+    )
+    check(
+        filled.messages[focus_at]["role"] == "user",
+        "复述是一条 user 消息（不是并进 system）",
+    )
+    check("目标：对 EGFR 做一轮虚拟筛选" in texts[focus_at], "复述里有目标")
+    check("受体必须用 4HJO" in texts[focus_at], "复述里有用户约束")
+    check("下一步：准备受体" in texts[focus_at], "复述里有下一步")
+    check("已完成" not in texts[focus_at], "不带已完成那一整段（那是 TASK 层的事）")
+    check(
+        estimate_tokens(texts[focus_at]) <= FOCUS_LIMIT,
+        f"复述不超过 {FOCUS_LIMIT} token：{estimate_tokens(texts[focus_at])}",
+    )
+    check(filled.messages[0]["content"] == prefix, "system 那条一个字节都没变")
+
+    # 多轮：只插一次，而且插在**最后**那条用户消息前。
+    many = build(session_with(True, rounds=3))
+    bodies = [str(item.get("content") or "") for item in many.messages]
+    check(
+        sum(1 for text in bodies if "当前任务复述" in text) == 1,
+        "多轮会话里只插一条复述",
+    )
+    focus_at = next(index for index, text in enumerate(bodies) if "当前任务复述" in text)
+    check(bodies[focus_at + 1].startswith("第 3 轮"), "复述贴着最后一条用户消息")
+
+    # 约束多了按顺序截断，并说明还有几条——不能悄悄少几条。
+    crowded = Session(title="约束多")
+    crowded.task_state.apply(
+        goal="目标", add_constraints=[f"约束{index}" for index in range(1, 6)]
+    )
+    user = crowded.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="继续"))
+    body = "\n".join(str(item.get("content") or "") for item in build(crowded).messages)
+    check(f"约束{FOCUS_CONSTRAINTS}" in body, "前几条约束都在")
+    check(
+        f"约束{FOCUS_CONSTRAINTS + 1}" not in body,
+        "超出条数的约束不铺开",
+    )
+    check("另有 2 条" in body, "少掉的约束写明「另有几条」")
+
+    # 没有待办时用阻塞顶上，别留一段空的。
+    blocked = Session(title="阻塞")
+    blocked.task_state.apply(goal="目标", blockers=["缺受体结构"])
+    user = blocked.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="继续"))
+    body = "\n".join(str(item.get("content") or "") for item in build(blocked).messages)
+    check("当前阻塞：缺受体结构" in body, "没有待办时复述阻塞")
+
+    check(
+        filled.usage[Layer.TASK] > empty.usage[Layer.TASK],
+        "复述算进 TASK 层的用量",
+    )
 
 
 def check_products() -> None:
@@ -14146,6 +14248,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("ledger", check_ledger),
     ("ledger-digest", check_ledger_digest),
     ("env-block", check_env_block),
+    ("focus", check_focus),
     ("products", check_products),
     ("tool-context", check_tool_context),
     ("uniprot", check_uniprot_tools),

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from ..models import Event, Message, Part, PartType, Session, ToolStatus
+from ..models import Event, Message, Part, PartType, Session, TaskState, ToolStatus
 from .prompt import (
     EVENT_NOTICE,
     MEMORY_NOTICE,
@@ -141,6 +141,15 @@ TOOL_ARCHIVE_MARK = "（输出已归档："
 EVIDENCE_REF_ARGUMENTS: tuple[str, ...] = (
     "path", "file", "structure", "receptor", "query", "command",
 )
+
+# FOCUS 复述的 token 上限。
+#
+# 它排在最后一条用户消息**前面**，作用是「这一步必须对齐什么」。300 是量出来的：
+# 目标一行 + 三条约束 + 下一步一行大约一百来字，300 token 已经能容下最啰嗦的写法；
+# 再大就变成第二份 TASK 层，白占额度。
+FOCUS_LIMIT = 300
+FOCUS_CONSTRAINTS = 3
+"""复述里最多带几条约束。约束多的会话按先后顺序取前几条——最早提的通常最硬。"""
 
 # 降级链的固定顺序。`degraded` 按这个顺序排，读的人一眼看出削到了第几级。
 # 先前用的是集合排序，顺序被抹掉了——而顺序正是「先削谁、后削谁」这件事本身。
@@ -856,6 +865,8 @@ class ContextAssembler:
         `ContextAssemblyError`，绝不静默截断。
         """
         raw_evidence = list(evidence or [])
+        # 复述只从任务状态来；状态空着就没有这一段，不凭空造一句。
+        focus_text = self._focus_block(session.task_state)
         budget = self.budget(tools)
         available = budget.available
         if available < MIN_AVAILABLE:
@@ -887,6 +898,7 @@ class ContextAssembler:
             + estimate_tokens(task_text)
             + estimate_tokens(digest_text)
             + estimate_tokens(env_text)
+            + estimate_tokens(focus_text)
             + estimate_tokens(event_block)
         )
         remaining = max(0, available - fixed)
@@ -929,6 +941,7 @@ class ContextAssembler:
                 task_text,
                 digest_text,
                 env_text,
+                focus_text,
                 event_block,
                 recent,
                 moved_out(),
@@ -1145,6 +1158,36 @@ class ContextAssembler:
                 cleared += 1
         return cleared
 
+    def _focus_block(self, state: TaskState) -> str:
+        """最后一条用户消息前面那段「目标复述」。
+
+        为什么要有：任务状态在 TASK 层（窗口最上面），而长会话里 RECENT 能有几万
+        token，模型读到「最近几步」时目标早就不在手边了。这一段把同一份状态复述到
+        新请求的正前方，让「现在要做成什么」紧挨着「用户刚说了什么」。
+
+        为什么不直接再读一遍 `render()`：那一段带「已完成 / 待办 / 阻塞」全表，
+        是给会话看的状态；这里只要三样能让人立刻对齐的东西——目标、约束、下一步。
+
+        只复述、不新增：这个块里出现的每一句都来自 `TaskState`，没有它自己的判断。
+        """
+        if state.is_empty():
+            return ""
+        lines = ["（当前任务复述：下面这些是前面已经定下的，不是新指令）"]
+        if state.goal:
+            lines.append(f"目标：{state.goal}")
+        if state.constraints:
+            shown = state.constraints[:FOCUS_CONSTRAINTS]
+            text = "；".join(shown)
+            if len(state.constraints) > len(shown):
+                text += f"；另有 {len(state.constraints) - len(shown)} 条"
+            lines.append(f"用户约束：{text}")
+        if state.todo:
+            lines.append(f"下一步：{state.todo[0]}")
+        elif state.blockers:
+            # 没有待办时，「卡在哪」就是下一步要处理的，别把这一段空着。
+            lines.append(f"当前阻塞：{state.blockers[0]}")
+        return _cap_text("\n".join(lines), FOCUS_LIMIT)
+
     def _compose(
         self,
         stable_prefix: str,
@@ -1152,6 +1195,7 @@ class ContextAssembler:
         task_text: str,
         digest_text: str,
         env_text: str,
+        focus_text: str,
         event_block: str,
         recent: list[Turn],
         moved: list[Turn],
@@ -1170,7 +1214,16 @@ class ContextAssembler:
         # 定下来就只在新事件出现时变，分开才有机会命中前缀缓存。
         if event_block:
             messages.append({"role": "user", "content": event_block})
-        for turn in recent:
+        # 复述插在**最后一条用户消息之前**：新请求一到，先看见「这件事原本要做成
+        # 什么」，再看用户这次说的话。同一轮里位置固定（用户消息就是这一轮的开头），
+        # 所以不会因为步数增加而挪动、把后面的缓存全打断。
+        last_user = -1
+        for position, turn in enumerate(recent):
+            if turn.messages and turn.messages[0].get("role") == "user":
+                last_user = position
+        for position, turn in enumerate(recent):
+            if focus_text and position == last_user:
+                messages.append({"role": "user", "content": focus_text})
             messages.extend(turn.messages)
         evidence_block = self._evidence_block(evidence)
         if evidence_block:
@@ -1186,6 +1239,7 @@ class ContextAssembler:
                 estimate_tokens(task_text)
                 + estimate_tokens(digest_text)
                 + estimate_tokens(env_text)
+                + estimate_tokens(focus_text)
             ),
             Layer.EVENT: estimate_tokens(event_block),
             Layer.RECENT: turns_tokens(recent),
@@ -1196,6 +1250,7 @@ class ContextAssembler:
                 - estimate_tokens(task_text)
                 - estimate_tokens(digest_text)
                 - estimate_tokens(env_text)
+                - estimate_tokens(focus_text)
             ),
         }
         return messages, usage

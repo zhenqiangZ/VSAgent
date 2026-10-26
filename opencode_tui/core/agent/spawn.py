@@ -100,11 +100,22 @@ def fork_messages(
     return len(picked), dropped
 
 
-def task_preamble(parent: Session, start: int, end: int, dropped: int = 0) -> str:
+def task_preamble(
+    parent: Session,
+    start: int,
+    end: int,
+    dropped: int = 0,
+    digest: str = "",
+) -> str:
     """子 agent 的第一段话：它从哪来、要做什么、不能做什么。
 
     写成用户消息而不是系统提示：它只该在子会话的第一轮出现，
     进稳定前缀的话会一直跟着这个子 agent 的每一次请求。
+
+    `digest` 是父会话的工作区索引（`SessionLedger.digest()`），**只在没复制历史
+    时才给**：fork 过来的子会话在历史里已经见过那些 handle，再列一遍是重复；
+    而 fresh 的只带着任务书，不给它就得自己 `list_workspace` —— 那还得先确认
+    装过 listing 族，两件事都可能白烧一步。
     """
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime())
     lines = [
@@ -116,6 +127,9 @@ def task_preamble(parent: Session, start: int, end: int, dropped: int = 0) -> st
         lines.append(f"父会话第 {end - copied + 1}–{end} 条消息已作为上文复制过来。")
     else:
         lines.append("没有复制父会话的历史，你只带着这份任务书开始。")
+        if digest.strip():
+            lines.append("父会话现在的工作区（handle 可以直接用）：")
+            lines.append(digest.strip())
     if dropped:
         lines.append(f"其中更早的 {dropped} 条消息因上下文预算没有复制。")
     lines.extend(
@@ -261,6 +275,12 @@ class SpawnAgentTool(Tool):
 # 的上下文，子 agent 的全文在它自己的会话里，要看完整内容点右栏进去。
 MAX_REPORTS = 8
 REPORT_LIMIT = 800
+# 一份报告整段进父会话上下文的上限（token）。
+#
+# 单条的 800 字是「别把结论全文抄过来」；这个总数管的是「八个子 agent 一起报」：
+# 8 × 800 字最坏约 3K token，等于把子 agent 的结论抄了四份进父会话。
+# 1500 是计划里给「父会话只多一条消息」定的量级，超出的写一句去哪看全文。
+REPORT_TOKENS = 1500
 
 
 def _status_text(status: str) -> str:
@@ -310,6 +330,26 @@ def _output_files(session: Session) -> list[str]:
             if path not in found:
                 found.append(path)
     return found
+
+
+def _cap_report(text: str, limit: int = REPORT_TOKENS) -> str:
+    """把整份报告压到限额以内：**按行**丢，末尾写明去哪看全文。
+
+    不按字符截：报告是「一行一个子 agent」的结构，切在半行上会留下半句结论，
+    读的人分不清那一行说的是谁。
+    """
+    if estimate_tokens(text) <= limit:
+        return text
+    note = "\n（报告已截断；完整内容在子 agent 的会话里，给 session_id 单独查）"
+    kept: list[str] = []
+    used = estimate_tokens(note)
+    for line in text.splitlines():
+        cost = estimate_tokens(line) + 1
+        if used + cost > limit:
+            break
+        kept.append(line)
+        used += cost
+    return "\n".join(kept) + note
 
 
 class AgentStatusTool(Tool):
@@ -399,6 +439,6 @@ class AgentStatusTool(Tool):
                 "给 session_id 可以单独查。"
             )
         return ToolResult(
-            output="\n".join(lines),
+            output=_cap_report("\n".join(lines)),
             meta={"count": len(children), "wait": bool(arguments.get("wait"))},
         )

@@ -54,7 +54,7 @@ class Evidence: ref: str; summary: str; detail: str = ""
 这与 Ledger 的 handle 是同一种思路：**上下文里放索引，不放整份内容**。
 
 ### 3.3 `EvidenceStore`（证据收集器，一轮生存）
-- `limit=EVIDENCE_LIMIT=12` 按**条数**滚动（不按 token —— 索引是短行，条数卡住就够；正文由装配器按预算展开）。
+- `limit=EVIDENCE_LIMIT=24` 按**条数**滚动（不按 token —— 索引是短行，条数卡住就够；正文由装配器按预算展开）。
 - `add(ref, summary, detail)`：ref/summary 各自压成一行（`one_line`，上限 120/60），ref 相同则**替换并挪到末尾**。
   同一个文件读三次不会占掉三条。
 - `add_from_part(part)`：只收「跑完（COMPLETED/FAILED）且输出含关键行」的工具结果。**失败例外保底收**——

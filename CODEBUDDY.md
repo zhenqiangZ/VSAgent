@@ -82,6 +82,7 @@ python tools/eval_context.py --session ses_xxx   # 逐个截断点看装配估�
 python tools/eval_context.py --sweep             # 同一份会话扫多个窗口：前缀命中 / 清理 / 丢组
 python tools/eval_context.py --sweep --families structure,receptor,ligand,docking
                                                  # 按已装族算工具定义（默认只发核心那 14 个）
+python tools/eval_context.py --evidence          # 证据探针：20 次工具运行，查关键行/重复/引用/artifact
 python tools/eval_memory.py                      # 记忆台账健康度（重复、失效、常驻占用）
 python tools/eval_memory.py --cases x.jsonl      # 人工标注集的 recall@k 与 stale 比例
 python tools/seed_memory_eval.py                 # 造一份可复现的合成台账 + 22 条召回集（.probe/memory-eval）

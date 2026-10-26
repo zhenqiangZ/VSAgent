@@ -69,6 +69,7 @@ from opencode_tui.core.agent.context import (  # noqa: E402
     DEGRADE_ORDER,
     EVIDENCE_LIMIT,
     EVIDENCE_MAX,
+    EVIDENCE_REF_LIMIT,
     HISTORY_MAX,
     TOOL_ARCHIVE_MARK,
     ContextAssembler,
@@ -12245,6 +12246,31 @@ def check_evidence_ref() -> None:
         evidence_ref_of(made, composite).endswith("receptor#1+ligandset#2"),
         "没有 handle 时把受体与配体集拼成一个引用",
     )
+
+    # 长参数：只按前 20 个字截断的话，两条不同的命令会共用一条 ref，
+    # 而 `EvidenceStore.add` 是按 ref **替换**的——前一条证据会无声消失。
+    # 证据探针（`tools/eval_context.py --evidence`）第一次跑就撞在这里。
+    bash = FakeTool("command")
+
+    def bash_part(command: str) -> Part:
+        return Part(
+            type=PartType.TOOL,
+            tool_name="bash",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"command": command},
+            tool_output="ok",
+        )
+
+    long_one = evidence_ref_of(bash_part("python tools/check.py --round 2"), {}, bash)
+    long_two = evidence_ref_of(bash_part("python tools/check.py --round 7"), {}, bash)
+    check(long_one != long_two, f"长命令的前缀一样也得分得开：{long_one} / {long_two}")
+    check(len(long_one) <= EVIDENCE_REF_LIMIT, f"分开之后仍不超长：{len(long_one)}")
+    check(
+        "~" in long_one,
+        f"截断过的值带一段指纹（不然还是可能撞）：{long_one}",
+    )
+    short = evidence_ref_of(bash_part("make test"), {}, bash)
+    check("~" not in short, f"没截断就不加指纹：{short}")
 
     store = EvidenceStore()
     store.add_from_part(made)

@@ -2053,6 +2053,17 @@ def check_prompt() -> None:
         "list_workspace" in system_prompt and "describe_entry" in system_prompt,
         "handle 从哪儿取、详情在哪儿查，也写在同一段里",
     )
+    # 复核癖：工具已经把结果写进返回，模型还要 ls → stat → md5sum 再核一遍。
+    # 实测五次运行里复核占工具调用的 25–81%，钱不多（多 35 步只多 $0.014），
+    # 但会撞满步数上限、还会把要核的那段上下文挤出窗口。
+    check(
+        "不要再用 bash 复核" in system_prompt,
+        "提示里写着：工具已经给出的事实不要再复核一遍",
+    )
+    check(
+        "md5sum" in system_prompt and "describe_entry" in system_prompt,
+        "点明了不该做的（ls/stat/md5sum 逐项）与该用的（describe_entry / read）",
+    )
     # 现场来的三条：模型写 pwd、写 cp、把上一条命令的 cd 当基准。它只能从系统提示里知道
     # 「每次调用是一个新解释器」「这里是哪个平台」，否则只能靠一次次失败去猜。
     check(

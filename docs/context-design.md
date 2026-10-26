@@ -29,7 +29,7 @@
 | --- | --- | --- | --- | --- |
 | `PREFIX` | 稳定前缀 | 身份、工作纪律、`AGENTS.md` 规则 | `prompt.build_system_prompt` | **不丢**；追求字节稳定 |
 | `MEMORY` | 常驻记忆 | 项目核心事实（跨会话） | `MemoryStore.resident_text` | pinned，但受 token 上限 |
-| `TASK` | 任务状态 | 目标、用户约束、已完成、待办、阻塞 | `Session.task_state`（新增） | **不丢**（pinned） |
+| `TASK` | 任务状态 | 目标、用户约束、已完成、待办、阻塞；**工作区索引**（当前受体 + 最近几个产物的 handle） | `Session.task_state` + `SessionLedger.digest()` | **不丢**（pinned） |
 | `RECENT` | 近期执行 | 最近若干个完整交互组 | `Session.messages` 翻译层 | 以**交互组**为单位进出 |
 | `EVIDENCE` | 按需证据 | 本步相关的文件片段、报错、产物详情，以及检索回来的记忆 | 工具结果 / Ledger / `recall` | 先摘要，正文按预算展开 |
 | `HISTORY` | 历史 | 旧对话摘要 + 可追溯引用 | `Session.summary` | 只留引用，正文不驻留 |
@@ -235,7 +235,7 @@ if available < MIN_AVAILABLE:  # 前缀都放不下，装配失败并报出原�
 | --- | --- | --- |
 | 1 | `PREFIX` | 直接放入。规则文件超出上限时按现有 `_cut_rules` 截断（32KB）。 |
 | 2 | `MEMORY` | `resident_text(limit)` 非空则放入。受 2k 上限；**不整段丢弃**。 |
-| 3 | `TASK` | 非空则渲染放入。**不参与淘汰**。 |
+| 3 | `TASK` | 任务状态与工作区索引非空则放入。**不参与淘汰**（索引 ≤10 行，每步现算）。 |
 | 4 | `RECENT` | 交互组**从最近往前**填，直到达到软配额或撞到「最少保留组数」。 |
 | 5 | `EVIDENCE` | 先放全部 `summary`，再按剩余额度展开 `detail`。来源见 3.3：检索回来的记忆 + 含关键行的工具结果。 |
 | 6 | `HISTORY` | 放入摘要；被移出的交互组在引用清单里各占一行。 |
@@ -283,14 +283,14 @@ if available < MIN_AVAILABLE:  # 前缀都放不下，装配失败并报出原�
 ```
 [
   {"role": "system", "content": PREFIX},        # L0 稳定前缀（缓存友好）
-  {"role": "user",   "content": TASK_HEADER},   # L1 常驻记忆 + 任务状态 + 摘要 + 引用清单
+  {"role": "user",   "content": TASK_HEADER},   # L1 常驻记忆 + 任务状态 + 工作区索引 + 摘要 + 引用清单
   ...RECENT 交互组（L2，完整、原子）...           # 从旧到新
   {"role": "user",   "content": EVIDENCE_BLOCK} # L3 本步证据与检索记忆（可选，放最后：recency）
 ]
 ```
 
 - `system` 只放稳定前缀，**不放时间、不放进度**，避免易变内容破坏前缀缓存。
-- 常驻记忆、任务状态、摘要、引用清单合成一条 `user` 头（`TASK_HEADER`）。
+- 常驻记忆、任务状态、工作区索引、摘要、引用清单合成一条 `user` 头（`TASK_HEADER`）。
 - 证据放最后，紧邻生成，利用近因效应。
 
 `TASK_HEADER` 渲染示例：

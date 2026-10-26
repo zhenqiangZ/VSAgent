@@ -521,6 +521,15 @@ class AgentLoop:
         state = session.task_state
         return "" if state.is_empty() else state.render()
 
+    def _digest_text(self) -> str:
+        """工作区索引：当前受体 + 最近几个产物的 handle；没装配登记表时是空串。
+
+        每次发问现取：上一步刚登记的产物这一步就该出现。模型正是在「隔了几步」之后
+        才记串编号的——那时原来的工具结果已经被清走，它手上只剩记忆。
+        """
+        digest = getattr(self.ledger, "digest", None)
+        return digest() if callable(digest) else ""
+
     def tool_specs(self, session: Session) -> list[dict[str, Any]]:
         """这一步该发出去的工具定义：全部减去还没 `load_tools` 装过的族。
 
@@ -545,6 +554,7 @@ class AgentLoop:
             tools=self.tool_specs(session) if with_tools else [],
             memory_text=self._memory_text(session),
             task_text=self._task_text(session),
+            digest_text=self._digest_text(),
             evidence=self.evidence.items(),
         )
 

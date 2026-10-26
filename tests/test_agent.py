@@ -174,6 +174,8 @@ from opencode_tui.core.agent.tools import (  # noqa: E402
 )
 from opencode_tui.core.agent.workspace import Workspace  # noqa: E402
 from opencode_tui.core.agent.ledger import (  # noqa: E402
+    DIGEST_LINE_CHARS,
+    DIGEST_MAX_LINES,
     ArtifactHandle,
     Entry,
     LedgerError,
@@ -4266,6 +4268,88 @@ def check_ledger() -> None:
         count == 2 and len(tolerant) == 2,
         f"一条坏记录只跳它自己，不废掉整份索引：读进 {count} 条",
     )
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def check_ledger_digest() -> None:
+    """工作区索引：空表、行数与长度上限、只列最近的、搁置的不列、进装配头不进前缀。"""
+    root = PROBE / "ledger_digest_fixture"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    ledger = SessionLedger(session_id="", snapshot_path=root / "digest.json")
+
+    check(ledger.digest() == "", "空登记表不给索引（一个字也不占额度）")
+
+    ledger.add("receptor", summary="4HJO 的 EGFR 激酶域")
+    ledger.add("ligandset", summary="原始库 5000 个")
+    for index in range(7):
+        ledger.add("artifact", summary=f"第 {index} 号产物")
+    digest = ledger.digest()
+    lines = digest.splitlines()
+    check(len(lines) <= DIGEST_MAX_LINES, f"索引不超过 {DIGEST_MAX_LINES} 行：{len(lines)}")
+    check("当前受体：receptor#1" in digest, f"当前受体在索引里：{lines[1]}")
+    check("artifact#7" in digest, "最新的产物在索引里")
+    check("artifact#1" not in digest, "只列最近 5 个，最早的两个不列")
+    check("共 7 个" in digest, "总数说出来了——没列全时模型知道还有")
+    check("ligandset#1" in digest, "配体集的 handle 也在")
+    check("来自 receptor" not in digest, "索引里不重复写血缘（每个产物都挂同一个受体）")
+    check(
+        "artifact#" not in ledger.digest(artifact_limit=0),
+        "限额为 0 时一个产物都不列（`-0` 就是 `0`，别退化成全列）",
+    )
+
+    # 长摘要截断且压成一行：换行会把一条索引拆成两行，读的人分不清下半截属于谁。
+    long_entry = ledger.add("artifact", summary="很长的一段说明\n第二行" * 10)
+    line = [item for item in ledger.digest().splitlines() if str(long_entry.handle) in item][0]
+    check(len(line) <= DIGEST_LINE_CHARS, f"一行不超过 {DIGEST_LINE_CHARS} 字：{len(line)}")
+    check("\n" not in line, "摘要里的换行被压掉了")
+
+    # 换受体：旧条目全部搁置，索引里不该再出现它们的编号——列出来等于让模型
+    # 去用一个「已经不在当前工作区」的 handle。
+    other = ledger.add("receptor", summary="另一个受体")
+    ledger.switch_receptor(other.handle)
+    switched = ledger.digest()
+    check("receptor#2" in switched, "切换之后当前受体换了")
+    check("artifact#" not in switched, f"搁置的产物不再列：{switched!r}")
+    check("ligandset#" not in switched, "搁置的配体集也不再列")
+
+    # 装配：索引进的是那条易变的 user 头，`system` 前缀一个字节都不能动。
+    session = Session(title="索引接线")
+    session.add_message(
+        Message(role="user", parts=[Part(type=PartType.TEXT, text="开始")])
+    )
+    prefix = "稳定前缀" * 10
+    with_digest = ContextAssembler(200_000).build(
+        session, prefix, digest_text="（工作区索引）当前受体：receptor#1"
+    )
+    without = ContextAssembler(200_000).build(session, prefix)
+    check(with_digest.messages[0]["content"] == prefix, "system 那条一个字节都没变")
+    check("当前受体：receptor#1" in with_digest.messages[1]["content"], "索引在 user 头里")
+    check(
+        with_digest.usage[Layer.TASK] > without.usage[Layer.TASK],
+        "索引算进 TASK 层的用量（否则它是一段看不见的开销）",
+    )
+
+    # 接线：循环层从登记表现取；没装配登记表时给空串，不炸。
+    config = ProviderConfig(base_url="http://127.0.0.1:1", api_key="x", model="fake")
+    loop = AgentLoop(
+        EventBus(),
+        SilentProvider(),  # type: ignore[arg-type]
+        ToolRegistry(),
+        config,
+        context_window=200_000,
+        ledger=ledger,
+    )
+    check(loop._digest_text() == switched, "循环层发出去的就是登记表现算的那一份")
+    bare = AgentLoop(
+        EventBus(),
+        SilentProvider(),  # type: ignore[arg-type]
+        ToolRegistry(),
+        config,
+        context_window=200_000,
+    )
+    check(bare._digest_text() == "", "没装配登记表时是空串")
 
     shutil.rmtree(root, ignore_errors=True)
 
@@ -13942,6 +14026,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("workspace", check_workspace),
     ("paths", check_paths),
     ("ledger", check_ledger),
+    ("ledger-digest", check_ledger_digest),
     ("products", check_products),
     ("tool-context", check_tool_context),
     ("uniprot", check_uniprot_tools),

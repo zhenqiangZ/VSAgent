@@ -126,8 +126,10 @@ from opencode_tui.core.agent.prompt import (  # noqa: E402
     SUMMARY_NOTICE,
     build_system_prompt,
     compress_tool_output,
+    environment_block,
     estimate_tokens,
     is_key_line,
+    platform_note,
     project_rules,
     rules_directory,
     stable_prefix,
@@ -2047,7 +2049,7 @@ def check_prompt() -> None:
         "handle 从哪儿取、详情在哪儿查，也写在同一段里",
     )
     # 现场来的三条：模型写 pwd、写 cp、把上一条命令的 cd 当基准。它只能从系统提示里知道
-    # 「每次调用是一个新解释器」「这里是 Windows」，否则只能靠一次次失败去猜。
+    # 「每次调用是一个新解释器」「这里是哪个平台」，否则只能靠一次次失败去猜。
     check(
         "每一次" in system_prompt or "每调用一次" in system_prompt,
         "系统提示里写着每次 bash 调用都是全新的解释器",
@@ -2056,9 +2058,15 @@ def check_prompt() -> None:
         "cd" in system_prompt and "&&" in system_prompt,
         "换目录要写在同一条命令里，提示里给了写法（cd ... && ...）",
     )
+    # 这一条原来是「提示里点明这是 Windows」。那句话写死在 Linux 上跑的时候，
+    # 是在**教模型写错命令**（实测 `dir /s /b`、`netstat -ano | findstr`，F2）。
     check(
-        "Windows" in system_prompt and "pwd" in system_prompt,
-        "提示里点明这是 Windows，并点名不要用 pwd",
+        platform_note() in system_prompt,
+        "提示里点明实际平台（按 sys.platform 现取，不写死）",
+    )
+    check(
+        ("这套环境是 Windows" in system_prompt) == sys.platform.lower().startswith("win"),
+        f"平台那句与真实平台一致（sys.platform={sys.platform}）",
     )
     built = ContextAssembler(context_window=200_000).build(session, prefix)
     roles = [item["role"] for item in built.messages]
@@ -2866,9 +2874,10 @@ async def check_loop(server: FakeModelServer) -> None:
     check(compact_session.summary_upto > 0, "摘要记下覆盖到第几条")
     request = server.requests[-1]["messages"]
     check(request[0]["role"] == "system", "第一条仍然是系统提示")
+    # 不判 startswith：那一头最前面现在是运行环境（日期/目录），摘要排在它后面。
     check(
-        str(request[1]["content"]).startswith(SUMMARY_NOTICE),
-        f"摘要插在系统提示之后：{str(request[1]['content'])[:40]}",
+        SUMMARY_NOTICE in str(request[1]["content"]),
+        f"摘要插在系统提示之后的那一条里：{str(request[1]['content'])[:40]}",
     )
     check(
         "这一段收成摘要" in str(request[1]["content"]),
@@ -3066,8 +3075,8 @@ async def check_compact(server: FakeModelServer) -> None:
     fed = server.requests[-1]["messages"]
     check(fed[0]["role"] == "system", "压缩之后最前面仍然是系统提示")
     check(
-        str(fed[1]["content"]).startswith(SUMMARY_NOTICE),
-        f"摘要插在系统提示之后：{str(fed[1]['content'])[:30]}",
+        SUMMARY_NOTICE in str(fed[1]["content"]),
+        f"摘要插在系统提示之后的那一条里：{str(fed[1]['content'])[:30]}",
     )
     check("这一段收成摘要" in str(fed[1]["content"]), "摘要正文进了请求体")
     check(len(fed) == KEEP_MESSAGES + 2, f"压完之后只带最近几条：{len(fed)} 条")
@@ -3153,9 +3162,10 @@ async def check_summary_compaction(server: FakeModelServer) -> None:
 
     fed = server.requests[-1]["messages"]
     check(fed[0]["role"] == "system", "发出去的第一条是系统提示")
+    # 那一头最前面是运行环境，摘要排在它后面，所以只判「在这一条里」。
     check(
-        str(fed[1]["content"]).startswith(SUMMARY_NOTICE),
-        f"第二条是摘要那一条：{str(fed[1]['content'])[:30]}",
+        SUMMARY_NOTICE in str(fed[1]["content"]),
+        f"第二条里带着摘要那一段：{str(fed[1]['content'])[:30]}",
     )
     check(
         str(fed[1]["content"]).split(SUMMARY_NOTICE, 1)[1].strip().startswith(session.summary),
@@ -4351,6 +4361,88 @@ def check_ledger_digest() -> None:
     )
     check(bare._digest_text() == "", "没装配登记表时是空串")
 
+    shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_env_block() -> None:
+    """运行环境：平台那句必须是真的，日期只到天，状态目录进易变头不进前缀。"""
+
+    # 平台那句：原先写死成 Windows，在 Linux 上就是在教模型写错命令（F2 的根因）。
+    check("这套环境是 Linux" in platform_note("linux"), "linux 上报 Linux")
+    check("这套环境是 Windows" in platform_note("win32"), "win32 上报 Windows")
+    check("这套环境是 macOS" in platform_note("darwin"), "darwin 上报 macOS")
+    check(
+        "用 dir 而不是 ls" in platform_note("win32"),
+        "Windows 上仍然教 dir——那正是当初写这句话的原因",
+    )
+    check(
+        "用 dir 而不是 ls" not in platform_note("linux"),
+        "Linux 上不许教 dir：模型照着写，失败两次才改回 ls",
+    )
+
+    # 日期与状态目录只在易变头里；平台在前缀里（它是常量，进前缀不伤缓存）。
+    session = Session(title="运行环境")
+    prefix = stable_prefix(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
+    check(platform_note() in prefix, "平台那句在稳定前缀里")
+    check("今天 " not in prefix, "日期不进前缀（每天变一次会击穿缓存）")
+    check("状态目录" not in prefix, "状态目录不进前缀")
+
+    # 固定一个 23:59 的时刻：只到天，就不该出现时分。
+    fixed = time.mktime((2026, 10, 26, 23, 59, 0, 0, 0, -1))
+    block = environment_block(Path("/work"), Path("/state"), now=fixed)
+    check("2026-10-26" in block, f"日期按当天给：{block.splitlines()[0]}")
+    check("/work" in block, "工作目录在环境块里")
+    check("/state" in block, "状态目录在环境块里")
+    check("23:59" not in block, "只写日期不写时分——带时间的话每一步都和上一步不同")
+    check(
+        environment_block(None, None, now=fixed).count("\n") == 0,
+        "两个路径都不给时只剩一行日期",
+    )
+
+    # 装配：环境排在 user 头最前，`system` 那条一个字节不动。
+    built = ContextAssembler(200_000).build(
+        session, prefix, env_text="（运行环境：今天 2026-10-26）"
+    )
+    plain = ContextAssembler(200_000).build(session, prefix)
+    check(built.messages[0]["content"] == prefix, "system 那条一个字节都没变")
+    check(
+        built.messages[1]["content"].startswith("（运行环境：今天"),
+        f"环境排在 user 头最前：{built.messages[1]['content'][:20]}",
+    )
+    check(built.usage[Layer.TASK] > plain.usage[Layer.TASK], "环境算进 TASK 层的用量")
+
+    # 接线：循环层拿得到工作目录与状态目录，应用装配时把状态目录交进去。
+    config = ProviderConfig(base_url="http://127.0.0.1:1", api_key="x", model="fake")
+    loop = AgentLoop(
+        EventBus(),
+        SilentProvider(),  # type: ignore[arg-type]
+        ToolRegistry(),
+        config,
+        context_window=200_000,
+        workspace_root=Path("/work"),
+        state_dir=Path("/state"),
+    )
+    text = loop._env_text()
+    check("/work" in text and "/state" in text, "循环层的环境块带上了两个目录")
+    bare = AgentLoop(
+        EventBus(),
+        SilentProvider(),  # type: ignore[arg-type]
+        ToolRegistry(),
+        config,
+        context_window=200_000,
+    )
+    check("/work" not in bare._env_text(), "没给目录时不编一个出来")
+
+    root = PROBE / "env_block_app"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    state = root / "state.toml"
+    app = OpenCodeApp(root=ROOT, state_path=state)
+    wired = app.host.loop_for(app.session_manager.current.id)
+    check(
+        wired.state_dir == app.session_manager.state_path.parent,
+        f"应用把状态目录交给了循环层：{wired.state_dir}",
+    )
     shutil.rmtree(root, ignore_errors=True)
 
 
@@ -14027,6 +14119,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("paths", check_paths),
     ("ledger", check_ledger),
     ("ledger-digest", check_ledger_digest),
+    ("env-block", check_env_block),
     ("products", check_products),
     ("tool-context", check_tool_context),
     ("uniprot", check_uniprot_tools),

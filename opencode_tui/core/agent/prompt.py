@@ -4,6 +4,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -78,17 +79,77 @@ EVENT_INSTRUCTION = (
 
 # bash 工具的执行方式说明。
 #
-# 这条是从现场来的：模型按 Linux 的习惯写 `pwd` 与 `cp a b`，而这里每一步都交给
-# Windows 的命令解释器上；更常见的一种是它把上一条命令里的 `cd` 当成了后续命令的基准，
-# 于是下一条命令在错的目录里找不到文件。两次调用之间没有任何东西被保持，
-# 这一句必须写在系统提示里，否则模型只能从失败里反复试。
+# 这条是从现场来的：模型把上一条命令里的 `cd` 当成了后续命令的基准，于是下一条
+# 命令在错的目录里找不到文件。两次调用之间没有任何东西被保持，这一句必须写在
+# 系统提示里，否则模型只能从失败里反复试。
+#
+# **平台不写在这一段里**：它由 `platform_note()` 按 `sys.platform` 现取，紧跟在这段
+# 后面。原先这里是写死的「这套环境是 Windows，用 dir 而不是 ls」——在 Linux 上跑
+# 的时候，那句话是在教模型写错命令（findings F2）。
 SHELL_DISCIPLINE = (
     "bash 工具每调用一次都是一次全新的命令解释器：上一条命令里的 cd、set、export "
     "都不会留到下一次。要换目录就在同一条命令里写全，例如 "
     "`cd 项目目录 && 命令`，或者在命令里直接用完整路径。\n"
-    "这套环境是 Windows，命令按它的语法写：用 dir 而不是 ls，用 copy 而不是 cp。"
-    "不要用 pwd，需要知道当前目录时用 cd 不带参数。"
+    "命令按当前平台的语法写，平台与可用的命令见下面那句。"
 )
+
+
+def platform_note(platform_name: str | None = None) -> str:
+    """平台那一句。**必须按实际平台给**，不能一律说 Windows。
+
+    这句话原先写死成「这套环境是 Windows，用 dir 而不是 ls」——它在 Linux 上跑
+    的时候是**在教模型写错命令**：实测模型照着它写 `dir /s /b`、`netstat -ano |
+    findstr`，失败之后才改回 `ls`。平台是本机的常量，放进稳定前缀不伤缓存
+    （同一次运行里每个字节都一样），但它必须是**真的**。
+
+    放在前缀而不是易变的头里，是为了让它在 system 角色下、且与 `AGENTS.md` 一样
+    只随环境变：日期那种每天一变的东西才需要躲到易变区。
+    """
+    name = (platform_name or sys.platform).lower()
+    if name.startswith("win"):
+        return (
+            "这套环境是 Windows：命令按它的语法写，用 dir 而不是 ls、用 copy 而不是 cp、"
+            "用 type 而不是 cat。不要用 pwd，需要知道当前目录时用 cd 不带参数。"
+        )
+    # 其余按 POSIX 处理：`linux` / `linux2` / `darwin` / `freebsd` 都是 bash + coreutils
+    # 那一套，差别只在几个命令的旗标上，不值得让模型去分辨。
+    label = {"darwin": "macOS", "linux": "Linux", "linux2": "Linux"}.get(name, name)
+    return (
+        f"这套环境是 {label}（bash）：用 ls、cp、grep；"
+        "Windows 的 dir、copy、findstr、type 在这里不存在。"
+    )
+
+
+def environment_block(
+    workspace: Path | None,
+    state_dir: Path | None,
+    *,
+    now: float | None = None,
+) -> str:
+    """易变区那段「运行环境」：日期、工作目录、状态目录。
+
+    为什么不并进 `PREFIX`：日期每天变一次，进了前缀就每天击穿一次 prompt cache。
+    **只写日期不写时分**——带上时间的话这一头每一步都和上一步不同，缓存从这
+    一条起全部作废，等于每步都重发一遍上下文。
+
+    为什么要写状态目录：`state.toml`、`connection.toml` 都在那儿，
+    而模型默认它在工作目录下的 `./.opencode_tui`。实测它就是这么 `cd` 进去、
+    失败，再 `ls ~/.opencode_tui` 才找着的（findings F4）。
+
+    **不写「ledgers/ 也在这里」**：登记表快照固定落在 `~/.opencode_tui/ledgers`，
+    与状态文件的位置无关——`state_path` 被改到别处时（测试与脚本常这么干），
+    那句话就是假的。只说这一句能保证为真的部分。
+    """
+    stamp = time.strftime("%Y-%m-%d", time.localtime(now))
+    lines = [f"（运行环境：今天 {stamp}）"]
+    if workspace is not None:
+        lines.append(f"- 工作目录：{workspace}（runs/、corpus/、logs/ 都在它下面）")
+    if state_dir is not None:
+        lines.append(
+            f"- 状态目录：{state_dir}"
+            "（state.toml、connection.toml 在这里，不在工作目录下）"
+        )
+    return "\n".join(lines)
 
 
 def estimate_tokens(text: str) -> int:
@@ -347,7 +408,7 @@ def stable_prefix(workspace: Workspace, session: Session) -> str:
         _identity(session.agent_name),
         WORK_DISCIPLINE,
         TOOL_DISCIPLINE,
-        SHELL_DISCIPLINE,
+        f"{SHELL_DISCIPLINE}\n{platform_note()}",
         LEDGER_DISCIPLINE,
         MEMORY_DISCIPLINE,
         EVENT_DISCIPLINE,

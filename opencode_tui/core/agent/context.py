@@ -815,13 +815,14 @@ class ContextAssembler:
         memory_text: str = "",
         task_text: str = "",
         digest_text: str = "",
+        env_text: str = "",
         evidence: list[Evidence] | None = None,
     ) -> ContextBundle:
         """装配这一轮发给模型的消息。
 
         `stable_prefix` 由 `prompt.stable_prefix` 给出；`task_text` 是任务状态渲染出的一段，
-        `digest_text` 是工作区索引（当前受体 + 最近的产物 handle）。摘要与压缩位置从
-        `session` 上取。
+        `digest_text` 是工作区索引（当前受体 + 最近的产物 handle），`env_text` 是
+        运行环境（日期、工作目录、状态目录）。摘要与压缩位置从 `session` 上取。
 
         各层先按软配额取一份，装不下再按降级链逐级削；削到底仍装不下就报
         `ContextAssemblyError`，绝不静默截断。
@@ -857,6 +858,7 @@ class ContextAssembler:
             + estimate_tokens(memory)
             + estimate_tokens(task_text)
             + estimate_tokens(digest_text)
+            + estimate_tokens(env_text)
             + estimate_tokens(event_block)
         )
         remaining = max(0, available - fixed)
@@ -898,6 +900,7 @@ class ContextAssembler:
                 memory,
                 task_text,
                 digest_text,
+                env_text,
                 event_block,
                 recent,
                 moved_out(),
@@ -1120,6 +1123,7 @@ class ContextAssembler:
         memory: str,
         task_text: str,
         digest_text: str,
+        env_text: str,
         event_block: str,
         recent: list[Turn],
         moved: list[Turn],
@@ -1128,7 +1132,9 @@ class ContextAssembler:
         has_events: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[Layer, int]]:
         """按固定布局把各层拼成消息，并给出每层的估算用量。"""
-        header = self._task_header(memory, task_text, digest_text, moved, summary, has_events)
+        header = self._task_header(
+            env_text, memory, task_text, digest_text, moved, summary, has_events
+        )
         messages: list[dict[str, Any]] = [{"role": "system", "content": stable_prefix}]
         if header:
             messages.append({"role": "user", "content": header})
@@ -1148,7 +1154,11 @@ class ContextAssembler:
             # 工作区索引算进 TASK 层：它与任务状态同为「这一步的工作前提」，
             # 同样 pinned、同样每步重算。单开一层要改 `Layer` 与降级链，
             # 而它的额度只有百来个 token，不值那一圈。
-            Layer.TASK: estimate_tokens(task_text) + estimate_tokens(digest_text),
+            Layer.TASK: (
+                estimate_tokens(task_text)
+                + estimate_tokens(digest_text)
+                + estimate_tokens(env_text)
+            ),
             Layer.EVENT: estimate_tokens(event_block),
             Layer.RECENT: turns_tokens(recent),
             Layer.EVIDENCE: estimate_tokens(evidence_block),
@@ -1157,12 +1167,14 @@ class ContextAssembler:
                 - estimate_tokens(memory)
                 - estimate_tokens(task_text)
                 - estimate_tokens(digest_text)
+                - estimate_tokens(env_text)
             ),
         }
         return messages, usage
 
     def _task_header(
         self,
+        env_text: str,
         memory: str,
         task_text: str,
         digest_text: str,
@@ -1170,12 +1182,16 @@ class ContextAssembler:
         summary: str,
         has_events: bool = False,
     ) -> str:
-        """常驻记忆 + 任务状态 + 工作区索引 + 摘要 + 引用清单，合成一条 user 头。
+        """运行环境 + 常驻记忆 + 任务状态 + 工作区索引 + 摘要 + 引用清单，合成一条 user 头。
 
         放在 `system` 之后单独一条，是因为 `system` 要保持字节稳定（缓存友好），
         而这一头的内容每一步都可能变。
         """
         blocks: list[str] = []
+        # 环境排最前：它是这一头里唯一的「机器事实」，读的时候先知道自己在哪台机器、
+        # 哪个目录下，后面那些「任务 / 索引 / 摘要」才落得到实处。
+        if env_text.strip():
+            blocks.append(env_text.strip())
         if memory:
             blocks.append(memory)
         if task_text.strip():

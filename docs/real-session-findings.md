@@ -14,7 +14,7 @@
 | # | 现象 | 代价 | 根因位置 | 刻意？ |
 | --- | --- | --- | --- | --- |
 | F1 | `load_tools` 把被关掉的工具报成「已装入」，模型调它拿到「请改用别的办法」，于是 bash 自建 RCSB 客户端 | ~20 步 / 300K 输入 | `toolset.py:95`（列的是 `catalog()` 而非注册表）+ `loop.py:130`（禁用文案） | 否 |
-| F2 | 模型在 Linux 上写 Windows 命令 | 2 步 | `bash` 工具的回执 | 否 |
+| F2 | 模型在 Linux 上写 Windows 命令 | 2 步 | `prompt.py` 的 `SHELL_DISCIPLINE` 写死「这套环境是 Windows」 | 否 |
 | F3 | 猜错 handle 编号，`open_viewer` 失败 | 1 步 | 上下文里没有「当前有哪些 handle」的索引 | 否 |
 | F4 | 模型不知道状态目录在哪，先试 `./.opencode_tui` | 2 步 | 上下文里没有工作目录 / 状态目录 | 否 |
 
@@ -68,9 +68,29 @@ load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出�
 
 **代价**：2 步。不致命，但它是「模型不知道自己在什么平台上」的直接证据。
 
-**建议**：与 Phase 4 的 ENV 块合并解决——把平台写进上下文，比在 `bash` 的失败回执里
-猜要稳。若 ENV 块一时不做，退而求其次：`bash` 失败且命令里出现 `dir`/`del`/`type`
-时，回执补一句「当前平台是 linux」。
+**根因（2026-10-26 更正）**：不是「缺一条环境信息」，是**系统提示在说谎**。
+`prompt.py` 的 `SHELL_DISCIPLINE` 里那句「这套环境是 Windows，命令按它的语法写：
+用 dir 而不是 ls」是写死的——它在 Linux 上跑的时候**就是在教模型写错命令**。
+模型不是猜的，是照着提示做的。判据那边也一样：`test_agent.py` 里有一条
+「提示里点明这是 Windows」，把这句话锁住了，所以它一直没被人发现。
+
+**已修**（2026-10-26）：那句话改成按 `sys.platform` 现取（`prompt.platform_note()`）。
+
+- 平台是**本机常量**，所以放在 `PREFIX` 里而不是易变头里：同一次运行每个字节都一样，
+  不伤缓存，而且它在 `system` 角色下比一条 user 消息更管用。这偏离了计划表里
+  「平台放进 HEADER」的写法，理由记在计划文档那一行。
+- Linux / macOS 那句反过来点名「Windows 的 dir、copy、findstr、type 在这里不存在」；
+  Windows 分支保留原来那句（它本来是从现场攒出来的，只是不该在别的平台上出现）。
+- 判据：`--only env-block`，含「linux 上不许教 dir」与「平台那句与 `sys.platform` 一致」；
+  原来那条锁死 Windows 的断言改成按实际平台判。
+
+**复测**（同日，干净家目录，两问：取 4HJO 登记成受体 → 状态目录在哪、列出来、今天几号）：
+五条 bash 全是 POSIX 写法（`date`、`cat`、`ls`、`for d in ...`），
+**没有一条 `dir` / `findstr` / `netstat -ano`**。同一台机器上改之前是
+`dir .opencode_tui\structures 2>nul`，还顺手在仓库根建了个 `nul` 文件。
+
+**建议**：~~与 Phase 4 的 ENV 块合并解决~~——已按上面的方式修掉。`bash` 失败回执
+里补「当前平台是 linux」这条退路不用做了：根因在提示，不在回执。
 
 ## F3 · 猜错 handle 编号
 
@@ -126,6 +146,28 @@ load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出�
 **易变区**：日期进了 `PREFIX` 就每天击穿一次缓存，还会红掉
 「PREFIX 连续两步字节相等」那条判据。
 
+**已修**（2026-10-26）：`prompt.environment_block()` 排在 user 头最前（`loop._env_text()`，
+状态目录由 `app.py` 把 `state_path.parent` 交给循环层）：
+
+```
+（运行环境：今天 2026-10-26）
+- 工作目录：/data/work/zq/project/VSAgent（runs/、corpus/、logs/ 都在它下面）
+- 状态目录：/tmp/vsa-env-session（state.toml、connection.toml 在这里，不在工作目录下）
+```
+
+- **只写日期不写时分**：带上时间的话这一头每一步都和上一步不同，缓存从这一条起
+  全部作废——那正是把 `Workspace.state_text` 从系统提示里搬走的理由。
+- **不写「ledgers/ 也在这里」**：登记表快照固定落在 `~/.opencode_tui/ledgers`，
+  与 `state_path` 无关；`state_path` 被改到别处时（测试与脚本常这么干）那句话就是假的。
+  复测里模型正是照着我写错的那半句去 `$HOME/.opencode_tui` 找登记表的。
+- 判据：`--only env-block`（日期只到天、两个目录都在、不进前缀、`system` 逐字节不变、
+  TASK 用量变大、应用确实把状态目录交给了循环层）。
+
+**复测**（与 F2 同一次会话）：环境块写着 `/tmp/vsa-env-session`，模型**第一条**
+bash 就去那里读 `connection.toml`，没有再 `cd .opencode_tui`。它随后还翻了
+`$HOME/.opencode_tui`——那是在找「登记表」放哪儿，属于上面那半句写错导致的，
+不是没看见状态目录。
+
 ## 已修 · 重试语义一直没接线
 
 `RetryableToolError` 的 docstring 写着「与 `ToolError` 分开，是为了让重试逻辑只重试
@@ -168,4 +210,4 @@ load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出�
 | — | 重试接线（**已做**） | 说好要重试的东西没人重试 | 已补 `tool-retry` 判据 |
 | — | F1 两条（**已做**，见上） | `load_tools` 在主动说谎，禁用文案在教绕道 | 已补 `tool-family` 判据 |
 | — | F3 产物索引（**已做**，见上） | 猜错 handle 是可复现的 | 已补 `ledger-digest` 判据；索引只进易变头 |
-| 1 | F2 + F4 ENV 块 | 各 2 步，但是「模型对环境一无所知」的同一件事 | 位置放错会击穿缓存 |
+| — | F2 + F4 环境块（**已做**，见上） | 各 2 步；F2 的真因是系统提示在说谎 | 已补 `env-block` 判据；平台进 PREFIX、日期进易变头 |

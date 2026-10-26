@@ -488,10 +488,24 @@ turn: int = 0              # 来源消息下标
 
 ### Phase 5 · 评测与文档
 
-**记忆 golden set**（`tools/eval_memory.py`，手动，不进 CI）：
+**记忆 golden set**（**已做** 2026-10-26，`tools/eval_memory.py` + `tools/seed_memory_eval.py`，手动，不进 CI）：
 
-- 30–50 条项目事实，刻意混入「事实更新」「互相矛盾」「引用文件被删」「过期」四类；
-- 指标：`recall@5`、`stale recall`（≤3%）、重复率、每回答 token、LLM judge 正确率（≥85%）。
+- 台账用 `tools/seed_memory_eval.py` **造**而不是手工标：32 条虚拟筛选领域的事实
+  （靶点编号、盒子参数、配体库规模、对接参数、DTA 环境……），其中 28 条生效，
+  另有「事实更新」2 组（旧值落成 `superseded_by`）、「互相矛盾」1 组（引用不同、
+  两条都活着）、「引用被删」1 条（落成 `missing`）、「过期」1 条、「内容变化」1 条
+  （落成 `stale`，仍可用）。造完脚本自己断言这四类都真的发生了——**规则一改坏，
+  seed 那一步就先红**。
+- 召回集 22 条，与台账一起生成到 `.probe/memory-eval/cases.jsonl`（`.probe/` 已 gitignore，
+  所以「评测集不进版本控制」这条不变：进版本控制的是**怎么造**）。
+- 实测：`recall@5` 22/22 = 100%，`recall@3` 也是 100%，`recall@1` 19/22 = 86.4%，
+  `stale` 1.3%（目标 ≤3%），重复正文 0 组，常驻注入 761/1200 token / 28 条。
+  **@1 掉的那 3 条是刻意的**：k=5 全中说明集合太容易，@1 有失手才说明它有区分度。
+- 量到的一件事：一条「内容变了」的记忆如果同时是热门主题（正文里带 `EGFR`、
+  `对接`、`4hjo` 这类全库都在用的词），会让几乎每道题都多带回一条 stale——
+  k=5、28 条的台账上这一项能到 10%，而它量到的是**检索不精**，不是「用过期的答案」。
+  所以这一条刻意写得窄（讲 `runs/batch-01` 那次筛选），stale 才回落到 1.3%。
+  真要压这个数，该动的是排序的精度，不是把这条藏起来。
 
 **证据探针**（`tools/eval_context.py`）：
 
@@ -526,6 +540,7 @@ turn: int = 0              # 来源消息下标
 | `tests/test_agent.py` | 0–4 | 新组：metrics / budget / evidence-ref / tool-clear / event-log / event-summary / memory-supersede / memory-resident；更新 `check_selective_compression` 的份额断言 |
 | `tools/eval_context.py`（新） | 0,5 | 上下文/证据探针 |
 | `tools/eval_memory.py`（新） | 5 | 记忆 golden set |
+| `tools/seed_memory_eval.py`（新） | 5 | 合成台账 + 召回集（可复现） |
 | `docs/*` | 5 | 计划、事件、记忆、CODEBUDDY 同步 |
 
 ---

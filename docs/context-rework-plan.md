@@ -481,7 +481,7 @@ turn: int = 0              # 来源消息下标
 | FOCUS 复述（**已做** 2026-10-26） | 最后一条 user 前面插一条 user 消息：目标 / 前三条约束 / 下一步（没有待办用阻塞顶上），取 `TaskState`，上限 300 token | `focus` 组 17 条：只插一条、贴着最后一条用户消息、`system` 逐字节不变；实测 66 token |
 | 产物索引（**已做** 2026-10-26） | `SessionLedger.digest()` 当前受体 + 最近 5 个产物，≤10 行，排进 TASK 层（易变头，不进 PREFIX） | 不调 `list_workspace` 也知道当前受体；`ledger-digest` 组 18 条 |
 | 工具瘦身 | 先压 schema 文案（11.1k → ~6k）；再评估「核心工具 + load_tools」按需加载 | `/context` 工具 token ≤6k；脚本任务每族只加载一次 |
-| 子代理 | `spawn_agent` 增加 `mode=fork/fresh`；`fresh` 只给任务书 + handle，回报 ≤1500 token | 父会话只多 1 条消息 |
+| 子代理（**已做** 2026-10-26） | fresh 就是已有的 `history="none"`，只是补上两头：任务书里带 `ledger.digest()` 的 handle 清单（仅没复制历史时给，fork 的不重复列）；`agent_status` 整份报告按 `REPORT_TOKENS=1500` 卡、**按行**丢并在末尾写去哪看全文 | `subagent` 组 104 条，含「fresh 带 handle / fork 不重复 / 报告不超 1500」；没有加 `mode` 参数——两个参数表达同一件事，模型会挑错那个 |
 | HEADER 后移（可选） | 只有 metrics 证明缓存失配严重才做 | 搬前/搬后 cache_hit 对比 |
 
 ---

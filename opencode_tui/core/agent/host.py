@@ -204,10 +204,19 @@ class AgentHost:
         if origin == "user":
             self._record_dispatch(parent, child)
         if prompt:
+            # 没复制历史时把工作区索引一起交过去：fresh 子会话没有别的途径知道
+            # 父会话手上有哪些 handle，而它要接着用那些东西。
+            digest = getattr(loop.ledger, "digest", None)
             self.prompt(
                 child.id,
                 task,
-                preamble=task_preamble(parent, start, end, dropped),
+                preamble=task_preamble(
+                    parent,
+                    start,
+                    end,
+                    dropped,
+                    digest() if callable(digest) else "",
+                ),
             )
         return child
 

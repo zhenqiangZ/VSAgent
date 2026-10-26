@@ -101,8 +101,10 @@ from opencode_tui.core.agent.event_log import (  # noqa: E402
 )
 from opencode_tui.core.agent.task import TaskTool  # noqa: E402
 from opencode_tui.core.agent.spawn import (  # noqa: E402
+    REPORT_TOKENS,
     AgentStatusTool,
     SpawnAgentTool,
+    _cap_report,
     fork_messages,
     history_end,
     recent_start,
@@ -13452,6 +13454,38 @@ async def check_subagent() -> None:
     notice = task_preamble(parent, 0, 4, dropped_tiny)
     check("不能再创建" in notice, "任务书里写明不能再派发")
     check("已作为上文复制过来" in notice, f"任务书说明历史是否复制：{notice}")
+
+    # fresh（一条历史都不复制）时把工作区索引交过去：子会话没有别的途径知道
+    # 父会话手上有哪些 handle，而它要接着用那些东西。
+    fresh = task_preamble(parent, 4, 4, 0, "（工作区索引）\n当前受体：receptor#1 · 4HJO")
+    check("没有复制父会话的历史" in fresh, "fresh 的任务书明说没有上文")
+    check("receptor#1" in fresh, "fresh 的任务书带着父会话的 handle")
+    check("handle 可以直接用" in fresh, "并说明这些 handle 是能直接用的")
+    forked = task_preamble(parent, 0, 4, 0, "（工作区索引）\n当前受体：receptor#1 · 4HJO")
+    check(
+        "receptor#1" not in forked,
+        "fork 过来的不重复列 handle（历史里已经见过）",
+    )
+
+    # 报告预算：八个子 agent 各 800 字最坏约 3K token，等于把结论抄四份进父会话。
+    short = "■「甲」（ses_1）　完成\n  结论：做完了"
+    check(_cap_report(short) == short, "没超预算的报告原样返回")
+    heavy = "\n".join(
+        f"■「子{index}」（ses_{index}）　完成 · 12 条 · 900 tok\n  结论："
+        + "结论内容" * 200
+        for index in range(8)
+    )
+    capped = _cap_report(heavy)
+    check(
+        estimate_tokens(capped) <= REPORT_TOKENS,
+        f"整份报告不超过 {REPORT_TOKENS} token：{estimate_tokens(capped)}",
+    )
+    check("报告已截断" in capped, "截断了要写明去哪看全文")
+    check(
+        all(line in heavy for line in capped.splitlines() if line and "报告已截断" not in line),
+        "按行丢，不切在半行上",
+    )
+    check("子0" in capped, "留下的是靠前的那些（按时间顺序读）")
 
     # --- 派发工具：根会话能派，子 agent 不能 ---
     class _Spawner:

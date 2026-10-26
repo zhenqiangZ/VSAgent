@@ -222,7 +222,7 @@ C1-1 ~ C1-8 已实施并验证：
 
 | 项 | 位置 | 内容 |
 | --- | --- | --- |
-| 收集器 | `context.py` | `EvidenceStore`：条数滚动（`EVIDENCE_LIMIT=12`）、同引用替换、`add_from_part` 提炼 |
+| 收集器 | `context.py` | `EvidenceStore`：条数滚动（`EVIDENCE_LIMIT=24`）、同引用替换、`add_from_part` 提炼 |
 | 提炼口径 | `context.py` | 复用第 3 期的 `is_key_line`：含关键行的工具结果才收；失败的那一类保底收 |
 | 注入通道 | `tools.py` | `Tool.evidence_argument`，与 `context_argument` / `task_argument` 并列 |
 | 记忆进层 | `memory.py` | `RecallTool` 把命中塞进收集器（它仍不声明 `context_argument`） |

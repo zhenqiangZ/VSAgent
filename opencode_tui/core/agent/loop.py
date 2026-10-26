@@ -18,7 +18,13 @@ from .event_log import EventRuntime, event_boundary, record_local_event
 from .toolset import family_of, hidden_names
 from .hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from .permission import PermissionDecision, PermissionPolicy, Verdict
-from .prompt import KEEP_MESSAGES, event_messages, stable_prefix, summary_messages
+from .prompt import (
+    KEEP_MESSAGES,
+    environment_block,
+    event_messages,
+    stable_prefix,
+    summary_messages,
+)
 from .provider import (
     ChatProvider,
     OpenAICompatProvider,
@@ -182,6 +188,7 @@ class AgentLoop:
         config: ProviderConfig,
         context_window: int = 128_000,
         workspace_root: Path | None = None,
+        state_dir: Path | None = None,
         policy: PermissionPolicy | None = None,
         hooks: HookRunner | None = None,
         ledger: Any = None,
@@ -196,6 +203,10 @@ class AgentLoop:
         self.config = config
         self.context_window = context_window
         self.workspace_root = workspace_root
+        # 状态目录（`state.toml` / `ledgers/` / `connection.toml` 所在）。
+        # 它**不在工作目录下**，而模型默认它在那儿——实测它会 `cd .opencode_tui`
+        # 找东西，失败之后才去 `~`。所以这一段要写进每一步的上下文。
+        self.state_dir = state_dir
         self.policy = policy or PermissionPolicy()
         self.hooks = hooks or HookRunner([], workspace_root)
         self.ledger = ledger
@@ -521,6 +532,14 @@ class AgentLoop:
         state = session.task_state
         return "" if state.is_empty() else state.render()
 
+    def _env_text(self) -> str:
+        """易变区的运行环境：日期、工作目录、状态目录。
+
+        日期每天变一次，所以只能放这一头；平台是常量，放在 `PREFIX` 里
+        （见 `prompt.platform_note`）。
+        """
+        return environment_block(self.workspace_root, self.state_dir)
+
     def _digest_text(self) -> str:
         """工作区索引：当前受体 + 最近几个产物的 handle；没装配登记表时是空串。
 
@@ -555,6 +574,7 @@ class AgentLoop:
             memory_text=self._memory_text(session),
             task_text=self._task_text(session),
             digest_text=self._digest_text(),
+            env_text=self._env_text(),
             evidence=self.evidence.items(),
         )
 

@@ -179,7 +179,8 @@ __main__.py → app.py ───────────────────
   `PREFIX → MEMORY → TASK → EVENT → RECENT → EVIDENCE → HISTORY` 分层装配。
   `PREFIX` 与 `TASK` 是 `pinned`，压缩时永不驱逐（用户的约束必须活过压缩）；
   `TASK` 里除了任务状态还有**工作区索引**（`SessionLedger.digest()`，当前受体 +
-  最近 5 个产物，≤10 行）：handle 只在工具返回那一刻出现过，之后要么进证据层、
+  最近 5 个产物，≤10 行）与**运行环境**（`environment_block()`：日期、工作目录、
+  状态目录）：handle 只在工具返回那一刻出现过，之后要么进证据层、
   要么被清走，模型要用时手里没有索引就只能凭记忆推编号（实测推错过三次）。
   预算**水填**：摘要/证据只封顶（3000 / 6000），剩下的全给 `RECENT`；
   `RECENT` 整 `Turn` 搬移，`tool_call` 与它的结果永远不拆散。装不下时先清旧工具正文
@@ -207,6 +208,10 @@ __main__.py → app.py ───────────────────
   **族与模块不是一一对应**：`structure` 族由 `rsearch` + `structure` 两个模块拼成。
 - `prompt.py` — `stable_prefix` 组装身份 + 工作纪律 + 项目规则。**前缀里不放时间不放进度**，
   否则每步都击穿 prompt cache。`project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`，32KB 上限）。
+  平台那句由 `platform_note()` 按 `sys.platform` 现取，**不许写死**：写死「这套环境是
+  Windows」的版本在 Linux 上跑就是在教模型写 `dir`，而且 `env-block` 判据盯着这一条。
+  易变的环境信息（日期、工作目录、状态目录）走 `environment_block()`，由循环层塞进 user 头，
+  **不进前缀**——日期每天变一次，进去了每天击穿一次缓存。
   摘要指令是八段（目标 / 改动 / 待办 / 约束 / 决定 / 错误 / 当前 / 关键数字），
   `summary_messages` 只喂 `[summary_upto, upto)` 新段 + 旧摘要，不再整段重喂。
 - `permission.py` — `PermissionPolicy.check` 的判定顺序是有讲究的：取消 → 用户手打 bash →

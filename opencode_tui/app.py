@@ -215,6 +215,7 @@ class OpenCodeApp(App[None]):
             config,
             context_window=config.context_window,
             workspace_root=self.root,
+            state_dir=self.session_manager.state_path.parent,
             policy=self._policy_for(session),
             hooks=self._build_hooks(),
             ledger=ledger,

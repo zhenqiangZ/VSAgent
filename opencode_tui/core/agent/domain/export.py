@@ -1568,6 +1568,34 @@ def _origin_method(origin: str) -> str:
     }.get(origin, "")
 
 
+def _run_files(target: Path, limit: int = 8) -> str:
+    """运行目录顶层有什么：文件名照列，目录带上子项数。
+
+    为什么要写进返回：`write_run` 之后最常被问的一句就是「里面有哪些文件」。
+    不列的话模型要么答「不知道」，要么再跑一次 `ls` —— 而那次 `ls` 只是把
+    磁盘上已经数得出来的东西重新描述一遍。四条上下文探针里，artifact 那一问
+    就卡在这里（见 `docs/context-rework-plan.md` Phase 5）。
+    """
+    try:
+        entries = sorted(target.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return ""
+    parts: list[str] = []
+    for entry in entries[:limit]:
+        if entry.is_dir():
+            try:
+                count = sum(1 for _ in entry.iterdir())
+            except OSError:
+                parts.append(f"{entry.name}/")
+                continue
+            parts.append(f"{entry.name}/（{count} 项）")
+        else:
+            parts.append(entry.name)
+    if len(entries) > limit:
+        parts.append(f"另有 {len(entries) - limit} 项")
+    return "、".join(parts)
+
+
 def _run_report(
     *,
     artifact: Any,
@@ -1589,6 +1617,13 @@ def _run_report(
     from . import align as align_module
 
     lines = [f"已写出运行目录 {target}，登记为 {artifact.handle}。"]
+    files = _run_files(target)
+    if files:
+        # 写成「结果文件」而不是「文件」：`is_key_line` 认的是**行首**的几个词
+        # （结论 / 结果 / 命中……）。这一行是这次调用的产出一览，本来就属于「结论」；
+        # 不带这个词的话，它会被当成过程输出清掉——实测压缩之后模型就答不出
+        # 「里面有哪些文件」了，而这正是它最常被问的一句。
+        lines.append(f"  结果文件：{files}")
     if view == "structure":
         lines.append(
             "  展示模式：只展示结构（未计算口袋、未联网）。"

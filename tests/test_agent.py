@@ -7820,6 +7820,40 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
         )
         check(not result.failed, f"write_run 跑通：{result.output[:200]}")
         check(not calls, "P0 有货时**一次都没调用预测**（优先级真的生效）")
+        # 「里面有哪些文件」是 write_run 之后最常被问的一句；返回里不列的话，
+        # 模型只能再跑一次 ls —— 四问探针里 artifact 那一问就卡在这里。
+        check("结果文件：" in result.output, f"返回里列出目录内容：{result.output[:200]}")
+        check("meta.json" in result.output, "列出来 meta.json")
+        check("receptor.pdb" in result.output, "列出来 receptor.pdb")
+        check("ligands/（" in result.output, f"目录带子项数：{result.output[:300]}")
+        file_line = next(
+            line for line in result.output.splitlines() if "结果文件：" in line
+        )
+        check(
+            is_key_line(file_line),
+            f"这一行算关键行（压缩时逐字留下，否则滚出 RECENT 就没了）：{file_line}",
+        )
+        # 再走一遍证据层：干净行要真能落进证据的正文里，光「is_key_line 为真」
+        # 还不够——`add_from_part` 还要选它。
+        from opencode_tui.core.agent.context import EvidenceStore as _Store
+
+        probe_part = Part(
+            type=PartType.TOOL,
+            tool_name="write_run",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"receptor": str(entry.handle)},
+            tool_output=result.output,
+            tool_meta=dict(result.meta or {}),
+        )
+        probe_store = _Store()
+        probe_store.add_from_part(probe_part)
+        kept = "\n".join(
+            item.summary + "\n" + item.detail for item in probe_store.items()
+        )
+        check(
+            "结果文件：" in kept,
+            f"文件清单真的进了证据层：{kept[:200]}",
+        )
         check(result.meta.get("origin") == "complex", f"返回 origin=complex：{result.meta.get('origin')}")
 
         run_dir = runs_root / "p0-check"

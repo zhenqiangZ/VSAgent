@@ -191,13 +191,17 @@ __main__.py → app.py ───────────────────
   补一条 `auto` 本地事件，此时 `_summarize` 停用（摘要与事件不重叠）。
 - `toolset.py` — 按族加载领域工具。38 个工具的完整定义 12.3K token，每一步都要发；
   核心 14 个（文件、登记表、任务、事件、记忆、`load_tools`）常驻，24 个领域工具分成
-  13 族由 `load_tools` 现装现用，装过之后每步只发 3.1K。**族记在
+  12 族由 `load_tools` 现装现用，装过之后每步只发 3.2K。**族记在
   `Session.tool_families` 上，不记在注册表上**（注册表按根 / 子 agent 共享两份，
   记在那里会让一个会话装过的工具漏到另一个）；子 agent 从父会话继承。
   `hidden_names(session)` 给的是**排除集**而不是允许清单：没登记族的工具默认常驻，
   新工具忘了登记时坏处只是白占额度，不会「写了却没装、模型看不见」。
   模型看不见某个工具时最容易直接叫它的名字，所以 `loop.missing_tool_reason` 会认族：
   回的是「属于 docking 族，先 `load_tools family=docking`」，不是 `unknown tool`。
+  **`load_tools` 的说明里那张「族 → 工具」表由 `catalog_text()` 从模块现数**，
+  不手写（手写的那份漂过三处）；结果也要减去 `registry.disabled`——对着被
+  `tools.toml` 关掉的工具说「已装入」，模型下一步就会去调，撞墙之后转去 bash 自己实现。
+  **族与模块不是一一对应**：`structure` 族由 `rsearch` + `structure` 两个模块拼成。
 - `prompt.py` — `stable_prefix` 组装身份 + 工作纪律 + 项目规则。**前缀里不放时间不放进度**，
   否则每步都击穿 prompt cache。`project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`，32KB 上限）。
   摘要指令是八段（目标 / 改动 / 待办 / 约束 / 决定 / 错误 / 当前 / 关键数字），

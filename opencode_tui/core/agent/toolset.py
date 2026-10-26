@@ -6,7 +6,7 @@
 
 - **不属于任何族的工具**常驻（14 个，约 3.1K）：文件、登记表、任务、事件、记忆、
   子 agent，加 `load_tools` 自己；
-- **领域工具的 13 个族**按需装入：`load_tools("docking")` 之后，这一族从下一步
+- **领域工具的 12 个族**按需装入：`load_tools("docking")` 之后，这一族从下一步
   起出现在清单里。
 
 装过的族记在 `Session.tool_families` 上，不是记在注册表上：注册表按「根 / 子 agent」
@@ -47,6 +47,19 @@ def family_of(name: str) -> str:
     return ""
 
 
+def catalog_text() -> str:
+    """一族一行「族名：这一族里有哪些工具」。
+
+    从 `catalog()` 现数，**不手写**。原先这段说明只列族名，模型得靠猜：它以为
+    结构检索在 `structure` 里，装完发现只有 `fetch_structure`；而手写的那份说明
+    也已经漂过三处（`structure` 多写了 `search_pdb`、`listing` 与 `chembl` 各漏一个）。
+    模型是照着这句话决定装哪一族的，它错一次就是几步。
+    """
+    return "\n".join(
+        f"- {family}：{'、'.join(names)}" for family, names in catalog().items()
+    )
+
+
 class LoadToolsTool(Tool):
     """把一族领域工具装进本会话的工具清单。"""
 
@@ -54,16 +67,18 @@ class LoadToolsTool(Tool):
         name="load_tools",
         description=(
             "按族装入领域工具。文件、登记表、任务、事件、记忆这些核心工具一直在；"
-            "其余工具分成 13 族，要先用这里装进来，**下一步起**才出现在工具清单里。\n"
-            "族名：" + "、".join(name for name, _label, _module in families()) + "。\n"
-            "装一次对整个会话有效；已经装过的再装一次只会把清单再列一遍。"
+            "其余工具分成 "
+            f"{len(families())} 族，要先用这里装进来，**下一步起**才出现在工具清单里。\n"
+            "族与工具：\n"
+            + catalog_text()
+            + "\n装一次对整个会话有效；已经装过的再装一次只会把清单再列一遍。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "family": {
                     "type": "string",
-                    "enum": [name for name, _label, _module in families()],
+                    "enum": [family for family, _modules in families()],
                     "description": "要装入的族",
                 },
             },
@@ -72,10 +87,16 @@ class LoadToolsTool(Tool):
         },
     )
     session_argument = "session"
+    # 只为读一件事：哪些工具被 `tools.toml` 关掉了。不读它就会对着关掉的工具
+    # 说「已装入」——模型照着这句话去调，撞上禁用文案之后转去 bash 自己实现了一遍
+    # （实测烧掉 20 步）。
+    registry_argument = "registry"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        """装一族，返回这一族里有哪些工具。"""
+        """装一族，返回这一族里**真的装得进来**的工具。"""
         session = arguments.get("session")
+        registry = arguments.get("registry")
+        disabled = getattr(registry, "disabled", frozenset())
         family = str(arguments.get("family") or "").strip()
         names = catalog().get(family)
         if names is None:
@@ -83,14 +104,37 @@ class LoadToolsTool(Tool):
                 output=f"没有这一族：{family}。可用：{'、'.join(catalog())}",
                 failed=True,
             )
+        # 被关掉的工具在装配时根本没进注册表，报「已装入」就是说了句做不到的话。
+        available = tuple(name for name in names if name not in disabled)
+        skipped = tuple(name for name in names if name in disabled)
+        if not available:
+            return ToolResult(
+                output=(
+                    f"{family} 族里的工具都被项目配置关掉了（{ '、'.join(skipped) }），"
+                    "装进来也用不了。\n"
+                    "这是 `.opencode_tui/tools.toml` 里的开关，不是网络或参数问题；"
+                    "不要用 bash 自己实现它，也不要换数据源绕过——"
+                    "要么请用户在 /tools 面板里打开，要么按用户的指示换方案。"
+                ),
+                failed=True,
+                meta={"family": family, "tools": [], "disabled": list(skipped)},
+            )
         already = family in session.tool_families
         if not already:
             session.tool_families.append(family)
         prefix = "已经装过" if already else "已装入"
+        listed = "、".join(available) + (
+            f"（{'、'.join(skipped)} 被项目配置关掉了，没有列进来）" if skipped else ""
+        )
         return ToolResult(
             output=(
-                f"{prefix} {family}：{'、'.join(names)}。"
+                f"{prefix} {family}：{listed}。"
                 "下一步起这些工具出现在清单里，参数按各工具的说明给。"
             ),
-            meta={"family": family, "tools": list(names), "already": already},
+            meta={
+                "family": family,
+                "tools": list(available),
+                "disabled": list(skipped),
+                "already": already,
+            },
         )

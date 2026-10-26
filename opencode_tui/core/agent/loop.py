@@ -124,9 +124,13 @@ def missing_tool_reason(
     `session` 留成可选：不给时按「真的没有」处理，与按需加载之前的行为一致。
     """
     if name in registry.disabled:
+        # **不许写「改用别的办法」**：那句话是在教模型绕道。实测一次这样的
+        # 误判，模型转去 bash + urllib 自己实现了 search_pdb，烧掉 20 步。
         return (
             f"{name} 已被禁用（配置在 .opencode_tui/tools.toml 里，可在 /tools 面板里打开），"
-            "本次会话不会提供这个工具，重试无用，请改用别的办法或告诉用户。"
+            "本次会话不会提供这个工具，重试无用。\n"
+            "不要用 bash 自己实现它，也不要换数据源绕过——"
+            "把这件事告诉用户，由用户决定是否打开它。"
         )
     family = family_of(name)
     if family and session is not None and family not in session.tool_families:
@@ -1068,6 +1072,7 @@ class AgentLoop:
                     viewer=self.viewer,
                     spawner=self.spawner,
                     event_runtime=self._event_runtime(session, message),
+                    registry=self.registry,
                     on_arguments=record_arguments,
                 )
                 break

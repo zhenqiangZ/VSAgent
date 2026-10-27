@@ -238,7 +238,7 @@ from opencode_tui.screens.home import HomeScreen  # noqa: E402
 from opencode_tui.screens.permission import PermissionDialog  # noqa: E402
 from opencode_tui.screens.session_picker import ConfirmDialog, SessionPickerScreen  # noqa: E402
 from opencode_tui.screens.spawn_agent import SpawnAgentScreen  # noqa: E402
-from opencode_tui.screens.subagent import SubagentChatScreen  # noqa: E402
+from opencode_tui.screens.subagent import StartBar, SubagentChatScreen  # noqa: E402
 
 from fake_model_server import (  # noqa: E402
     FakeModelServer,
@@ -14079,6 +14079,61 @@ async def check_subagent_ui() -> None:
             "重命名后重新填充仍然只有根会话",
         )
         picker.action_dismiss()
+        await pilot.pause()
+
+        # --- 仅创建：任务书先存着，不自动跑；开始条与 ctrl+r 是入口 ---
+        app.execute_command("agent")
+        await pilot.pause()
+        modal = app.screen
+        check(isinstance(modal, SpawnAgentScreen), f"再次打开派发模态：{modal}")
+        modal.query_one("#spawn-name", Input).value = "待开始"
+        modal.query_one("#spawn-task", TextArea).text = "查一下 5AFN"
+        await pilot.click("#spawn-create-only")
+        await pilot.pause()
+        idle = app.host.children_of(session.id)[0]
+        check(idle.status == "idle", f"仅创建不自动跑：{idle.status}")
+        check(idle.has_pending_prompt, "任务书写成了一条待发用户消息")
+        check(
+            "查一下 5AFN"
+            in "".join(p.text for m in idle.messages for p in m.parts),
+            "任务书真的落进了子会话",
+        )
+        check(
+            state.exists() and idle.id in state.read_text(encoding="utf-8"),
+            "创建当场就落盘，不靠子 agent 跑完",
+        )
+
+        # 派发标记不是用户气泡：notice 样式，底色透明、没有边框
+        notices = chat.query(".message-notice")
+        check(bool(notices), "派发标记走 message-notice 样式")
+        check(
+            all(notice.styles.background.a == 0 for notice in notices),
+            "派发标记没有气泡底色",
+        )
+        check(
+            all(not notice.styles.border.top[0] for notice in notices),
+            "派发标记没有气泡边框",
+        )
+
+        app.open_subagent(idle.id)
+        await pilot.pause()
+        sub2 = app.screen
+        bar = sub2.query_one(StartBar)
+        check(bar.styles.display == "block", "待开始的子 agent 显示开始条")
+        check(
+            "ctrl+r" in [binding.key for binding in SubagentChatScreen.BINDINGS],
+            "开始条有键盘入口",
+        )
+        sub2.action_start()
+        check(app.host.is_running(idle.id), "开始条起了一轮")
+        app.host.cancel(idle.id)
+        await pilot.pause()
+        sub2.action_back()
+        await pilot.pause()
+        app.open_subagent(idle.id)
+        await pilot.pause()
+        app.execute_command("delete")
+        await pilot.press("y")
         await pilot.pause()
     state.unlink(missing_ok=True)
 

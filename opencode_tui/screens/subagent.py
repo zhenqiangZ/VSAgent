@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.widgets import Static
@@ -62,6 +63,17 @@ class SubagentBanner(Static):
             screen.action_back()
 
 
+class StartBar(Static):
+    """「仅创建」留下的子 agent 顶部的开始条：点一下就开始跑。"""
+
+    def on_click(self, event: events.Click) -> None:
+        """点整条开始，不是只点某个按钮。"""
+        screen = self.screen
+        if isinstance(screen, SubagentChatScreen):
+            event.stop()
+            screen.action_start()
+
+
 class SubagentChatScreen(ChatScreen):
     """一个子 agent 的持久聊天界面。"""
 
@@ -73,6 +85,7 @@ class SubagentChatScreen(ChatScreen):
     BINDINGS = [
         *[binding for binding in ChatScreen.BINDINGS if binding.key != "tab"],
         Binding("ctrl+b", "back", "Back", priority=True),
+        Binding("ctrl+r", "start", "Start", priority=True),
     ]
 
     def __init__(self, root: Path | None = None, session_id: str = "") -> None:
@@ -88,19 +101,24 @@ class SubagentChatScreen(ChatScreen):
 
     def compose(self) -> ComposeResult:
         yield SubagentBanner(self._banner_text(), id="subagent-banner", markup=False)
+        yield StartBar("", id="subagent-start", markup=False)
         yield from super().compose()
 
     def _banner_text(self) -> str:
         """返回栏文字：父会话、名字、运行状态。"""
         session = self.session
         parent = self.app.session_manager.get_session(session.parent_id)
-        status = {
-            "idle": "空闲",
-            "running": "运行中",
-            "done": "完成",
-            "failed": "失败",
-            "cancelled": "已中断",
-        }.get(session.status, session.status)
+        status = (
+            "待开始"
+            if session.has_pending_prompt
+            else {
+                "idle": "空闲",
+                "running": "运行中",
+                "done": "完成",
+                "failed": "失败",
+                "cancelled": "已中断",
+            }.get(session.status, session.status)
+        )
         icon = "●" if session.status == "running" else "○"
         note = f" · {session.status_note[:16]}" if session.status_note else ""
         origin = "用户派发" if session.origin == "user" else "模型派发"
@@ -114,11 +132,32 @@ class SubagentChatScreen(ChatScreen):
         )
 
     def refresh_status(self) -> None:
-        """刷新状态栏并把返回栏上的状态一起更新。"""
+        """刷新状态栏并把返回栏、开始条上的状态一起更新。"""
         super().refresh_status()
         banner = self.query(SubagentBanner)
         if banner:
             banner.first().update(self._banner_text())
+        bar = self.query(StartBar)
+        if bar:
+            pending = self.session.has_pending_prompt
+            bar.first().styles.display = "block" if pending else "none"
+            if pending:
+                bar.first().update("▶ 任务已就绪 · 点这里或按 ctrl+r 开始")
+
+    def action_start(self) -> None:
+        """开始「仅创建」留下的任务。
+
+        任务书创建时已经写进会话，这里只起一轮；已经在跑或没有待发任务时
+        只给一句提示，不重复发。
+        """
+        session = self.session
+        if not session.has_pending_prompt:
+            self.app.show_toast("这个子 agent 没有待开始的任务", "info")
+            return
+        if not self.app.host.start_pending(session.id):
+            self.app.show_toast("任务没能开始：它已经在运行", "warning")
+            return
+        self.refresh_status()
 
     def on_editor_pane_interrupt_requested(self) -> None:
         """esc：运行中先中断，空闲时返回父会话。"""

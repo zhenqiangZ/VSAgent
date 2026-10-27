@@ -79,7 +79,7 @@ def _render_part(part: Part) -> list[str]:
     if part.type is PartType.FILE:
         return [f"引用文件 `{part.file_path}`", ""]
     if part.type is PartType.AGENT:
-        return [f"Agent `{part.agent_name}`", ""]
+        return [f"已派发子 agent「{part.agent_name}」", ""]
     if part.type is PartType.STEP_START:
         return [f"── 步骤开始 {part.text}".rstrip(), ""]
     if part.type is PartType.STEP_FINISH:

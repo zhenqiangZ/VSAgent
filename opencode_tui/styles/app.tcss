@@ -716,6 +716,20 @@ ModalScreen {
     color: #FFFFFF;
 }
 
+/* 「仅创建」留下的任务：整条可点，提示它还没开始 */
+#subagent-start {
+    height: 1;
+    display: none;
+    background: #16212E;
+    color: #FFB300;
+    padding: 0 1;
+}
+
+#subagent-start:hover {
+    background: #1E3A5F;
+    color: #FFFFFF;
+}
+
 /* 派发模态 */
 SpawnAgentScreen {
     align: center middle;
@@ -765,11 +779,10 @@ SpawnAgentScreen {
 #spawn-preview {
     height: auto;
     color: #888888;
-    margin-top: 1;
 }
 
 #spawn-task {
-    height: 8;
+    height: 7;
     border: solid #333333;
 }
 

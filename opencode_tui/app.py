@@ -607,11 +607,17 @@ class OpenCodeApp(App[None]):
                 start=request.start,
                 end=request.end,
                 origin="user",
+                run=request.run,
             )
         except ValueError as error:
             self.show_toast(str(error), "warning")
             return
-        self.show_toast(f"已派发子 agent「{child.title}」，在后台运行", "success")
+        if request.run:
+            self.show_toast(f"已派发子 agent「{child.title}」，在后台运行", "success")
+        else:
+            self.show_toast(
+                f"已创建子 agent「{child.title}」，进去后按 ctrl+r 开始", "success"
+            )
 
     def open_subagent(self, session_id: str) -> None:
         """进入子 agent 界面。当前会话不切换，返回时父会话还在原处。

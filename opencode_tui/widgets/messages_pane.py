@@ -497,7 +497,7 @@ class SimplePartView(Static):
             preview = f"  {len(part.text.splitlines())} 行" if part.text else ""
             return f"▤ {part.file_path or part.text}{preview}"
         if part.type is PartType.AGENT:
-            return f"◆ 子 agent: {part.agent_name}"
+            return f"◆ 已派发子 agent「{part.agent_name}」 · 点击进入"
         if part.type is PartType.STEP_START:
             return f"── step {part.text or 'start'} " + "─" * 20
         if part.type is PartType.STEP_FINISH:
@@ -554,10 +554,28 @@ class MessageView(Container):
         padding: 1 1 0 1;
     }
     MessageView.message-assistant { padding-left: 2; }
+    /* 派发标记不是用户说的话。它仍然是一条 user 消息（翻译层把它翻成空，
+       不进模型上下文），但视觉上必须去掉气泡底色与左侧蓝线，
+       否则看起来就像用户自己发了一句「◆ 已派发子 agent…」。 */
+    MessageView.message-notice {
+        background: transparent;
+        border: none;
+        /* 与正文左边界取齐：正文是容器 2 列 + Markdown 自带 2 列，
+           这里补上容器这 2 列，SimplePartView 自己还有 2 列。 */
+        padding: 0 0 0 2;
+    }
     """
 
     def __init__(self, message: Message, pane: MessagesPane) -> None:
-        super().__init__(classes=f"message-view message-{message.role}")
+        # 只有派发标记的消息不是「用户说了什么」：给它单独的样式类，
+        # 让气泡的底色与蓝边不套在它身上。
+        notice = bool(message.parts) and all(
+            part.type is PartType.AGENT for part in message.parts
+        )
+        classes = f"message-view message-{message.role}"
+        if notice:
+            classes += " message-notice"
+        super().__init__(classes=classes)
         self.message = message
         self.pane = pane
         self.parts_box: Vertical | None = None

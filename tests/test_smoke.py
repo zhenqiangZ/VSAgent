@@ -2448,7 +2448,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         # 这些 Part 类型由样本喂给渲染分支，导出里的这几行没走过真实一轮。
         exported_markers = {
             PartType.FILE: "引用文件 `opencode_tui/app.py`",
-            PartType.AGENT: "Agent `Build`",
+            PartType.AGENT: "已派发子 agent「Build」",
             PartType.STEP_START: "── 步骤开始 start",
             PartType.STEP_FINISH: "── 步骤结束 finish",
             PartType.PATCH: "补丁 `opencode_tui/app.py`",

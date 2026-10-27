@@ -29,6 +29,8 @@ class SpawnRequest:
     task: str
     start: int
     end: int
+    # True = 创建后立刻在后台开跑；False = 只创建，等用户进子 agent 界面再开始。
+    run: bool = True
 
 
 def _first_line(message: Message) -> str:
@@ -82,13 +84,13 @@ class SpawnAgentScreen(ModalScreen[SpawnRequest | None]):
             yield TextArea(id="spawn-task")
             yield Static("", id="spawn-error")
             yield Static(
-                "创建后立即在后台开始，父会话可以继续用。"
-                "子 agent 内不能再派发新的 agent。\n"
+                "「仅创建」只存任务书，进去按 ctrl+r 再开始。\n"
                 "ctrl+enter 创建并运行　esc 取消",
                 id="spawn-hint",
             )
             with Horizontal(id="spawn-buttons"):
                 yield Button("创建并运行", id="spawn-create", variant="primary")
+                yield Button("仅创建", id="spawn-create-only")
                 yield Button("取消", id="spawn-cancel")
 
     def on_mount(self) -> None:
@@ -105,9 +107,11 @@ class SpawnAgentScreen(ModalScreen[SpawnRequest | None]):
             self._refresh_preview()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """两个按钮。"""
+        """三个按钮：创建并运行 / 仅创建 / 取消。"""
         if event.button.id == "spawn-create":
             self.action_submit()
+        elif event.button.id == "spawn-create-only":
+            self.action_submit(run=False)
         else:
             self.action_cancel()
 
@@ -115,8 +119,11 @@ class SpawnAgentScreen(ModalScreen[SpawnRequest | None]):
         """取消，不创建任何东西。"""
         self.dismiss(None)
 
-    def action_submit(self) -> None:
-        """校验之后创建。校验不过就把原因写在窗里，不关窗。"""
+    def action_submit(self, run: bool = True) -> None:
+        """校验之后创建。校验不过就把原因写在窗里，不关窗。
+
+        `run=False` 是「仅创建」：任务书照常写进子会话，只是先不发。
+        """
         total = len(self.source.messages)
         try:
             start = int(self.query_one("#spawn-start", Input).value.strip())
@@ -148,6 +155,7 @@ class SpawnAgentScreen(ModalScreen[SpawnRequest | None]):
                 task=task,
                 start=zero_based,
                 end=end,
+                run=run,
             )
         )
 

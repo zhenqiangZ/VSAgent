@@ -974,7 +974,7 @@ class ContextAssembler:
         # 比一行占位贵，所以排在工具结果清理之后、记忆之前。
         while total > available and events:
             events.pop(0)
-            event_block = self._event_block(events)
+            event_block = self._event_block(events, len(session.events) - len(events))
             degraded.append("event_layer")
             messages, usage = compose()
             total = sum(usage.values())
@@ -1328,11 +1328,21 @@ class ContextAssembler:
             return "、".join(names)
         return "用户消息" if turn.messages[0].get("role") == "user" else "助手回复"
 
-    def _event_block(self, events: list[Event]) -> str:
-        """事件层：每个事件一行，从旧到新。空列表时是空串。"""
+    def _event_block(self, events: list[Event], dropped: int = 0) -> str:
+        """事件层：每个事件一行，从旧到新。空列表时是空串。
+
+        `dropped` 是被裁掉的条数。**必须说出来**：被裁的事件覆盖的消息既不在
+        事件块里，也不在 RECENT 里（`compact` 已经推到事件末端），不提示的话
+        那一段就是无声消失，而上下文看起来完全正常。
+        """
         if not events:
             return ""
-        return "\n".join([EVENT_NOTICE, *(event_line(event) for event in events)])
+        lines = [EVENT_NOTICE, *(event_line(event) for event in events)]
+        if dropped:
+            lines.append(
+                f"（更早还有 {dropped} 条事件没放下；recall_event 不带参数可以列清单）"
+            )
+        return "\n".join(lines)
 
     def _cap_events(self, events: list[Event], limit: int) -> tuple[list[Event], str]:
         """按 token 上限保留事件，从新往旧留。
@@ -1349,7 +1359,7 @@ class ContextAssembler:
             kept.append(event)
             used += cost
         kept.reverse()
-        return kept, self._event_block(kept)
+        return kept, self._event_block(kept, len(events) - len(kept))
 
     def _evidence_block(self, evidence: list[Evidence]) -> str:
         """证据层：先给 summary，再按剩余额度展开 detail。"""

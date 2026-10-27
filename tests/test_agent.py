@@ -95,7 +95,6 @@ from opencode_tui.core.agent.event_log import (  # noqa: E402
     RecordEventTool,
     build_local_event,
     event_boundary,
-    parse_event_text,
     record_local_event,
     render_event_detail,
 )
@@ -12967,6 +12966,64 @@ async def check_event_log() -> None:
     check(merged is not None and merged.id == event.id, "相邻的自动事件合并成一条")
     check(merged.end == 12 and len(session.events) == 1, f"合并之后仍是一条：{len(session.events)}")
 
+    # 合并之后标题要覆盖整段，不是只描述开头：只取第一句的话，后面几段做的事
+    # 在索引里一个字都不留，而模型以为自己已经知道这一段了。
+    check(
+        "／" in merged.title and "等 6 段" in merged.title,
+        f"标题拼上整段的诉求：{merged.title}",
+    )
+    check(
+        "产物 docking#0、docking#1" in merged.summary,
+        f"产物排在调用之前，不会被挤掉：{merged.summary}",
+    )
+    check("调用 dock" in merged.summary, f"调用清单还在：{merged.summary}")
+
+    # 工具一多，调用清单要压成「前三个 等 N 个」，否则它把产物挤到 160 字外面。
+    wide = Session(id="ses_wide")
+    for name in (
+        "fetch_structure",
+        "prepare_receptor",
+        "detect_pockets",
+        "import_ligandset",
+        "prepare_ligands",
+        "dock",
+        "score_affinity",
+        "write_run",
+        "open_viewer",
+        "export_summary",
+    ):
+        assistant = wide.add_message(Message(role="assistant"))
+        assistant.add_part(
+            Part(
+                type=PartType.TOOL,
+                tool_name=name,
+                tool_status=ToolStatus.COMPLETED,
+                tool_input={},
+                tool_output="ok",
+                tool_meta={"handle": f"{name}#1"},
+            )
+        )
+    wide_event = record_local_event(wide, len(wide.messages), "auto")
+    check("等 10 个" in wide_event.title, f"没有用户原话时标题数得出工具个数：{wide_event.title}")
+    wide_line = event_line(wide_event)
+    check(
+        "产物 fetch_structure#1" in wide_line and "prepare_ligands#1" in wide_line,
+        f"五个产物一个都没被截掉：{wide_line}",
+    )
+    check(
+        wide_line.endswith("…") and wide_line.index("产物") < wide_line.index("调用"),
+        f"截断只吃掉尾巴上的调用清单：{wide_line}",
+    )
+
+    # 事件多到装不下时，被裁掉的那几条必须留一句提示：它们覆盖的消息既不在
+    # 事件块里、也不在 RECENT 里（compact 已推到事件末端），不说就是无声消失。
+    many = [
+        Event(id=f"evt_{index:04d}", title=f"第 {index} 段", summary="做完了一段", start=index, end=index + 1)
+        for index in range(1, 9)
+    ]
+    kept, block = ContextAssembler(128_000)._cap_events(many, 60)
+    check(len(kept) < len(many) and "更早还有" in block, f"裁掉的事件要留提示：{block}")
+
     runtime = EventRuntime(session=session, current_index=len(session.messages))
     recorded = await RecordEventTool().execute(
         {"title": "手动收口", "summary": "这一段做完了"}, event_runtime=runtime
@@ -13015,9 +13072,6 @@ async def check_event_log() -> None:
     gap.sanitize_events()
     check(gap.events == [], "首条不从 summary_upto 开始时丢掉")
 
-    check(parse_event_text("标题：准备受体\n摘要正文") == ("准备受体", "摘要正文"), "标题行切得出来")
-    check(parse_event_text("没有标题行") == ("", "没有标题行"), "格式不对时整段当摘要")
-
     tail = Session(id="ses_tail")
     tail.add_message(Message(role="assistant"))
     tail.add_message(Message(role="user"))
@@ -13026,8 +13080,8 @@ async def check_event_log() -> None:
     check(render_range(tail, 0, 2).count("\n") >= 0, "render_range 可用（read_turn 与 recall 共用）")
 
 
-async def check_event_summary(server: FakeModelServer) -> None:
-    """事件摘要：只喂新段、不带工具、失败落本地、取消不写、溢出零额外请求。"""
+async def check_event_capture(server: FakeModelServer) -> None:
+    """事件收口：标题与摘要随调用给出，缺一个就当场退回，全程不另发请求。"""
     bus = EventBus()
     loop = build_loop(server, bus, ToolRegistry())
     session = _event_fixture(4)
@@ -13035,67 +13089,39 @@ async def check_event_summary(server: FakeModelServer) -> None:
     session.add_event(Event(id="evt_0001", title="前一段", summary="前一段做完了", start=0, end=4, kind="manual"))
     session.event_seq = 1
     session.sanitize_events()
-    message = session.add_message(Message(role="assistant", session_id=session.id))
+    session.add_message(Message(role="assistant", session_id=session.id))
 
     server.clear()
-    server.script(
-        Reply(
-            chunks=[
-                *text_chunks("标题：准备受体\n这一段取了结构并准备了受体。", size=6),
-                usage_chunk(7, 9),
-            ]
-        )
+    runtime = loop._event_runtime(session)
+    missing = await RecordEventTool().execute({}, event_runtime=runtime)
+    check(missing.failed and "缺少 title" in missing.output, f"没给标题就退回：{missing.output}")
+    only_title = await RecordEventTool().execute({"title": "只有标题"}, event_runtime=runtime)
+    check(
+        only_title.failed and "缺少 summary" in only_title.output,
+        f"没给摘要就退回：{only_title.output}",
     )
-    runtime = loop._event_runtime(session, message)
-    recorded = await RecordEventTool().execute({}, event_runtime=runtime)
-    check(not recorded.failed, f"模型写得出来时照常记录：{recorded.output}")
-    check(len(server.requests) == 1, f"收口只发一次请求：{len(server.requests)}")
-    request = server.requests[0]
-    check(not request.get("tools"), "收口请求不带工具")
-    transcript = str(request["messages"][1]["content"])
-    check("第 0 步" not in transcript, "只喂新露出来的那一段")
-    check("第 2 步：跑对接" in transcript, "新段的内容在")
+    blank = await RecordEventTool().execute(
+        {"title": "   ", "summary": "有摘要"}, event_runtime=runtime
+    )
+    check(blank.failed and "缺少 title" in blank.output, f"空白标题也算缺：{blank.output}")
+    check(len(server.requests) == 0, f"退回时不发任何请求：{len(server.requests)}")
+    check(not session.events[1:], "退回时不落半条事件")
+
+    recorded = await RecordEventTool().execute(
+        {"title": "准备受体", "summary": "取了 4HJO 结构并准备了受体"},
+        event_runtime=runtime,
+    )
+    check(not recorded.failed, f"标题摘要都给时记下来：{recorded.output}")
+    check(len(server.requests) == 0, "收口全程零请求")
     newest = session.events[-1]
-    check(newest.title == "准备受体", f"标题从模型输出里取：{newest.title}")
-    check("准备了受体" in newest.summary, "摘要从模型输出里取")
+    check(
+        newest.title == "准备受体" and newest.summary.startswith("取了 4HJO"),
+        "标题与摘要照模型给的那份",
+    )
+    check(not newest.degraded, "两份都给全时不算降级")
+    check(newest.actions == ["dock"], f"动作仍从 Part 数出来：{newest.actions}")
+    check("docking#3" in newest.artifacts, f"产物仍从 tool_meta 取：{newest.artifacts}")
     check(session.events[-2].id == "evt_0001", "前面那条事件没被动过")
-    check(message.tokens["input"] == 7, "收口的用量记在这一轮的消息上")
-
-    # 标题与摘要都给全时不再请求模型。换一份新会话：上一份已经被收口到最新位置，
-    # 没有新内容时工具本来就该是 no-op。
-    fresh = _event_fixture(2)
-    fresh_message = fresh.add_message(Message(role="assistant", session_id=fresh.id))
-    server.clear()
-    explicit = await RecordEventTool().execute(
-        {"title": "手工", "summary": "手工摘要"},
-        event_runtime=loop._event_runtime(fresh, fresh_message),
-    )
-    check(not explicit.failed, "显式收口成功")
-    check(len(server.requests) == 0, "显式给全时不发请求")
-    check(len(fresh.events) == 1 and fresh.events[0].title == "手工", "确实记了一条")
-
-    # 请求失败：落一条本地事件，但不算工具失败。
-    failing = _event_fixture(2)
-    failing_message = failing.add_message(Message(role="assistant", session_id=failing.id))
-    server.clear()
-    server.script(Reply(status=500, body='{"error": "boom"}'))
-    failed = await RecordEventTool().execute(
-        {}, event_runtime=loop._event_runtime(failing, failing_message)
-    )
-    check(not failed.failed, f"摘要写不出来不算工具失败：{failed.output}")
-    check(failing.events and failing.events[-1].degraded, "退化成本地汇编")
-    check(bool(failing.events[-1].actions), "本地汇编仍带动作")
-
-    # 取消：什么都不写。
-    cancelling = _event_fixture(2)
-    cancel_message = cancelling.add_message(Message(role="assistant", session_id=cancelling.id))
-    server.clear()
-    loop.cancelled = True
-    cancelled = await RecordEventTool().execute(
-        {}, event_runtime=loop._event_runtime(cancelling, cancel_message)
-    )
-    loop.cancelled = False
-    check(cancelled.failed and not cancelling.events, "中断时一条都不写")
 
     # 已有事件时溢出：补本地事件，不额外请求模型。
     crowded = _event_fixture(3)
@@ -14386,7 +14412,7 @@ SERVER_GROUPS: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("hooks-in-loop", check_hooks_in_loop),
     ("context-metrics", check_context_metrics),
     ("tool-family-loop", check_tool_family_loop),
-    ("event-summary", check_event_summary),
+    ("event-capture", check_event_capture),
     ("summary-compaction", check_summary_compaction),
     ("live-app", check_live_app),
 )

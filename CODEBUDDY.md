@@ -197,9 +197,13 @@ __main__.py → app.py ───────────────────
   recent_turns → recent_reasoning → recent_output`。装不下就抛
   `ContextAssemblyError` 明说，**不静默截断**。
 - `event_log.py` — 事件层：把做完的一段压成「标题 + 摘要」，原文让位但仍可
-  `recall_event` 取回。三条不变式（连续覆盖、边界排除当前消息、本地兜底不花请求）
-  见 [`docs/event-log-design.md`](docs/event-log-design.md)。溢出时 `_run_steps`
+  `recall_event` 取回。三条不变式（连续覆盖、边界排除当前消息、收口不花请求）
+  见 [`docs/event-log-design.md`](docs/event-log-design.md)。`record_event` 的
+  `title` / `summary` **都必填**：收口的位置是模型自己选的，这一段它刚看过，
+  内核不再为此另发一次请求；缺一个就退回让它补。溢出时 `_run_steps`
   补一条 `auto` 本地事件，此时 `_summarize` 停用（摘要与事件不重叠）。
+  事件块超额裁掉最旧几条时要补一行「更早还有 N 条」——被裁事件覆盖的原文
+  既不在事件里也不在 RECENT 里（`compact` 已推到事件末端），不说就是无声消失。
 - `toolset.py` — 按族加载领域工具。38 个工具的完整定义 12.3K token，每一步都要发；
   核心 14 个（文件、登记表、任务、事件、记忆、`load_tools`）常驻，24 个领域工具分成
   12 族由 `load_tools` 现装现用，装过之后每步只发 3.2K。**族记在

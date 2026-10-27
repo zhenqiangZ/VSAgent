@@ -21,7 +21,6 @@ from .permission import PermissionDecision, PermissionPolicy, Verdict
 from .prompt import (
     KEEP_MESSAGES,
     environment_block,
-    event_messages,
     stable_prefix,
     summary_messages,
 )
@@ -469,20 +468,16 @@ class AgentLoop:
         self.last_cached_tokens = cached_tokens
         self.bus.publish("context.metrics", {"session_id": session.id, **metrics})
 
-    def _event_runtime(self, session: Session, message: Message) -> EventRuntime:
-        """造一份事件运行时：收口位置、摘要请求与取消状态。
+    def _event_runtime(self, session: Session) -> EventRuntime:
+        """造一份事件运行时：只决定收口能收到哪儿。
 
-        摘要请求借用 `_ask_summary`，用量因此记在这一轮的消息上——收口花的钱
-        与这一轮的其他花费记在同一处，状态栏上的数字才对得上。
+        收口不再另发请求（标题与摘要由模型随调用给出），所以这里不需要
+        摘要回调，也不需要取消状态——工具本身就是一次同步记账。
         """
         return EventRuntime(
             session=session,
             # 当前正在写的那条 assistant 消息，收口必须停在它前面。
             current_index=max(0, len(session.messages) - 1),
-            summarize=lambda target, start, end: self._ask_summary(
-                message, event_messages(target, start, end)
-            ),
-            is_cancelled=lambda: self.cancelled,
         )
 
     def _memory_text(self, session: Session) -> str:
@@ -1101,7 +1096,7 @@ class AgentLoop:
                     evidence=self.evidence,
                     viewer=self.viewer,
                     spawner=self.spawner,
-                    event_runtime=self._event_runtime(session, message),
+                    event_runtime=self._event_runtime(session),
                     registry=self.registry,
                     on_arguments=record_arguments,
                 )

@@ -610,12 +610,17 @@ def _prepared_records(entry: Any) -> tuple[list[dict[str, Any]], str]:
         manifest = products.read_json(manifest_path)
     except (OSError, ValueError) as error:
         return [], f"读 {manifest_path} 失败（{type(error).__name__}：{error}）"
-    directory = Path(str(entry.path)) / str(meta.get("pdbqt_dir") or ligand.PDBQT_DIR)
+    # `pdbqt` 里**已经带了 `ligands/` 前缀**（`prepare_ligands` 写的是相对产物根的
+    # 路径，见 `ligand.py` 的 `f"{PDBQT_DIR}/{filename}"`）。这里原先又拼了一次
+    # `meta["pdbqt_dir"]`，于是变成 `…/ligands/ligands/x.pdbqt`——库里的每一条都
+    # 读不出坐标，而报出来的是「5 条读不出坐标」，看着像分子的问题。
+    # 判据当时没抓住，因为夹具里写的 `pdbqt` 是裸文件名，与真实产物不同形。
+    root = Path(str(entry.path))
     records = []
     for item in manifest.get("records") or []:
         if str(item.get("status") or "") != "ok" or not item.get("pdbqt"):
             continue
-        records.append({**item, "path": directory / str(item["pdbqt"])})
+        records.append({**item, "path": root / str(item["pdbqt"])})
     return records, ""
 
 

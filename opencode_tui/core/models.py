@@ -592,6 +592,19 @@ class Session:
         """是不是子 agent。"""
         return bool(self.parent_id) or self.depth > 0
 
+    @property
+    def has_pending_prompt(self) -> bool:
+        """最后一条是用户消息、且这一轮还没跑：派发时「仅创建」留下的待发任务。
+
+        不另存字段，按状态与消息形状推断：跑起来的第一步就会写一条 assistant
+        消息，这个条件自然不再成立；重启读回来的状态也一样成立。
+        """
+        return (
+            self.status == "idle"
+            and bool(self.messages)
+            and self.messages[-1].role == "user"
+        )
+
     def add_message(self, message: Message) -> Message:
         """追加消息并刷新更新时间。"""
         message.session_id = self.id

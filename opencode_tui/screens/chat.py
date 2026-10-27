@@ -143,7 +143,9 @@ class SidePanel(Vertical):
             # 有失败/中断原因就显示原因，没有就显示消息条数：
             # 「失败」两个字不说明是请求出错还是工具没能完成，那正是用户要看的。
             note = child.status_note.strip()
-            detail = _status_text(child.status)
+            # 「仅创建」的子 agent 还是 idle，但任务书已经在了：说「空闲」会让人
+            # 以为它什么都不用做，说「待开始」才对应界面里那条开始条。
+            detail = "待开始" if child.has_pending_prompt else _status_text(child.status)
             if note:
                 detail += f" · {_short(note, 8)}"
             else:

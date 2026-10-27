@@ -147,8 +147,12 @@ class AgentHost:
         end: int | None = None,
         origin: str = "user",
         prompt: bool = True,
+        run: bool = True,
     ) -> Session:
         """从父会话 fork 一个子 agent，可选立刻开跑。
+
+        `prompt=False` 连任务书都不写（工具层校验失败之类的场景用）；
+        `run=False` 写任务书但不立刻跑，留给用户在子 agent 界面里手动开始。
 
         深度上限在这里兜底。工具层与界面层都各自拦过一次，但真正决定
         「能不能创建」的是这一处：前两层只是让模型与用户早点看到原因。
@@ -207,10 +211,10 @@ class AgentHost:
             # 没复制历史时把工作区索引一起交过去：fresh 子会话没有别的途径知道
             # 父会话手上有哪些 handle，而它要接着用那些东西。
             digest = getattr(loop.ledger, "digest", None)
-            self.prompt(
-                child.id,
+            _message, body = self._append_user_message(
+                child,
                 task,
-                preamble=task_preamble(
+                task_preamble(
                     parent,
                     start,
                     end,
@@ -218,6 +222,15 @@ class AgentHost:
                     digest() if callable(digest) else "",
                 ),
             )
+            # 仅创建：任务书已经写成子会话的第一条用户消息，只是先不发。
+            # 用户在子 agent 界面里按开始（`start_pending`）再跑这一轮。
+            if run:
+                self._start(child, self.loop_for(child.id).stream_reply(child, body))
+        # 创建本身就落一次盘：子会话与父会话里的派发标记都得活过重启。
+        # 以前只靠「子 agent 跑完时 `_run` 顺手存一次」，不跑（或跑到一半进程没了）
+        # 就整个消失，而界面上它明明已经出现了。
+        if self.save_state is not None:
+            self.save_state()
         return child
 
     def _unique_title(self, parent_id: str, title: str) -> str:
@@ -269,6 +282,19 @@ class AgentHost:
         session = self.manager.get_session(session_id)
         if session is None or self.is_running(session_id):
             return False
+        _message, body = self._append_user_message(session, text, preamble)
+        self._start(session, self.loop_for(session.id).stream_reply(session, body))
+        return True
+
+    def _append_user_message(
+        self, session: Session, text: str, preamble: str = ""
+    ) -> tuple[Message, str]:
+        """写一条用户消息并广播，返回 (消息, 正文)。
+
+        只写不发：`prompt` 与「仅创建」都要走出同一种消息形状，
+        区别只在写完要不要立刻起一轮。文件引用也在这里解析，
+        两条路拿到的 Part 才一致。
+        """
         clean, file_parts = resolve_file_refs(text, self.workspace_root)
         body = f"{preamble}\n\n{clean}".strip() if preamble else clean
         message = Message(
@@ -289,7 +315,20 @@ class AgentHost:
                 "part.add",
                 {"session_id": session.id, "message_id": message.id, "part_id": part.id},
             )
-        self._start(session, self.loop_for(session.id).stream_reply(session, body))
+        return message, body
+
+    def start_pending(self, session_id: str) -> bool:
+        """开始一个「仅创建」留下的子 agent。
+
+        任务书在创建时已经作为用户消息写进会话（`spawn(run=False)`），
+        这里只起一轮，不再写第二条——再写一遍会让模型看到两份同样的任务。
+        """
+        session = self.manager.get_session(session_id)
+        if session is None or self.is_running(session_id):
+            return False
+        if not session.has_pending_prompt:
+            return False
+        self._start(session, self.loop_for(session.id).stream_reply(session, ""))
         return True
 
     def run_bash(self, session_id: str, command: str) -> bool:

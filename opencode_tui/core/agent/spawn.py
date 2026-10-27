@@ -21,8 +21,16 @@ from .tools import Tool, ToolError, ToolResult, ToolSpec
 
 # 复制时跳过的 Part：它们是「上一轮怎么跑的」过程标记，不是对话内容。
 # 留着会让子 agent 的历史里出现一堆别人的 step 编号，既占额度又误导。
+# AGENT 是父会话里的派发标记（点一下进另一个子 agent），更不该跟着复制：
+# 复制过去之后，子 agent 的界面里会多出一条指向兄弟会话的紫色行。
 SKIPPED_PARTS = frozenset(
-    {PartType.STEP_START, PartType.STEP_FINISH, PartType.RETRY, PartType.COMPACTION}
+    {
+        PartType.STEP_START,
+        PartType.STEP_FINISH,
+        PartType.RETRY,
+        PartType.COMPACTION,
+        PartType.AGENT,
+    }
 )
 
 # 复制区间最多占可用上下文的比例。超过就从最早的消息开始丢。
@@ -418,9 +426,10 @@ class AgentStatusTool(Tool):
         shown = children[:MAX_REPORTS]
         lines: list[str] = []
         for child in shown:
+            status = "待开始" if child.has_pending_prompt else _status_text(child.status)
             lines.append(
                 f"■「{child.title}」（{child.id}）"
-                f"　{_status_text(child.status)} · {len(child.messages)} 条 · "
+                f"　{status} · {len(child.messages)} 条 · "
                 f"{child.total_tokens()} tok"
             )
             if child.status_note:

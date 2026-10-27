@@ -15161,6 +15161,32 @@ def check_debug_tools() -> None:
         "重对接验证排在对接之后——它读的是对接产物，顺序反了只会读到上一轮",
     )
 
+    # **一条 CALLS 就是一次调用**，同名工具可以出现多次（三次 import_ligandset 各导入
+    # 一份夹具）。原先把同名工具从池子里 pop 掉、参数按名字查，于是三条合成一条、
+    # 用的是最后那条的参数：链看起来跑满 42 个，实际 ligands.smi 与 actives.csv
+    # 一次都没导入，参考集、指纹筛选、pose 分析全建在错的库上。
+    plan = debug_tools._plan(debug_tools._tool_modules())
+    check(len(plan) == len(debug_tools.CALLS), f"CALLS 有几条就跑几次：{len(plan)}/{len(debug_tools.CALLS)}")
+    repeated = [name for name, _ in debug_tools.CALLS if names.count(name) > 1]
+    check(
+        len(repeated) == 3 and set(repeated) == {"import_ligandset"},
+        f"同名的那几条（三次导入）都还在计划里：{repeated}",
+    )
+    by_position = [arguments for _label, tool, arguments in plan if tool.spec.name == "import_ligandset"]
+    check(
+        [item["path"] for item in by_position]
+        == [
+            "tests/fixtures/ligands.smi",
+            "tests/fixtures/actives.csv",
+            "tests/fixtures/series.csv",
+        ],
+        f"参数按位置取，不是按工具名取最后一条：{[i['path'] for i in by_position]}",
+    )
+    check(
+        all(arguments is not None for _label, _tool, arguments in plan),
+        "每个工具都有 CALLS 里的参数（漏一行会变成「跳过」而不是悄悄少跑）",
+    )
+
 
 async def check_tool_family() -> None:
     """按族加载：目录覆盖全部领域工具、没装的族不进请求体、装完就出现。"""

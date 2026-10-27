@@ -845,7 +845,7 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
 | `rank-candidates` | `check_rank_candidates` | 29 | 合并、方向、对齐、分档 |
 | `analyze-pose` | `check_analyze_pose` | 18 | 接触、氢键、冲突、缺位姿 |
 | `curate-ligands` | `check_curate_ligands` | 24 | PAINS、去重、窗口、flag 模式 |
-| `screen` | `check_screen_similarity` / `check_screen_shape` | 16 + 10 | 指纹、形状（USR）、SMARTS、换参不复用 |
+| `screen` | `check_screen_similarity` / `check_screen_shape` | 16 + 10 | 指纹、形状（USR）、SMARTS、换参不复用；夹具的 `pdbqt` 与 `prepare_ligands` 同形 |
 | `validate-docking` | `check_validate_docking` | 16 | 原地 RMSD、阈值、无共晶配体、gate 进表、带氢的位姿、键级读法不同 |
 | `reference-set` | `check_reference_set` | 16 | 最强活性、PAINS 只标、too_small |
 | `batch-offset` | `check_batch_offset` | 21 | 两批无重叠、越界、换参不复用 |
@@ -952,3 +952,50 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
 第三条**第一次是绿的**：判的是源码里有没有 `rsearch._ids_from`，而函数的 docstring
 里本来就写着这个名字，注入进去的副本照样命中。改成剥掉 docstring 再判才红——
 和 §9.3 里那个「夹具正好压在阈值上」是同一类问题：**断言写得太宽，注入才看得见**。
+
+### 11.2 缓存只剩一套之后，另外三套为什么不跟着合
+
+合并当时口径是「搜索结果的缓存」，`chembl` / `prankweb` / `uniprot` 三套**故意留着**：
+
+| 模块 | 缓存的是什么 | 为什么不该并进 `search_dir` |
+|---|---|---|
+| `chembl.py` | 整个接口响应（文本）+ 内容指纹 + 元数据 | 它做的是**续传**：指纹对不上就重下，`read_cache` 那套「过期当没有」表达不了这个状态 |
+| `prankweb.py` | 一次预测的完整 payload，按 PDB 编号 | 预测是**异步任务的结果**，键是条目而不是查询；有效期的依据是「这个编号预测过没有」 |
+| `uniprot.py` | 一条 UniProt 记录 + 指纹 | 同上，且它要区分「记录变了」与「过期了」——`saved_at` 不够 |
+
+共用的其实只有「读—写—`saved_at`—原子替换」这层壳。把这层抽出来单做一次，
+收益是省几十行，代价是三条带指纹/续传语义的路径都要重新验一遍；而它们的使用频率
+远低于 RCSB 搜索。**结论：保持分开，别为了整齐去合并。**
+
+### 11.3 端到端链自己的三个缺陷（2026-10-27 补）
+
+第一次真跑 `debug_tools.py` 是 35 正常 / 6 失败 / 1 跳过。六个失败里有四个不是工具的
+问题，是**这条链自己没按写的那样跑**：
+
+1. **同名工具被合并，参数取最后一条**（最严重）。`_plan` 用 `by_tool.pop(name)` 取工具，
+   于是 `CALLS` 里三条 `import_ligandset` 只跑一条；`DEFAULTS` 又是按名字建字典、后者
+   覆盖前者，所以唯一那次用的是 `series.csv` 的参数。`ligands.smi` 与 `actives.csv`
+   一次都没导入——参考集、指纹筛选、pose 分析全建在错的库上，而链看起来跑满了 42 个。
+   改成**一条 `CALLS` 就是一次调用**（44 次），参数按位置走；`check_debug_tools` 加断言
+   盯住这件事（plan 条数 = CALLS 条数、三次导入的参数各是各的）。
+2. **`import_structure` 指向 `.probe/1iep.pdb`**：gitignore 的本地文件，干净 checkout
+   上没有。改成 `tests/fixtures/1iep.pdb`。
+3. **`prepare_receptor` 只给 pocket、没给 `ligand`**：产物里 `ligand_file` 为空，
+   `validate_docking` 与 `screen_shape` 同时拿不到参照。补 `ligand=AQ4`（1M17 的共晶
+   配体），并在 `ligands.smi` 头部放**厄洛替尼**——它必须落在 `dock` 的 `limit` 之内，
+   否则重对接仍无可比分子。
+
+跑完自清：`--clean` 删掉本轮登记表指向的 `~/.opencode_tui/` 产物并删登记表，
+`runs/` 与 `corpus/` 不动（前者是交付物，后者是语料库）。
+
+### 11.4 同一次真跑挖出的第三个工具 bug
+
+`screen._prepared_records` 把 `meta["pdbqt_dir"]` 又拼了一次，而 `prepare_ligands`
+写进 manifest 的 `pdbqt` **本来就带 `ligands/` 前缀**（相对产物根，与 `docking.py`
+的读法一致）。于是路径成了 `…/ligands/ligands/x.pdbqt`，库里的每一条都「读不出坐标」。
+
+判据没抓到，因为夹具里写的是裸文件名 `line.pdbqt`——**夹具与真实产物不同形**。
+改夹具成 `ligands/line.pdbqt` 之后，这条断言在旧实现上立刻变红，才成为真正的判据。
+这和 §4.3 那两个 bug（`removeHs` 空转、键级读法不同）是同一类：合成夹具只覆盖了
+工具**接受**的形状，没覆盖上游**真实写出**的形状。
+

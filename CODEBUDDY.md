@@ -56,7 +56,8 @@ python tests/test_agent.py --only hooks-in-loop
 python tests/dump_layout.py       # 100x30 布局快照，写到 tests/output/
 
 # 领域工具调试：唯一需要真实网络的脚本（真的打 UniProt/ChEMBL/RCSB/PubMed）
-python debug_tools.py             # 全跑 11 模块 19 工具，顺序即依赖顺序，零参数
+python debug_tools.py             # 全跑 19 模块 44 次调用（42 工具），顺序即依赖顺序，零参数
+python debug_tools.py --clean     # 同上，跑完删掉本轮产物（只删 ~/.opencode_tui 下的）
 # dock 需要外部 vina：PATH 里有 vina，或设置 VSA_VINA_BIN；没有时这一步照实失败
 # score_affinity 需要 models/DTA/.venv：没有时同样照实失败并给安装指引
 python debug_tools.py --list

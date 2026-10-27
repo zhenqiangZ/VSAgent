@@ -3,7 +3,7 @@
 放在仓库根目录，不放在 `opencode_tui/core/agent/domain/` 里：它是开发期用的东西，
 不该和那 42 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
 
-    # 一、全跑：19 个模块、42 个工具，按依赖顺序一个接一个（不需要任何参数）
+    # 一、全跑：19 个模块、44 次调用（42 个工具），按依赖顺序一个接一个（不需要任何参数）
     .venv/Scripts/python.exe debug_tools.py
 
     # 二、只跑一个模块（10 个工具模块末尾的块就是这么用的）
@@ -95,22 +95,27 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("define_pocket", {"pockets": "{artifact:pockets}", "index": 1}),
     # 把它准备成可以直接对接的受体，再设为当前受体。1M17 是单链但带交替构象，
     # 所以只给 altloc；盒子来自上一步的口袋，不再由共晶配体现算。
+    # **`ligand=AQ4` 是必须的**：不给就只留盒子、`ligand_file` 为空，后面
+    # `validate_docking` 与 `screen_shape` 全都拿不到参照（实测两条都红）。
     ("prepare_receptor", {
         "structure": "{receptor:raw}",
         "pocket": "{artifact:pocket}",
+        "ligand": "AQ4",
         "confirm": True,
         "altloc": "A",
     }),
     ("switch_receptor", {"receptor": "{receptor:prepared}"}),
     # 导一份本机坐标（全库唯一收路径的动作）。**排在这里是为了让 `{receptor:raw}`
-    # 仍指向 1M17**：它也会登记一条 raw 受体，排在准备受体之前就会被换掉
-    ("import_structure", {"path": ".probe/1iep.pdb"}),
+    # 仍指向 1M17**：它也会登记一条 raw 受体，排在准备受体之前就会被换掉。
+    # 路径必须用仓库里那份 `tests/fixtures/1iep.pdb`——原先写 `.probe/1iep.pdb`，
+    # 那是 gitignore 的本地文件，干净 checkout 上根本不存在（实测这一步一直红）。
+    ("import_structure", {"path": "tests/fixtures/1iep.pdb"}),
     # 导入一份本机配体文件（第二个收路径的动作）：.smi 每行 `SMILES 名字`。
     # 里面的盐会被去掉、无效 SMILES 会被跳过并逐条报出来。
     ("import_ligandset", {"path": "tests/fixtures/ligands.smi"}),
-    # 过第一道闸：PAINS / Brenk / 去重 / 性质窗口。夹具 5 条（4 条可用），能筛掉几条。
+    # 过第一道闸：PAINS / Brenk / 去重 / 性质窗口。夹具 6 条（5 条可用），能筛掉几条。
     ("curate_ligands", {"ligands": "{ligandset:raw}", "max_mw": 500}),
-    # 把它准备成 PDBQT：真跑 ETKDGv3 + Meeko，4 个分子通常几秒
+    # 把它准备成 PDBQT：真跑 ETKDGv3 + Meeko，5 个分子通常几秒
     ("prepare_ligands", {"ligands": "{ligandset:raw}", "confirm": True, "limit": 10}),
     # 真跑 Vina：需要 PATH 里有 vina 或设置 VSA_VINA_BIN；没有时这一步会照实失败。
     # 参数调小是为了调试快，不是推荐值。
@@ -231,10 +236,12 @@ INLINE = re.compile(r"\{([a-z]+)(?::([a-z]+))?\}")
 REPO_ROOT = Path(__file__).resolve().parent
 DEBUG_LEDGER_PATH = REPO_ROOT / ".probe" / "debug-ledger.json"
 
-USAGE_ROOT = "python debug_tools.py [<模块>] [<工具名> [参数…]] [--list] [--raw] [--reset]"
+USAGE_ROOT = (
+    "python debug_tools.py [<模块>] [<工具名> [参数…]] [--list] [--raw] [--reset] [--clean]"
+)
 USAGE_MODULE = "python -m opencode_tui.core.agent.domain.<模块> [<工具名> [参数…]] [--list] [--raw] [--reset]"
 
-SWITCHES = ("--raw", "--reset", "--list")
+SWITCHES = ("--raw", "--reset", "--list", "--clean")
 LIST_FLAGS = ("-h", "--help", "--list")
 
 
@@ -261,7 +268,7 @@ def main(module_name: str, tools: list[Tool], argv: list[str] | None = None) -> 
 def root_main(argv: list[str] | None = None) -> int:
     """根目录那一侧的入口：第一个词是模块名就用它，是工具名就去找它在哪个模块。
 
-    不带参数时按模块表把 19 个模块、42 个工具全跑一遍。
+    不带参数时按模块表把 19 个模块、44 条 `CALLS` 全跑一遍；`--clean` 跑完清产物。
     """
     load_env()
     args = list(sys.argv[1:] if argv is None else argv)
@@ -271,7 +278,7 @@ def root_main(argv: list[str] | None = None) -> int:
         if "--list" in args or "-h" in args or "--help" in args:
             _print_all(modules)
             return 0
-        return _run_batch(modules)
+        return _run_batch(modules, clean="--clean" in args)
     if positional[0] in LIST_FLAGS:
         _print_all(modules)
         return 0
@@ -300,6 +307,10 @@ def _dispatch(module_name: str, tools: list[Tool], args: list[str]) -> int:
     if "--reset" in args:
         args.remove("--reset")
         _reset_ledger()
+    if "--clean" in args:
+        # 只有全跑模式会在跑完之后清；单跑一个工具时清掉产物等于把刚看的东西删了。
+        args.remove("--clean")
+        print("（--clean 只对全跑有效，这一次忽略）", file=sys.stderr)
     raw = "--raw" in args
     if raw:
         args.remove("--raw")
@@ -354,19 +365,70 @@ def _tool_modules() -> list[tuple[str, list[Tool]]]:
     return found
 
 
-def _run_batch(groups: list[tuple[str, list[Tool]]]) -> int:
-    """全跑：`CALLS` 里那 42 个工具依次跑一遍，最后给一张表。
+def _clean_products() -> None:
+    """删掉这一轮登记表指向的产物，只删 `~/.opencode_tui/` 下的那些。
+
+    **不碰 `runs/` 与 `corpus/`**：前者是交付物（`write_run` 的产物，用户可能要拿去
+    看页面），后者是语料库，删了要重新入库。只清缓存性质的东西——受体、配体集、
+    对接位姿、候选表、验证结果。清理完把调试登记表也删掉，否则单工具模式下一次
+    读到的是一串指向空目录的 handle。
+    """
+    import shutil
+
+    ledger = _debug_ledger(quiet=True)
+    root = Path.home() / ".opencode_tui"
+    removed: list[str] = []
+    kept: list[str] = []
+    for entry in ledger.entries(include_archived=True):
+        path = Path(str(entry.path))
+        try:
+            inside = path == root or root in path.parents
+        except OSError:
+            inside = False
+        if not inside:
+            kept.append(str(path))
+            continue
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+            removed.append(str(path).replace(str(Path.home()), "~", 1))
+        except OSError as error:
+            kept.append(f"{path}（没删掉：{error}）")
+    try:
+        DEBUG_LEDGER_PATH.unlink()
+    except OSError:
+        pass
+    print("=" * 64)
+    print(f"清理：删掉 {len(removed)} 个产物、登记表已删。")
+    for item in removed[:8]:
+        print(f"  - {item}")
+    if len(removed) > 8:
+        print(f"  …… 还有 {len(removed) - 8} 个")
+    if kept:
+        print("没删（不在 ~/.opencode_tui 下，或删不掉）：")
+        for item in kept[:6]:
+            print(f"  · {item}")
+
+
+def _run_batch(groups: list[tuple[str, list[Tool]]], *, clean: bool = False) -> int:
+    """全跑：`CALLS` 里那 44 条调用依次跑一遍，最后给一张表。
 
     开跑前清空登记表：全跑的价值在于「一条链从头串到尾」，起点必须是同一份空表。
     单个工具失败不打断后面的——调试要看的正是「哪一个不行、为什么」。
     """
     _reset_ledger()
     plan = _plan(groups)
+    distinct = len({tool.spec.name for _label, tool, _args in plan})
     head = (
-        f"全跑：{len(groups)} 个模块、{len(plan)} 个工具，按依赖顺序来。\n"
+        f"全跑：{len(groups)} 个模块、{len(plan)} 次调用（{distinct} 个工具），按依赖顺序来。\n"
         f"登记表：{_relative(DEBUG_LEDGER_PATH)}（开跑前已清空）"
     )
-    return _run_plan(plan, head)
+    code = _run_plan(plan, head)
+    if clean:
+        _clean_products()
+    return code
 
 
 def _run_module(module_name: str, tools: list[Tool]) -> int:
@@ -377,22 +439,23 @@ def _run_module(module_name: str, tools: list[Tool]) -> int:
     自己先补前置，工具会照实报「依赖不存在」。
     """
     short = module_name.rsplit(".", 1)[-1]
-    plan = [(f"{short}.{tool.spec.name}", tool) for tool in tools]
+    plan = [
+        (f"{short}.{tool.spec.name}", tool, DEFAULTS.get(tool.spec.name)) for tool in tools
+    ]
     head = f"跑 {short} 这一组：{len(plan)} 个工具（登记表接着上一轮用）。"
     return _run_plan(plan, head)
 
 
-def _run_plan(plan: list[tuple[str, Tool]], head: str) -> int:
-    """执行一串 (标签, 工具)：逐个打印参数与结果，末尾给小结。"""
+def _run_plan(plan: list[tuple[str, Tool, dict[str, Any] | None]], head: str) -> int:
+    """执行一串 (标签, 工具, 参数)：逐个打印参数与结果，末尾给小结。"""
     total = len(plan)
     print(head + "\n")
 
     report: list[tuple[str, bool, str, float]] = []
     started = time.monotonic()
-    for index, (label, tool) in enumerate(plan, start=1):
+    for index, (label, tool, sample) in enumerate(plan, start=1):
         name = tool.spec.name
         print(f"==== [{index}/{total}] {label} " + "=" * max(2, 60 - len(label)))
-        sample = DEFAULTS.get(name)
         if sample is None:
             print("（`CALLS` 里没有它，跳过——补一行就能跑）\n")
             report.append((label, False, "跳过", 0.0))
@@ -416,23 +479,32 @@ def _run_plan(plan: list[tuple[str, Tool]], head: str) -> int:
     return 0 if all(ok for _, ok, _, _ in report) else 1
 
 
-def _plan(groups: list[tuple[str, list[Tool]]]) -> list[tuple[str, Tool]]:
-    """按 `CALLS` 的顺序排出这一轮要跑的 (标签, 工具)。
+def _plan(groups: list[tuple[str, list[Tool]]]) -> list[tuple[str, Tool, dict[str, Any] | None]]:
+    """按 `CALLS` 的顺序排出这一轮要跑的 (标签, 工具, 参数)。
 
-    `CALLS` 只写工具名，模块名由这里补上（印出来是 `模块.工具`，一眼看得出谁在跑）。
-    `CALLS` 没提到的工具接在末尾——新加的工具不会被漏掉。
+    **一条 `CALLS` 就是一次调用**，同名工具可以出现多次（三次 `import_ligandset`
+    各导入一份不同的夹具，供后面三步各取所需）。原先按工具名查参数、并把工具从池子里
+    `pop` 掉，于是这三条被合成一条、用的是**最后那条**的参数——链看起来跑满 42 个，
+    实际 `ligands.smi` 与 `actives.csv` 一次都没导入，参考集与指纹筛选全建在错的库上。
+
+    `CALLS` 没提到的工具接在末尾（参数为 None，跑的时候报「跳过——补一行就能跑」），
+    新加的工具这样才不会被漏掉。
     """
     by_tool: dict[str, tuple[str, Tool]] = {}
     for module_name, tools in groups:
         for tool in tools:
             by_tool.setdefault(tool.spec.name, (module_name, tool))
-    plan: list[tuple[str, Tool]] = []
-    for name, _arguments in CALLS:
-        found = by_tool.pop(name, None)
-        if found is not None:
-            plan.append((f"{found[0]}.{name}", found[1]))
+    plan: list[tuple[str, Tool, dict[str, Any] | None]] = []
+    used: set[str] = set()
+    for name, arguments in CALLS:
+        found = by_tool.get(name)
+        if found is None:
+            continue
+        plan.append((f"{found[0]}.{name}", found[1], arguments))
+        used.add(name)
     for name, (module_name, tool) in by_tool.items():
-        plan.append((f"{module_name}.{name}", tool))
+        if name not in used:
+            plan.append((f"{module_name}.{name}", tool, None))
     return plan
 
 

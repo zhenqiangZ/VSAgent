@@ -8664,6 +8664,16 @@ async def check_validate_docking() -> None:
     (docking_dir / "poses" / "other.pdb").write_text(
         "\n".join(crystal[:2]) + "\n", encoding="utf-8"
     )
+    # 带显式氢的位姿：Vina 写出来的就是带氢的（真实数据：伊马替尼位姿 68 原子对
+    # 共晶配体 37 个重原子）。`MolFromPDBBlock(removeHs=True)` 在 `sanitize=False`
+    # 下是空转的，这一条专门盯「氢没删掉 → 每一行都变成原子数不同」。
+    hydrogenated = crystal + [
+        line("HETATM", 5, "H1", -1.9, 1.0, 0.0, "H"),
+        line("HETATM", 6, "H2", 0.6, -1.0, 0.0, "H"),
+    ]
+    (docking_dir / "poses" / "hydrogenated.pdb").write_text(
+        "\n".join(hydrogenated) + "\n", encoding="utf-8"
+    )
     products_module.write_json_atomic(
         docking_dir / "manifest.json",
         {
@@ -8677,6 +8687,8 @@ async def check_validate_docking() -> None:
                  "pose_pdb": "poses/shifted.pdb"},
                 {"id": "other", "name": "other", "score": -7.0,
                  "pose_pdb": "poses/other.pdb"},
+                {"id": "hydrogenated", "name": "hydrogenated", "score": -6.0,
+                 "pose_pdb": "poses/hydrogenated.pdb"},
             ],
         },
     )
@@ -8726,6 +8738,32 @@ async def check_validate_docking() -> None:
         check(
             rows["other"]["rmsd"] is None and "原子数不同" in rows["other"]["detail"],
             f"不是同一个分子要逐条说明：{rows['other']}",
+        )
+        check(
+            rows["hydrogenated"]["rmsd"] is not None
+            and abs(rows["hydrogenated"]["rmsd"]) < 1e-6,
+            f"位姿里带显式氢也要先删氢再比（Vina 写出来的就带氢）：{rows['hydrogenated']}",
+        )
+        # 键级是读 PDB 时猜出来的，两边猜法可以不同：Vina 位姿带 CONECT、会读成
+        # 24 根芳香键，共晶配体 `ligand.pdb` 读成 41 根单键。按键级比，同一张图也对不上。
+        # 这里造一对真家伙：同一份苯环、同一套坐标，一份按 RDKit 写出（读回来是
+        # 交替单双键），一份压成纯拓扑再写出（读回来全单键）。压平之后必须相等。
+        from rdkit import Chem as _Chem
+        from rdkit.Chem import AllChem as _AllChem
+
+        benzene = _Chem.MolFromSmiles("c1ccccc1")
+        _AllChem.EmbedMolecule(benzene, randomSeed=7)
+        kekule_pose = work / "benzene-kekule.pdb"
+        kekule_pose.write_text(_Chem.MolToPDBBlock(benzene), encoding="utf-8")
+        single_reference = work / "benzene-single.pdb"
+        single_reference.write_text(
+            _Chem.MolToPDBBlock(analysis_module._topology(benzene)), encoding="utf-8"
+        )
+        order_insensitive, reason = analysis_module._rmsd(kekule_pose, single_reference)
+        check(
+            order_insensitive is not None and abs(order_insensitive) < 1e-6,
+            "只比拓扑：键级读法不同（芳香/交替单双 vs 全单键）不影响判同一个分子，"
+            f"否则真位姿永远对不上：{order_insensitive} {reason}",
         )
         check(
             entry.meta.get("kind") == "validation",
@@ -15086,6 +15124,27 @@ async def check_tool_clear() -> None:
     check("输出00" in restored.output, "被收成占位的那条仍能取回原文")
 
 
+def check_debug_tools() -> None:
+    """调试入口的覆盖度：每个领域工具都要在 `debug_tools.CALLS` 里跑过一遍。
+
+    这条是补出来的：`validate_docking` 从 P1 加进来之后一直没进 CALLS，
+    因为它需要夹具里有一个**就是共晶配体本身**的分子，而当时没人写下这个前提，
+    于是 42 个工具里唯一没被端到端跑过的，恰好是风险最高的那一个（原地 RMSD）。
+    判据原本一条都不管这件事——它只看工具注册得对不对，不看调试脚本覆盖到没有。
+    """
+    import debug_tools
+
+    names = [name for name, _ in debug_tools.CALLS]
+    missing = sorted(set(DOMAIN_TOOL_NAMES) - set(names))
+    check(not missing, f"每个领域工具都在 CALLS 里跑过一遍：缺 {missing}")
+    unknown = sorted(set(names) - set(DOMAIN_TOOL_NAMES))
+    check(not unknown, f"CALLS 里没有拼错或改名后剩下的工具名：{unknown}")
+    check(
+        names.index("dock") < names.index("validate_docking"),
+        "重对接验证排在对接之后——它读的是对接产物，顺序反了只会读到上一轮",
+    )
+
+
 async def check_tool_family() -> None:
     """按族加载：目录覆盖全部领域工具、没装的族不进请求体、装完就出现。"""
     groups = catalog()
@@ -16957,6 +17016,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("evidence-dedupe", check_evidence_dedupe),
     ("tool-clear", check_tool_clear),
     ("tool-family", check_tool_family),
+    ("debug-tools", check_debug_tools),
     ("tool-retry", check_tool_retry),
     ("event-log", check_event_log),
     ("evidence", check_evidence_layer),

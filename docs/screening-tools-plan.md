@@ -43,12 +43,12 @@ P2–P4 才是新增的 ADME、SAR 与药效团。
 | 期 | 工具 | 状态 |
 |---|---|---|
 | P0 | `detect_pockets` / `define_pocket` / `prepare_receptor(pocket=)` | 已完成 2026-10-27，`pocket-tools` 组 30 条 |
-| P0 | `rank_candidates` | 已完成 2026-10-27，`rank-candidates` 组 21 条 |
+| P0 | `rank_candidates` | 已完成 2026-10-27，`rank-candidates` 组 29 条 |
 | P0 | `analyze_pose` | 已完成 2026-10-27，`analyze-pose` 组 17 条 |
 | P0 | `curate_ligands` | 已完成 2026-10-27，`curate-ligands` 组 24 条 |
 | P1 | `screen_similarity` / `screen_shape` | 已完成 2026-10-27，两个组共 26 条 |
 | P1 | `validate_docking` / `build_reference_set` | 已完成 2026-10-27，两个组共 30 条 |
-| P2 | `offset` / mmCIF / `assess_structure` | 已完成 2026-10-27，三个组共 50 条 |
+| P2 | `offset` / mmCIF / `assess_structure` | 已完成 2026-10-27，三个组共 52 条 |
 | P3 | `predict_admet` / 骨架 / 匹配对 / 枚举 / 实验回填 | 已完成 2026-10-27，两个组共 47 条 |
 | P4 | `build_pharmacophore` / `screen_pharmacophore` / `align_ligands` | 已完成 2026-10-27，`pharmacophore` 组 33 条 |
 
@@ -499,6 +499,19 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
   验证是一次性的协议体检，不需要让用户把它也塞进 `sources`；只有真的是共晶配体
   本人的那条会带上这个门禁。
 - 原子数不同 / 连接关系对不上时逐条记 `detail`，`rmsd` 留空——不给一个假的数。
+- **`debug_tools.py` 里的端到端跑法挖出两个 bug（2026-10-27 补）**，两条都只在
+  真位姿上才露头，合成夹具看不见：
+  1. `MolFromPDBBlock(removeHs=True, sanitize=False)` 是**空转**的——`removeHs` 要等
+     解析后的标准后处理才生效，而那条要求 `sanitize=True`。Vina 写出的位姿带氢
+     （伊马替尼 68 原子对共晶配体 37 个重原子），于是每一行都是「原子数不同」，
+     看着像工具坏了。改成解析后显式 `Chem.RemoveHs(mol, sanitize=False)`。
+  2. 键级是**读 PDB 时猜出来的**：同一份伊马替尼，从位姿里读出来 24 根芳香键 +
+     1 根双键（那份 PDB 带 35 行 CONECT），从共晶配体 `ligand.pdb` 读出来 41 根单键。
+     按键级比，「同一个分子」永远「连接图对不上」。改成比之前先用 `_topology()`
+     压成「元素 + 连接」的图；代价是分不出键级不同的两种分子，口径写进 `RMSD_METHOD`。
+- 修完之后 1IEP 上的真结果是 **imatinib 1.09 Å 通过**（其余两个不是同一个分子，
+  照实记「原子数不同」）。这也是「`validate_docking` 必须进 `debug_tools.py`」的
+  理由：判据里那套 4 原子夹具两条都测不出来。
 
 ### 4.4 `build_reference_set`（族 `ligand`）
 
@@ -833,16 +846,17 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
 | `analyze-pose` | `check_analyze_pose` | 18 | 接触、氢键、冲突、缺位姿 |
 | `curate-ligands` | `check_curate_ligands` | 24 | PAINS、去重、窗口、flag 模式 |
 | `screen` | `check_screen_similarity` / `check_screen_shape` | 16 + 10 | 指纹、形状（USR）、SMARTS、换参不复用 |
-| `validate-docking` | `check_validate_docking` | 14 | 原地 RMSD、阈值、无共晶配体、gate 进表 |
+| `validate-docking` | `check_validate_docking` | 16 | 原地 RMSD、阈值、无共晶配体、gate 进表、带氢的位姿、键级读法不同 |
 | `reference-set` | `check_reference_set` | 16 | 最强活性、PAINS 只标、too_small |
-| `batch-offset` | `check_batch_offset` | 19 | 两批无重叠、越界、换参不复用 |
+| `batch-offset` | `check_batch_offset` | 21 | 两批无重叠、越界、换参不复用 |
 | `mmcif` | `check_mmcif` | 14 | 有/无 gemmi 两路、失败不登记、来源格式记住 |
 | `assess-structure` | `check_assess_structure` | 17 | 缺失残基、NMR 只算第一套、金属不算配体 |
 | `admet` | `check_admet` | 16 | source 标注、unsupported、公式进产物 |
 | `sar` | `check_sar` | 31 | 骨架、配对方向、枚举去重、实验回填 |
 | `pharmacophore` | `check_pharmacophore` | 33 | 共识点、叠合失败逐条记、分数分得开活性与诱饵、叠合产物可直接复用 |
 
-合计约 106 条，分五批进 `GROUPS`，与现有断言一起跑。
+合计 291 条（2026-10-27 逐组 `--only` 数出来的；写这份计划时估的是 106，实际条数
+是落地时一条条加的，别拿估算当基线），分五批进 `GROUPS`，与现有断言一起跑。
 
 ### 9.2 跨工具的六条
 

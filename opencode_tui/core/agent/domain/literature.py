@@ -19,7 +19,7 @@ from typing import Any
 
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
 from . import http
-from .rsearch import _cache_path, _read_cache, _write_cache
+from .rsearch import cache_path, read_cache, write_cache
 
 __all__ = [
     "Article",
@@ -222,9 +222,9 @@ def search_literature(
     标题丢了还能点链接看，整次判失败就什么也没有。
     """
     term = (query or "").strip()
-    path = _cache_path("literature", {"term": term, "limit": limit})
+    path = cache_path("literature", {"term": term, "limit": limit})
     if use_cache:
-        cached = _read_cache(path)
+        cached = read_cache(path)
         if cached is not None:
             articles = [Article(**item) for item in cached.get("articles", [])]
             return articles, int(cached.get("total") or len(articles))
@@ -239,7 +239,7 @@ def search_literature(
         articles = [Article(pmid=pid) for pid in ids]
 
     if use_cache:
-        _write_cache(
+        write_cache(
             path,
             {"articles": [item.as_dict() for item in articles], "total": total},
         )

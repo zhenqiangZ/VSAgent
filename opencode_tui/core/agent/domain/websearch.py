@@ -29,7 +29,7 @@ from typing import Any
 from ... import corpus, corpus_config, embed, index, search_config
 from ..tools import RetryableToolError, Tool, ToolResult, ToolSpec
 from . import http
-from .rsearch import _cache_path, _read_cache, _write_cache
+from .rsearch import cache_path, read_cache, write_cache
 
 __all__ = [
     "DEFAULT_PAGE_CHARS",
@@ -355,8 +355,8 @@ class SearchWebTool(Tool):
         shown = _clamp_int(arguments.get("count"), DEFAULT_RESULTS, 1, MAX_RESULTS)
         refresh = bool(arguments.get("refresh"))
 
-        path = _cache_path("web", {"query": query})
-        body = None if refresh else _read_cache(path, ttl=None)
+        path = cache_path("web", {"query": query})
+        body = None if refresh else read_cache(path, ttl=None)
         cached = body is not None
 
         if body is None:
@@ -382,7 +382,7 @@ class SearchWebTool(Tool):
             except RetryableToolError:
                 # 429 / 5xx / 连不上：交给内核的重试策略，不在这里吞掉。
                 raise
-            _write_cache(path, body)
+            write_cache(path, body)
 
         hits = _hits_from(body)
         if not hits:
@@ -496,10 +496,16 @@ class FetchWebpageTool(Tool):
                 retry_statuses=(408,),
             )
         except http.NotFound as error:
+            # **这个 404 是抓取后端说的，不是页面说的。** 后端可能取不到这个地址
+            # （站点拦截、超时、内容类型不支持），也可能压根没有这个路由。
+            # 原先写成「资源不存在（HTTP 404）」，模型读到的结论是「页面不存在」，
+            # 于是换个说法继续试——而该做的是换个来源。实测时本机直连那个站点
+            # 20 秒超时，后端回的却是 404，两个说法指向完全不同的下一步。
             return _failed(
                 "抓取",
-                f"{normalized} 拿不到可用的正文（HTTP 404：不可达、被站点策略拦截、"
-                f"内容类型不支持、或页面没有可提取的正文）。{error}",
+                f"{normalized} 没抓到：抓取后端回了 404（{error}）。"
+                "**这不等于页面不存在**——可能是站点拒绝抓取、后端取不到，"
+                "或后端不认识这个地址。换一个来源，或先用 search_web 看看有没有别的页面。",
             )
         except http.ResponseError as error:
             return _failed("抓取", _status_text(error))

@@ -40,11 +40,14 @@ __all__ = [
     "SearchError",
     "SearchPdbTool",
     "attribute_query",
+    "cache_path",
     "domain_tools",
     "fetch_ligands",
+    "read_cache",
     "search_dir",
     "search_entries",
     "text_query",
+    "write_cache",
 ]
 
 RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
@@ -111,18 +114,18 @@ def search_dir() -> Path:
     （P0 复合物检索）、`literature`（PubMed）、`websearch`（联网摘要）。原先
     `complexes` 自带一份 `~/.opencode_tui/rcsb/search/`，两处写的逻辑一样、
     目录不同——同一个 Uniprot 连问两遍也互相看不见。合并之后只认这一处，
-    键由 `_cache_path(kind, payload)` 算，**不同模块的同类请求算出来的键必须一致**。
+    键由 `cache_path(kind, payload)` 算，**不同模块的同类请求算出来的键必须一致**。
     """
     return Path.home() / ".opencode_tui" / "search"
 
 
-def _cache_path(kind: str, payload: Any) -> Path:
+def cache_path(kind: str, payload: Any) -> Path:
     blob = json.dumps({"kind": kind, "payload": payload}, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
     return search_dir() / f"{kind}-{digest}.json"
 
 
-def _read_cache(path: Path, *, ttl: float | None = SEARCH_CACHE_TTL) -> Any | None:
+def read_cache(path: Path, *, ttl: float | None = SEARCH_CACHE_TTL) -> Any | None:
     """读缓存。**过期或损坏都当没有**——损坏的缓存不能变成一次假结果。
 
     `ttl=None` 表示**永不过期**。联网搜索走的就是这一档：查过的 query 与服务
@@ -140,7 +143,7 @@ def _read_cache(path: Path, *, ttl: float | None = SEARCH_CACHE_TTL) -> Any | No
     return payload.get("body")
 
 
-def _write_cache(path: Path, body: Any) -> None:
+def write_cache(path: Path, body: Any) -> None:
     """写缓存。**失败不影响主流程**——缓存是加速用的，不是真相。"""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -250,9 +253,9 @@ def search_entries(
     请求、缓存、错误分档都在这里。零命中也进缓存（204 归一成空响应），
     所以「查了确实没有」这个结论一天内不会反复打接口。
     """
-    path = _cache_path("search", query)
+    path = cache_path("search", query)
     if use_cache:
-        cached = _read_cache(path)
+        cached = read_cache(path)
         if cached is not None:
             return _ids_from(cached), _total_from(cached), cached
 
@@ -279,7 +282,7 @@ def search_entries(
         raise SearchError(f"RCSB 检索没成：{error}") from error
 
     if use_cache:
-        _write_cache(path, body)
+        write_cache(path, body)
     return _ids_from(body), _total_from(body), body
 
 
@@ -337,8 +340,8 @@ def fetch_ligands(
     for start in range(0, len(wanted), GRAPHQL_BATCH):
         chunk = wanted[start : start + GRAPHQL_BATCH]
         payload = {"query": _GRAPHQL_QUERY, "variables": {"ids": chunk}}
-        path = _cache_path("ligands", {"ids": chunk})
-        body = _read_cache(path) if use_cache else None
+        path = cache_path("ligands", {"ids": chunk})
+        body = read_cache(path) if use_cache else None
         if body is None:
             try:
                 body = http.post_json(RCSB_GRAPHQL_URL, payload, timeout=timeout)
@@ -348,7 +351,7 @@ def fetch_ligands(
             except Exception as error:
                 raise SearchError(f"RCSB 配体查询没成：{error}") from error
             if use_cache:
-                _write_cache(path, body)
+                write_cache(path, body)
         for hit in _hits_from(body):
             out[hit.pdb_id] = hit
     return out

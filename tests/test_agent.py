@@ -8488,7 +8488,9 @@ async def check_screen_shape() -> None:
         )
         records.append(
             {"id": name, "name": name, "smiles": "C", "status": "ok",
-             "pdbqt": f"{name}.pdbqt", "heavy_atoms": 4}
+             # **与 `prepare_ligands` 写出来的同形**：带 `ligands/` 前缀、相对产物根。
+             # 早先这里是裸文件名，于是「多拼一次 pdbqt_dir」的 bug 一直测不出来。
+             "pdbqt": f"{ligand_module.PDBQT_DIR}/{name}.pdbqt", "heavy_atoms": 4}
         )
     records.append(
         {"id": "failed_one", "name": "failed", "smiles": "C", "status": "embed_failed",
@@ -8513,7 +8515,7 @@ async def check_screen_shape() -> None:
             "stage": "prepared",
             "records": [
                 {"id": "line", "name": "line", "smiles": "C", "status": "ok",
-                 "pdbqt": "line.pdbqt", "heavy_atoms": 4}
+                 "pdbqt": f"{ligand_module.PDBQT_DIR}/line.pdbqt", "heavy_atoms": 4}
             ],
         },
     )
@@ -10926,7 +10928,7 @@ async def check_literature() -> None:
     from opencode_tui.core.agent.domain import rsearch as rsearch_module
 
     tmp = _Path(tempfile.mkdtemp(prefix="vsa-lit-"))
-    # 缓存的路径拼法在 `rsearch._cache_path` 里，它调的是 **rsearch 的** `search_dir`，
+    # 缓存的路径拼法在 `rsearch.cache_path` 里，它调的是 **rsearch 的** `search_dir`，
     # 所以改 `literature.search_dir` 没用——两个搜索工具共用一个缓存目录（§7.11）。
     original_dir = rsearch_module.search_dir
     rsearch_module.search_dir = lambda: tmp
@@ -11316,6 +11318,21 @@ async def check_websearch() -> None:
         http_module.post_json = status(403)
         blocked = await fetch.run({"url": "https://example.com/blocked", "refresh": True})
         check(blocked.failed and "403" in blocked.output, f"403 说的是站点策略：{blocked.output[:80]}")
+
+        # 抓取后端的 404 ≠ 页面不存在。实测：本机直连某站点 20 秒超时，后端回的却是 404，
+        # 而老文案把它写成「资源不存在（HTTP 404）」，模型据此断定页面没了、换说法重试。
+        def not_found(url: str, payload: Any, **kwargs: Any) -> Any:
+            raise http_module.NotFound("后端回 404：取不到这个地址")
+
+        http_module.post_json = not_found
+        gone = await fetch.run(
+            {"url": "https://example.com/backend-cannot-fetch", "refresh": True}
+        )
+        check(gone.failed, "后端 404 照实失败")
+        check(
+            "不等于页面不存在" in gone.output and "资源不存在" not in gone.output,
+            f"后端 404 不能说成「资源不存在」：{gone.output[:140]}",
+        )
         http_module.post_json = post_json
 
         # ---- 十一、http 层：状态码、408 可重试、OpenAI 形状的报错 ----

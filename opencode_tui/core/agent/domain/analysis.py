@@ -1184,7 +1184,10 @@ VALIDATION_ROOT = "validation"
 DEFAULT_RMSD_CUTOFF = 2.0
 MIN_RMSD_CUTOFF = 0.5
 MAX_RMSD_CUTOFF = 5.0
-RMSD_METHOD = "原地 RMSD（不重新叠合），仅重原子，按元素自动配对并取对称等价的最小值"
+RMSD_METHOD = (
+    "原地 RMSD（不重新叠合），仅重原子，按元素自动配对并取对称等价的最小值；"
+    "配对只比拓扑不比键级（PDB 里没有键级，两边读法可能不同）"
+)
 
 
 def validation_dir() -> Path:
@@ -1193,14 +1196,21 @@ def validation_dir() -> Path:
 
 
 def _rdkit_mol(path: Path):
-    """读一份单分子 PDB。**不 sanitize 成功也要能拿到坐标**——PDB 里没有键级。"""
+    """读一份单分子 PDB。**不 sanitize 成功也要能拿到坐标**——PDB 里没有键级。
+
+    氢要显式删一次，不能只靠 `MolFromPDBBlock(removeHs=True)`：那个开关是在
+    解析后的标准后处理里生效的，而标准后处理要求 `sanitize=True`；这里给的是
+    `sanitize=False`，于是它静默空转。Vina 写出来的位姿就是带氢的（实测伊马替尼
+    68 个原子对共晶配体 37 个重原子），不删的话每一行都变成「原子数不同」，
+    工具看着像坏了——而真正的原因是这条读法从来没删过氢。
+    """
     from rdkit import Chem
 
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return None
-    mol = Chem.MolFromPDBBlock(text, removeHs=True, sanitize=False)
+    mol = Chem.MolFromPDBBlock(text, removeHs=False, sanitize=False)
     if mol is None:
         return None
     try:
@@ -1208,7 +1218,38 @@ def _rdkit_mol(path: Path):
     except Exception:
         # 键级猜错的 PDB 很常见；拿不到芳香性不影响原子配对与 RMSD。
         pass
+    try:
+        mol = Chem.RemoveHs(mol, sanitize=False)
+    except Exception:
+        # 删不掉就把氢留着：原子数对不上时下面的报错会说清是多少对多少，
+        # 比吞掉异常、拿一份带着氢的分子去算 RMSD 强。
+        pass
     return mol
+
+
+def _topology(mol):
+    """把分子压成**只有元素与连接**的图：所有键改单键、清掉芳香标记、不要隐式氢。
+
+    不这么做的话「是不是同一个分子」这一问没有答案：PDB 里没有键级，键级是读文件
+    时按 CONECT 与距离猜出来的。实测同一份伊马替尼，从 Vina 位姿里读出来是
+    24 根芳香键 + 1 根双键（那份 PDB 带 35 行 CONECT），从共晶配体 `ligand.pdb`
+    里读出来是 41 根单键——按键级比，这两个「同一个分子」永远对不上，
+    而报出来的话是「连接图对不上」，把人指向错误的方向。
+
+    代价是分不出「同一张连接图、不同键级」的两种分子（比如芳香环与还原环）。
+    重对接要判的是「位姿有没有回到晶体位置」，不是「它是不是同一个互变异构体」；
+    这一层的取舍写在 `RMSD_METHOD` 里。
+    """
+    from rdkit import Chem
+
+    copy = Chem.RWMol(mol)
+    for bond in copy.GetBonds():
+        bond.SetBondType(Chem.BondType.SINGLE)
+        bond.SetIsAromatic(False)
+    for atom in copy.GetAtoms():
+        atom.SetIsAromatic(False)
+        atom.SetNoImplicit(True)
+    return copy.GetMol()
 
 
 def _rmsd(pose: Path, reference: Path) -> tuple[float | None, str]:
@@ -1231,9 +1272,11 @@ def _rmsd(pose: Path, reference: Path) -> tuple[float | None, str]:
             f"原子数不同（位姿 {probe.GetNumAtoms()}、共晶配体 {target.GetNumAtoms()}），"
             "不是同一个分子，没法算重对接 RMSD"
         )
+    probe = _topology(probe)
+    target = _topology(target)
     matches = probe.GetSubstructMatches(target, uniquify=False, useChirality=False)
     if not matches:
-        return None, "位姿与共晶配体的连接关系对不上（不是同一个分子，或键级猜错了）"
+        return None, "位姿与共晶配体的连接图对不上（不是同一个分子，或 PDB 的连接丢了）"
 
     probe_conf = probe.GetConformer()
     reference_conf = target.GetConformer()
@@ -1270,9 +1313,9 @@ def _render_validation(
     ]
     if comparable:
         best = min(comparable, key=lambda row: row["rmsd"])
-        verdict = "通过" if passed else f"**没有通过**（阈值 {cutoff:g} Å）"
+        verdict = "整体通过" if passed else f"一条都没通过（阈值 {cutoff:g} Å）"
         lines.append(
-            f"{len(comparable)} 个分子可比，{len(passed)} 个通过 {verdict}；"
+            f"{len(comparable)} 个分子可比、{len(passed)} 个通过；{verdict}。"
             f"最小 RMSD {best['rmsd']:.2f} Å（{best['id']}）。"
         )
     else:

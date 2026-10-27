@@ -61,7 +61,7 @@ receptor#2 (prepared) ─────── dock ──▶ artifact#3 (docking)
 | `opencode_tui/core/agent/domain/products.py` | 内容寻址产物目录、`params.json` 提交标记、原子写 JSON/文本。只放库函数，不登记工具。 |
 | `opencode_tui/core/agent/domain/ligand.py` | `ImportLigandsetTool`、`PrepareLigandsTool`；文件解析、去盐、去重、ETKDGv3、Meeko。 |
 | `opencode_tui/core/agent/domain/docking.py` | `DockTool`；定位 Vina、读盒子、构造命令、跑子进程、解析分数、PDBQT→PDB。 |
-| `tests/fixtures/ligands.smi` | 给 `debug_tools.py` 的固定配体样例（含一条盐、一条无效 SMILES）。 |
+| `tests/fixtures/ligands.smi` | 给 `debug_tools.py` 的固定配体样例（含一条盐、一条无效 SMILES，第一条伊马替尼是 1IEP 的共晶配体本身——`validate_docking` 靠它才比得出 RMSD）。 |
 | `tools/check_docking_ui.js` | 对接排名与详情降级的前端判据（Playwright，手工跑）。 |
 
 `products.py` 关键函数：

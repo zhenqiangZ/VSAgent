@@ -108,9 +108,9 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     # 导入一份本机配体文件（第二个收路径的动作）：.smi 每行 `SMILES 名字`。
     # 里面的盐会被去掉、无效 SMILES 会被跳过并逐条报出来。
     ("import_ligandset", {"path": "tests/fixtures/ligands.smi"}),
-    # 过第一道闸：PAINS / Brenk / 去重 / 性质窗口。夹具里 4 条，能筛掉几条。
+    # 过第一道闸：PAINS / Brenk / 去重 / 性质窗口。夹具 5 条（4 条可用），能筛掉几条。
     ("curate_ligands", {"ligands": "{ligandset:raw}", "max_mw": 500}),
-    # 把它准备成 PDBQT：真跑 ETKDGv3 + Meeko，3 个分子通常几秒
+    # 把它准备成 PDBQT：真跑 ETKDGv3 + Meeko，4 个分子通常几秒
     ("prepare_ligands", {"ligands": "{ligandset:raw}", "confirm": True, "limit": 10}),
     # 真跑 Vina：需要 PATH 里有 vina 或设置 VSA_VINA_BIN；没有时这一步会照实失败。
     # 参数调小是为了调试快，不是推荐值。
@@ -122,6 +122,12 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "limit": 3,
         "timeout": 120,
     }),
+    # 重对接验证：拿受体产物里的共晶配体当普通配体比一遍位姿。
+    # **夹具第一条就是伊马替尼 —— 1IEP 的共晶配体本身（STI）**，而且必须排在
+    # `dock` 的 `limit` 之内：排在后面会被 limit 截掉，这一步就只剩「原子数不同，
+    # 不是同一个分子」，看着像工具坏了，其实是链上没有可比的分子。
+    # 只读已有产物，不跑引擎；阈值默认 2 埃。
+    ("validate_docking", {"receptor": "{receptor:prepared}", "docking": "{artifact:docking}"}),
     # 亲和力打分：真加载模型，需要 DTA 的独立 Python 环境（见 models/DTA/README.md）。
     # 没有环境时这一步会照实失败并给出安装指引；limit 调小是为了调试快。
     ("score_affinity", {

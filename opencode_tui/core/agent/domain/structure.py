@@ -22,12 +22,13 @@ ChEMBL 回答了**已知答案是什么**，但对接要的是一套**具体的�
 sidecar 元数据。这些解析都用不上化学依赖——固定列文本而已，所以这个工具在没装
 化学依赖的机器上照样能用。
 
-**超大结构取不回来，而且必须说清为什么。** RCSB 对超出 PDB 格式上限的条目不提供
-`.pdb`，只给 mmCIF（实测 4YBB 29.5 万原子、3J3Q 244 万原子：`.pdb` 404 而 `.cif`
-200）。本模块**只取 `.pdb`**：下游读不了 mmCIF，取回一份用不了的文件、还把它登记成
-受体，比当场说清「这个条目取不了、为什么」糟糕得多——前者会在几步之后以另一种面目
-炸开。所以那条路是两档错误，各自可操作：两个格式都没有 = 编号不存在；只有 mmCIF =
-结构太大，建议换一个覆盖同一蛋白的小结构。
+**超大条目：装了 gemmi 就现场转成 PDB，没装才是两档错误。** RCSB 对超出 PDB 格式
+上限的条目不提供 `.pdb`，只给 mmCIF（实测 4YBB 29.5 万原子、3J3Q 244 万原子：`.pdb`
+404 而 `.cif` 200）。下游读不了 mmCIF，所以这条路只有两种诚实做法：能转就转成 PDB
+再登记（`source_format=mmCIF` 记在正文的一行 REMARK 与 meta 里），不能转就当场说清
+「这个条目取不了、为什么」——取回一份用不了的文件、还把它登记成受体，会在几步之后
+以另一种面目炸开。所以没装 gemmi 时仍是两档错误：两个格式都没有 = 编号不存在；
+只有 mmCIF = 结构太大，建议换一个覆盖同一蛋白的小结构。
 
 **NMR 结构有多套模型，统计只算第一套。** 不做这一步的话，1D3Z 的 10 套模型会让原子数
 变成 10 倍，而「观测到的残基」这类按 (序号, 插入码) 去重的统计又不受影响——两个数
@@ -44,9 +45,10 @@ sidecar 元数据。这些解析都用不上化学依赖——固定列文本而
 指纹缓存的下游动作，整条链会以一种看不出病因的方式重新跑一遍。顺带还让「远端取的」与
 「本地导的」写进同一个目录，用户在磁盘上找东西只需要看一个地方。
 
-**格式只收 PDB 坐标（`.pdb` / `.ent`），mmCIF 明确拒绝。** 这与「只下 `.pdb`」是
-同一条理由：下游读不了 mmCIF，收下一个读不了的受体比当场拒绝更糟。拒绝时必须给出可走
-的路（先转格式，或换一个小一些的等价条目），否则用户只会觉得「不支持」。
+**本地导入只收 PDB 坐标（`.pdb` / `.ent`），mmCIF 明确拒绝。** 远端那条路能转，
+是因为 RCSB 的 mmCIF 是我们自己下的、格式可信；用户手里的 `.cif` 可能是任何变体，
+静默转换失败比当场拒绝更糟。拒绝时必须给出可走的路（先转格式，或换一个小一些的
+等价条目），否则用户只会觉得「不支持」。
 """
 
 from __future__ import annotations
@@ -55,7 +57,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from ..ledger import SessionLedger, fingerprint_bytes, fingerprint_text
 from ..tools import Tool, ToolResult, ToolSpec
@@ -423,12 +425,49 @@ def _structure_path(pdb_id: str) -> Path:
     return structure_dir() / f"{pdb_id}.pdb"
 
 
-def _download(pdb_id: str, *, timeout: float) -> str:
-    """取坐标文件。**错误分两档，因为两种 404 的成因完全不同。**
+CIF_CONVERTED_MARKER = (
+    "REMARK 999 本文件由 RCSB mmCIF 转换而来（原始条目超出 PDB 格式上限）"
+)
+"""转换过的文件在开头留一行 REMARK。
+
+为什么不留一个 sidecar 文件：缓存只按 `<编号>.pdb` 一份文件存放，多了旁挂文件就有
+「文件与旁挂不同步」的新状态。写在正文里，重新读盘时也认得出它从哪来——
+`_source_format` 读的就是这一行。
+"""
+
+
+def _source_format(text: str) -> str:
+    """这份坐标原本是什么格式。转换过的会有那行 REMARK。"""
+    return "mmCIF" if text.startswith(CIF_CONVERTED_MARKER) else "PDB"
+
+
+def _cif_to_pdb(cif_text: str) -> str:
+    """mmCIF → PDB 文本。
+
+    **gemmi 只在函数体里导入**（纪律 8）：它装在可选的化学依赖里，顶层导入会让
+    「没装化学栈」直接拖垮整个程序。缺依赖时抛 `ImportError`，由调用方翻成一条
+    能照着做的错。
+    """
+    import gemmi
+
+    document = gemmi.cif.read_string(cif_text)
+    block = document.sole_block()
+    structure = gemmi.make_structure_from_block(block)
+    pdb_text = structure.make_pdb_string()
+    if "ATOM" not in pdb_text and "HETATM" not in pdb_text:
+        raise ValueError("转换出来的 PDB 里没有任何坐标记录")
+    return f"{CIF_CONVERTED_MARKER}\n{pdb_text}"
+
+
+def _download(pdb_id: str, *, timeout: float) -> tuple[str, str]:
+    """取坐标文件，返回 `(PDB 文本, 原始格式)`。
+
+    **错误分三档，因为三种 404 的成因完全不同。**
 
     `.pdb` 与 `.cif` 都没有 → 编号不存在，改参数才有用（不重试）。
-    只有 `.cif` → 结构超出 PDB 格式上限，这个编号取不回来（不重试，但要说清原因、
-    并给出可走的路）。
+    只有 `.cif` 且装了 gemmi → 现场转成 PDB，登记时记 `source_format=mmCIF`。
+    只有 `.cif` 且没装 gemmi → 结构超出 PDB 格式上限，这个编号取不回来
+    （不重试，但要说清原因、并给出可走的路）。
 
     网络那一层（超时、429、5xx）由 `http` 统一翻译成 `RetryableToolError`，
     404 由 `get_text_or_none` 变成 None，这里再按 `.cif` 是否存在分档；其余 4xx 原样抛出。
@@ -437,17 +476,30 @@ def _download(pdb_id: str, *, timeout: float) -> str:
     text = http.get_text_or_none(url, {}, timeout=timeout, headers={"Accept": "text/plain"})
 
     if text is None:
-        if http.probe(f"{BASE_URL}/{pdb_id}.cif", timeout=timeout) == 200:
+        cif_text = http.get_text_or_none(
+            f"{BASE_URL}/{pdb_id}.cif", {}, timeout=timeout, headers={"Accept": "text/plain"}
+        )
+        if cif_text is None:
+            raise http.ToolError(
+                f"RCSB 里没有编号为 {pdb_id} 的条目。请核对编号——"
+                "它必须来自 fetch_target 返回的可用结构清单"
+            )
+        try:
+            converted = _cif_to_pdb(cif_text)
+        except ImportError:
             raise http.ToolError(
                 f"{pdb_id} 超出了 PDB 格式的上限（约 62 条链 / 10 万原子），RCSB 对这类"
                 "条目只提供 mmCIF、不提供 .pdb，而受体准备读不了 mmCIF。可行的做法："
                 "换一个覆盖同一蛋白、规模小一些的结构（用 fetch_target 看有没有别的"
                 "条目），或者缩小范围（只取其中一个结构域）"
-            )
-        raise http.ToolError(
-            f"RCSB 里没有编号为 {pdb_id} 的条目。请核对编号——"
-            "它必须来自 fetch_target 返回的可用结构清单"
-        )
+            ) from None
+        except Exception as error:
+            # 转换失败不写盘、不登记：半截 PDB 会被下次调用当成有效缓存读进来。
+            raise http.ToolError(
+                f"{pdb_id} 只有 mmCIF，转换成 PDB 失败（{type(error).__name__}：{error}）。"
+                "换一个小一些的结构，或先用别的工具把它转成 PDB 再用 import_structure"
+            ) from None
+        return converted, "mmCIF"
 
     if "ATOM  " not in text and "HETATM" not in text:
         # 200 而内容是别的东西（代理拦截页、配额提示页）。存下去只会变成一份
@@ -456,7 +508,7 @@ def _download(pdb_id: str, *, timeout: float) -> str:
             f"RCSB 返回的内容不是坐标文件（HTTP 200、{len(text)} 字节，"
             f"开头是 {(text.strip()[:80] or '空')!r}）"
         )
-    return text
+    return text, "PDB"
 
 
 def _write_structure(path: Path, data: str | bytes) -> None:
@@ -738,9 +790,9 @@ class FetchStructureTool(Tool):
             "范围（缺口就是对接用不上的那几段）、共晶配体、水、交替构象。**同一个编号"
             "第二次调用直接读盘、不联网**（要重新下载用 refresh=true）。"
             "编号形如 1M17，必须来自 fetch_target 返回的可用结构清单——UniProt 编号"
-            "（P00533）与 AlphaFold 编号（AF-P00533-F1）都不是它。**超出 PDB 格式上限的"
-            "巨大结构（约 62 条链 / 10 万原子）取不回来**：RCSB 对那类条目只提供 mmCIF，"
-            "而受体准备读不了 mmCIF，所以这里会明确报错并建议换一个小一些的结构。"
+            "（P00533）与 AlphaFold 编号（AF-P00533-F1）都不是它。**超大条目（约 62 条链 / "
+            "10 万原子）RCSB 只提供 mmCIF**：本机装了 gemmi 时会自动转成 PDB 再登记"
+            "（`meta.source_format` 会写 mmCIF），没装时明确报错并建议换一个小一些的结构。"
             "返回的链清单是准备受体的必要输入（同源二聚体会给出几条几乎一样的链），"
             "用哪条链必须显式指定。"
         ),
@@ -778,9 +830,12 @@ class FetchStructureTool(Tool):
         path = _structure_path(code)
 
         text = None if refresh else _read_structure(path)
+        # 读盘时也要认得出「这份是从 mmCIF 转来的」：那行 REMARK 就在正文里，
+        # 不另存旁挂文件（见 CIF_CONVERTED_MARKER 的说明）。
+        source_format = _source_format(text) if text else ""
         if text is None:
             try:
-                text = _download(code, timeout=DOWNLOAD_TIMEOUT)
+                text, source_format = _download(code, timeout=DOWNLOAD_TIMEOUT)
             except http.RetryableToolError as error:
                 return ToolResult(output=str(error), failed=True)
             except http.ToolError as error:
@@ -815,7 +870,10 @@ class FetchStructureTool(Tool):
                 summary=_entry_summary(facts),
                 fingerprint=fingerprint,
                 meta=_entry_meta(
-                    facts, path, source_url=RCSB_ENTRY_URL.format(pdb_id=code)
+                    facts,
+                    path,
+                    source_url=RCSB_ENTRY_URL.format(pdb_id=code),
+                    extra={"source_format": source_format},
                 ),
             )
             registered = f"已登记 {entry.handle}"
@@ -1084,9 +1142,207 @@ class ImportStructureTool(Tool):
         )
 
 
+# ---------------------------------------------------------------------------
+# 结构质量评估
+# ---------------------------------------------------------------------------
+METALS = frozenset(
+    {"NA", "K", "MG", "CA", "MN", "FE", "ZN", "CU", "CO", "NI", "CD", "HG", "CS", "RB",
+     "SR", "BA", "YB", "GD", "SM", "EU", "AU", "AG", "PT", "MO", "W"}
+)
+"""金属离子。它们不是配体，但会占住口袋，也会让 `strip_hetero` 产生歧义。"""
+
+GOOD_RESOLUTION = 2.5
+POOR_RESOLUTION = 3.5
+MAX_MISSING_SHOWN = 5
+
+
+def _coordinate_path(entry: Any) -> Path | None:
+    """受体条目对应的坐标文件。
+
+    **在函数体里导入 `export`**：`export` 顶层就 import 了本模块，顶层反过来 import
+    会成环。这条路径（raw 是文件本身、prepared 是目录里的 `receptor.pdb`）与
+    `write_run` 用的是同一份实现，不在这里另写一份。
+    """
+    from . import export
+
+    return export._receptor_coordinate(entry)
+
+
+def _metals(text: str) -> list[tuple[str, int]]:
+    """金属离子 → 原子数。按元素列判，不看残基名（名字可以是 ZN、ZN2、NA…）。"""
+    from . import pdbtext
+
+    counts: dict[str, int] = {}
+    try:
+        document = pdbtext.parse(text)
+    except Exception:
+        return []
+    for atom in document.atoms:
+        if not atom.is_hetero:
+            continue
+        element = (atom.element or atom.resname).strip().upper()
+        if element in METALS:
+            counts[element] = counts.get(element, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
+def _render_assessment(
+    *,
+    label: str,
+    facts: Any,
+    metals: Sequence[tuple[str, int]],
+    path: Path,
+) -> str:
+    lines = [f"结构评估：{label}"]
+    method = facts.method or "未知"
+    resolution = f"{facts.resolution:.2f} Å" if facts.resolution else "无（NMR / 电镜的常见情况）"
+    lines.append(f"方法：{method}；分辨率：{resolution}；模型套数：{facts.models}（统计只算第一套）。")
+    lines.append(f"原子数：{facts.total_atoms}；水原子：{facts.water_atoms}。")
+
+    polymer = facts.polymer_chains
+    lines.append(f"聚合物链：{'、'.join(polymer) if polymer else '（没有）'}")
+    for chain in facts.chains:
+        missing = chain.missing
+        if missing is None:
+            gap = "缺失残基：无法判断（这份文件没有 SEQRES）"
+        elif missing == 0:
+            gap = "缺失残基：0（声明与观测一致）"
+        else:
+            gap = (
+                f"缺失残基：{missing}（声明 {chain.seqres_length}、观测 "
+                f"{chain.observed_residues}；缺口＝对接用不上的那几段）"
+            )
+        span = (
+            f"{chain.first_residue}–{chain.last_residue}"
+            if chain.first_residue is not None
+            else "无观测"
+        )
+        lines.append(f"  {chain.chain_id}：{span}，{gap}")
+
+    if facts.hetero_chains:
+        lines.append(
+            "只出现在杂原子里的链："
+            + "、".join(chain.chain_id for chain in facts.hetero_chains)
+            + "（糖链 / 离子 / 孤立配体，不是可对接的肽链）"
+        )
+    if metals:
+        lines.append("金属：" + "、".join(f"{name}×{count}" for name, count in metals))
+    # 金属离子也走 HETATM，但把它们列成「共晶配体候选」会误导：它们不是可对接的分子。
+    ligands = [item for item in facts.ligands if item[0].upper() not in METALS]
+    if ligands:
+        lines.append(
+            "非水杂原子（共晶配体候选）："
+            + "、".join(f"{name}×{count}" for name, count in ligands[:MAX_MISSING_SHOWN])
+        )
+    if facts.alt_locs:
+        lines.append(
+            f"交替构象标记：{'、'.join(facts.alt_locs)}（准备受体时要显式选一个）"
+        )
+
+    # 结论只给一句，依据写在上面：这句话会被模型直接转述给用户，含糊没有意义。
+    if facts.method and "NMR" in facts.method.upper():
+        verdict = "NMR 结构：多套模型只算了第一套，对接前先确认想用哪一套构象"
+    elif facts.resolution is None:
+        verdict = "没有分辨率数据：模型质量无法从文件判断，谨慎使用"
+    elif facts.resolution <= GOOD_RESOLUTION:
+        verdict = f"分辨率 {facts.resolution:.2f} Å，可用于对接"
+    elif facts.resolution <= POOR_RESOLUTION:
+        verdict = f"分辨率 {facts.resolution:.2f} Å 偏低，侧链位置不可全信"
+    else:
+        verdict = f"分辨率 {facts.resolution:.2f} Å 很差，只适合看大致折叠"
+    lines.append(f"结论：{verdict}。")
+    lines.append(f"坐标文件：{path}")
+    return "\n".join(lines)
+
+
+class AssessStructureTool(Tool):
+    """看一套结构能不能用、哪里不能用。"""
+
+    spec = ToolSpec(
+        name="assess_structure",
+        description=(
+            "评估一套**结构**的质量与适用性：实验方法、分辨率、模型套数、每条链的"
+            "声明/观测残基与缺口、只出现在杂原子里的链、金属离子、共晶配体、交替构象。"
+            "只读，不登记任何东西。\n"
+            "缺口是 SEQRES 与 ATOM 的差集：它直接决定「哪几段对接时不存在」。"
+            "没有 SEQRES 时写「无法判断」，**不报 0**——「没声明」和「一个都不缺」是两件事。"
+            "NMR 的多套模型只统计第一套。\n"
+            "用途：拿到结构先看一眼，或者在两个候选结构之间做选择。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "structure": {
+                    "type": "string",
+                    "description": "受体 handle（raw 或 prepared 都收）",
+                },
+            },
+            "required": ["structure"],
+            "additionalProperties": False,
+        },
+    )
+    primary_argument = "structure"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：assess_structure 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+        raw = str(arguments.get("structure") or "").strip()
+        if not raw:
+            return ToolResult(
+                output="缺少参数 structure。先 list_workspace 看清有哪份受体。", failed=True
+            )
+        try:
+            entry = ledger.get(raw)
+            from ..ledger import ReceptorHandle, expect_handle
+
+            expect_handle(entry, ReceptorHandle, "structure")
+        except Exception as error:
+            return ToolResult(output=str(error), failed=True)
+        path = _coordinate_path(entry)
+        if path is None:
+            return ToolResult(
+                output=(
+                    f"{entry.handle} 找不到坐标文件（准备产物不完整？）。"
+                    "先 describe_entry 看这条登记的是什么。"
+                ),
+                failed=True,
+            )
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            return ToolResult(output=f"读坐标失败：{error}", failed=True)
+
+        facts = parse_pdb(text, pdb_id=str((entry.meta or {}).get("pdb_id") or ""))
+        metals = _metals(text)
+        source_format = str((entry.meta or {}).get("source_format") or _source_format(text))
+        label = f"{entry.handle} · {facts.pdb_id or path.stem}"
+        output = _render_assessment(label=label, facts=facts, metals=metals, path=path)
+        if source_format == "mmCIF":
+            output += "\n来源格式：mmCIF（本机转换过；原始条目超出 PDB 格式上限）"
+        missing_total = sum(chain.missing or 0 for chain in facts.chains)
+        unknown = any(chain.missing is None for chain in facts.chains)
+        return ToolResult(
+            output=output,
+            meta={
+                "method": facts.method,
+                "resolution": facts.resolution,
+                "models": facts.models,
+                "chains": list(facts.polymer_chains),
+                "missing_residues": None if unknown else missing_total,
+                "metals": [name for name, _count in metals],
+                "source_format": source_format,
+            },
+        )
+
+
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具，按装配顺序。"""
-    return [FetchStructureTool(), ImportStructureTool()]
+    return [FetchStructureTool(), ImportStructureTool(), AssessStructureTool()]
 
 if __name__ == "__main__":
     from debug_tools import main

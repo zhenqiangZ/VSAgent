@@ -9,7 +9,7 @@
 应当是看清手上有哪些条目，而不是先动手。同一份清单也决定了工具在请求体里的
 先后，靠前的更容易被选中。
 
-**2026-10 起这份清单还兼一个用途：按族加载。** 24 个领域工具的定义合计约 9.5K token，
+**2026-10 起这份清单还兼一个用途：按族加载。** 27 个领域工具的定义合计约 10K token，
 每一步都要发；实际一轮任务通常只用到一两族。所以只把「核心工具」（文件、登记表、
 任务、事件、记忆、load_tools）常驻，其余按族由 `load_tools` 现装现用。
 
@@ -29,7 +29,9 @@ from types import ModuleType
 
 from ..tools import Tool
 from . import (
+    admet,
     affinity,
+    analysis,
     chembl,
     corpus,
     docking,
@@ -37,8 +39,12 @@ from . import (
     ligand,
     listing,
     literature,
+    pharmacophore,
+    pockets,
     receptor,
     rsearch,
+    sar,
+    screen,
     structure,
     uniprot,
     websearch,
@@ -53,14 +59,31 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     # 原先单独立一个 `rsearch` 族，族里只有它一个，说明写的却是「反向检索」——
     # 名不副实，模型于是先装 rsearch，装完才发现里面只有 search_pdb。
     ("structure", (rsearch, structure)),
+    # 口袋跟着结构走：先看有哪些口袋、选一处，再准备受体（盒子来自口袋）。
+    # 单独成族而不是塞进 structure，是因为它自己会联网（复合物检索 / 预测），
+    # 与「查条目 → 取坐标」的代价不在一个量级。
+    ("pocket", (pockets,)),
     ("chembl", (chembl,)),
     ("literature", (literature,)),
     ("corpus", (corpus,)),
     ("websearch", (websearch,)),
     ("receptor", (receptor,)),
     ("ligand", (ligand,)),
+    # 相似度 / 形状是**不看靶点**的通道：只比分子之间像不像，不需要受体。
+    # 放在 docking 之前，是因为它便宜（毫秒级/分子）、可以先缩小待对接的库。
+    ("screen", (screen,)),
     ("docking", (docking,)),
     ("affinity", (affinity,)),
+    # 分析排在打分之后：它吃的是 docking / affinity 的产物，不是原始结构。
+    # 单独成族是因为「跑完一次」与「看完所有结果」是两件事——前者要引擎，
+    # 后者只读产物，装在一起会让只想排序的会话连 vina 的说明一起背上。
+    ("analysis", (analysis,)),
+    # 类药性与构效关系排在最后：它们吃的是已经排好序的候选表，而不是原始结构。
+    # 两者分开成族，是因为「这批分子能不能成药」与「下一轮该改哪个基团」是
+    # 两个不同的问题，一轮里通常只问其中一个。
+    ("admet", (admet,)),
+    ("sar", (sar,)),
+    ("pharmacophore", (pharmacophore,)),
     ("export", (export,)),
 )
 

@@ -63,6 +63,10 @@ MAX_SKIPPED_INLINE = 5
 
 DEFAULT_PREPARE_LIMIT = 200
 MAX_PREPARE_LIMIT = 2_000
+# offset 是「去重后的第几条」，上限跟导入上限同量级（库最多 5 万条）。
+# 不跟 limit 同量级：`limit ⊆ 2000` 说的是「一批多大」，offset 说的是「库有多深」，
+# 两者绑在一起会让 1000 条之后的分子永远取不到——那正是这次要修的问题。
+MAX_OFFSET = MAX_IMPORT_LIMIT
 DEFAULT_SEED = 42
 MAX_SEED = 2_147_483_647
 
@@ -646,9 +650,13 @@ def _source_cleaned(entry: Any) -> tuple[list[PrepItem], str]:
 
 
 def _unique_items(
-    items: Sequence[PrepItem], *, limit: int
+    items: Sequence[PrepItem], *, limit: int, offset: int = 0
 ) -> tuple[list[PrepItem], dict[str, int]]:
-    """按 canonical SMILES 去重，再按 `limit` 截断（去重后名额才算数）。"""
+    """按 canonical SMILES 去重，再取 `[offset, offset+limit)`（去重后名额才算数）。
+
+    `remaining` 是**这一批之后还剩多少**，不是「总数减 limit」：分批跑的时候，
+    前一批的 offset 也算在已处理里，否则每批都会说「还剩 N」而 N 一直不变。
+    """
     seen: set[str] = set()
     unique: list[PrepItem] = []
     duplicate = 0
@@ -659,8 +667,8 @@ def _unique_items(
             continue
         seen.add(key)
         unique.append(item)
-    kept = unique[:limit]
-    remaining = len(unique) - len(kept)
+    kept = unique[offset : offset + limit]
+    remaining = max(len(unique) - offset - len(kept), 0)
     return kept, {
         "input": len(items),
         "unique": len(unique),
@@ -816,8 +824,9 @@ def _preview_text(
     )
     if counts["remaining"]:
         lines.append(
-            f"另有 {counts['remaining']} 个有效分子没有处理；调大 limit 再跑一次会生成"
-            "另一组参数的新目录，不覆盖本次结果。"
+            f"另有 {counts['remaining']} 个有效分子没有处理；接着处理用 "
+            f"offset={counts.get('next_offset', 0)}，或调大 limit。"
+            "换 offset / limit 都会生成另一组参数的新目录，不覆盖本次结果。"
         )
     return "\n".join(lines)
 
@@ -948,8 +957,9 @@ def _render_prepared(
     )
     if counts["remaining"]:
         lines.append(
-            f"另有 {counts['remaining']} 个有效分子没有处理；调大 limit 再跑一次会生成"
-            "另一组参数的新目录，不覆盖本次结果。"
+            f"另有 {counts['remaining']} 个有效分子没有处理；接着处理用 "
+            f"offset={counts.get('next_offset', 0)}，或调大 limit。"
+            "换 offset / limit 都会生成另一组参数的新目录，不覆盖本次结果。"
         )
     digest = _failure_digest(records)
     if digest:
@@ -1181,6 +1191,8 @@ class PrepareLigandsTool(Tool):
             "同一组参数按内容指纹复用，不覆盖旧产物。单条失败（3D 或 Meeko）不中断整批，"
             "但整批一个都没成功时不登记。源可以是 import_ligandset 的产物，也可以是 "
             "search_actives / find_analogs 直接落下的 CSV。"
+            "\n**大库用 offset 分批**：`limit` 是这一批取多少，`offset` 是从第几条开始。"
+            "两批之间不会重叠，也不会漏——`offset` 进缓存键，所以两批是两个产物目录。"
         ),
         parameters={
             "type": "object",
@@ -1191,7 +1203,11 @@ class PrepareLigandsTool(Tool):
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "最多准备多少个（去重后按源顺序取），默认 200，上限 2000",
+                    "description": "这一批最多准备多少个（去重后按源顺序取），默认 200，上限 2000",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几条开始取（去重后的序号），默认 0；大库分批用",
                 },
                 "seed": {
                     "type": "integer",
@@ -1250,6 +1266,17 @@ class PrepareLigandsTool(Tool):
                 failed=True,
             )
 
+        offset = arguments.get("offset")
+        if offset is None:
+            offset = 0
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            return ToolResult(output="参数 offset 应当是整数", failed=True)
+        if not 0 <= offset <= MAX_OFFSET:
+            return ToolResult(
+                output=f"offset 要在 0 到 {MAX_OFFSET} 之间（现在是 {offset}）",
+                failed=True,
+            )
+
         seed = arguments.get("seed")
         if seed is None:
             seed = DEFAULT_SEED
@@ -1278,10 +1305,21 @@ class PrepareLigandsTool(Tool):
                 failed=True,
             )
 
-        kept, counts = _unique_items(items, limit=limit)
+        kept, counts = _unique_items(items, limit=limit, offset=offset)
         counts["selected"] = len(kept)
+        counts["offset"] = offset
+        counts["next_offset"] = offset + len(kept)
         if not kept:
-            return ToolResult(output="去重之后没有可准备的分子。", failed=True)
+            beyond = offset >= counts["unique"]
+            return ToolResult(
+                output=(
+                    f"offset={offset} 已经越过末尾：去重后有 {counts['unique']} 个分子，"
+                    f"从第 {offset + 1} 条开始一条也没有。"
+                    if beyond
+                    else "去重之后没有可准备的分子。"
+                ),
+                failed=True,
+            )
 
         if not confirm:
             descriptions: list[dict[str, Any]] = []
@@ -1310,6 +1348,7 @@ class PrepareLigandsTool(Tool):
             "source_fingerprint": str(entry.fingerprint or ""),
             "source_path": str(source_path or ""),
             "limit": limit,
+            "offset": offset,
             "seed": seed,
             "strip_salts": True,
             "dedupe": True,
@@ -1497,9 +1536,1126 @@ class PrepareLigandsTool(Tool):
         )
 
 
+# ---------------------------------------------------------------------------
+# 待筛库的第一道闸：PAINS / Brenk / 去重 / 性质窗口
+# ---------------------------------------------------------------------------
+CURATED_DIR = "curated"
+CURATED_COLUMNS: tuple[str, ...] = CSV_COLUMNS + ("flags",)
+
+DEFAULT_MAX_MW = 500.0
+MAX_MW_LIMIT = 2000.0
+DEDUPE_MODES = ("none", "canonical", "inchikey", "scaffold")
+MODE_MODES = ("drop", "flag")
+MAX_DROP_EXAMPLES = 5
+INCHIKEY_SKELETON = 14
+
+
+def curated_ligandset_dir() -> Path:
+    """筛过的配体集的根。测试替换它，避免写用户家目录。"""
+    return ligands_dir() / CURATED_DIR
+
+
+def _optional_number(
+    arguments: dict[str, Any], name: str, low: float, high: float
+) -> float | None:
+    """可选窗口参数：不给就是 `None`（这一条不设限），不是 0。"""
+    value = arguments.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LigandError(f"参数 {name} 应当是数")
+    number = float(value)
+    if not low <= number <= high:
+        raise LigandError(f"参数 {name} 要在 {low:g} 到 {high:g} 之间（现在是 {number:g}）")
+    return number
+
+
+def _optional_int(arguments: dict[str, Any], name: str, low: int, high: int) -> int | None:
+    value = arguments.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise LigandError(f"参数 {name} 应当是整数")
+    if not low <= value <= high:
+        raise LigandError(f"参数 {name} 要在 {low} 到 {high} 之间（现在是 {value}）")
+    return value
+
+
+def _filter_catalog(kinds: Sequence[str]):
+    """把若干 `FilterCatalogParams.FilterCatalogs` 拼成一个目录。"""
+    try:  # rdkit ≥ 2023.09 把 FilterCatalog 挪进了 rdfiltercatalog
+        from rdkit.Chem import rdfiltercatalog as catalog_module
+        from rdkit.Chem.rdfiltercatalog import FilterCatalogParams
+    except ImportError:  # 老版本仍在 rdkit.Chem 下
+        from rdkit.Chem import FilterCatalog as catalog_module
+        from rdkit.Chem.FilterCatalog import FilterCatalogParams
+
+    params = FilterCatalogParams()
+    for kind in kinds:
+        params.AddCatalog(getattr(FilterCatalogParams.FilterCatalogs, kind))
+    return catalog_module.FilterCatalog(params)
+
+
+def _properties(mol: Any) -> dict[str, float]:
+    from rdkit.Chem import Descriptors, Lipinski
+
+    return {
+        "mw": float(Descriptors.MolWt(mol)),
+        "logp": float(Descriptors.MolLogP(mol)),
+        "tpsa": float(Descriptors.TPSA(mol)),
+        "hbd": float(Lipinski.NumHDonors(mol)),
+        "hba": float(Lipinski.NumHAcceptors(mol)),
+        "rotb": float(Lipinski.NumRotatableBonds(mol)),
+    }
+
+
+def _dedupe_key(mol: Any, smiles: str, mode: str) -> str:
+    """去重键。`scaffold` 用 InChIKey 的前 14 位（骨架段），不是 Murcko 骨架。"""
+    from rdkit import Chem
+
+    if mode == "canonical":
+        return Chem.MolToSmiles(mol)
+    inchikey = Chem.MolToInchiKey(mol)
+    if mode == "scaffold":
+        return inchikey[:INCHIKEY_SKELETON] or smiles
+    return inchikey or smiles
+
+
+def _window_hits(properties: dict[str, float], windows: dict[str, tuple[float | None, float | None]]) -> list[str]:
+    """闭区间判据：正好等于上限的保留，超过才算命中。"""
+    hits: list[str] = []
+    for name, (low, high) in windows.items():
+        value = properties.get(name)
+        if value is None:
+            continue
+        if low is not None and value < low:
+            hits.append(f"{name}<{low:g}")
+        elif high is not None and value > high:
+            hits.append(f"{name}>{high:g}")
+    return hits
+
+
+def _curated_csv_text(records: Sequence[dict[str, Any]]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer, fieldnames=CURATED_COLUMNS, lineterminator="\n", extrasaction="ignore"
+    )
+    writer.writeheader()
+    for record in records:
+        row = {key: record.get(key, "") for key in CURATED_COLUMNS}
+        row["flags"] = ";".join(record.get("flags") or [])
+        writer.writerow(row)
+    return buffer.getvalue()
+
+
+def _render_curated(
+    *,
+    handle: str,
+    reused: bool,
+    kept: int,
+    dropped: dict[str, int],
+    examples: Sequence[dict[str, Any]],
+    total: int,
+    mode: str,
+    target: Path,
+) -> str:
+    removed = sum(dropped.values())
+    lines = [
+        f"已筛过一遍，登记为 {handle}。" if not reused else f"登记表里已有同一份：{handle}（未重筛）。",
+        f"输入 {total} 条，保留 {kept} 条，淘汰 {removed} 条（mode={mode}）。",
+    ]
+    if dropped:
+        detail = "、".join(f"{name} {count} 条" for name, count in dropped.items() if count)
+        lines.append(f"按规则：{detail}。")
+    else:
+        lines.append("按规则：没有一条命中——这套库在这一组判据下是干净的。")
+    if examples:
+        lines.append("淘汰示例：")
+        for item in examples[:MAX_DROP_EXAMPLES]:
+            lines.append(
+                f"  · {item['id']}（{item['smiles'][:40]}）：{'、'.join(item['flags'])}"
+            )
+        rest = removed - min(len(examples), MAX_DROP_EXAMPLES)
+        if rest > 0:
+            lines.append(f"  ……另有 {rest} 条未显示")
+    lines.append(f"产物目录：{target}")
+    lines.append(f"下一步：prepare_ligands(ligands={handle}, confirm=true)。")
+    return "\n".join(lines)
+
+
+class CurateLigandsTool(Tool):
+    """把待筛库过一遍 PAINS / Brenk / 去重 / 性质窗口。"""
+
+    spec = ToolSpec(
+        name="curate_ligands",
+        description=(
+            "把**待筛库**过第一道闸：PAINS / Brenk 结构警报、去重、理化窗口，"
+            "产出一份筛过的配体集（可直接交给 prepare_ligands）。"
+            + CHEM_TOOL_DESCRIPTION_NOTE
+            + "\n"
+            "窗口都是**闭区间**（等于上限的保留），不给就不设限。`mode=drop`（默认）"
+            "真删，`mode=flag` 只标注、把命中的规则写进 `flags` 列——想先看看会删掉什么"
+            "就用它。\n"
+            "判据由代码算（RDKit FilterCatalog + 描述符），schema 里没有让模型自己判的开关。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ligands": {
+                    "type": "string",
+                    "description": "原始配体集的 handle（已经 prepare 过的不能筛）",
+                },
+                "min_mw": {"type": "number", "description": "分子量下限"},
+                "max_mw": {
+                    "type": "number",
+                    "description": f"分子量上限，常用 {DEFAULT_MAX_MW:g}",
+                },
+                "max_logp": {"type": "number", "description": "logP 上限"},
+                "max_tpsa": {"type": "number", "description": "TPSA 上限（Å²）"},
+                "max_hbd": {"type": "integer", "description": "氢键供体数上限"},
+                "max_hba": {"type": "integer", "description": "氢键受体数上限"},
+                "max_rotb": {"type": "integer", "description": "可旋转键数上限"},
+                "pains": {
+                    "type": "boolean",
+                    "description": "是否查 PAINS_A/B/C，默认 true",
+                },
+                "brenk": {
+                    "type": "boolean",
+                    "description": "是否查 Brenk 不稳定/反应性片段，默认 true",
+                },
+                "dedupe": {
+                    "type": "string",
+                    "description": "去重键：none / canonical / inchikey（默认）/ scaffold（InChIKey 前 14 位）",
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "drop（默认，真删）/ flag（只标注，保留全集）",
+                },
+                "name": {"type": "string", "description": "显示名，只影响产物目录名"},
+            },
+            "required": ["ligands"],
+            "additionalProperties": False,
+        },
+    )
+    primary_argument = "ligands"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：curate_ligands 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+
+        raw = str(arguments.get("ligands") or "").strip()
+        if not raw:
+            return ToolResult(
+                output="缺少参数 ligands。先 import_ligandset 或 list_workspace 看清有哪份配体集。",
+                failed=True,
+            )
+        try:
+            entry = ledger.get(raw)
+            expect_handle(entry, LigandSetHandle, "ligands")
+        except Exception as error:
+            return ToolResult(output=str(error), failed=True)
+
+        dedupe = str(arguments.get("dedupe") or "inchikey").strip().lower()
+        if dedupe not in DEDUPE_MODES:
+            return ToolResult(
+                output=f"参数 dedupe 只能是 {', '.join(DEDUPE_MODES)}（现在是 {dedupe}）",
+                failed=True,
+            )
+        mode = str(arguments.get("mode") or "drop").strip().lower()
+        if mode not in MODE_MODES:
+            return ToolResult(
+                output=f"参数 mode 只能是 {', '.join(MODE_MODES)}（现在是 {mode}）", failed=True
+            )
+        want_pains = arguments.get("pains")
+        want_brenk = arguments.get("brenk")
+        for name, value in (("pains", want_pains), ("brenk", want_brenk)):
+            if value is not None and not isinstance(value, bool):
+                return ToolResult(output=f"参数 {name} 应当是 true / false", failed=True)
+
+        try:
+            windows = {
+                "mw": (
+                    _optional_number(arguments, "min_mw", 0.0, MAX_MW_LIMIT),
+                    _optional_number(arguments, "max_mw", 0.0, MAX_MW_LIMIT),
+                ),
+                "logp": (None, _optional_number(arguments, "max_logp", -20.0, 40.0)),
+                "tpsa": (None, _optional_number(arguments, "max_tpsa", 0.0, 1000.0)),
+                "hbd": (None, _optional_int(arguments, "max_hbd", 0, 50)),
+                "hba": (None, _optional_int(arguments, "max_hba", 0, 50)),
+                "rotb": (None, _optional_int(arguments, "max_rotb", 0, 100)),
+            }
+        except LigandError as error:
+            return ToolResult(output=str(error), failed=True)
+        if windows["mw"][0] is not None and windows["mw"][1] is not None:
+            if windows["mw"][0] > windows["mw"][1]:
+                return ToolResult(
+                    output=(
+                        f"min_mw（{windows['mw'][0]:g}）大于 max_mw（{windows['mw'][1]:g}），"
+                        "这个窗口是空的"
+                    ),
+                    failed=True,
+                )
+
+        try:
+            require_chem()
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+
+        try:
+            items, source_kind = _source_cleaned(entry)
+        except LigandError as error:
+            return ToolResult(output=str(error), failed=True)
+        if not items:
+            return ToolResult(output=f"{entry.handle} 里没有可筛的分子。", failed=True)
+
+        from rdkit import Chem, rdBase
+
+        catalogs = []
+        if want_pains is not False:
+            catalogs.append(("PAINS", _filter_catalog(["PAINS_A", "PAINS_B", "PAINS_C"])))
+        if want_brenk is not False:
+            catalogs.append(("Brenk", _filter_catalog(["BRENK"])))
+
+        params = {
+            "source": str(entry.handle),
+            "windows": {
+                name: [low, high] for name, (low, high) in windows.items()
+                if low is not None or high is not None
+            },
+            "pains": want_pains is not False,
+            "brenk": want_brenk is not False,
+            "dedupe": dedupe,
+            "mode": mode,
+        }
+        stem = str(arguments.get("name") or entry.meta.get("name") or "curated")
+        try:
+            target, reused = products.content_dir(
+                curated_ligandset_dir(), stem, params, (MANIFEST_FILE, CSV_FILE, products.PARAMS_FILE)
+            )
+        except OSError as error:
+            return ToolResult(output=f"建产物目录失败：{error}", failed=True)
+
+        if reused:
+            existing = ledger.find(
+                kind="ligandset", fingerprint=fingerprint_path(target), include_archived=True
+            )
+            for candidate in existing:
+                if str((candidate.meta or {}).get("stage") or "") == "curated":
+                    counts = dict((candidate.meta or {}).get("counts") or {})
+                    return ToolResult(
+                        output=_render_curated(
+                            handle=str(candidate.handle),
+                            reused=True,
+                            kept=int(counts.get("kept", 0)),
+                            dropped=dict(counts.get("dropped_by_rule") or {}),
+                            examples=[],
+                            total=int(counts.get("input", 0)),
+                            mode=mode,
+                            target=target,
+                        ),
+                        meta={"handle": str(candidate.handle), "reused": True,
+                              "kept": counts.get("kept", 0)},
+                    )
+
+        records: list[dict[str, Any]] = []
+        dropped: dict[str, int] = {}
+        examples: list[dict[str, Any]] = []
+        seen: dict[str, str] = {}
+
+        with rdBase.BlockLogs():
+            for item in items:
+                mol = Chem.MolFromSmiles(item.cleaned.smiles)
+                if mol is None:
+                    dropped["无法解析"] = dropped.get("无法解析", 0) + 1
+                    examples.append({"id": item.id, "smiles": item.cleaned.smiles,
+                                     "flags": ["无法解析"]})
+                    continue
+                flags: list[str] = []
+                for label, catalog in catalogs:
+                    matches = catalog.GetMatches(mol)
+                    for match in matches:
+                        flags.append(f"{label}:{match.GetDescription()}")
+                properties = _properties(mol)
+                flags.extend(_window_hits(properties, windows))
+                if dedupe != "none":
+                    key = _dedupe_key(mol, item.cleaned.smiles, dedupe)
+                    first = seen.get(key)
+                    if first is not None:
+                        flags.append(f"重复:{first}")
+                    else:
+                        seen[key] = item.id
+                if flags:
+                    rule = flags[0].split(":", 1)[0].split(">", 1)[0].split("<", 1)[0]
+                    dropped[rule] = dropped.get(rule, 0) + 1
+                    examples.append({"id": item.id, "smiles": item.cleaned.smiles, "flags": flags})
+                    if mode == "drop":
+                        continue
+                records.append(
+                    {
+                        "id": item.id,
+                        "name": item.name,
+                        "smiles": item.cleaned.smiles,
+                        "input_smiles": item.cleaned.input_smiles,
+                        "heavy_atoms": item.cleaned.heavy_atoms,
+                        "source_index": item.source_index,
+                        "flags": flags,
+                    }
+                )
+
+        if not records:
+            detail = "、".join(f"{name} {count} 条" for name, count in dropped.items() if count)
+            return ToolResult(
+                output=(
+                    f"全部 {len(items)} 条都被淘汰了（{detail}）。"
+                    "换一组判据，或者先用 mode=flag 看一眼会删掉什么。"
+                ),
+                failed=True,
+            )
+
+        manifest = {
+            "kind": "ligandset",
+            "stage": "curated",
+            "tool": "curate_ligands",
+            "source": {"handle": str(entry.handle), "format": source_kind},
+            "params": params,
+            "counts": {
+                "input": len(items),
+                "kept": len(records),
+                "dropped": sum(dropped.values()),
+            },
+            "dropped": dropped,
+            "columns": list(CURATED_COLUMNS),
+        }
+        try:
+            products.write_text_atomic(target / CSV_FILE, _curated_csv_text(records))
+            products.write_json_atomic(target / MANIFEST_FILE, manifest)
+            # 最后写：缺它说明上一次写在中间崩了，不能当完整产物复用。
+            products.write_json_atomic(target / products.PARAMS_FILE, params)
+        except OSError as error:
+            return ToolResult(output=f"写筛选产物失败：{error}", failed=True)
+
+        fingerprint = fingerprint_path(target)
+        handle = ""
+        existing = ledger.find(kind="ligandset", fingerprint=fingerprint, include_archived=True)
+        for candidate in existing:
+            if str((candidate.meta or {}).get("stage") or "") == "curated":
+                handle = str(candidate.handle)
+                break
+        if not handle:
+            registered = ledger.add(
+                "ligandset",
+                path=target,
+                summary=f"筛过的配体集 · {len(records)} 个（{stem}）",
+                fingerprint=fingerprint,
+                parents=[entry.handle],
+                meta={
+                    "kind": "ligandset",
+                    "stage": "curated",
+                    "tool": "curate_ligands",
+                    "source": {"handle": str(entry.handle), "format": source_kind},
+                    "params": params,
+                    "counts": {
+                        "input": len(items),
+                        "kept": len(records),
+                        "dropped": sum(dropped.values()),
+                        "dropped_by_rule": dropped,
+                    },
+                    "file": CSV_FILE,
+                    "manifest": MANIFEST_FILE,
+                },
+                # 配体库跨靶点：换受体时不该被搁置。
+                link_current_receptor=False,
+            )
+            handle = str(registered.handle)
+
+        return ToolResult(
+            output=_render_curated(
+                handle=handle,
+                reused=False,
+                kept=len(records),
+                dropped=dropped,
+                examples=examples,
+                total=len(items),
+                mode=mode,
+                target=target,
+            ),
+            meta={
+                "handle": handle,
+                "kept": len(records),
+                "dropped": sum(dropped.values()),
+                "reused": False,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# 参考活性集：从已知活性里挑出「像药」的那一批
+# ---------------------------------------------------------------------------
+REFERENCE_DIR = "reference"
+MIN_REFERENCE_SIZE = 10
+MAX_REFERENCE_KEEP = 5000
+
+
+def reference_ligandset_dir() -> Path:
+    """参考集的根。测试替换它，避免写用户家目录。"""
+    return ligands_dir() / REFERENCE_DIR
+
+
+def _activities_of(entry: Any) -> list[RawLigand]:
+    """读活性来源：`search_actives` 落的 CSV（`path` 是文件）或配体集目录。
+
+    **不经过 `load_ligand_file`**：那个函数按 canonical SMILES 去重时是「先到先得」，
+    而参考集要的是**同一分子取最强的那条**。先去重再想取最大值已经晚了。
+    """
+    path = Path(str(entry.path))
+    if path.is_dir():
+        path = path / CSV_FILE
+    if not path.is_file():
+        raise LigandError(f"活性来源的产物不在：{path}")
+    try:
+        text = _decode_text(path.read_bytes())
+    except OSError as error:
+        raise LigandError(f"读活性来源失败（{type(error).__name__}：{error}）") from error
+    return _read_csv(text, smiles_column="")
+
+
+def _render_reference(
+    *,
+    handle: str,
+    reused: bool,
+    kept: int,
+    pchembl_min: float | None,
+    pchembl_max: float | None,
+    dropped: dict[str, int],
+    flagged: int,
+    too_small: bool,
+    target: Path,
+) -> str:
+    lines = [
+        f"参考活性集已生成，登记为 {handle}。" if not reused
+        else f"登记表里已有同一份：{handle}（未重做）。",
+        f"保留 {kept} 条"
+        + (
+            f"，最强 pChEMBL {pchembl_max:.2f}、最弱 {pchembl_min:.2f}"
+            if pchembl_min is not None and pchembl_max is not None
+            else ""
+        )
+        + "。",
+    ]
+    if dropped:
+        detail = "、".join(f"{name} {count} 条" for name, count in dropped.items() if count)
+        if detail:
+            lines.append(f"没进来：{detail}。")
+    if flagged:
+        lines.append(
+            f"其中 {flagged} 条命中 PAINS，**只标不删**：已知活性是真的活性，"
+            "删掉会把参考分布打歪（要不要排除由下游决定）。"
+        )
+    if too_small:
+        lines.append(
+            f"只有 {kept} 条（少于 {MIN_REFERENCE_SIZE}），"
+            "当参考分布用会不稳——放宽 min_pchembl 或换一个靶点。"
+        )
+    lines.append(f"产物目录：{target}")
+    lines.append(f"下一步：screen_similarity(query={handle}, library=...) 拿它当查询集。")
+    return "\n".join(lines)
+
+
+class BuildReferenceSetTool(Tool):
+    """从已知活性里挑出一批当参考集（可按活性下限截断）。"""
+
+    spec = ToolSpec(
+        name="build_reference_set",
+        description=(
+            "把 `search_actives` 的产物变成**参考活性集**：按 pChEMBL 下限过滤、"
+            "同一分子取最强的那条、按活性排序后截断。"
+            + CHEM_TOOL_DESCRIPTION_NOTE
+            + "\n"
+            "产物是一个配体集（`stage=reference`、`label=active`），可直接当 "
+            "`screen_similarity` 的查询集。PAINS 命中的**只标不删**——已知活性是真的活性，"
+            "删掉会把参考分布打歪。"
+            "\n少于 10 条时会标 `too_small`：那样的参考分布不稳，先看一眼再拿去分档。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "actives": {
+                    "type": "string",
+                    "description": "search_actives 的产物 handle（也接受 import_ligandset 的目录）",
+                },
+                "min_pchembl": {
+                    "type": "number",
+                    "description": "活性下限，默认 6（≈1 μM）；越大越严",
+                },
+                "max": {
+                    "type": "integer",
+                    "description": f"最多保留多少条，默认 500，上限 {MAX_REFERENCE_KEEP}",
+                },
+                "pains": {
+                    "type": "boolean",
+                    "description": "是否标注 PAINS，默认 true（只标不删）",
+                },
+                "name": {"type": "string", "description": "显示名，只影响产物目录名"},
+            },
+            "required": ["actives"],
+            "additionalProperties": False,
+        },
+    )
+    primary_argument = "actives"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：build_reference_set 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+
+        raw = str(arguments.get("actives") or "").strip()
+        if not raw:
+            return ToolResult(
+                output="缺少参数 actives。先 search_actives 拿到已知活性。", failed=True
+            )
+        try:
+            entry = ledger.get(raw)
+            expect_handle(entry, LigandSetHandle, "actives")
+        except Exception as error:
+            return ToolResult(output=str(error), failed=True)
+
+        try:
+            floor = _optional_number(arguments, "min_pchembl", -20.0, 20.0)
+            keep_max = _optional_int(arguments, "max", 1, MAX_REFERENCE_KEEP)
+        except LigandError as error:
+            return ToolResult(output=str(error), failed=True)
+        floor = 6.0 if floor is None else floor
+        keep_max = 500 if keep_max is None else keep_max
+        want_pains = arguments.get("pains")
+        if want_pains is not None and not isinstance(want_pains, bool):
+            return ToolResult(output="参数 pains 应当是 true / false", failed=True)
+
+        try:
+            require_chem()
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+        try:
+            rows = _activities_of(entry)
+        except LigandError as error:
+            return ToolResult(output=str(error), failed=True)
+        if not rows:
+            return ToolResult(output=f"{entry.handle} 里一条记录都没有。", failed=True)
+
+        dropped = {"低于活性下限": 0, "没有活性值": 0, "结构解析失败": 0}
+        best: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if row.pchembl_value is None:
+                dropped["没有活性值"] += 1
+                continue
+            if row.pchembl_value < floor:
+                dropped["低于活性下限"] += 1
+                continue
+            try:
+                cleaned = canonicalize_smiles(row.smiles)
+            except LigandError:
+                dropped["结构解析失败"] += 1
+                continue
+            current = best.get(cleaned.smiles)
+            if current is None or row.pchembl_value > current["pchembl_value"]:
+                best[cleaned.smiles] = {
+                    "id": row.id,
+                    "name": row.name,
+                    "smiles": cleaned.smiles,
+                    "input_smiles": cleaned.input_smiles,
+                    "heavy_atoms": cleaned.heavy_atoms,
+                    "source_index": row.index,
+                    "pchembl_value": float(row.pchembl_value),
+                }
+        if not best:
+            detail = "、".join(f"{name} {count} 条" for name, count in dropped.items() if count)
+            return ToolResult(
+                output=(
+                    f"按 min_pchembl={floor:g} 筛完一条都不剩（{detail}）。"
+                    "放宽下限再试；不要因为空的参考集就说这个靶点没有活性分子。"
+                ),
+                failed=True,
+            )
+
+        kept = sorted(best.values(), key=lambda item: (-item["pchembl_value"], item["id"]))
+        kept = kept[:keep_max]
+        flagged = 0
+        if want_pains is not False:
+            from rdkit import Chem, rdBase
+
+            catalog = _filter_catalog(["PAINS_A", "PAINS_B", "PAINS_C"])
+            with rdBase.BlockLogs():
+                for item in kept:
+                    mol = Chem.MolFromSmiles(item["smiles"])
+                    hits = [
+                        match.GetDescription() for match in catalog.GetMatches(mol)
+                    ] if mol is not None else []
+                    item["flags"] = [f"PAINS:{name}" for name in hits]
+                    if hits:
+                        flagged += 1
+        else:
+            for item in kept:
+                item["flags"] = []
+
+        too_small = len(kept) < MIN_REFERENCE_SIZE
+        params = {
+            "actives": str(entry.handle),
+            "min_pchembl": floor,
+            "max": keep_max,
+            "pains": want_pains is not False,
+        }
+        stem = str(arguments.get("name") or entry.meta.get("accession") or "reference")
+        try:
+            target, reused = products.content_dir(
+                reference_ligandset_dir(),
+                stem,
+                params,
+                (MANIFEST_FILE, CSV_FILE, products.PARAMS_FILE),
+            )
+        except OSError as error:
+            return ToolResult(output=f"建产物目录失败：{error}", failed=True)
+
+        if reused:
+            existing = ledger.find(
+                kind="ligandset", fingerprint=fingerprint_path(target), include_archived=True
+            )
+            for candidate in existing:
+                if str((candidate.meta or {}).get("stage") or "") == "reference":
+                    counts = dict((candidate.meta or {}).get("counts") or {})
+                    return ToolResult(
+                        output=_render_reference(
+                            handle=str(candidate.handle),
+                            reused=True,
+                            kept=int(counts.get("kept") or 0),
+                            pchembl_min=counts.get("pchembl_min"),
+                            pchembl_max=counts.get("pchembl_max"),
+                            dropped={},
+                            flagged=int(counts.get("pains") or 0),
+                            too_small=bool((candidate.meta or {}).get("too_small")),
+                            target=target,
+                        ),
+                        meta={"handle": str(candidate.handle), "kept": counts.get("kept", 0),
+                              "reused": True},
+                    )
+
+        manifest = {
+            "kind": "ligandset",
+            "stage": "reference",
+            "label": "active",
+            "tool": "build_reference_set",
+            "source": {"handle": str(entry.handle)},
+            "params": params,
+            "counts": {
+                "input": len(rows),
+                "kept": len(kept),
+                "dropped": sum(dropped.values()),
+                "pains": flagged,
+                "pchembl_min": min(item["pchembl_value"] for item in kept),
+                "pchembl_max": max(item["pchembl_value"] for item in kept),
+            },
+            "too_small": too_small,
+            "columns": list(CURATED_COLUMNS),
+        }
+        try:
+            products.write_text_atomic(target / CSV_FILE, _curated_csv_text(kept))
+            products.write_json_atomic(target / MANIFEST_FILE, manifest)
+            # 最后写：缺它说明上一次写在中间崩了，不能当完整产物复用。
+            products.write_json_atomic(target / products.PARAMS_FILE, params)
+        except OSError as error:
+            return ToolResult(output=f"写参考集失败：{error}", failed=True)
+
+        fingerprint = fingerprint_path(target)
+        handle = ""
+        existing = ledger.find(kind="ligandset", fingerprint=fingerprint, include_archived=True)
+        for candidate in existing:
+            if str((candidate.meta or {}).get("stage") or "") == "reference":
+                handle = str(candidate.handle)
+                break
+        if not handle:
+            registered = ledger.add(
+                "ligandset",
+                path=target,
+                summary=f"参考活性集 · {len(kept)} 条 · pChEMBL ≥ {floor:g}",
+                fingerprint=fingerprint,
+                parents=[entry.handle],
+                meta={
+                    "kind": "ligandset",
+                    "stage": "reference",
+                    "label": "active",
+                    "tool": "build_reference_set",
+                    "source": {"handle": str(entry.handle)},
+                    "params": params,
+                    "counts": dict(manifest["counts"]),
+                    "too_small": too_small,
+                    "file": CSV_FILE,
+                    "manifest": MANIFEST_FILE,
+                },
+                # 参考集跨靶点：换受体时不该被搁置。
+                link_current_receptor=False,
+            )
+            handle = str(registered.handle)
+
+        return ToolResult(
+            output=_render_reference(
+                handle=handle,
+                reused=False,
+                kept=len(kept),
+                pchembl_min=min(item["pchembl_value"] for item in kept),
+                pchembl_max=max(item["pchembl_value"] for item in kept),
+                dropped=dropped,
+                flagged=flagged,
+                too_small=too_small,
+                target=target,
+            ),
+            meta={"handle": handle, "kept": len(kept), "too_small": too_small,
+                  "pains": flagged, "reused": False},
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# 叠合：把一组分子放进同一个参考系
+# ---------------------------------------------------------------------------
+ALIGNED_DIR = "aligned"
+ALIGNED_SDF = "aligned.sdf"
+DEFAULT_ALIGN_RMSD = 2.5
+MIN_ALIGN_ATOMS = 6
+
+
+def aligned_ligandset_dir() -> Path:
+    """叠合产物的根。测试替换它，避免写用户家目录。"""
+    return ligands_dir() / ALIGNED_DIR
+
+
+def embed_smiles(smiles: str, *, seed: int = DEFAULT_SEED) -> tuple[Any, str]:
+    """从 SMILES 生成一个 3D 构象，返回 `(分子, 失败原因)`。种子固定，两次跑同一套坐标。"""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, "SMILES 解析失败"
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    if AllChem.EmbedMolecule(mol, params) != 0:
+        return None, "生成 3D 构象失败"
+    return Chem.RemoveHs(mol), ""
+
+
+def align_to_reference(
+    reference: Any,
+    mol: Any,
+    *,
+    min_atoms: int = MIN_ALIGN_ATOMS,
+    max_rmsd: float = DEFAULT_ALIGN_RMSD,
+) -> tuple[Any, float, str]:
+    """按最大公共子结构把 `mol` 叠到 `reference` 上（原地改构象）。
+
+    返回 `(分子, rmsd, 失败原因)`。失败时不抛——叠不上是很正常的事（不是同一个系列），
+    调用方要逐条记下来而不是整批失败。
+    """
+    from rdkit import Chem, rdBase
+    from rdkit.Chem import rdFMCS, rdMolAlign
+
+    with rdBase.BlockLogs():
+        try:
+            mcs = rdFMCS.FindMCS(
+                [reference, mol], timeout=5, ringMatchesRingOnly=True, completeRingsOnly=True
+            )
+        except Exception as error:
+            return mol, 0.0, f"MCS 搜索失败（{type(error).__name__}）"
+    if mcs.numAtoms < min_atoms:
+        return mol, 0.0, f"与参考分子的公共骨架只有 {mcs.numAtoms} 个原子"
+    pattern = Chem.MolFromSmarts(mcs.smartsString)
+    if pattern is None:
+        return mol, 0.0, "MCS 的 SMARTS 解析不了"
+    probe = mol.GetSubstructMatch(pattern)
+    target = reference.GetSubstructMatch(pattern)
+    if not probe or not target:
+        return mol, 0.0, "公共骨架在这两个分子里都对不上"
+    try:
+        rmsd = float(
+            rdMolAlign.AlignMol(mol, reference, atomMap=list(zip(probe, target)))
+        )
+    except Exception as error:
+        return mol, 0.0, f"叠合失败（{type(error).__name__}）"
+    if rmsd > max_rmsd:
+        return mol, rmsd, f"叠合后 RMSD {rmsd:.2f} Å 超过 {max_rmsd:g} Å"
+    return mol, rmsd, ""
+
+
+def _render_aligned(
+    *, handle: str, kept: int, dropped: Sequence[dict[str, str]], mean_rmsd: float | None,
+    target: Path,
+) -> str:
+    lines = [f"叠合完成，登记为 {handle}。"]
+    lines.append(
+        f"{kept} 个分子叠到同一个参考系里"
+        + (f"，平均 RMSD {mean_rmsd:.2f} Å。" if mean_rmsd is not None else "。")
+    )
+    if dropped:
+        lines.append(f"{len(dropped)} 个没叠上（不是同一个系列）：")
+        for item in dropped[:3]:
+            lines.append(f"  · {item['id']}：{item['reason']}")
+    lines.append(f"产物目录：{target}")
+    lines.append(f"下一步：build_pharmacophore(actives={handle}) 直接用这份坐标，不再重新叠合。")
+    return "\n".join(lines)
+
+
+class AlignLigandsTool(Tool):
+    """把一组配体叠到同一个参考系里。"""
+
+    spec = ToolSpec(
+        name="align_ligands",
+        description=(
+            "把一组配体**叠到同一个参考系**：每个分子生成 3D 构象，再按最大公共子结构"
+            "（MCS）叠到参考分子上。" + CHEM_TOOL_DESCRIPTION_NOTE + "\n"
+            "叠不上的逐条列出原因（公共骨架太小、RMSD 超阈值），不静默丢掉——"
+            "它们本来就不是同一个系列，硬叠出来的药效团没有意义。\n"
+            "产物是一份 `stage=aligned` 的配体集（`aligned.sdf` + `ligands.csv`），"
+            "`build_pharmacophore` 认这个阶段，直接读坐标、不再重复叠合。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ligands": {"type": "string", "description": "待叠合的配体集 handle"},
+                "reference": {
+                    "type": "string",
+                    "description": "可选：用哪个分子当参考（另一个配体集 handle）；默认用第一个能叠的分子",
+                },
+                "rmsd_cutoff": {
+                    "type": "number",
+                    "description": f"叠合后 RMSD 上限（埃），默认 {DEFAULT_ALIGN_RMSD:g}",
+                },
+                "min_atoms": {
+                    "type": "integer",
+                    "description": f"公共骨架至少多少个原子，默认 {MIN_ALIGN_ATOMS}",
+                },
+                "name": {"type": "string", "description": "显示名，只影响产物目录名"},
+            },
+            "required": ["ligands"],
+            "additionalProperties": False,
+        },
+    )
+    primary_argument = "ligands"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：align_ligands 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+        raw = str(arguments.get("ligands") or "").strip()
+        if not raw:
+            return ToolResult(output="缺少参数 ligands。", failed=True)
+        try:
+            entry = ledger.get(raw)
+            expect_handle(entry, LigandSetHandle, "ligands")
+        except Exception as error:
+            return ToolResult(output=str(error), failed=True)
+
+        cutoff = arguments.get("rmsd_cutoff", DEFAULT_ALIGN_RMSD)
+        min_atoms = arguments.get("min_atoms", MIN_ALIGN_ATOMS)
+        if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)) or not 0.1 <= cutoff <= 10:
+            return ToolResult(output="参数 rmsd_cutoff 要在 0.1 到 10 之间", failed=True)
+        if isinstance(min_atoms, bool) or not isinstance(min_atoms, int) or not 3 <= min_atoms <= 50:
+            return ToolResult(output="参数 min_atoms 要在 3 到 50 之间", failed=True)
+
+        try:
+            require_chem()
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+        try:
+            rows = _source_cleaned(entry)[0]
+        except LigandError as error:
+            return ToolResult(output=str(error), failed=True)
+        if len(rows) < 2:
+            return ToolResult(output="少于两个分子，没有可叠合的对象。", failed=True)
+
+        reference_mol = None
+        raw_reference = str(arguments.get("reference") or "").strip()
+        if raw_reference:
+            try:
+                reference_entry = ledger.get(raw_reference)
+                expect_handle(reference_entry, LigandSetHandle, "reference")
+                reference_rows = _source_cleaned(reference_entry)[0]
+            except Exception as error:
+                return ToolResult(output=str(error), failed=True)
+            if not reference_rows:
+                return ToolResult(output="参考配体集里没有分子。", failed=True)
+            reference_mol, reason = embed_smiles(reference_rows[0].cleaned.smiles)
+            if reference_mol is None:
+                return ToolResult(output=f"参考分子生成 3D 失败：{reason}", failed=True)
+
+        from rdkit import Chem
+
+        aligned: list[dict[str, Any]] = []
+        dropped: list[dict[str, str]] = []
+        rmsds: list[float] = []
+        for item in rows:
+            mol, reason = embed_smiles(item.cleaned.smiles)
+            if mol is None:
+                dropped.append({"id": item.id, "reason": reason})
+                continue
+            if reference_mol is None:
+                reference_mol = mol
+                aligned.append({"id": item.id, "name": item.name, "mol": mol, "rmsd": 0.0,
+                                "smiles": item.cleaned.smiles,
+                                "input_smiles": item.cleaned.input_smiles,
+                                "heavy_atoms": item.cleaned.heavy_atoms,
+                                "source_index": item.source_index})
+                continue
+            mol, rmsd, why = align_to_reference(
+                reference_mol, mol, min_atoms=min_atoms, max_rmsd=float(cutoff)
+            )
+            if why:
+                dropped.append({"id": item.id, "reason": why})
+                continue
+            rmsds.append(rmsd)
+            aligned.append({"id": item.id, "name": item.name, "mol": mol, "rmsd": rmsd,
+                            "smiles": item.cleaned.smiles,
+                            "input_smiles": item.cleaned.input_smiles,
+                            "heavy_atoms": item.cleaned.heavy_atoms,
+                            "source_index": item.source_index})
+        if len(aligned) < 2:
+            return ToolResult(
+                output=(
+                    f"只有 {len(aligned)} 个分子叠上了（至少要有 2 个）。"
+                    + "".join(f"\n  · {item['id']}：{item['reason']}" for item in dropped[:5])
+                ),
+                failed=True,
+            )
+
+        params = {
+            "source": str(entry.handle),
+            "reference": raw_reference,
+            "rmsd_cutoff": float(cutoff),
+            "min_atoms": min_atoms,
+        }
+        stem = str(arguments.get("name") or "aligned")
+        try:
+            target, reused = products.content_dir(
+                aligned_ligandset_dir(), stem, params,
+                (MANIFEST_FILE, CSV_FILE, ALIGNED_SDF, PARAMS_FILE),
+            )
+        except OSError as error:
+            return ToolResult(output=f"建产物目录失败：{error}", failed=True)
+
+        handle = ""
+        if reused:
+            existing = ledger.find(
+                kind="ligandset", fingerprint=fingerprint_path(target), include_archived=True
+            )
+            for candidate in existing:
+                if str((candidate.meta or {}).get("stage") or "") == "aligned":
+                    handle = str(candidate.handle)
+                    break
+        mean_rmsd = sum(rmsds) / len(rmsds) if rmsds else None
+        if not handle:
+            manifest = {
+                "kind": "ligandset",
+                "stage": "aligned",
+                "tool": "align_ligands",
+                "source": {"handle": str(entry.handle)},
+                "reference": raw_reference,
+                "params": params,
+                "counts": {"input": len(rows), "aligned": len(aligned),
+                           "dropped": len(dropped)},
+                "mean_rmsd": None if mean_rmsd is None else round(mean_rmsd, 3),
+                "results": [
+                    {"id": item["id"], "rmsd": round(item["rmsd"], 3),
+                     "atoms": item["heavy_atoms"]}
+                    for item in aligned
+                ],
+                "dropped": dropped,
+                "file": ALIGNED_SDF,
+            }
+            try:
+                # content_dir 只建了根目录：SDWriter 不会替我们建叶子目录
+                target.mkdir(parents=True, exist_ok=True)
+                writer = Chem.SDWriter(str(target / ALIGNED_SDF))
+                try:
+                    for item in aligned:
+                        item["mol"].SetProp("_Name", item["id"])
+                        writer.write(item["mol"])
+                finally:
+                    writer.close()
+                # 多一列 align_rmsd：`_csv_text` 的列是固定的（CSV_COLUMNS），这里自己写，
+                # 否则那一列会被静默丢掉——而它正是「这个分子叠得好不好」的唯一记录。
+                columns = list(CSV_COLUMNS) + ["align_rmsd"]
+                buffer = io.StringIO()
+                writer_csv = csv.DictWriter(
+                    buffer, fieldnames=columns, lineterminator="\n", extrasaction="ignore"
+                )
+                writer_csv.writeheader()
+                for item in aligned:
+                    writer_csv.writerow(
+                        {
+                            "id": item["id"],
+                            "name": item["name"],
+                            "smiles": item["smiles"],
+                            "input_smiles": item["input_smiles"],
+                            "heavy_atoms": item["heavy_atoms"],
+                            "source_index": item["source_index"],
+                            "align_rmsd": round(item["rmsd"], 3),
+                        }
+                    )
+                products.write_text_atomic(target / CSV_FILE, buffer.getvalue())
+                products.write_json_atomic(target / MANIFEST_FILE, manifest)
+                products.write_json_atomic(target / PARAMS_FILE, params)
+            except OSError as error:
+                return ToolResult(output=f"写产物失败：{error}", failed=True)
+            registered = ledger.add(
+                "ligandset",
+                path=target,
+                summary=f"叠合后的配体集 · {len(aligned)} 个（{stem}）",
+                fingerprint=fingerprint_path(target),
+                parents=[entry.handle],
+                meta={
+                    "kind": "ligandset",
+                    "stage": "aligned",
+                    "tool": "align_ligands",
+                    "counts": manifest["counts"],
+                    "mean_rmsd": manifest["mean_rmsd"],
+                    "sdf": ALIGNED_SDF,
+                    "file": CSV_FILE,
+                    "manifest": MANIFEST_FILE,
+                },
+                link_current_receptor=False,
+            )
+            handle = str(registered.handle)
+
+        return ToolResult(
+            output=_render_aligned(
+                handle=handle, kept=len(aligned), dropped=dropped,
+                mean_rmsd=None if mean_rmsd is None else round(mean_rmsd, 3),
+                target=target,
+            ),
+            meta={"handle": handle, "count": len(aligned), "dropped": len(dropped),
+                  "reused": bool(handle) and reused},
+        )
+
+
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具。"""
-    return [ImportLigandsetTool(), PrepareLigandsTool()]
+    return [
+        ImportLigandsetTool(),
+        PrepareLigandsTool(),
+        CurateLigandsTool(),
+        BuildReferenceSetTool(),
+        AlignLigandsTool(),
+    ]
 
 
 if __name__ == "__main__":

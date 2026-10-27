@@ -212,6 +212,11 @@ from opencode_tui.core.agent.domain import prankweb as prankweb_module  # noqa: 
 from opencode_tui.core.agent.domain import pockets as pockets_module  # noqa: E402
 from opencode_tui.core.agent.domain import align as align_module  # noqa: E402
 from opencode_tui.core.agent.domain import products as products_module  # noqa: E402
+from opencode_tui.core.agent.domain import analysis as analysis_module  # noqa: E402
+from opencode_tui.core.agent.domain import screen as screen_module  # noqa: E402
+from opencode_tui.core.agent.domain import admet as admet_module  # noqa: E402
+from opencode_tui.core.agent.domain import sar as sar_module  # noqa: E402
+from opencode_tui.core.agent.domain import pharmacophore as pharmacophore_module  # noqa: E402
 from opencode_tui.core.agent.domain.all_tools import catalog, families, tool_family  # noqa: E402
 from opencode_tui.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
 from opencode_tui.core.agent.toolset import (  # noqa: E402
@@ -6881,6 +6886,42 @@ def _pdb_fixture() -> str:
     return "".join(lines)
 
 
+def _cif_fixture() -> str:
+    """一份能过 gemmi 的最小 mmCIF：一条链、五个原子、带条目编号。
+
+    没有晶体学与实验方法字段是有意的——转换之后 `parse_pdb` 照样要能给出链清单，
+    而这类字段缺失正是「只有 mmCIF 的超大条目」的常态。
+    """
+    return """data_6VXX
+_entry.id 6VXX
+_struct.title 'TEST COMPLEX'
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.pdbx_PDB_model_num
+ATOM 1 N N   . ALA A 1 1 ? 0.000 0.000 0.000 1.00 20.00 1 A 1
+ATOM 2 C CA  . ALA A 1 1 ? 1.458 0.000 0.000 1.00 20.00 1 A 1
+ATOM 3 C C   . ALA A 1 1 ? 2.009 1.420 0.000 1.00 20.00 1 A 1
+ATOM 4 O O   . ALA A 1 1 ? 3.200 1.500 0.000 1.00 20.00 1 A 1
+ATOM 5 C CB  . ALA A 1 1 ? 2.000 -0.770 1.200 1.00 20.00 1 A 1
+"""
+
+
 def check_complexes() -> None:
     """P0 主来源：搜 / 排 / 下三段，以及「不编条目」这条底线。"""
     # ---- 搜：解出条目 id，不顺手解旁支字段 ----
@@ -7294,6 +7335,2354 @@ def check_pockets() -> None:
     # 没有 PDB 编号 → 直接说没查成
     no_id = pockets_module.p2rank_pockets(pdb_id="")
     check(no_id.origin == "none" and "没查成" in no_id.note, f"没有编号时说明白：{no_id.note}")
+
+
+async def check_pocket_tools() -> None:
+    """口袋工具：四层装配、登记形状、三路互斥、盒子进受体。
+
+    全程离线：只走「这份结构自带的共晶配体」那一层，复合物与预测只验**缺参数时
+    报什么**，不真的联网。准备受体那一段用假的参数化函数替掉 Meeko——替掉的
+    只有模板匹配，文本编辑、算盒子、产物目录、写盘、登记都是真的。
+    """
+    work = PROBE / "pocket_tools"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    original_dir = pockets_module.pockets_dir
+    original_prepared = receptor_module.prepared_receptor_dir
+    original_parameterize = receptor_module.parameterize
+    original_probe = chemistry_module._probe_deps
+
+    pockets_module.pockets_dir = lambda: work / "pockets"
+    receptor_module.prepared_receptor_dir = lambda: work / "receptors"
+
+    def fake_parameterize(receptor_text: str, *, relax: bool) -> object:
+        lines = [
+            line
+            for line in receptor_text.splitlines()
+            if line[:6].strip() in ("ATOM", "HETATM")
+        ]
+        return receptor_module.Parameterization(
+            pdbqt="".join(
+                f"ATOM  {index:>5}  CA  ALA A   1\n"
+                for index in range(1, len(lines) + 1)
+            ),
+            atoms=len(lines),
+            monomers=len(lines),
+            ignored=(),
+            residues_with_added_h=len(lines),
+            residues_with_excess_h=(),
+            excess_bonds=(),
+            chosen_by_fewest_missing_h=(),
+        )
+
+    receptor_module.parameterize = fake_parameterize
+    chemistry_module._probe_deps = lambda: ()
+
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        text = IEP_FIXTURE.read_text(encoding="utf-8")
+        raw = ledger.add(
+            "receptor",
+            path=IEP_FIXTURE,
+            summary="1IEP",
+            fingerprint=fingerprint_text(text),
+            meta={"stage": "raw", "pdb_id": "1IEP", "chains": [{"chain_id": "A"}]},
+        )
+        detect = pockets_module.DetectPocketsTool()
+        define = pockets_module.DefinePocketTool()
+
+        # ---- 一、这份结构自带的配体 → 口袋 ----
+        found = await detect.execute({"receptor": str(raw.handle)}, context=ledger)
+        check(not found.failed, f"检测口袋成功：{found.output}")
+        check(found.meta.get("count", 0) >= 1, f"1IEP 至少一处口袋：{found.meta}")
+        set_entry = ledger.get(found.meta["handle"])
+        payload = products_module.read_json(set_entry.path / "pockets.json")
+        first = payload["pockets"][0]
+        check(first["source"] == "ligand", f"结构自带配体的来源是 ligand：{first['source']}")
+        check(
+            first["support"]["complexes"] == 1,
+            f"支持度记了复合物数：{first['support']}",
+        )
+        check(
+            first["box"]["size"] == [26.0, 26.0, 26.0],
+            f"盒子由中心 + 半径 + padding 现算：{first['box']}",
+        )
+        check(
+            [item["resseq"] for item in first["residues"][:3]] == [360, 315, 318],
+            f"口袋残基与夹具对得上：{first['residues'][:3]}",
+        )
+        check(
+            "define_pocket" in found.output,
+            f"返回里给出下一步：{found.output}",
+        )
+
+        # ---- 二、同参复用 ----
+        again = await detect.execute({"receptor": str(raw.handle)}, context=ledger)
+        check(again.meta.get("reused") is True, "同参第二次调用复用旧产物")
+        check(
+            again.meta.get("handle") == found.meta.get("handle"),
+            "复用时不重复登记",
+        )
+
+        # ---- 三、没有配体时留空，不编 ----
+        bare = work / "bare.pdb"
+        bare.write_text(
+            "\n".join(line for line in text.splitlines() if line[:6] != "HETATM") + "\n",
+            encoding="utf-8",
+        )
+        bare_entry = ledger.add(
+            "receptor",
+            path=bare,
+            summary="无配体结构",
+            fingerprint=fingerprint_text(bare.read_text(encoding="utf-8")),
+            meta={"stage": "raw", "chains": [{"chain_id": "A"}]},
+        )
+        empty = await detect.execute(
+            {"receptor": str(bare_entry.handle), "sources": "ligand"}, context=ledger
+        )
+        check(not empty.failed, "没有配体不是失败")
+        check(empty.meta.get("count") == 0, "空集就是空集")
+        check(
+            "没有可当配体的杂原子组" in empty.output,
+            f"空集要说清原因：{empty.output}",
+        )
+
+        # ---- 四、缺参数与坏来源 ----
+        no_uni = await detect.execute(
+            {"receptor": str(raw.handle), "sources": "complex"}, context=ledger
+        )
+        check(
+            no_uni.failed and "uniprot" in no_uni.output,
+            f"复合物来源要 uniprot：{no_uni.output}",
+        )
+        no_pred = await detect.execute(
+            {"receptor": str(bare_entry.handle), "sources": "predicted"}, context=ledger
+        )
+        check(
+            no_pred.failed and "pdb_id" in no_pred.output,
+            f"预测来源要 pdb_id：{no_pred.output}",
+        )
+        bad_src = await detect.execute(
+            {"receptor": str(raw.handle), "sources": "bogus"}, context=ledger
+        )
+        check(
+            bad_src.failed and "ligand" in bad_src.output,
+            f"坏来源要列出允许值：{bad_src.output}",
+        )
+
+        # ---- 五、define_pocket 三路 ----
+        picked = await define.execute(
+            {"pockets": found.meta["handle"], "index": 1, "name": "STI 位点"},
+            context=ledger,
+        )
+        check(not picked.failed, f"从口袋集选一处：{picked.output}")
+        chosen = ledger.get(picked.meta["handle"])
+        check(chosen.meta.get("kind") == "pocket", f"登记成单个口袋：{chosen.meta}")
+        check(
+            picked.meta.get("center") == first["center"],
+            "选出来的中心与口袋里的一致",
+        )
+
+        both = await define.execute(
+            {"pockets": found.meta["handle"], "index": 1, "residues": "A:315"},
+            context=ledger,
+        )
+        check(both.failed and "二选一" in both.output, f"三路互斥：{both.output}")
+        no_index = await define.execute(
+            {"pockets": found.meta["handle"]}, context=ledger
+        )
+        check(
+            no_index.failed and "index" in no_index.output,
+            f"缺 index 要说清：{no_index.output}",
+        )
+
+        manual = await define.execute(
+            {"receptor": str(raw.handle), "residues": "A:315,A:318,A:319"},
+            context=ledger,
+        )
+        check(not manual.failed, f"残基那一路可用：{manual.output}")
+        check(
+            manual.meta["size"] != [26.0, 26.0, 26.0],
+            f"残基盒子按坐标算，不是固定的 26³：{manual.meta['size']}",
+        )
+        missing = await define.execute(
+            {"receptor": str(raw.handle), "residues": "A:9999"}, context=ledger
+        )
+        check(
+            missing.failed and "225–498" in missing.output,
+            f"坏残基要列范围：{missing.output}",
+        )
+        explicit = await define.execute(
+            {"receptor": str(raw.handle), "center": "1,2,3", "size": "20,20,20"},
+            context=ledger,
+        )
+        check(
+            not explicit.failed and explicit.meta["size"] == [20.0, 20.0, 20.0],
+            "显式坐标可用",
+        )
+
+        # ---- 六、盒子进受体 ----
+        prepare = receptor_module.PrepareReceptorTool()
+        done = await prepare.execute(
+            {
+                "structure": str(raw.handle),
+                "pocket": picked.meta["handle"],
+                "chain": "A",
+                "altloc": "A",
+                "confirm": True,
+            },
+            context=ledger,
+        )
+        check(not done.failed, f"口袋盒子能准备受体：{done.output}")
+        prepared = ledger.get(done.meta["handle"])
+        box_text = (prepared.path / "box.txt").read_text(encoding="utf-8")
+        check(
+            f"center_x = {first['center'][0]:.3f}" in box_text,
+            f"box.txt 来自口袋：{box_text}",
+        )
+        check(
+            f"口袋 {picked.meta['handle']}" in done.output,
+            f"返回里写明盒子来源：{done.output}",
+        )
+
+        mutex = await prepare.execute(
+            {
+                "structure": str(raw.handle),
+                "pocket": picked.meta["handle"],
+                "box_center": "1,2,3",
+                "box_size": "10,10,10",
+            },
+            context=ledger,
+        )
+        check(mutex.failed and "互斥" in mutex.output, f"口袋与显式坐标互斥：{mutex.output}")
+
+        other = ledger.add(
+            "receptor",
+            path=bare,
+            summary="另一条受体",
+            fingerprint="other",
+            meta={"stage": "raw", "chains": [{"chain_id": "A"}]},
+        )
+        other_pocket = await define.execute(
+            {"receptor": str(other.handle), "residues": "A:315"}, context=ledger
+        )
+        wrong = await prepare.execute(
+            {
+                "structure": str(raw.handle),
+                "pocket": other_pocket.meta["handle"],
+                "chain": "A",
+                "altloc": "A",
+                "confirm": True,
+            },
+            context=ledger,
+        )
+        check(wrong.failed and "不属于" in wrong.output, f"跨受体的口袋要拒绝：{wrong.output}")
+
+        # 不给 pocket 时行为不变：盒子仍然来自共晶配体
+        legacy = await prepare.execute(
+            {
+                "structure": str(raw.handle),
+                "ligand": "STI",
+                "chain": "A",
+                "altloc": "A",
+                "confirm": True,
+            },
+            context=ledger,
+        )
+        check(
+            not legacy.failed and "共晶配体：STI" in legacy.output,
+            f"旧路径不变：{legacy.output}",
+        )
+    finally:
+        pockets_module.pockets_dir = original_dir
+        receptor_module.prepared_receptor_dir = original_prepared
+        receptor_module.parameterize = original_parameterize
+        chemistry_module._probe_deps = original_probe
+
+
+async def check_rank_candidates() -> None:
+    """候选表：方向、平均秩、缺路留空、对齐、分档、复用。
+
+    夹具是两份产物目录（对接 + 亲和力），手写 manifest——`rank_candidates` 只读
+    产物，不跑引擎，所以不需要替掉 vina 或 DTA。
+    """
+    work = PROBE / "rank_candidates"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    original_dir = analysis_module.candidates_dir
+    analysis_module.candidates_dir = lambda: work / "candidates"
+
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+
+        def add_source(kind: str, name: str, rows: list[dict]) -> Any:
+            directory = work / name
+            directory.mkdir(parents=True, exist_ok=True)
+            products_module.write_json_atomic(
+                directory / "manifest.json",
+                {"kind": kind, "stage": kind, "results": rows},
+            )
+            products_module.write_json_atomic(directory / "params.json", {})
+            return ledger.add(
+                "artifact",
+                path=directory,
+                summary=name,
+                fingerprint=fingerprint_path(directory),
+                meta={"kind": kind, "stage": kind},
+            )
+
+        docking_entry = add_source(
+            "docking",
+            "dock-a",
+            [
+                # A 与 D 同分：秩要取平均（1.5），不是「谁在前谁第一」
+                {"id": "A", "name": "alpha", "smiles": "CCO", "score": -9.0},
+                {"id": "B", "name": "beta", "smiles": "CCC", "score": -8.0},
+                {"id": "C", "name": "gamma", "smiles": "CCN", "score": -7.0},
+                {"id": "D", "name": "delta", "smiles": "CCCl", "score": -9.0},
+            ],
+        )
+        affinity_entry = add_source(
+            "affinity",
+            "aff-a",
+            [
+                {"id": "A", "smiles": "CCO", "pk": 8.0},
+                {"id": "C", "smiles": "CCN", "pk": 7.5},
+                # E 只在亲和力这一路里有：不能因为「另一路没有」就掉到最后
+                {"id": "E", "smiles": "CCBr", "pk": 6.0},
+            ],
+        )
+
+        rank = analysis_module.RankCandidatesTool()
+        result = await rank.execute(
+            {"sources": f"{docking_entry.handle},{affinity_entry.handle}", "top": 10},
+            context=ledger,
+        )
+        check(not result.failed, f"合成候选表成功：{result.output}")
+        payload = products_module.read_json(
+            ledger.get(result.meta["handle"]).path / analysis_module.CANDIDATES_FILE
+        )
+        rows = {row["id"]: row for row in payload["rows"]}
+        check(set(rows) == {"A", "B", "C", "D", "E"}, f"五条都在：{sorted(rows)}")
+
+        # ---- 一、方向与秩 ----
+        check(rows["A"]["ranks"]["dock"] == 1.5, f"并列取平均秩：{rows['A']['ranks']}")
+        check(rows["D"]["ranks"]["dock"] == 1.5, f"同分的另一条也是 1.5：{rows['D']['ranks']}")
+        check(rows["A"]["ranks"]["affinity"] == 1, f"pK 高的排前面：{rows['A']['ranks']}")
+        check(
+            rows["C"]["ranks"]["affinity"] == 2,
+            f"affinity 是降序（越高越好），与 dock 相反：{rows['C']['ranks']}",
+        )
+        check(rows["A"]["consensus_rank"] == 1.25, f"共识取两路平均：{rows['A']}")
+        check(
+            [row["id"] for row in payload["rows"]] == ["A", "D", "C", "B", "E"],
+            f"排序按共识、再按覆盖路数：{[row['id'] for row in payload['rows']]}",
+        )
+
+        # ---- 二、缺一路留空，不补 0 ----
+        check("affinity" not in rows["B"]["scores"], f"B 没有 affinity 分：{rows['B']['scores']}")
+        check(
+            rows["B"]["consensus_rank"] == 3,
+            f"缺一路时按已有那路算，不是 0 也不是最差：{rows['B']['consensus_rank']}",
+        )
+        check(
+            rows["E"]["consensus_rank"] == 3 and "dock" not in rows["E"]["scores"],
+            f"只在 affinity 里的 E 也不会被推到第一：{rows['E']}",
+        )
+
+        # ---- 三、分档 ----
+        counts = payload["counts"]
+        check(sum(counts.values()) == len(payload["rows"]), f"四档之和等于行数：{counts}")
+        check(counts["high"] == 1, f"5 条时高档至少一条：{counts}")
+        check(rows["A"]["tier"] == "high", f"榜首是 high：{rows['A']['tier']}")
+        check(
+            analysis_module._gate_failures({"redock_rmsd": 2.4}) == ["redock_rmsd=2.4>2"],
+            "门禁阈值是写死的，不由模型给",
+        )
+        check(
+            analysis_module._gate_failures({"pains": True}) == ["pains"],
+            "布尔门禁为真即不通过",
+        )
+        check(
+            analysis_module._gate_failures({"pains": False, "redock_rmsd": 0.8}) == [],
+            "没过阈值的门禁不算失败",
+        )
+
+        # ---- 四、对齐：id 对不上时按结构认 ----
+        left = add_source(
+            "docking", "dock-b", [{"id": "X1", "name": "x", "smiles": "c1ccccc1", "score": -5.0}]
+        )
+        right = add_source("affinity", "aff-b", [{"id": "Y2", "smiles": "c1ccccc1", "pk": 5.0}])
+        merged = await rank.execute(
+            {"sources": f"{left.handle},{right.handle}"}, context=ledger
+        )
+        check(not merged.failed, f"只有结构相同的两条也能合：{merged.output}")
+        merged_payload = products_module.read_json(
+            ledger.get(merged.meta["handle"]).path / analysis_module.CANDIDATES_FILE
+        )
+        check(
+            len(merged_payload["rows"]) == 1,
+            f"id 不同但结构相同的两条合成一行：{merged_payload['rows']}",
+        )
+
+        # ---- 五、拒绝与复用 ----
+        duplicate = await rank.execute(
+            {"sources": f"{docking_entry.handle},{docking_entry.handle}"}, context=ledger
+        )
+        check(
+            duplicate.failed and "重复" in duplicate.output,
+            f"同一路算两次要拒绝：{duplicate.output}",
+        )
+        bad_cutoffs = await rank.execute(
+            {"sources": f"{docking_entry.handle},{affinity_entry.handle}", "cutoffs": "20,5"},
+            context=ledger,
+        )
+        check(bad_cutoffs.failed, f"分位点写反了要拒绝：{bad_cutoffs.output}")
+
+        pocket_like = add_source("pocket", "pocket-a", [{"id": "A", "score": 1.0}])
+        wrong_kind = await rank.execute({"sources": str(pocket_like.handle)}, context=ledger)
+        check(
+            wrong_kind.failed and "docking" in wrong_kind.output,
+            f"认不出来的来源不猜方向：{wrong_kind.output}",
+        )
+
+        no_ledger = await rank.execute({"sources": str(docking_entry.handle)})
+        check(
+            no_ledger.failed and "内核装配问题" in no_ledger.output,
+            f"没注入登记表是装配问题：{no_ledger.output}",
+        )
+
+        again = await rank.execute(
+            {"sources": f"{docking_entry.handle},{affinity_entry.handle}", "top": 10},
+            context=ledger,
+        )
+        check(again.meta.get("reused") is True, "同参第二次调用复用旧产物")
+        check(
+            again.meta.get("handle") == result.meta.get("handle"),
+            "复用时不重复登记",
+        )
+
+        entry = ledger.get(result.meta["handle"])
+        check(entry.meta.get("kind") == "candidates", f"登记成候选表：{entry.meta}")
+        check(
+            [str(parent) for parent in entry.parents]
+            == [str(docking_entry.handle), str(affinity_entry.handle)],
+            f"血缘记了两路来源：{entry.parents}",
+        )
+        csv_text = (entry.path / analysis_module.CANDIDATES_CSV).read_text(encoding="utf-8")
+        check(
+            csv_text.splitlines()[0].startswith("id,name,smiles,consensus_rank,tier,dock"),
+            f"CSV 表头：{csv_text.splitlines()[0]}",
+        )
+
+        single = await rank.execute({"sources": str(docking_entry.handle)}, context=ledger)
+        check(
+            "单路分位数" in single.output,
+            f"只有一路时要写明不是共识：{single.output}",
+        )
+    finally:
+        analysis_module.candidates_dir = original_dir
+
+
+async def check_analyze_pose() -> None:
+    """位姿分析：接触、氢键、冲突、缺位姿的报法、只读。
+
+    坐标是手写的小分子：一个供体（Thr OG1，背后有 CG2 当「第二个原子」）、
+    一个疏水残基、一个远处的 Met。这样每一处距离都能口算核对，不需要真跑 Vina。
+    """
+
+    def line(kind: str, serial: int, name: str, resname: str, number: int,
+             x: float, y: float, z: float, element: str) -> str:
+        return (
+            f"{kind:<6}{serial:>5} {name:<4} {resname:>3} A{number:>4}    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{1.00:>6.2f}{20.00:>6.2f}          "
+            f"{element:>2}"
+        )
+
+    work = PROBE / "analyze_pose"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    receptor_path = work / "receptor.pdb"
+    receptor_path.write_text(
+        "\n".join(
+            [
+                line("ATOM", 1, "CG2", "THR", 315, 0.0, 1.5, 0.0, "C"),
+                line("ATOM", 2, "OG1", "THR", 315, 0.0, 0.0, 0.0, "O"),
+                line("ATOM", 3, "CE1", "PHE", 331, 3.0, -3.0, 0.0, "C"),
+                line("ATOM", 4, "SD", "MET", 330, 12.0, 0.0, 0.0, "S"),
+                # 用来验角度判据：NZ 的第二个原子在 +z，配体那个原子在 100° 方向上，
+                # 距离 3.0 Å 够近、角度 100° 不够——阈值改成 90° 时它就会混进来。
+                line("ATOM", 5, "NZ", "LYS", 333, 0.0, 0.0, 3.0, "N"),
+                line("ATOM", 6, "CE", "LYS", 333, 0.0, 0.0, 4.5, "C"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    poses = work / "poses"
+    poses.mkdir(parents=True, exist_ok=True)
+    (poses / "mol-ok.pdb").write_text(
+        "\n".join(
+            [
+                line("HETATM", 1, "O1", "LIG", 1, 0.0, -3.0, 0.0, "O"),
+                line("HETATM", 2, "C1", "LIG", 1, 0.0, -4.4, 0.0, "C"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (poses / "mol-clash.pdb").write_text(
+        "\n".join(
+            [
+                line("HETATM", 1, "O1", "LIG", 1, 0.0, -3.0, 0.0, "O"),
+                line("HETATM", 2, "C2", "LIG", 1, 0.5, 0.0, 0.0, "C"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (poses / "mol-angle.pdb").write_text(
+        "\n".join(
+            [
+                line("HETATM", 1, "O1", "LIG", 1, 0.0, -3.0, 0.0, "O"),
+                # 与 LYS333 NZ 相距 3.0 Å，但与 NZ→CE 的方向成 100°
+                line("HETATM", 2, "O2", "LIG", 1, 2.954, 0.0, 2.479, "O"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+    receptor = ledger.add(
+        "receptor",
+        path=receptor_path,
+        summary="合成受体",
+        fingerprint=fingerprint_text(receptor_path.read_text(encoding="utf-8")),
+        meta={"stage": "raw"},
+    )
+    docking_entry = ledger.add(
+        "artifact",
+        path=work,
+        summary="对接产物",
+        fingerprint="fp-dock",
+        meta={"kind": "docking", "stage": "docking"},
+    )
+    products_module.write_json_atomic(
+        work / analysis_module.docking.MANIFEST_FILE,
+        {
+            "kind": "docking",
+            "stage": "docking",
+            "receptor": {"handle": str(receptor.handle)},
+            "results": [
+                {
+                    "id": "mol-ok",
+                    "name": "cmpd_ok",
+                    "score": -9.0,
+                    "pose_pdb": "poses/mol-ok.pdb",
+                },
+                {
+                    "id": "mol-clash",
+                    "name": "cmpd_clash",
+                    "score": -8.5,
+                    "pose_pdb": "poses/mol-clash.pdb",
+                },
+                {"id": "mol-nopose", "name": "cmpd_np", "score": -7.0, "pose_pdb": ""},
+                {
+                    "id": "mol-angle",
+                    "name": "cmpd_angle",
+                    "score": -7.5,
+                    "pose_pdb": "poses/mol-angle.pdb",
+                },
+            ],
+        },
+    )
+
+    analyze = analysis_module.AnalyzePoseTool()
+    before = len(ledger.find(kind="artifact", include_archived=True))
+
+    result = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-ok"}, context=ledger
+    )
+    check(not result.failed, f"位姿分析成功：{result.output}")
+    check(result.meta.get("contacts") == 2, f"两个残基接触：{result.meta}")
+    check(result.meta.get("hbonds") == 1, f"一个氢键：{result.meta}")
+    check(result.meta.get("clashes") == 0, f"没有冲突：{result.meta}")
+    check("A:315:THR" in result.output, f"接触残基按标签列出：{result.output}")
+    check(
+        "≤ 3.5 Å" in result.output and "120°" in result.output,
+        f"氢键判据写在返回里：{result.output}",
+    )
+    check(
+        "近似" in result.output,
+        "没有氢时角度是近似值，要写明",
+    )
+
+    # 口径收紧之后同一份位姿的接触数要变少：说明 cutoff 真的在用
+    tight = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-ok", "cutoff": 2.5},
+        context=ledger,
+    )
+    check(tight.meta.get("contacts") == 0, f"2.5 Å 内没有接触：{tight.meta}")
+
+    no_hbond = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-ok", "hbond": False},
+        context=ledger,
+    )
+    check(no_hbond.meta.get("hbonds") == 0, "hbond=false 时不报氢键")
+
+    # 3.0 Å 但角度只有 100°：距离够、角度不够，不算氢键。把阈值改成 90° 这条会变红。
+    angle = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-angle"}, context=ledger
+    )
+    check(
+        angle.meta.get("hbonds") == 1,
+        f"角度不够的极性接触不算氢键（100° < 120°）：{angle.meta}",
+    )
+
+    clash = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-clash"}, context=ledger
+    )
+    check(clash.meta.get("clashes", 0) >= 1, f"穿进受体要报冲突：{clash.meta}")
+    check("处冲突" in clash.output, f"首行要提示冲突：{clash.output}")
+
+    missing = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-404"}, context=ledger
+    )
+    check(
+        missing.failed and "mol-ok" in missing.output,
+        f"分子不存在时列出可用的 id：{missing.output}",
+    )
+
+    no_pose = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-nopose"}, context=ledger
+    )
+    check(
+        no_pose.failed and "没有转出 PDB" in no_pose.output,
+        f"缺位姿要说清是没转出来，不是文件丢了：{no_pose.output}",
+    )
+
+    bad_cutoff = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-ok", "cutoff": 9.0},
+        context=ledger,
+    )
+    check(bad_cutoff.failed, f"cutoff 越界要拒绝：{bad_cutoff.output}")
+
+    wrong_kind = await analyze.execute(
+        {"docking": str(receptor.handle), "molecule": "mol-ok"}, context=ledger
+    )
+    check(wrong_kind.failed, f"受体不是对接产物：{wrong_kind.output}")
+
+    no_ledger = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-ok"}
+    )
+    check(
+        no_ledger.failed and "内核装配问题" in no_ledger.output,
+        f"没注入登记表是装配问题：{no_ledger.output}",
+    )
+
+    after = len(ledger.find(kind="artifact", include_archived=True))
+    check(after == before, f"只读：调用前后产物条目数不变（{before} → {after}）")
+
+
+async def check_curate_ligands() -> None:
+    """待筛库第一道闸：PAINS/Brenk、去重三种键、窗口闭区间、flag 模式。
+
+    源配体集是手写目录（`manifest.json` + `ligands.csv`），因为 `import_ligandset`
+    自己在导入时就会按 canonical SMILES 去重——那样就测不到 `curate_ligands` 的去重了。
+    这也不是假想形状：ChEMBL 那种直接落 CSV 的条目就是这样进来的。
+    """
+    work = PROBE / "curate_ligands"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    rows = [
+        # id, name, smiles, input_smiles, heavy_atoms, source_index
+        ("caffeine", "caffeine", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C", 14, 1),
+        ("ibuprofen", "ibuprofen", "CC(C)Cc1ccc(cc1)C(C)C(=O)O", "CC(C)Cc1ccc(cc1)C(C)C(=O)O", 15, 2),
+        ("catechol", "catechol", "Oc1ccccc1O", "Oc1ccccc1O", 8, 3),
+        ("nitro", "nitro", "O=[N+]([O-])c1ccccc1", "O=[N+]([O-])c1ccccc1", 9, 4),
+        ("long", "long", "C" * 33 + "C(=O)O", "C" * 33 + "C(=O)O", 34, 5),
+        ("aspirin_a", "aspirin", "CC(=O)Oc1ccccc1C(=O)O", "OC(=O)c1ccccc1OC(C)=O", 13, 6),
+        ("aspirin_b", "aspirin copy", "CC(=O)Oc1ccccc1C(=O)O", "CC(=O)Oc1ccccc1C(=O)O", 13, 7),
+        ("ala_l", "L-alanine", "C[C@H](N)C(=O)O", "C[C@H](N)C(=O)O", 6, 8),
+        ("ala_d", "D-alanine", "C[C@@H](N)C(=O)O", "C[C@@H](N)C(=O)O", 6, 9),
+    ]
+    source_dir = work / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    header = "id,name,smiles,input_smiles,heavy_atoms,source_index\n"
+    csv_text = header + "".join(
+        f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n" for row in rows
+    )
+    (source_dir / ligand_module.CSV_FILE).write_text(csv_text, encoding="utf-8")
+    products_module.write_json_atomic(
+        source_dir / ligand_module.MANIFEST_FILE,
+        {"kind": "ligandset", "stage": "raw", "tool": "fixture", "counts": {"accepted": len(rows)}},
+    )
+    before_bytes = (source_dir / ligand_module.CSV_FILE).read_bytes()
+
+    original_dir = ligand_module.curated_ligandset_dir
+    ligand_module.curated_ligandset_dir = lambda: work / "curated"
+
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        source = ledger.add(
+            "ligandset",
+            path=source_dir,
+            summary="夹具库",
+            fingerprint=fingerprint_text(csv_text),
+            meta={"kind": "ligandset", "stage": "raw"},
+            link_current_receptor=False,
+        )
+        curate = ligand_module.CurateLigandsTool()
+
+        # ---- 一、默认：PAINS + Brenk 都开 ----
+        strict = await curate.execute({"ligands": str(source.handle)}, context=ledger)
+        check(not strict.failed, f"筛库成功：{strict.output}")
+        check(strict.meta.get("kept") == 4, f"干净的四条留下：{strict.meta}")
+        check(strict.meta.get("dropped") == 5, f"五条被淘汰：{strict.meta}")
+        check("PAINS 1 条" in strict.output, f"PAINS 单独计数：{strict.output}")
+        check("catechol" in strict.output, f"淘汰示例里点了名：{strict.output}")
+        entry = ledger.get(strict.meta["handle"])
+        check(entry.meta.get("stage") == "curated", f"阶段标成 curated：{entry.meta.get('stage')}")
+        check(
+            [str(parent) for parent in entry.parents] == [str(source.handle)],
+            f"血缘记了源配体集：{entry.parents}",
+        )
+        # 形状必须与 import_ligandset 同形，否则 prepare_ligands 读不了
+        items, kind = ligand_module._source_cleaned(entry)
+        check(len(items) == 4 and kind == "raw", f"prepare_ligands 能直接读：{len(items)} 条")
+        check(
+            {item.id for item in items} == {"caffeine", "ibuprofen", "ala_l", "ala_d"},
+            f"读出来的正是留下的四条：{sorted(item.id for item in items)}",
+        )
+
+        # ---- 二、去重的三种键 ----
+        async def run(**extra: Any) -> Any:
+            arguments = {"ligands": str(source.handle), "pains": False, "brenk": False}
+            arguments.update(extra)
+            return await curate.execute(arguments, context=ledger)
+
+        none_kept = await run(dedupe="none")
+        check(none_kept.meta.get("kept") == 9, f"不去重时九条全在：{none_kept.meta}")
+
+        canonical = await run(dedupe="canonical")
+        check(canonical.meta.get("kept") == 8, f"canonical 去掉一条重复：{canonical.meta}")
+
+        inchikey = await run(dedupe="inchikey")
+        check(inchikey.meta.get("kept") == 8, f"完整 InChIKey 也去掉一条：{inchikey.meta}")
+
+        scaffold = await run(dedupe="scaffold")
+        check(
+            scaffold.meta.get("kept") == 7,
+            f"前 14 位把一对对映体算成同一个骨架：{scaffold.meta}",
+        )
+
+        # ---- 三、窗口是闭区间 ----
+        window = await run(dedupe="none", max_mw=194.2)
+        check(window.meta.get("kept") == 7, f"等于上限的保留：{window.meta}")
+        tighter = await run(dedupe="none", max_mw=194.0)
+        check(tighter.meta.get("kept") == 6, f"上限收 0.2 就少一条：{tighter.meta}")
+
+        # ---- 四、flag 只标注不删 ----
+        flag = await run(mode="flag", pains=True, brenk=True, dedupe="inchikey")
+        check(flag.meta.get("kept") == 9, f"flag 模式保留全集：{flag.meta}")
+        flag_entry = ledger.get(flag.meta["handle"])
+        with (flag_entry.path / ligand_module.CSV_FILE).open(encoding="utf-8") as handle:
+            flagged = [row for row in csv.DictReader(handle) if row["flags"]]
+        check(
+            len(flagged) == 5,
+            f"命中的五行都带了标记（catechol / nitro / long / 两个 aspirin）：{len(flagged)} 行",
+        )
+        check(
+            any("PAINS" in row["flags"] for row in flagged),
+            "标记里写明命中的是哪一类规则",
+        )
+
+        # ---- 五、全灭要报失败并说清 ----
+        empty = await run(max_mw=50.0)
+        check(
+            empty.failed and "全部" in empty.output,
+            f"一条不剩是失败，不是空表：{empty.output}",
+        )
+
+        # ---- 六、源文件一个字节都不动 ----
+        check(
+            (source_dir / ligand_module.CSV_FILE).read_bytes() == before_bytes,
+            "筛完源配体集没被改写",
+        )
+
+        # ---- 七、同参复用 ----
+        again = await curate.execute({"ligands": str(source.handle)}, context=ledger)
+        check(again.meta.get("reused") is True, "同参第二次调用复用旧产物")
+        check(
+            again.meta.get("handle") == strict.meta.get("handle"),
+            "复用时不重复登记",
+        )
+
+        no_ledger = await curate.execute({"ligands": str(source.handle)})
+        check(
+            no_ledger.failed and "内核装配问题" in no_ledger.output,
+            f"没注入登记表是装配问题：{no_ledger.output}",
+        )
+        bad_mode = await curate.execute(
+            {"ligands": str(source.handle), "mode": "delete"}, context=ledger
+        )
+        check(bad_mode.failed and "mode" in bad_mode.output, f"认不出的模式要拒绝：{bad_mode.output}")
+    finally:
+        ligand_module.curated_ligandset_dir = original_dir
+
+
+async def check_reference_set() -> None:
+    """参考活性集：同一分子取最强、活性下限、PAINS 只标不删、too_small。
+
+    源是 `search_actives` 那种 CSV（`entry.path` 是文件）；也验一遍目录形态，
+    因为 `prepare_ligands` 的两侧都要能吃。
+    """
+    work = PROBE / "reference_set"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    actives = work / "actives.csv"
+    actives.write_text(
+        "molecule_chembl_id,molecule_pref_name,smiles,pchembl_value\n"
+        # 同一个分子两条记录：只留强的 7.5
+        "C1,aspirin,CC(=O)Oc1ccccc1C(=O)O,6.5\n"
+        "C1,aspirin (strong),CC(=O)Oc1ccccc1C(=O)O,7.5\n"
+        "C2,caffeine,CN1C=NC2=C1C(=O)N(C(=O)N2C)C,8.0\n"
+        "C3,weak,CC(C)Cc1ccc(cc1)C(C)C(=O)O,5.0\n"
+        "C4,catechol,Oc1ccccc1O,6.9\n"
+        "C5,broken,not-a-smiles,7.0\n"
+        "C6,no-value,CCO,\n",
+        encoding="utf-8",
+    )
+
+    original_dir = ligand_module.reference_ligandset_dir
+    ligand_module.reference_ligandset_dir = lambda: work / "reference"
+
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        source = ledger.add(
+            "ligandset",
+            path=actives,
+            summary="ChEMBL 活性",
+            fingerprint=fingerprint_text(actives.read_text(encoding="utf-8")),
+            meta={"kind": "ligandset", "accession": "P00533"},
+            link_current_receptor=False,
+        )
+        build = ligand_module.BuildReferenceSetTool()
+        result = await build.execute({"actives": str(source.handle)}, context=ledger)
+        check(not result.failed, f"参考集生成成功：{result.output}")
+        check(result.meta.get("kept") == 3, f"三条达到 pChEMBL≥6：{result.meta}")
+        check(result.meta.get("too_small") is True, f"少于 10 条要标 too_small：{result.meta}")
+        check(result.meta.get("pains") == 1, f"catechol 命中 PAINS：{result.meta}")
+        check(
+            "只标不删" in result.output,
+            f"PAINS 只标注的语义要写在返回里：{result.output}",
+        )
+
+        entry = ledger.get(result.meta["handle"])
+        check(entry.meta.get("stage") == "reference", f"阶段是 reference：{entry.meta.get('stage')}")
+        check(entry.meta.get("label") == "active", f"标签是 active：{entry.meta.get('label')}")
+        payload = products_module.read_json(entry.path / ligand_module.MANIFEST_FILE)
+        check(
+            payload["counts"]["pchembl_max"] == 8.0,
+            f"最强活性记在产物里：{payload['counts']}",
+        )
+        rows = {}
+        with (entry.path / ligand_module.CSV_FILE).open(encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                rows[row["id"]] = float(row["pchembl_value"])
+        check(rows.get("C1") == 7.5, f"同一分子取最强那条：{rows}")
+        check(rows.get("C3") is None, f"低于下限的不进来：{rows}")
+        check(len(rows) == 3, f"三条：{rows}")
+
+        # 形状必须是 prepare_ligands 能直接读的那种
+        items, kind = ligand_module._source_cleaned(entry)
+        check(len(items) == 3 and kind == "raw", f"可直接准备：{len(items)} 条")
+
+        # 目录形态也认（`import_ligandset` 的产物）
+        alt = work / "alt"
+        alt.mkdir(parents=True, exist_ok=True)
+        (alt / ligand_module.CSV_FILE).write_text(
+            "id,name,smiles,pchembl_value\nX1,ethanol,CCO,7.0\n", encoding="utf-8"
+        )
+        products_module.write_json_atomic(
+            alt / ligand_module.MANIFEST_FILE, {"kind": "ligandset", "stage": "raw"}
+        )
+        alt_entry = ledger.add(
+            "ligandset", path=alt, summary="目录形态",
+            fingerprint="fp-alt", meta={"kind": "ligandset", "stage": "raw"},
+            link_current_receptor=False,
+        )
+        from_dir = await build.execute({"actives": str(alt_entry.handle)}, context=ledger)
+        check(
+            not from_dir.failed and from_dir.meta.get("kept") == 1,
+            f"目录形态也认：{from_dir.output}",
+        )
+
+        empty = await build.execute(
+            {"actives": str(source.handle), "min_pchembl": 9}, context=ledger
+        )
+        check(
+            empty.failed and "一条都不剩" in empty.output,
+            f"全被筛掉要说清，不是空表：{empty.output}",
+        )
+        again = await build.execute({"actives": str(source.handle)}, context=ledger)
+        check(again.meta.get("reused") is True, "同参第二次调用复用旧产物")
+        no_ledger = await build.execute({"actives": str(source.handle)})
+        check(
+            no_ledger.failed and "内核装配问题" in no_ledger.output,
+            f"没注入登记表是装配问题：{no_ledger.output}",
+        )
+    finally:
+        ligand_module.reference_ligandset_dir = original_dir
+
+
+async def check_screen_similarity() -> None:
+    """2D 指纹筛选：最近邻、换 metric 不复用、SMARTS、cutoff、top 截断。"""
+    work = PROBE / "screen_similarity"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    library_dir = work / "library"
+    library_dir.mkdir(parents=True, exist_ok=True)
+    rows = [
+        ("aspirin", "CC(=O)Oc1ccccc1C(=O)O"),
+        ("caffeine", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"),
+        ("catechol", "Oc1ccccc1O"),
+        ("ibuprofen", "CC(C)Cc1ccc(cc1)C(C)C(=O)O"),
+    ]
+    (library_dir / ligand_module.CSV_FILE).write_text(
+        "id,name,smiles\n" + "".join(f"{name},{name},{smiles}\n" for name, smiles in rows),
+        encoding="utf-8",
+    )
+    products_module.write_json_atomic(
+        library_dir / ligand_module.MANIFEST_FILE, {"kind": "ligandset", "stage": "raw"}
+    )
+
+    original_dir = screen_module.candidates_dir
+    screen_module.candidates_dir = lambda: work / "candidates"
+
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        library = ledger.add(
+            "ligandset", path=library_dir, summary="库",
+            fingerprint="fp-lib", meta={"kind": "ligandset", "stage": "raw"},
+            link_current_receptor=False,
+        )
+        screen = screen_module.ScreenSimilarityTool()
+
+        result = await screen.execute(
+            {"smiles": rows[0][1], "library": str(library.handle)}, context=ledger
+        )
+        check(not result.failed, f"相似度筛选成功：{result.output}")
+        entry = ledger.get(result.meta["handle"])
+        payload = products_module.read_json(entry.path / "candidates.json")
+        check(payload.get("score_column") == "similarity", f"分数列写进产物：{payload.keys()}")
+        check(payload.get("higher_is_better") is True, "方向写在产物里，不交给模型")
+        top_row = payload["rows"][0]
+        check(top_row["id"] == "aspirin", f"查询分子自己排第一：{top_row['id']}")
+        check(abs(top_row["scores"]["similarity"] - 1.0) < 1e-9, f"自身相似度为 1：{top_row}")
+
+        # 换 metric 不复用
+        other = await screen.execute(
+            {"smiles": rows[0][1], "library": str(library.handle), "metric": "maccs"},
+            context=ledger,
+        )
+        check(
+            other.meta["handle"] != result.meta["handle"],
+            "换 metric 是新产物，不复用旧目录",
+        )
+        bad_metric = await screen.execute(
+            {"smiles": rows[0][1], "library": str(library.handle), "metric": "daylight"},
+            context=ledger,
+        )
+        check(bad_metric.failed, f"认不出的 metric 要拒绝：{bad_metric.output}")
+
+        # SMARTS：只留带苯环的（咖啡因是咪唑环，不算）
+        smarts = await screen.execute(
+            {"smiles": "c1ccccc1", "library": str(library.handle), "smarts": "c1ccccc1"},
+            context=ledger,
+        )
+        check(not smarts.failed, f"子结构检索成功：{smarts.output}")
+        smarts_entry = ledger.get(smarts.meta["handle"])
+        smarts_payload = products_module.read_json(smarts_entry.path / "candidates.json")
+        check(
+            {row["id"] for row in smarts_payload["rows"]}
+            == {"catechol", "aspirin", "ibuprofen"},
+            f"只有带苯环的命中：{[row['id'] for row in smarts_payload['rows']]}",
+        )
+        bad_smarts = await screen.execute(
+            {"smiles": "CCO", "library": str(library.handle), "smarts": "[C1"},
+            context=ledger,
+        )
+        check(
+            bad_smarts.failed and "SMARTS 解析不了" in bad_smarts.output,
+            f"坏 SMARTS 要说清哪一段：{bad_smarts.output}",
+        )
+
+        # cutoff 与 top
+        filtered = await screen.execute(
+            {"smiles": rows[0][1], "library": str(library.handle), "cutoff": 0.9},
+            context=ledger,
+        )
+        check(
+            filtered.meta.get("count") == 1,
+            f"cutoff=0.9 只剩它自己：{filtered.meta}",
+        )
+        truncated = await screen.execute(
+            {"smiles": rows[0][1], "library": str(library.handle), "top": 2},
+            context=ledger,
+        )
+        check(truncated.meta.get("count") == 2, f"top=2 只留两条：{truncated.meta}")
+        check(
+            "调大 top" in truncated.output,
+            f"截断要写明还有多少、怎么取：{truncated.output}",
+        )
+
+        both = await screen.execute(
+            {"query": str(library.handle), "smiles": "CCO", "library": str(library.handle)},
+            context=ledger,
+        )
+        check(both.failed and "只能给一个" in both.output, f"query 与 smiles 互斥：{both.output}")
+        neither = await screen.execute({"library": str(library.handle)}, context=ledger)
+        check(neither.failed, f"两个都不给要报错：{neither.output}")
+
+        # 查询集当 query：整组当查询，取最近邻
+        as_set = await screen.execute(
+            {"query": str(library.handle), "library": str(library.handle)}, context=ledger
+        )
+        check(
+            not as_set.failed and as_set.meta.get("count") == 4,
+            f"整组当查询时每个都能找到自己：{as_set.meta}",
+        )
+    finally:
+        screen_module.candidates_dir = original_dir
+
+
+async def check_screen_shape() -> None:
+    """3D 形状：USR 对齐无关、缺 3D 明说、读不出坐标逐条记录。"""
+    work = PROBE / "screen_shape"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    def atom(serial: int, name: str, x: float, y: float, z: float, kind: str = "") -> str:
+        head = (
+            f"ATOM  {serial:>5} {name:<4} LIG A   1    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{1.00:>6.2f}{0.00:>6.2f}"
+        )
+        return f"{head}    {0.000:>6.3f} {kind:<2}" if kind else head
+
+    library_dir = work / "prepared"
+    (library_dir / ligand_module.PDBQT_DIR).mkdir(parents=True, exist_ok=True)
+    files = {
+        # 一条直线
+        "line": [atom(i + 1, "C", 3.0 * i, 0, 0) for i in range(4)],
+        # 同一条直线，整体平移 20 Å：形状描述子与位置无关
+        "line_shifted": [atom(i + 1, "C", 20.0 + 3.0 * i, 0, 0) for i in range(4)],
+        # 一团
+        "blob": [
+            atom(1, "C", 0, 0, 0),
+            atom(2, "C", 1.4, 0, 0),
+            atom(3, "C", 0, 1.4, 0),
+            atom(4, "C", 0, 0, 1.4),
+        ],
+        # 带一个 PDBQT 类型的氢：按类型判氢时它不该参与
+        "with_hydrogen": [
+            atom(1, "C", 0, 0, 0),
+            atom(2, "C", 3.0, 0, 0),
+            atom(3, "H1", 6.0, 0, 0, "HD"),
+            atom(4, "C", 9.0, 0, 0),
+        ],
+        # 与上一条的**重原子**完全一样（0 / 3 / 9），没有那个氢。
+        # 两条分数相同才说明氢真的没参与；拿它跟 0/3/6/9 比是比不出来的。
+        "line_gap": [
+            atom(1, "C", 0, 0, 0),
+            atom(2, "C", 3.0, 0, 0),
+            atom(3, "C", 9.0, 0, 0),
+        ],
+    }
+    records = []
+    for name, lines in files.items():
+        (library_dir / ligand_module.PDBQT_DIR / f"{name}.pdbqt").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+        records.append(
+            {"id": name, "name": name, "smiles": "C", "status": "ok",
+             "pdbqt": f"{name}.pdbqt", "heavy_atoms": 4}
+        )
+    records.append(
+        {"id": "failed_one", "name": "failed", "smiles": "C", "status": "embed_failed",
+         "pdbqt": "", "heavy_atoms": 0}
+    )
+    products_module.write_json_atomic(
+        library_dir / ligand_module.MANIFEST_FILE,
+        {"kind": "ligandset", "stage": "prepared", "records": records},
+    )
+
+    # 查询侧只要一条「直线」：查询集里如果也含 blob，取最近邻会把它自己算成 1.0，
+    # 那样「团状不如线状像」这条断言就永远绿。
+    query_dir = work / "query"
+    (query_dir / ligand_module.PDBQT_DIR).mkdir(parents=True, exist_ok=True)
+    (query_dir / ligand_module.PDBQT_DIR / "line.pdbqt").write_text(
+        "\n".join(files["line"]) + "\n", encoding="utf-8"
+    )
+    products_module.write_json_atomic(
+        query_dir / ligand_module.MANIFEST_FILE,
+        {
+            "kind": "ligandset",
+            "stage": "prepared",
+            "records": [
+                {"id": "line", "name": "line", "smiles": "C", "status": "ok",
+                 "pdbqt": "line.pdbqt", "heavy_atoms": 4}
+            ],
+        },
+    )
+
+    original_dir = screen_module.candidates_dir
+    screen_module.candidates_dir = lambda: work / "candidates"
+
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        prepared = ledger.add(
+            "ligandset", path=library_dir, summary="已备 3D",
+            fingerprint="fp-3d", meta={"kind": "ligandset", "stage": "prepared",
+                                        "pdbqt_dir": ligand_module.PDBQT_DIR},
+            link_current_receptor=False,
+        )
+        screen = screen_module.ScreenShapeTool()
+        query_entry = ledger.add(
+            "ligandset", path=query_dir, summary="查询（一条直线）",
+            fingerprint="fp-query", meta={"kind": "ligandset", "stage": "prepared",
+                                          "pdbqt_dir": ligand_module.PDBQT_DIR},
+            link_current_receptor=False,
+        )
+
+        result = await screen.execute(
+            {"query": str(query_entry.handle), "library": str(prepared.handle)}, context=ledger
+        )
+        check(not result.failed, f"形状筛选成功：{result.output}")
+        entry = ledger.get(result.meta["handle"])
+        payload = products_module.read_json(entry.path / "candidates.json")
+        scores = {row["id"]: row["scores"]["shape"] for row in payload["rows"]}
+        check(
+            abs(scores["line"] - 1.0) < 1e-9,
+            f"自己跟自己形状分是 1：{scores}",
+        )
+        check(
+            abs(scores["line_shifted"] - 1.0) < 1e-6,
+            f"整体平移不改变形状分：{scores}",
+        )
+        check(
+            scores["blob"] < scores["line"],
+            f"团状比线状更不像线：{scores['blob']:.3f} < {scores['line']:.3f}",
+        )
+        check(
+            abs(scores["with_hydrogen"] - scores["line_gap"]) < 1e-9,
+            f"按 PDBQT 类型判氢：那个 HD 不参与，与没有氢的同构分子同分：{scores}",
+        )
+        check(
+            payload.get("score_column") == "shape",
+            "形状分单独一列，不混进 similarity",
+        )
+
+        # 查询用受体（共晶配体）
+        receptor_dir = work / "receptor"
+        receptor_dir.mkdir(parents=True, exist_ok=True)
+        (receptor_dir / "ligand.pdb").write_text(
+            "\n".join(line.replace("ATOM  ", "HETATM") for line in files["line"]) + "\n",
+            encoding="utf-8",
+        )
+        receptor = ledger.add(
+            "receptor", path=receptor_dir, summary="带共晶配体的受体",
+            fingerprint="fp-rec",
+            meta={"stage": "prepared", "ligand_file": "ligand.pdb"},
+        )
+        by_receptor = await screen.execute(
+            {"query": str(receptor.handle), "library": str(prepared.handle)}, context=ledger
+        )
+        check(
+            not by_receptor.failed,
+            f"查询可以是受体的共晶配体：{by_receptor.output}",
+        )
+        rec_entry = ledger.get(by_receptor.meta["handle"])
+        rec_payload = products_module.read_json(rec_entry.path / "candidates.json")
+        top_id = rec_payload["rows"][0]["id"]
+        check(
+            top_id in {"line", "line_shifted", "with_hydrogen"},
+            f"共晶配体是直线，排第一的也该是直线：{top_id}",
+        )
+
+        # 没准备 3D 直接说缺什么
+        raw_dir = work / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        (raw_dir / ligand_module.CSV_FILE).write_text(
+            "id,name,smiles\nA,a,CCO\n", encoding="utf-8"
+        )
+        products_module.write_json_atomic(
+            raw_dir / ligand_module.MANIFEST_FILE, {"kind": "ligandset", "stage": "raw"}
+        )
+        raw = ledger.add(
+            "ligandset", path=raw_dir, summary="没准备", fingerprint="fp-raw",
+            meta={"kind": "ligandset", "stage": "raw"}, link_current_receptor=False,
+        )
+        not_prepared = await screen.execute(
+            {"query": str(prepared.handle), "library": str(raw.handle)}, context=ledger
+        )
+        check(
+            not_prepared.failed and "prepare_ligands" in not_prepared.output,
+            f"缺 3D 时要提示先准备：{not_prepared.output}",
+        )
+        no_ledger = await screen.execute(
+            {"query": str(prepared.handle), "library": str(prepared.handle)}
+        )
+        check(
+            no_ledger.failed and "内核装配问题" in no_ledger.output,
+            f"没注入登记表是装配问题：{no_ledger.output}",
+        )
+    finally:
+        screen_module.candidates_dir = original_dir
+
+
+async def check_validate_docking() -> None:
+    """重对接：原地 RMSD（不重新叠合）、阈值、无共晶配体不假装通过、gate 进候选表。"""
+    work = PROBE / "validate_docking"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    def line(kind: str, serial: int, name: str, x: float, y: float, z: float,
+             element: str) -> str:
+        return (
+            f"{kind:<6}{serial:>5} {name:<4} {'LIG':>3} A{1:>4}    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{1.00:>6.2f}{20.00:>6.2f}          {element:>2}"
+        )
+
+    crystal = [
+        line("HETATM", 1, "C1", 0.0, 0.0, 0.0, "C"),
+        line("HETATM", 2, "C2", 1.5, 0.0, 0.0, "C"),
+        line("HETATM", 3, "O1", 2.5, 1.0, 0.0, "O"),
+        line("HETATM", 4, "N1", -1.0, 0.5, 0.0, "N"),
+    ]
+    receptor_dir = work / "receptor"
+    receptor_dir.mkdir(parents=True, exist_ok=True)
+    (receptor_dir / "ligand.pdb").write_text("\n".join(crystal) + "\n", encoding="utf-8")
+
+    docking_dir = work / "docking"
+    (docking_dir / "poses").mkdir(parents=True, exist_ok=True)
+    # 完全复现晶体位置
+    (docking_dir / "poses" / "perfect.pdb").write_text("\n".join(crystal) + "\n",
+                                                       encoding="utf-8")
+    # 整体平移 2.5 Å（原地 RMSD 应等于 2.5；若重新叠合会变成 0）
+    shifted = [
+        line("HETATM", 1, "C1", 2.5, 0.0, 0.0, "C"),
+        line("HETATM", 2, "C2", 4.0, 0.0, 0.0, "C"),
+        line("HETATM", 3, "O1", 5.0, 1.0, 0.0, "O"),
+        line("HETATM", 4, "N1", 1.5, 0.5, 0.0, "N"),
+    ]
+    (docking_dir / "poses" / "shifted.pdb").write_text("\n".join(shifted) + "\n",
+                                                       encoding="utf-8")
+    # 原子数不同：不是同一个分子
+    (docking_dir / "poses" / "other.pdb").write_text(
+        "\n".join(crystal[:2]) + "\n", encoding="utf-8"
+    )
+    products_module.write_json_atomic(
+        docking_dir / "manifest.json",
+        {
+            "kind": "docking",
+            "stage": "docking",
+            "receptor": {"handle": "PLACEHOLDER"},
+            "results": [
+                {"id": "perfect", "name": "perfect", "score": -9.0,
+                 "pose_pdb": "poses/perfect.pdb"},
+                {"id": "shifted", "name": "shifted", "score": -8.0,
+                 "pose_pdb": "poses/shifted.pdb"},
+                {"id": "other", "name": "other", "score": -7.0,
+                 "pose_pdb": "poses/other.pdb"},
+            ],
+        },
+    )
+    products_module.write_json_atomic(docking_dir / "params.json", {})
+
+    original_dir = analysis_module.validation_dir
+    original_candidates = analysis_module.candidates_dir
+    analysis_module.validation_dir = lambda: work / "validation"
+    analysis_module.candidates_dir = lambda: work / "candidates"
+
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        receptor = ledger.add(
+            "receptor", path=receptor_dir, summary="带共晶配体",
+            fingerprint="fp-rec",
+            meta={"stage": "prepared", "ligand_file": "ligand.pdb", "ligand_label": "STI"},
+        )
+        # 清单里要写真实 handle：工具会核对「这份对接用的是不是这个受体」
+        manifest_path = docking_dir / "manifest.json"
+        manifest = products_module.read_json(manifest_path)
+        manifest["receptor"]["handle"] = str(receptor.handle)
+        products_module.write_json_atomic(manifest_path, manifest)
+        docking_entry = ledger.add(
+            "artifact", path=docking_dir, summary="对接",
+            fingerprint=fingerprint_path(docking_dir),
+            parents=[receptor.handle],
+            meta={"kind": "docking", "stage": "docking"},
+        )
+
+        validate = analysis_module.ValidateDockingTool()
+        result = await validate.execute(
+            {"receptor": str(receptor.handle), "docking": str(docking_entry.handle)},
+            context=ledger,
+        )
+        check(not result.failed, f"重对接验证成功：{result.output}")
+        entry = ledger.get(result.meta["handle"])
+        rows = {row["id"]: row for row in entry.meta["results"]}
+        check(abs(rows["perfect"]["rmsd"]) < 1e-6, f"复现晶体位置 RMSD=0：{rows['perfect']}")
+        check(
+            abs(rows["shifted"]["rmsd"] - 2.5) < 1e-6,
+            f"平移 2.5 Å 的原地 RMSD 是 2.5（重新叠合会把它算成 0）：{rows['shifted']}",
+        )
+        check(
+            rows["perfect"]["pass"] is True and rows["shifted"]["pass"] is False,
+            f"2.0 Å 阈值下只有一个通过：{rows}",
+        )
+        check(
+            rows["other"]["rmsd"] is None and "原子数不同" in rows["other"]["detail"],
+            f"不是同一个分子要逐条说明：{rows['other']}",
+        )
+        check(
+            entry.meta.get("kind") == "validation",
+            f"登记成 validation：{entry.meta.get('kind')}",
+        )
+        check(
+            [str(parent) for parent in entry.parents]
+            == [str(receptor.handle), str(docking_entry.handle)],
+            f"血缘记了受体与对接：{entry.parents}",
+        )
+        check("原地" in entry.meta.get("method", ""), "口径写进产物")
+
+        loose = await validate.execute(
+            {"receptor": str(receptor.handle), "docking": str(docking_entry.handle),
+             "cutoff": 3.0},
+            context=ledger,
+        )
+        loose_entry = ledger.get(loose.meta["handle"])
+        loose_rows = {row["id"]: row for row in loose_entry.meta["results"]}
+        check(loose_rows["shifted"]["pass"] is True, "阈值放宽到 3.0 后 2.5 Å 也算通过")
+
+        # gate 进候选表：rank_candidates 读得到 redock_rmsd
+        rank = analysis_module.RankCandidatesTool()
+        ranked = await rank.execute(
+            {"sources": str(docking_entry.handle)}, context=ledger
+        )
+        check(not ranked.failed, f"候选表能读这份对接：{ranked.output}")
+        ranked_entry = ledger.get(ranked.meta["handle"])
+        payload = products_module.read_json(
+            ranked_entry.path / analysis_module.CANDIDATES_FILE
+        )
+        gates = {row["id"]: row["gates"] for row in payload["rows"]}
+        check(
+            gates["shifted"].get("redock_rmsd") == 2.5,
+            f"重对接 RMSD 作为门禁进候选表：{gates}",
+        )
+        check(
+            "perfect" in gates and "redock_rmsd" in gates["perfect"],
+            "通过的那条也带上门禁值（0.0）",
+        )
+
+        # 没有共晶配体的受体：明说做不了
+        bare_dir = work / "bare"
+        bare_dir.mkdir(parents=True, exist_ok=True)
+        bare = ledger.add(
+            "receptor", path=bare_dir, summary="无配体", fingerprint="fp-bare",
+            meta={"stage": "prepared"},
+        )
+        no_ligand = await validate.execute(
+            {"receptor": str(bare.handle), "docking": str(docking_entry.handle)},
+            context=ledger,
+        )
+        check(
+            no_ligand.failed and "没法做重对接" in no_ligand.output,
+            f"没共晶配体不能假装通过：{no_ligand.output}",
+        )
+
+        raw_receptor = ledger.add(
+            "receptor", path=receptor_dir, summary="没准备的受体", fingerprint="fp-raw",
+            meta={"stage": "raw"},
+        )
+        not_prepared = await validate.execute(
+            {"receptor": str(raw_receptor.handle), "docking": str(docking_entry.handle)},
+            context=ledger,
+        )
+        check(
+            not_prepared.failed and "还没有准备过" in not_prepared.output,
+            f"没准备过的受体要拒绝：{not_prepared.output}",
+        )
+    finally:
+        analysis_module.validation_dir = original_dir
+        analysis_module.candidates_dir = original_candidates
+
+
+async def check_batch_offset() -> None:
+    """分批：两批合起来覆盖全部、不重叠；越界说清；换 offset 不复用；不给 offset 行为不变。"""
+    work = PROBE / "batch_offset"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    # ---- 一、先验纯函数：切片不重叠、不漏 ---
+    from opencode_tui.core.agent.domain.ligand import PrepItem, Cleaned
+
+    items = [
+        PrepItem(
+            id=f"m{index}",
+            name=f"m{index}",
+            source_index=index,
+            cleaned=Cleaned(input_smiles="C", smiles=f"C{index}", heavy_atoms=1,
+                            fragments_removed=0),
+        )
+        for index in range(5)
+    ]
+    first, first_counts = ligand_module._unique_items(items, limit=2, offset=0)
+    second, second_counts = ligand_module._unique_items(items, limit=2, offset=2)
+    head_ids = [item.id for item in first]
+    tail_ids = [item.id for item in second]
+    check(head_ids == ["m0", "m1"], f"第一批取前两个：{head_ids}")
+    check(tail_ids == ["m2", "m3"], f"第二批从第 3 个开始：{tail_ids}")
+    check(not set(head_ids) & set(tail_ids), "两批不重叠")
+    check(
+        first_counts["remaining"] == 3 and second_counts["remaining"] == 1,
+        f"remaining 是这一批之后还剩多少：{first_counts} / {second_counts}",
+    )
+
+    original_dir = docking_module.dockings_dir
+    original_resolve = docking_module.resolve_vina
+    original_run = docking_module.run_vina
+    original_convert = docking_module.best_pose_to_pdb
+    original_prepared = ligand_module.prepared_ligandset_dir
+    original_probe = chemistry_module._probe_deps
+
+    seen: list[str] = []
+
+    async def fake_run_vina(argv, *, cwd, timeout, log_path) -> Any:
+        ligand_path = Path(argv[argv.index("--ligand") + 1])
+        out_path = Path(argv[argv.index("--out") + 1])
+        seen.append(ligand_path.stem)
+        out_path.write_text(
+            "MODEL 1\nREMARK VINA RESULT: -7.0 0.0 0.0\nATOM\nENDMDL\n", encoding="utf-8"
+        )
+        log_path.write_text("ok\n", encoding="utf-8")
+        return docking_module.VinaRun(tuple(argv), 0, "ok", False, log_path)
+
+    def fake_convert(pose_pdbqt: Path, dest: Path) -> bool:
+        dest.write_text("ATOM      1  C   LIG A   1       0.000   0.000   0.000\n",
+                        encoding="utf-8")
+        return True
+
+    try:
+        docking_module.dockings_dir = lambda: work / "docking"
+        docking_module.resolve_vina = lambda: docking_module.VinaBinary("/fake/vina", "1.2.5")
+        docking_module.run_vina = fake_run_vina
+        docking_module.best_pose_to_pdb = fake_convert
+        ligand_module.prepared_ligandset_dir = lambda: work / "prepared"
+        chemistry_module._probe_deps = lambda: ()
+
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        receptor_dir = work / "receptor"
+        receptor_dir.mkdir(parents=True, exist_ok=True)
+        (receptor_dir / "receptor.pdbqt").write_text("REMARK receptor\n", encoding="utf-8")
+        (receptor_dir / "box.txt").write_text(
+            "center_x = 1.0\ncenter_y = 2.0\ncenter_z = 3.0\n"
+            "size_x = 20.0\nsize_y = 21.0\nsize_z = 22.0\n",
+            encoding="utf-8",
+        )
+        receptor = ledger.add(
+            "receptor", path=receptor_dir, summary="受体",
+            fingerprint=fingerprint_path(receptor_dir),
+            meta={"stage": "prepared", "pdbqt_file": "receptor.pdbqt", "box_file": "box.txt"},
+        )
+
+        ligand_dir = work / "ligands"
+        (ligand_dir / "ligands").mkdir(parents=True, exist_ok=True)
+        records = []
+        for name in ["A", "B", "C", "D", "E"]:
+            (ligand_dir / "ligands" / f"{name}.pdbqt").write_text("ATOM\n", encoding="utf-8")
+            records.append(
+                {"id": name, "name": name, "smiles": "C", "status": "ok",
+                 "pdbqt": f"ligands/{name}.pdbqt", "heavy_atoms": 1}
+            )
+        products_module.write_json_atomic(
+            ligand_dir / "manifest.json",
+            {"kind": "ligandset", "stage": "prepared", "records": records, "counts": {}},
+        )
+        ligand_set = ledger.add(
+            "ligandset", path=ligand_dir, summary="五个配体",
+            fingerprint=fingerprint_path(ligand_dir),
+            meta={"stage": "prepared"}, link_current_receptor=False,
+        )
+
+        tool = docking_module.DockTool()
+        batches = []
+        for offset in (0, 2, 4):
+            result = await tool.execute(
+                {
+                    "receptor": str(receptor.handle),
+                    "ligands": str(ligand_set.handle),
+                    "offset": offset,
+                    "limit": 2,
+                },
+                context=ledger,
+            )
+            check(not result.failed, f"offset={offset} 对接成功：{result.output}")
+            batches.append(result)
+
+        ids = [
+            [row["id"] for row in
+             products_module.read_json(ledger.get(result.meta["handle"]).path / "manifest.json")["results"]]
+            for result in batches
+        ]
+        check(ids[0] == ["A", "B"], f"第一批是 A/B：{ids[0]}")
+        check(ids[1] == ["C", "D"], f"第二批是 C/D：{ids[1]}")
+        check(ids[2] == ["E"], f"第三批是 E：{ids[2]}")
+        check(
+            len({str(ledger.get(result.meta["handle"]).path) for result in batches}) == 3,
+            "三批是三个产物目录（offset 进缓存键）",
+        )
+        check(
+            batches[0].meta.get("remaining") == 3
+            and batches[1].meta.get("remaining") == 1
+            and batches[2].meta.get("remaining") == 0,
+            f"remaining 按这一批算：{[b.meta.get('remaining') for b in batches]}",
+        )
+
+        beyond = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "ligands": str(ligand_set.handle),
+                "offset": 9,
+            },
+            context=ledger,
+        )
+        check(
+            beyond.failed and "越过末尾" in beyond.output and "5" in beyond.output,
+            f"offset 越界要说清只有几条：{beyond.output}",
+        )
+
+        again = await tool.execute(
+            {
+                "receptor": str(receptor.handle),
+                "ligands": str(ligand_set.handle),
+                "offset": 0,
+                "limit": 2,
+            },
+            context=ledger,
+        )
+        check(again.meta.get("reused") is True, "同参第二次调用复用旧产物")
+
+        legacy = await tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle), "limit": 2},
+            context=ledger,
+        )
+        check(
+            not legacy.failed
+            and legacy.meta.get("handle") == batches[0].meta.get("handle"),
+            "不给 offset 等价于 offset=0（命中同一份产物）",
+        )
+
+        # ---- 二、prepare_ligands 的 offset 是真跑 Meeko ----
+        raw_dir = work / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        (raw_dir / ligand_module.CSV_FILE).write_text(
+            "id,name,smiles\nm1,a,CCO\nm2,b,CCCl\nm3,c,CCC\n", encoding="utf-8"
+        )
+        products_module.write_json_atomic(
+            raw_dir / ligand_module.MANIFEST_FILE, {"kind": "ligandset", "stage": "raw"}
+        )
+        raw = ledger.add(
+            "ligandset", path=raw_dir, summary="三个分子",
+            fingerprint="fp-raw-offset", meta={"kind": "ligandset", "stage": "raw"},
+            link_current_receptor=False,
+        )
+        prepare = ligand_module.PrepareLigandsTool()
+        one = await prepare.execute(
+            {"ligands": str(raw.handle), "offset": 0, "limit": 1, "confirm": True},
+            context=ledger,
+        )
+        two = await prepare.execute(
+            {"ligands": str(raw.handle), "offset": 1, "limit": 1, "confirm": True},
+            context=ledger,
+        )
+        check(not one.failed and not two.failed, f"两批准备都成功：{one.output} / {two.output}")
+        first_entry = ledger.get(one.meta["handle"])
+        second_entry = ledger.get(two.meta["handle"])
+        check(
+            first_entry.path != second_entry.path,
+            "两批准备落在两个目录（offset 进缓存键）",
+        )
+        first_ids = [
+            row["id"] for row in
+            products_module.read_json(first_entry.path / ligand_module.MANIFEST_FILE)["records"]
+            if row.get("status") == "ok"
+        ]
+        second_ids = [
+            row["id"] for row in
+            products_module.read_json(second_entry.path / ligand_module.MANIFEST_FILE)["records"]
+            if row.get("status") == "ok"
+        ]
+        check(first_ids == ["m1"], f"第一批只准备 m1：{first_ids}")
+        check(second_ids == ["m2"], f"第二批只准备 m2：{second_ids}")
+        check(not set(first_ids) & set(second_ids), "两批准备的不是同一个分子")
+
+        empty = await prepare.execute(
+            {"ligands": str(raw.handle), "offset": 99, "limit": 1, "confirm": True},
+            context=ledger,
+        )
+        check(
+            empty.failed and "越过末尾" in empty.output,
+            f"准备的 offset 越界也要说清：{empty.output}",
+        )
+    finally:
+        docking_module.dockings_dir = original_dir
+        docking_module.resolve_vina = original_resolve
+        docking_module.run_vina = original_run
+        docking_module.best_pose_to_pdb = original_convert
+        ligand_module.prepared_ligandset_dir = original_prepared
+        chemistry_module._probe_deps = original_probe
+
+
+async def check_mmcif() -> None:
+    """只有 mmCIF 的条目：装了 gemmi 就转换并登记，转换失败不写盘不登记。"""
+    work = PROBE / "mmcif"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    store = work / "structures"
+
+    calls: list[tuple[str, str]] = []
+
+    def get_text_or_none(url, params=None, *, timeout=45.0, headers=None):
+        calls.append(("GET", url))
+        if url.endswith(".cif"):
+            return _cif_fixture()
+        return None  # .pdb 一律 404：这就是「只有 mmCIF」
+
+    original_text = structure_module.http.get_text_or_none
+    original_dir = structure_module.structure_dir
+    original_cif = structure_module._cif_to_pdb
+    structure_module.http.get_text_or_none = get_text_or_none
+    structure_module.structure_dir = lambda: store
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        fetch = structure_module.FetchStructureTool()
+
+        result = await fetch.execute({"pdb_id": "6VXX"}, context=ledger)
+        check(not result.failed, f"mmCIF 能转换并登记：{result.output.splitlines()[0]}")
+        entry = ledger.entries()[0]
+        check(
+            entry.meta.get("source_format") == "mmCIF",
+            f"登记时记下来源格式：{entry.meta.get('source_format')}",
+        )
+        check(entry.meta.get("format") == "pdb", "磁盘上那份确实是 PDB")
+        check(
+            result.meta.get("chains") == ["A"],
+            f"转换后的坐标能读出链：{result.meta.get('chains')}",
+        )
+        text = (store / "6VXX.pdb").read_text(encoding="utf-8")
+        check(
+            text.startswith(structure_module.CIF_CONVERTED_MARKER),
+            "写盘的文件带一行来源标记（读盘时才认得出它从哪来）",
+        )
+
+        before = len(calls)
+        again = await fetch.execute({"pdb_id": "6VXX"}, context=ledger)
+        check(not again.failed, "第二次取同一个编号成功")
+        check(len(calls) == before, f"第二次读盘、不联网：新增 {len(calls) - before} 次")
+        check(
+            ledger.entries()[0].meta.get("source_format") == "mmCIF",
+            "读盘时仍认得出它原本是 mmCIF",
+        )
+        check(len(ledger.entries()) == 1, "重新读取不重复登记")
+
+        # 转换失败：不登记、不写半截文件
+        def broken(_text: str) -> str:
+            raise ValueError("没有坐标记录")
+
+        structure_module._cif_to_pdb = broken
+        entries_before = len(ledger.entries())
+        failed = await fetch.execute({"pdb_id": "7ABC", "refresh": True}, context=ledger)
+        check(failed.failed, "转换失败要报失败")
+        check(
+            "转换成 PDB 失败" in failed.output and "import_structure" in failed.output,
+            f"说清失败原因并给出替代做法：{failed.output}",
+        )
+        check(
+            len(ledger.entries()) == entries_before,
+            "转换失败不登记（登记了就会指着一个不存在的产物）",
+        )
+        check(not (store / "7ABC.pdb").exists(), "转换失败不写半截文件")
+        structure_module._cif_to_pdb = original_cif
+
+        check(
+            structure_module._source_format("ATOM      1  N   ALA A   1\n") == "PDB",
+            "没有标记的文件算 PDB",
+        )
+    finally:
+        structure_module.http.get_text_or_none = original_text
+        structure_module.structure_dir = original_dir
+        structure_module._cif_to_pdb = original_cif
+
+
+async def check_assess_structure() -> None:
+    """结构评估：缺口来自 SEQRES 差集、无 SEQRES 报「无法判断」、NMR 只算第一套。"""
+    work = PROBE / "assess_structure"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    full = work / "1M17.pdb"
+    full.write_text(_pdb_fixture(), encoding="utf-8")
+
+    bare_text = "".join(
+        [
+            "EXPDTA    X-RAY DIFFRACTION\n",
+            "REMARK   2 RESOLUTION.    2.10 ANGSTROMS.\n",
+            _pdb_atom(1, "CA", "ALA", "A", 1, 1.0, 1.0, 1.0),
+            _pdb_atom(2, "CA", "GLY", "A", 2, 2.0, 1.0, 1.0),
+            # 一个锌离子：金属要单独报，不能混进配体
+            _pdb_atom(3, "ZN", "ZN", "A", 900, 3.0, 3.0, 3.0, kind="HETATM", element="ZN"),
+            "END\n",
+        ]
+    )
+    bare = work / "bare.pdb"
+    bare.write_text(bare_text, encoding="utf-8")
+
+    nmr_text = "".join(
+        [
+            "EXPDTA    SOLUTION NMR\n",
+            "SEQRES   1 A    2  MET ALA\n",
+            _pdb_atom(1, "CA", "MET", "A", 1, 1.0, 1.0, 1.0),
+            _pdb_atom(2, "CA", "ALA", "A", 2, 2.0, 1.0, 1.0),
+            "END\n",
+        ]
+    )
+    nmr = work / "nmr.pdb"
+    nmr.write_text(nmr_text, encoding="utf-8")
+
+    prepared_dir = work / "prepared"
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+    (prepared_dir / "receptor.pdb").write_text(bare_text, encoding="utf-8")
+
+    ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+    raw = ledger.add(
+        "receptor", path=full, summary="1M17", fingerprint=fingerprint_text(_pdb_fixture()),
+        meta={"stage": "raw", "pdb_id": "1M17"},
+    )
+    bare_entry = ledger.add(
+        "receptor", path=bare, summary="裸结构", fingerprint=fingerprint_text(bare_text),
+        meta={"stage": "raw"},
+    )
+    nmr_entry = ledger.add(
+        "receptor", path=nmr, summary="NMR", fingerprint=fingerprint_text(nmr_text),
+        meta={"stage": "raw"},
+    )
+    prepared = ledger.add(
+        "receptor", path=prepared_dir, summary="准备过的", fingerprint="fp-prep",
+        meta={"stage": "prepared", "pdb_file": "receptor.pdb"},
+    )
+    not_a_receptor = ledger.add(
+        "ligandset", path=full, summary="不是受体", fingerprint="fp-not-receptor",
+        meta={"stage": "raw"}, link_current_receptor=False,
+    )
+
+    assess = structure_module.AssessStructureTool()
+    before = len(ledger.entries(include_archived=True))
+
+    result = await assess.execute({"structure": str(raw.handle)}, context=ledger)
+    check(not result.failed, f"结构评估成功：{result.output.splitlines()[0]}")
+    check(
+        result.meta.get("method") == "X-RAY DIFFRACTION",
+        f"方法读出来了：{result.meta.get('method')}",
+    )
+    check(
+        result.meta.get("resolution") == 2.6,
+        f"分辨率读出来了：{result.meta.get('resolution')}",
+    )
+    check(result.meta.get("models") == 2, f"模型套数：{result.meta.get('models')}")
+    check(
+        result.output.count("缺失残基：2（声明 5、观测 3") == 1,
+        f"缺口按 SEQRES 差集算，并写明声明/观测：{result.output}",
+    )
+    check(
+        "交替构象标记：B" in result.output,
+        f"交替构象写出来（准备时要选一个）：{result.output}",
+    )
+    check("AQ4" in result.output, "共晶配体列出来")
+    check("水原子：1" in result.output, f"水原子数：{result.output}")
+
+    no_seqres = await assess.execute({"structure": str(bare_entry.handle)}, context=ledger)
+    check(
+        "无法判断" in no_seqres.output,
+        f"没有 SEQRES 时说「无法判断」，不报 0：{no_seqres.output}",
+    )
+    check(
+        no_seqres.meta.get("missing_residues") is None,
+        f"meta 里也不写成 0：{no_seqres.meta.get('missing_residues')}",
+    )
+    check(
+        "金属：ZN×1" in no_seqres.output and no_seqres.meta.get("metals") == ["ZN"],
+        f"金属单独报：{no_seqres.output}",
+    )
+    check(
+        "共晶配体候选" not in no_seqres.output,
+        f"金属不算「共晶配体候选」（那会让人以为锌是配体）：{no_seqres.output}",
+    )
+
+    nmr_result = await assess.execute({"structure": str(nmr_entry.handle)}, context=ledger)
+    check(
+        "NMR" in nmr_result.output and "第一套" in nmr_result.output,
+        f"NMR 的结论要提第一套模型：{nmr_result.output}",
+    )
+
+    prepared_result = await assess.execute(
+        {"structure": str(prepared.handle)}, context=ledger
+    )
+    check(
+        not prepared_result.failed,
+        f"准备过的受体也收（坐标在目录里）：{prepared_result.output}",
+    )
+
+    wrong = await assess.execute({"structure": str(not_a_receptor.handle)}, context=ledger)
+    check(wrong.failed, f"不是受体要拒绝：{wrong.output}")
+    no_ledger = await assess.execute({"structure": str(raw.handle)})
+    check(
+        no_ledger.failed and "内核装配问题" in no_ledger.output,
+        f"没注入登记表是装配问题：{no_ledger.output}",
+    )
+    after = len(ledger.entries(include_archived=True))
+    check(after == before, f"只读：调用前后登记表条目数不变（{before} → {after}）")
+
+
+async def check_admet() -> None:
+    """类药性规则层：每列的来源、公式进产物、做不了的端点标 unsupported。"""
+    work = PROBE / "admet"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    library = work / "library"
+    library.mkdir(parents=True, exist_ok=True)
+    rows = [
+        # 苯：小、疏水、无 TPSA
+        ("benzene", "c1ccccc1"),
+        # 葡萄糖：TPSA 110 还没到 Veber 的 140，也还没到 BBB 的 120 —— 落在「边界」
+        ("glucose", "OCC1OC(O)C(O)C(O)C1O"),
+        # 磷酸糖：TPSA 157，Veber 与 BBB 都该被挡下
+        ("sugar_phos", "O=P(O)(O)OCC1OC(O)C(O)C(O)C1O"),
+        # 苯胺片段：CYP 警示里应该有 aniline
+        ("aniline", "Nc1ccccc1"),
+        # 长链：可旋转键多
+        ("long", "C" * 30 + "C(=O)O"),
+    ]
+    (library / ligand_module.CSV_FILE).write_text(
+        "id,name,smiles\n" + "".join(f"{i},{i},{s}\n" for i, s in rows), encoding="utf-8"
+    )
+    products_module.write_json_atomic(
+        library / ligand_module.MANIFEST_FILE, {"kind": "ligandset", "stage": "raw"}
+    )
+
+    original_dir = admet_module.admet_dir
+    admet_module.admet_dir = lambda: work / "admet"
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        source = ledger.add(
+            "ligandset", path=library, summary="库", fingerprint="fp-admet",
+            meta={"kind": "ligandset", "stage": "raw"}, link_current_receptor=False,
+        )
+        tool = admet_module.AdmetTool()
+        result = await tool.execute(
+            {"ligands": str(source.handle), "endpoints": "solubility,veber,bbb,cyp"},
+            context=ledger,
+        )
+        check(not result.failed, f"类药性预筛成功：{result.output.splitlines()[0]}")
+        entry = ledger.get(result.meta["handle"])
+        check(entry.meta.get("stage") == "admet", f"阶段是 admet：{entry.meta.get('stage')}")
+        payload = products_module.read_json(entry.path / ligand_module.MANIFEST_FILE)
+
+        columns = payload.get("columns") or {}
+        check(
+            all(item.get("source") in ("rule", "unsupported") for item in columns.values()),
+            f"每列都有来源，且只有 rule / unsupported：{columns}",
+        )
+        check(
+            columns.get("hppb", {}).get("source") == "unsupported"
+            and columns.get("cyp_inhibition", {}).get("source") == "unsupported",
+            f"做不了的端点明确标 unsupported：{columns.get('hppb')}",
+        )
+        check(
+            payload.get("formula_version"),
+            f"公式版本写进产物：{payload.get('formula_version')}",
+        )
+        check(
+            admet_module.ESOL_FORMULA in (columns.get("esol_logs", {}).get("method") or ""),
+            "ESOL 的公式与系数一起写进产物（结果要能复核）",
+        )
+
+        table: dict[str, dict[str, str]] = {}
+        with (entry.path / ligand_module.CSV_FILE).open(encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                table[row["id"]] = row
+        check(len(table) == 5, f"五条都进表：{sorted(table)}")
+        check(
+            table["benzene"]["veber_pass"] == "是"
+            and table["sugar_phos"]["veber_pass"] == "否",
+            f"Veber：苯通过、磷酸糖被 TPSA 挡下：{table['sugar_phos']['veber_note']}",
+        )
+        check(
+            table["sugar_phos"]["bbb_class"] == "不太可能",
+            f"TPSA 157 透不过血脑屏障：{table['sugar_phos']['bbb_class']}",
+        )
+        check(
+            table["glucose"]["bbb_class"] == "边界",
+            f"TPSA 110 落在边界（不是「不太可能」）：{table['glucose']['bbb_class']}",
+        )
+        check(
+            table["aniline"]["cyp_alerts"] == "aniline",
+            f"CYP 警示子结构命中苯胺：{table['aniline']['cyp_alerts']!r}",
+        )
+        check(
+            table["long"]["veber_pass"] == "否" and "可旋转" in table["long"]["veber_note"],
+            f"长链被可旋转键挡下：{table['long']['veber_note']}",
+        )
+        check(
+            float(table["glucose"]["esol_logs"]) > float(table["benzene"]["esol_logs"]),
+            f"极性的葡萄糖比苯更溶（logS 更大）：{table['glucose']['esol_logs']} / "
+            f"{table['benzene']['esol_logs']}",
+        )
+
+        subset = await tool.execute(
+            {"ligands": str(source.handle), "endpoints": "veber"}, context=ledger
+        )
+        check(
+            not subset.failed and subset.meta["handle"] != result.meta["handle"],
+            "换端点组合是另一份产物",
+        )
+        unsupported = await tool.execute(
+            {"ligands": str(source.handle), "endpoints": "hppb"}, context=ledger
+        )
+        check(
+            unsupported.failed and "hppb" in unsupported.output,
+            f"要一个做不到的端点要明确拒绝：{unsupported.output}",
+        )
+        no_ledger = await tool.execute({"ligands": str(source.handle)})
+        check(
+            no_ledger.failed and "内核装配问题" in no_ledger.output,
+            f"没注入登记表是装配问题：{no_ledger.output}",
+        )
+    finally:
+        admet_module.admet_dir = original_dir
+
+
+async def check_sar() -> None:
+    """构效关系：骨架分组、匹配分子对、类似物枚举、实验回填。"""
+    work = PROBE / "sar"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    # 候选表夹具：同一个苯环上换取代基，分数差得开
+    candidates_dir = work / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"id": "c1", "name": "ethoxy", "smiles": "CCOc1ccccc1", "scores": {"dock": -9.0}},
+        {"id": "c2", "name": "propoxy", "smiles": "CCCOc1ccccc1", "scores": {"dock": -7.0}},
+        {"id": "c3", "name": "amino", "smiles": "CCNc1ccccc1", "scores": {"dock": -8.0}},
+        {"id": "c4", "name": "chain", "smiles": "CCOCC", "scores": {"dock": -6.0}},
+    ]
+    products_module.write_json_atomic(
+        candidates_dir / "candidates.json",
+        {
+            "kind": "candidates",
+            "score_column": "dock",
+            "higher_is_better": False,
+            "rows": [
+                {"id": row["id"], "name": row["name"], "smiles": row["smiles"],
+                 "scores": row["scores"]}
+                for row in rows
+            ],
+        },
+    )
+    products_module.write_json_atomic(candidates_dir / "params.json", {})
+
+    original_sar = sar_module.sar_dir
+    original_ligands = ligand_module.ligands_dir
+    original_runs = export_module.runs_dir
+    sar_module.sar_dir = lambda: work / "sar"
+    ligand_module.ligands_dir = lambda: work / "ligands"
+    export_module.runs_dir = lambda: work / "runs"
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        source = ledger.add(
+            "artifact", path=candidates_dir, summary="候选表",
+            fingerprint=fingerprint_path(candidates_dir),
+            meta={"kind": "candidates", "score_column": "dock", "higher_is_better": False},
+        )
+
+        # ---- 一、骨架分组 ----
+        scaffold_tool = sar_module.ScaffoldAnalysisTool()
+        grouped = await scaffold_tool.execute(
+            {"source": str(source.handle), "min_size": 1}, context=ledger
+        )
+        check(not grouped.failed, f"骨架分组成功：{grouped.output.splitlines()[0]}")
+        check(grouped.meta.get("groups") == 2, f"两个骨架组：{grouped.meta}")
+        entry = ledger.get(grouped.meta["handle"])
+        payload = products_module.read_json(entry.path / "manifest.json")
+        first = payload["groups"][0]
+        check(first["scaffold"] == "c1ccccc1", f"苯环是第一个骨架：{first['scaffold']}")
+        check(first["size"] == 3, f"苯环组有三个分子：{first['size']}")
+        check(
+            first["representative"]["id"] == "c1",
+            f"代表分子是组内分数最好的（dock 越低越好）：{first['representative']['id']}",
+        )
+        check(
+            payload["groups"][-1]["scaffold"] == "",
+            f"无环分子归成 acyclic：{payload['groups'][-1]}",
+        )
+
+        # ---- 二、匹配分子对 ----
+        mmp_tool = sar_module.MatchedPairsTool()
+        pairs = await mmp_tool.execute(
+            {"source": str(source.handle), "min_delta": 0.5}, context=ledger
+        )
+        check(not pairs.failed, f"匹配分子对成功：{pairs.output.splitlines()[0]}")
+        pairs_entry = ledger.get(pairs.meta["handle"])
+        pair_rows = products_module.read_json(pairs_entry.path / "manifest.json")["pairs"]
+        check(len(pair_rows) >= 1, f"至少找到一对：{pairs.meta}")
+        top_pair = pair_rows[0]
+        check(top_pair["better"]["id"] == "c1", f"dock 越低越好，c1 是「更优」侧：{top_pair['better']}")
+        check(
+            abs(top_pair["delta"]) >= 0.5,
+            f"delta 按下限过滤，且恒为正：{top_pair['delta']}",
+        )
+        check(
+            pair_rows == sorted(pair_rows, key=lambda item: -item["delta"]),
+            "按 delta 降序",
+        )
+        no_pairs = await mmp_tool.execute(
+            {"source": str(source.handle), "min_delta": 99}, context=ledger
+        )
+        check(
+            not no_pairs.failed and no_pairs.meta.get("pairs") == 0,
+            f"没有达到差值的对子时给空表并说明：{no_pairs.output.splitlines()[:2]}",
+        )
+
+        # ---- 三、类似物枚举 ----
+        enum_tool = sar_module.EnumerateAnalogsTool()
+        analogs = await enum_tool.execute(
+            {"scaffold": str(grouped.meta["handle"]), "group": 1, "max": 20}, context=ledger
+        )
+        check(not analogs.failed, f"枚举成功：{analogs.output.splitlines()[0]}")
+        analog_entry = ledger.get(analogs.meta["handle"])
+        check(
+            analog_entry.meta.get("stage") == "raw",
+            f"枚举产物是 raw 配体集，可直接准备：{analog_entry.meta.get('stage')}",
+        )
+        with (analog_entry.path / ligand_module.CSV_FILE).open(encoding="utf-8") as handle:
+            made = [row for row in csv.DictReader(handle)]
+        check(len(made) >= 1, f"生成了分子：{len(made)}")
+        originals = {row["smiles"] for row in rows}
+        check(
+            all(row["smiles"] not in originals for row in made),
+            "组内原有的分子不算「新类似物」",
+        )
+        check(
+            len({row["smiles"] for row in made}) == len(made),
+            "生成结果不重复",
+        )
+        check(
+            all(row["id"] and row["heavy_atoms"] for row in made),
+            "每条都有 id 与重原子数（prepare_ligands 要用）",
+        )
+        acyclic_group = await enum_tool.execute(
+            {"scaffold": str(grouped.meta["handle"]), "group": 2}, context=ledger
+        )
+        check(
+            acyclic_group.failed and "acyclic" in acyclic_group.output,
+            f"无环组没有核心，要说清而不是生成空表：{acyclic_group.output}",
+        )
+        bad_group = await enum_tool.execute(
+            {"scaffold": str(grouped.meta["handle"]), "group": 9}, context=ledger
+        )
+        check(bad_group.failed, f"组号越界要拒绝：{bad_group.output}")
+
+        # ---- 四、实验回填 ----
+        assay_csv = work / "assay-in.csv"
+        assay_csv.write_text(
+            "molecule,value\nc1,>10000\nc2,120\nc3,not-a-number\n", encoding="utf-8"
+        )
+        assay_tool = sar_module.RecordAssayTool()
+        recorded = await assay_tool.execute(
+            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger
+        )
+        check(not recorded.failed, f"实验回填成功：{recorded.output.splitlines()[0]}")
+        check(recorded.meta.get("received") == 2, f"只收可解析的两条：{recorded.meta}")
+        check(recorded.meta.get("skipped") == 1, f"跳过一条非数字：{recorded.meta}")
+        assay_path = work / "runs" / "egfr" / "assay.csv"
+        check(assay_path.is_file(), "落在 runs/<campaign>/assay.csv")
+        with assay_path.open(encoding="utf-8") as handle:
+            stored = {row["molecule"]: row for row in csv.DictReader(handle)}
+        check(
+            stored["c1"]["value"] == "10000.0" and stored["c1"]["qualifier"] == ">",
+            f"限定符与数值分开存：{stored['c1']}",
+        )
+
+        # 同一个分子再报一次：保留最新，旧值进历史
+        assay_csv.write_text("molecule,value\nc2,15\n", encoding="utf-8")
+        again = await assay_tool.execute(
+            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger
+        )
+        check(again.meta.get("superseded") == 1, f"覆盖了一条旧值：{again.meta}")
+        with assay_path.open(encoding="utf-8") as handle:
+            stored = {row["molecule"]: row for row in csv.DictReader(handle)}
+        check(stored["c2"]["value"] == "15.0", f"表里是最新的值：{stored['c2']}")
+        check(
+            (work / "runs" / "egfr" / "assay-history.csv").is_file(),
+            "旧值进了历史文件，不丢",
+        )
+
+        other = work / "runs" / "other" / "assay.csv"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("molecule,value\nz1,1\n", encoding="utf-8")
+        before = other.read_text(encoding="utf-8")
+        await assay_tool.execute(
+            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger
+        )
+        check(other.read_text(encoding="utf-8") == before, "别的 campaign 一个字节都不动")
+
+        bad_campaign = await assay_tool.execute(
+            {"file": str(assay_csv), "campaign": "../etc", "assay": "IC50"}, context=ledger
+        )
+        check(
+            bad_campaign.failed,
+            f"campaign 会当目录名，不能带路径：{bad_campaign.output}",
+        )
+        bad_columns = work / "bad.csv"
+        bad_columns.write_text("foo,bar\n1,2\n", encoding="utf-8")
+        missing = await assay_tool.execute(
+            {"file": str(bad_columns), "campaign": "egfr", "assay": "IC50"}, context=ledger
+        )
+        check(
+            missing.failed and "表头" in missing.output,
+            f"列名对不上要说清认哪些名字：{missing.output}",
+        )
+    finally:
+        sar_module.sar_dir = original_sar
+        ligand_module.ligands_dir = original_ligands
+        export_module.runs_dir = original_runs
+
+
+async def check_pharmacophore() -> None:
+    """药效团：共识点、叠合失败的分子逐条记录、筛选分数能分开活性和诱饵。"""
+    work = PROBE / "pharmacophore"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    library = work / "library"
+    library.mkdir(parents=True, exist_ok=True)
+    actives = [
+        ("a1", "c1ccc(OCC(=O)N)cc1"),
+        ("a2", "c1ccc(OCCC(=O)N)cc1"),
+        ("a3", "Cc1ccc(OCC(=O)N)cc1"),
+        ("a4", "Clc1ccc(OCC(=O)N)cc1"),
+        ("a5", "c1ccc(OCC(=O)NC)cc1"),
+        ("a6", "c1ccc(OCC(=O)NCC)cc1"),
+    ]
+    decoys = [("z1", "CCOCC"), ("z2", "c1ccncc1")]
+    (library / ligand_module.CSV_FILE).write_text(
+        "id,name,smiles\n"
+        + "".join(f"{i},{i},{s}\n" for i, s in actives + decoys),
+        encoding="utf-8",
+    )
+    products_module.write_json_atomic(
+        library / ligand_module.MANIFEST_FILE, {"kind": "ligandset", "stage": "reference"}
+    )
+
+    small = work / "small"
+    small.mkdir(parents=True, exist_ok=True)
+    (small / ligand_module.CSV_FILE).write_text(
+        "id,name,smiles\n" + "".join(f"{i},{i},{s}\n" for i, s in actives[:3]),
+        encoding="utf-8",
+    )
+    products_module.write_json_atomic(
+        small / ligand_module.MANIFEST_FILE, {"kind": "ligandset", "stage": "reference"}
+    )
+
+    original_dir = pharmacophore_module.pharmacophore_dir
+    original_candidates = screen_module.candidates_dir
+    pharmacophore_module.pharmacophore_dir = lambda: work / "pharm"
+    screen_module.candidates_dir = lambda: work / "candidates"
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        reference = ledger.add(
+            "ligandset", path=library, summary="参考集", fingerprint="fp-ref",
+            meta={"kind": "ligandset", "stage": "reference"}, link_current_receptor=False,
+        )
+        tiny = ledger.add(
+            "ligandset", path=small, summary="三条", fingerprint="fp-small",
+            meta={"kind": "ligandset", "stage": "reference"}, link_current_receptor=False,
+        )
+
+        build = pharmacophore_module.BuildPharmacophoreTool()
+        result = await build.execute(
+            {"actives": str(reference.handle), "min_support": 0.5}, context=ledger
+        )
+        check(not result.failed, f"药效团生成成功：{result.output.splitlines()[0]}")
+        check(result.meta.get("n_actives") == 6, f"六个分子参与共识：{result.meta}")
+        check(result.meta.get("features") >= 3, f"至少三个药效点：{result.meta}")
+
+        entry = ledger.get(result.meta["handle"])
+        check(entry.meta.get("kind") == "pharmacophore", f"登记成药效团：{entry.meta.get('kind')}")
+        check(
+            [str(parent) for parent in entry.parents] == [str(reference.handle)],
+            f"血缘记了参考集：{entry.parents}",
+        )
+        check(
+            entry.meta.get("align_rmsd") is not None and entry.meta["align_rmsd"] < 2.5,
+            f"叠合 RMSD 记在产物里：{entry.meta.get('align_rmsd')}",
+        )
+        counts = entry.meta.get("counts") or {}
+        check(
+            sum(counts.values()) == len(entry.meta.get("features") or []),
+            f"按类型计数与特征点数对得上：{counts}",
+        )
+        check(
+            "z1" in result.output and "公共骨架" in result.output,
+            f"叠不上的分子要逐条列出原因：{result.output}",
+        )
+        check(
+            all(0 < item["support"] <= 6 for item in entry.meta["features"]),
+            "每个点都记了支持度（有几个分子贡献了它）",
+        )
+        # min_support=0.5、6 个分子 → 每个保留下来的点至少在 3 个分子里出现。
+        # 这条是「共识」这个词的全部内容：门槛失效时只出现在一个分子里的点会混进来。
+        check(
+            all(item["support"] >= 3 for item in entry.meta["features"]),
+            f"低于 min_support 的点被丢掉：{[item['support'] for item in entry.meta['features']]}",
+        )
+
+        again = await build.execute(
+            {"actives": str(reference.handle), "min_support": 0.5}, context=ledger
+        )
+        check(again.meta.get("reused") is True, "同参第二次调用复用旧产物")
+
+        too_few = await build.execute({"actives": str(tiny.handle)}, context=ledger)
+        check(
+            too_few.failed and "少于 5" in too_few.output,
+            f"不足 5 个分子直接拒绝：{too_few.output}",
+        )
+        bad_support = await build.execute(
+            {"actives": str(reference.handle), "min_support": 1.5}, context=ledger
+        )
+        check(bad_support.failed, f"min_support 越界要拒绝：{bad_support.output}")
+
+        # ---- 独立叠合工具：叠好之后药效团直接读坐标，不再重复叠 ----
+        ligand_module.aligned_ligandset_dir = lambda: work / "aligned"
+        aligner = ligand_module.AlignLigandsTool()
+        aligned = await aligner.execute({"ligands": str(reference.handle)}, context=ledger)
+        check(not aligned.failed, f"叠合成功：{aligned.output.splitlines()[0]}")
+        check(aligned.meta.get("count") == 6, f"六个同系列的叠上了：{aligned.meta}")
+        check(aligned.meta.get("dropped") == 2, f"两个诱饵叠不上，逐条记下：{aligned.meta}")
+        aligned_entry = ledger.get(aligned.meta["handle"])
+        check(
+            aligned_entry.meta.get("stage") == "aligned",
+            f"产物阶段是 aligned：{aligned_entry.meta.get('stage')}",
+        )
+        sdf_path = aligned_entry.path / aligned_entry.meta.get("sdf")
+        check(sdf_path.is_file(), f"写出一份带坐标的 SDF：{sdf_path.name}")
+        from rdkit import Chem as _Chem_align
+
+        sdf_mols = [mol for mol in _Chem_align.SDMolSupplier(str(sdf_path), removeHs=True)
+                    if mol is not None]
+        check(len(sdf_mols) == 6, f"SDF 里六个构象：{len(sdf_mols)}")
+        check(
+            {mol.GetProp("_Name") for mol in sdf_mols} == {i for i, _ in actives},
+            "SDF 里的分子名就是原来的 id（下游靠它对上）",
+        )
+        with (aligned_entry.path / ligand_module.CSV_FILE).open(encoding="utf-8") as handle:
+            aligned_rows = list(csv.DictReader(handle))
+        check(
+            "align_rmsd" in (aligned_rows[0] if aligned_rows else {}),
+            "CSV 里带每个分子的叠合 RMSD",
+        )
+        reused_aligned = await aligner.execute(
+            {"ligands": str(reference.handle)}, context=ledger
+        )
+        check(reused_aligned.meta.get("reused") is True, "同参第二次叠合复用旧产物")
+
+        from_aligned = await build.execute(
+            {"actives": str(aligned.meta["handle"]), "min_support": 0.5}, context=ledger
+        )
+        check(
+            not from_aligned.failed,
+            f"药效团可以直接吃叠好的产物：{from_aligned.output.splitlines()[0]}",
+        )
+        aligned_pharm = ledger.get(from_aligned.meta["handle"])
+        check(
+            aligned_pharm.meta.get("align_rmsd") == aligned_entry.meta.get("mean_rmsd"),
+            f"叠合 RMSD 沿用上游那份，不重新算：{aligned_pharm.meta.get('align_rmsd')} / "
+            f"{aligned_entry.meta.get('mean_rmsd')}",
+        )
+
+        strict = await aligner.execute(
+            {"ligands": str(reference.handle), "min_atoms": 40}, context=ledger
+        )
+        check(
+            strict.failed and "公共骨架" in strict.output,
+            f"骨架要求太严时要说清为什么叠不上：{strict.output}",
+        )
+
+        screen_tool = pharmacophore_module.ScreenPharmacophoreTool()
+        screened = await screen_tool.execute(
+            {"pharmacophore": str(result.meta["handle"]), "library": str(reference.handle)},
+            context=ledger,
+        )
+        check(not screened.failed, f"按药效团筛成功：{screened.output.splitlines()[0]}")
+        table = ledger.get(screened.meta["handle"])
+        payload = products_module.read_json(table.path / "candidates.json")
+        check(
+            payload.get("score_column") == "pharmacophore",
+            f"分数列单独一列：{payload.get('score_column')}",
+        )
+        scores = {row["id"]: row["scores"]["pharmacophore"] for row in payload["rows"]}
+        check(
+            min(scores[i] for i, _ in actives) > max(scores[i] for i, _ in decoys),
+            f"活性分子的分数普遍高于诱饵：{ {k: round(v, 2) for k, v in scores.items()} }",
+        )
+        check(
+            payload["rows"][0]["id"] in {i for i, _ in actives},
+            f"榜首是活性分子：{payload['rows'][0]['id']}",
+        )
+
+        truncated = await screen_tool.execute(
+            {"pharmacophore": str(result.meta["handle"]), "library": str(reference.handle),
+             "top": 3},
+            context=ledger,
+        )
+        check(truncated.meta.get("count") == 3, f"top 生效：{truncated.meta}")
+        check("调大 top" in truncated.output, "截断要写明还有多少")
+
+        wrong = await screen_tool.execute(
+            {"pharmacophore": str(reference.handle), "library": str(reference.handle)},
+            context=ledger,
+        )
+        check(wrong.failed, f"不是药效团的产物要拒绝：{wrong.output}")
+        no_ledger = await screen_tool.execute(
+            {"pharmacophore": str(result.meta["handle"]), "library": str(reference.handle)}
+        )
+        check(
+            no_ledger.failed and "内核装配问题" in no_ledger.output,
+            f"没注入登记表是装配问题：{no_ledger.output}",
+        )
+    finally:
+        pharmacophore_module.pharmacophore_dir = original_dir
+        screen_module.candidates_dir = original_candidates
 
 
 def check_align_and_prior() -> None:
@@ -9243,7 +11632,9 @@ async def check_structure_tools() -> None:
         calls.append(("GET", url))
         if "1M17" in url:
             return _pdb_fixture()
-        # 6VXX 与 9ZZZ 都取不到 .pdb（404），区别只在 .cif 在不在——那由 probe 决定。
+        if "6VXX" in url and url.endswith(".cif"):
+            return _cif_fixture()
+        # 9ZZZ 两个格式都 404；6VXX 的 .pdb 也是 404（只有 mmCIF）
         return None
 
     def probe(url, *, timeout=45.0):
@@ -9255,6 +11646,7 @@ async def check_structure_tools() -> None:
     original_text = structure_module.http.get_text_or_none
     original_probe = structure_module.http.probe
     original_dir = structure_module.structure_dir
+    original_cif = structure_module._cif_to_pdb
     structure_module.http.get_text_or_none = get_text_or_none
     structure_module.http.probe = probe
     structure_module.structure_dir = lambda: store
@@ -9338,10 +11730,14 @@ async def check_structure_tools() -> None:
             "业务失败不该被当成装配问题",
         )
 
-        # 只有 mmCIF（超大结构）→ 另一档错，说清原因并给出可走的路。
-        # 6VXX 在这个假传输里 .pdb 是 404、.cif 是 200，正是「超出 PDB 上限」那条路。
+        # 只有 mmCIF（超大结构）→ 没装 gemmi 时仍是原来那条错，文案逐字不变。
+        # 6VXX 在这个假传输里 .pdb 是 404、.cif 是 200。
+        def no_gemmi(_text: str) -> str:
+            raise ImportError("No module named 'gemmi'")
+
+        structure_module._cif_to_pdb = no_gemmi
         huge = await fetch.execute({"pdb_id": "6VXX"}, context=ledger)
-        check(huge.failed, "超出 PDB 上限的编号失败")
+        check(huge.failed, "超出 PDB 上限且没有 gemmi 时失败")
         check(
             "超出了 PDB 格式的上限" in huge.output and "mmCIF" in huge.output,
             f"说清是超出了 PDB 上限、只提供 mmCIF：{huge.output.splitlines()[0]}",
@@ -9355,13 +11751,14 @@ async def check_structure_tools() -> None:
             "「太大」那一档不能说成「编号不存在」",
         )
         check(
-            calls.count(("HEAD", "https://files.rcsb.org/download/6VXX.cif")) == 1,
-            f"探 .cif 用的是 HEAD：{calls}",
+            calls.count(("GET", "https://files.rcsb.org/download/6VXX.pdb")) == 1,
+            f"只取过一次 .pdb，失败之后不再重试：{calls}",
         )
         check(
-            calls.count(("GET", "https://files.rcsb.org/download/6VXX.pdb")) == 1,
-            f"只取过一次 .pdb，探 .cif 时不再下载：{calls}",
+            not (store / "6VXX.pdb").exists(),
+            "转换失败不写半截文件（否则下次会被当成有效缓存读进来）",
         )
+        structure_module._cif_to_pdb = original_cif
 
         # 参数校验失败时一次请求都不发。
         calls.clear()
@@ -9545,6 +11942,7 @@ async def check_structure_tools() -> None:
         structure_module.http.get_text_or_none = original_text
         structure_module.http.probe = original_probe
         structure_module.structure_dir = original_dir
+        structure_module._cif_to_pdb = original_cif
         shutil.rmtree(work, ignore_errors=True)
 
 
@@ -10409,8 +12807,9 @@ def check_chemistry_gate() -> None:
     ligand_tools = ligand_module.domain_tools()
     check(
         [item.spec.name for item in ligand_tools]
-        == ["import_ligandset", "prepare_ligands"],
-        f"配体模块导出导入与准备两个工具：{[item.spec.name for item in ligand_tools]}",
+        == ["import_ligandset", "prepare_ligands", "curate_ligands", "build_reference_set",
+            "align_ligands"],
+        f"配体模块导出五个工具：{[item.spec.name for item in ligand_tools]}",
     )
     for item in ligand_tools:
         check(
@@ -10425,7 +12824,7 @@ def check_chemistry_gate() -> None:
             "ledger" not in (item.spec.parameters.get("properties") or {}),
             f"{item.spec.name} 的参数模式里不列 ledger",
         )
-    import_tool, prepare_tool = ligand_tools
+    import_tool, prepare_tool, curate_tool, reference_tool, align_tool = ligand_tools
     check(
         "path" in (import_tool.spec.parameters.get("required") or []),
         "配体导入的 path 是必填",
@@ -10440,6 +12839,18 @@ def check_chemistry_gate() -> None:
         .get("type")
         == "boolean",
         "配体准备的 confirm 是布尔（两阶段开关）",
+    )
+    check(
+        "ligands" in (curate_tool.spec.parameters.get("required") or []),
+        "筛库的 ligands 是必填",
+    )
+    check(
+        "actives" in (reference_tool.spec.parameters.get("required") or []),
+        "参考集的 actives 是必填",
+    )
+    check(
+        "ligands" in (align_tool.spec.parameters.get("required") or []),
+        "叠合的 ligands 是必填",
     )
 
     docking_tools = docking_module.domain_tools()
@@ -11322,6 +13733,7 @@ async def check_listing_tools() -> None:
         "search_corpus",
         "read_source",
         "open_viewer",
+        "analyze_pose",
     ):
         check(readonly not in PLAN_DENY, f"只读工具 {readonly} 不在 PLAN_DENY 里（Plan 下要放行）")
     ledger.reset()
@@ -12644,10 +15056,17 @@ async def check_tool_family() -> None:
         listing in description and "族与工具" in description,
         "load_tools 的说明带上了族 → 工具那张表",
     )
+    check(f"{len(groups)} 族" in description, "说明里的族数就是目录里的族数")
+    # 光比对内容抓不到「写死一个恰好正确的数」。原先这条拿 "13 族" 当哨兵，
+    # 族数真的涨到 13 之后哨兵永远成立，等于没测——改成看源码：说明必须是
+    # `len(families())` 现算，类体里不许出现「数字 + 族」这种字面量。
+    class_source = inspect.getsource(LoadToolsTool)
     check(
-        "13 族" not in description and f"{len(groups)} 族" in description,
-        "族数是数出来的，不是写死的",
+        "len(families())" in class_source,
+        "族数由 families() 现算",
     )
+    hard_coded = [n for n in range(len(groups) + 2) if f"{n} 族" in class_source]
+    check(not hard_coded, f"族数是数出来的，不是写死的：写死了 {hard_coded}")
 
     registry = ToolRegistry()
     for tool in (LoadToolsTool(), ReadTurnTool()):
@@ -12720,7 +15139,7 @@ async def check_tool_family() -> None:
     )
     check(not part.failed, f"只关掉一部分时其余照装：{part.output}")
     check(
-        part.meta["tools"] == ["fetch_structure", "import_structure"],
+        part.meta["tools"] == ["fetch_structure", "import_structure", "assess_structure"],
         f"装进来的只有可用的那些：{part.meta['tools']}",
     )
     check(
@@ -14418,6 +16837,20 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("complexes", check_complexes),
     ("prankweb", check_prankweb),
     ("pockets", check_pockets),
+    ("pocket-tools", check_pocket_tools),
+    ("rank-candidates", check_rank_candidates),
+    ("analyze-pose", check_analyze_pose),
+    ("curate-ligands", check_curate_ligands),
+    ("reference-set", check_reference_set),
+    ("screen-similarity", check_screen_similarity),
+    ("screen-shape", check_screen_shape),
+    ("validate-docking", check_validate_docking),
+    ("batch-offset", check_batch_offset),
+    ("mmcif", check_mmcif),
+    ("assess-structure", check_assess_structure),
+    ("admet", check_admet),
+    ("sar", check_sar),
+    ("pharmacophore", check_pharmacophore),
     ("align-prior", check_align_and_prior),
     ("write-run", check_write_run),
     ("write-run-docking", check_write_run_docking),

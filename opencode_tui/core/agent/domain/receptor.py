@@ -446,6 +446,8 @@ def _build(
     keep_raw: str,
     center_raw: str,
     size_raw: str,
+    pocket_box: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None,
+    pocket_label: str = "",
     padding: float,
     altloc: str,
     relax: bool,
@@ -504,6 +506,11 @@ def _build(
     keep_names = tuple(dict.fromkeys([*modified_names, *_tokens(keep_raw)]))
 
     groups = pdbtext.hetero_groups(doc, exclude_names=modified_names)
+    # 给了口袋时盒子已经定死，不再需要从杂原子里挑一个当配体——多配体结构
+    # （1IEP 有 STI 加四个 Cl）否则会卡在「哪个才是配体」这一步，而那个选择
+    # 对盒子已经没有任何影响。
+    if pocket_box is not None and not ligand_raw.strip():
+        ligand_raw = NONE
     if ligand_raw.strip().lower() == WHOLE:
         ligand, ligand_note = None, "按参数用整份受体算盒子（盲对接）"
     else:
@@ -523,10 +530,14 @@ def _build(
             f"这份结构的链清单：{_chain_summary(facts)}"
         )
 
-    # 盒子：显式给的优先，其次共晶配体，最后才是整份受体（盲对接）。
-    # 顺序不能反——由配体算出来的盒子是「结合位点」，由整份受体算出来的是「整张蛋白」，
-    # 后者会让对接在几十埃的范围里瞎找。
-    if center_raw.strip() or size_raw.strip():
+    # 盒子：口袋对象优先，其次显式给的，再次共晶配体，最后才是整份受体（盲对接）。
+    # 口袋排第一是因为它是用户/模型**先看过**再选的：先看口袋、再定盒子、再准备受体，
+    # 这条链比「准备完才发现盒子不对、回头重做」短。顺序不能反——由配体算出来的盒子
+    # 是「结合位点」，由整份受体算出来的是「整张蛋白」，后者会让对接在几十埃的范围里瞎找。
+    if pocket_box is not None:
+        box = pocket_box
+        source = f"口袋 {pocket_label}" if pocket_label else "口袋"
+    elif center_raw.strip() or size_raw.strip():
         if not (center_raw.strip() and size_raw.strip()):
             raise ToolError("盒子要成对给：box_center 与 box_size 必须同时给")
         box = (
@@ -912,6 +923,50 @@ def _render_done(situation: Situation) -> str:
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
+def _same_lineage(ledger: SessionLedger, left: Any, right: Any) -> bool:
+    """两条条目是不是同一条受体线上的（自己、或互为祖先）。
+
+    只比 handle 相等会挡掉一个常见动作：口袋是从 **prepared** 受体上定义的，
+    而准备要回到 **raw** 那一条重做。两者在血缘上是一条线，盒子仍然有效。
+    """
+    if str(left.handle) == str(right.handle):
+        return True
+    left_lineage = {str(item.handle) for item in ledger.lineage(left.handle)}
+    right_lineage = {str(item.handle) for item in ledger.lineage(right.handle)}
+    return str(right.handle) in left_lineage or str(left.handle) in right_lineage
+
+
+def _read_pocket_box(
+    path: Path, label: str
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """从 `pocket.json` 读盒子。**只读 `box.center` / `box.size`**，不重算。
+
+    重算会让「用户看到的那处口袋」与「实际对接的盒子」变成两个东西，而两边
+    都不会报错——这类偏差只会在结果不合理时才被发现。
+    """
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    box = payload.get("box") if isinstance(payload, dict) else None
+    if not isinstance(box, dict):
+        raise ValueError(f"{label} 里没有 box 字段")
+    center = box.get("center")
+    size = box.get("size")
+    if not (isinstance(center, list) and len(center) == 3):
+        raise ValueError(f"{label} 的 box.center 不是三个数")
+    if not (isinstance(size, list) and len(size) == 3):
+        raise ValueError(f"{label} 的 box.size 不是三个数")
+    try:
+        center_values = tuple(float(value) for value in center)
+        size_values = tuple(float(value) for value in size)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} 的 box 里有非数字") from None
+    if any(value <= 0 for value in size_values):
+        raise ValueError(f"{label} 的 box.size 有非正数")
+    return (
+        (center_values[0], center_values[1], center_values[2]),
+        (size_values[0], size_values[1], size_values[2]),
+    )
+
+
 class PrepareReceptorTool(Tool):
     """把一套实验坐标准备成可以直接对接的受体。"""
 
@@ -942,6 +997,13 @@ class PrepareReceptorTool(Tool):
                 "ligand": {
                     "type": "string",
                     "description": "共晶配体：残基名或 残基名:链；whole 盲对接；none 不取",
+                },
+                "pocket": {
+                    "type": "string",
+                    "description": (
+                        "口袋 handle（define_pocket 的产物）；给了就用它的盒子，"
+                        "与 box_center / box_size 互斥。ligand 仍可用来抽走共晶配体"
+                    ),
                 },
                 "box_center": {
                     "type": "string",
@@ -1064,6 +1126,65 @@ class PrepareReceptorTool(Tool):
                 failed=True,
             )
 
+        # ---- 口袋：盒子从口袋对象读，不再由配体或整份受体现算 ----
+        raw_pocket = str(arguments.get("pocket") or "").strip()
+        pocket_box = None
+        pocket_label = ""
+        if raw_pocket:
+            if str(arguments.get("box_center") or "").strip() or str(
+                arguments.get("box_size") or ""
+            ).strip():
+                return ToolResult(
+                    output=(
+                        "pocket 与 box_center / box_size 互斥：盒子只能有一个来源。"
+                        "用口袋就删掉显式坐标，反之亦然"
+                    ),
+                    failed=True,
+                )
+            try:
+                from ..ledger import ArtifactHandle, expect_handle
+
+                pocket_entry = ledger.get(raw_pocket)
+                expect_handle(pocket_entry, ArtifactHandle, "pocket")
+            except Exception as error:
+                return ToolResult(output=str(error), failed=True)
+            if str(pocket_entry.meta.get("kind") or "") != "pocket":
+                return ToolResult(
+                    output=(
+                        f"{pocket_entry.handle} 不是口袋（meta.kind="
+                        f"{pocket_entry.meta.get('kind') or '空'}）。"
+                        "先用 define_pocket 定义一处"
+                    ),
+                    failed=True,
+                )
+            if not _same_lineage(ledger, pocket_entry, entry):
+                return ToolResult(
+                    output=(
+                        f"口袋 {pocket_entry.handle} 不属于这条受体（{entry.handle}）："
+                        "两者既不是同一条，也不在同一条血缘上。"
+                        "换一个从这条受体算出来的口袋"
+                    ),
+                    failed=True,
+                )
+            if pocket_entry.path is None or not Path(pocket_entry.path).is_dir():
+                return ToolResult(
+                    output=(
+                        f"口袋 {pocket_entry.handle} 的产物目录不在了"
+                        f"（{pocket_entry.path}）。重新跑一次 define_pocket"
+                    ),
+                    failed=True,
+                )
+            try:
+                pocket_box = _read_pocket_box(
+                    Path(pocket_entry.path) / "pocket.json", str(pocket_entry.handle)
+                )
+                pocket_label = str(pocket_entry.handle)
+            except (OSError, ValueError) as error:
+                return ToolResult(
+                    output=f"读口袋盒子失败（{type(error).__name__}：{error}）",
+                    failed=True,
+                )
+
         confirm = bool(arguments.get("confirm"))
         try:
             text = entry.path.read_text(encoding="utf-8", errors="replace")
@@ -1075,6 +1196,8 @@ class PrepareReceptorTool(Tool):
                 keep_raw=str(arguments.get("keep_hetero") or ""),
                 center_raw=str(arguments.get("box_center") or ""),
                 size_raw=str(arguments.get("box_size") or ""),
+                pocket_box=pocket_box,
+                pocket_label=pocket_label,
                 padding=padding,
                 altloc=altloc,
                 relax=bool(arguments.get("relax")),

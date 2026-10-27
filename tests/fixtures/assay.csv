@@ -1,0 +1,5 @@
+﻿molecule,value
+aspirin,>10000
+caffeine,120
+ibuprofen,35.5
+not-a-number,n/a

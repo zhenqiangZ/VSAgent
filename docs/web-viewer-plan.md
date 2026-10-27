@@ -877,9 +877,12 @@ prankweb 的响应 39 KB 可直接存盘，不需要筛）。
    在页面上视觉尺度一致；**不用** prankweb 的 `surface` 原子集反推半径（那是另一套概念）。
 9. **P0 的下载上限与缓存**：**N = 12**，按 2.3.6 排序取前 N，返回里报 `total=69, used=12`；
    **不设按需下载**（口袋要靠这些坐标算出来）。缓存放 `~/.opencode_tui/rcsb/`，按条目 id 存 `.pdb`，
-   不自动过期。搜索那一步也缓存：按查询条件哈希存 `~/.opencode_tui/rcsb/search/<哈希>.json`，时效一天。
+   不自动过期。搜索那一步也缓存，时效一天——**目录见第 11 条**（原定 `rcsb/search/`，
+   2026-10-27 与 `search_pdb` 那套合并成一处）。
 10. **搜索工具做两个**：`search_pdb`（收 `{"query": "..."}` 或属性条件如 `{"uniprot": "Q15858"}`，
     内部决定走文本搜还是属性搜）与 `search_literature`（收 `{"query": "..."}`）。
     返回条目 id 列表 + 每个条目的配体代号与名称 + 命中总数；文献则是 id + 标题 + 摘要片段。
     **不带任何归类或「是否真配体」的判断**。**不**为「按 UniProt 列结构」单列工具。
-11. **搜索结果缓存到磁盘**：`~/.opencode_tui/search/<哈希>.json`，时效一天，理由同 prankweb 缓存。
+11. **搜索结果缓存到磁盘**：`~/.opencode_tui/search/<kind>-<哈希>.json`，时效一天，理由同
+    prankweb 缓存。**这是唯一一处**：`rsearch` / `complexes` / `literature` / `websearch`
+    都从这里读写，实现只在 `rsearch._cache_path` / `_read_cache` / `_write_cache` 一份。

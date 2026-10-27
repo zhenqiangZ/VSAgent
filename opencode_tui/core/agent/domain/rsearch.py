@@ -51,7 +51,11 @@ RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 RCSB_GRAPHQL_URL = "https://data.rcsb.org/graphql"
 
 SEARCH_CACHE_TTL = 24 * 3600
-"""搜索结果缓存时效（秒），与 `complexes.py` 同一档。一天——新结构发布是低频事件。"""
+"""搜索结果缓存时效（秒）。一天——新结构发布是低频事件，一天足够新鲜。
+
+**只有这一处定义**：`complexes.py` 原先自己写了一份一模一样的值，合并缓存时
+一并收掉。改这个数就是改全局，别再往别处抄第二个。
+"""
 
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 100
@@ -101,7 +105,14 @@ class PdbHit:
 # 缓存
 # ---------------------------------------------------------------------------
 def search_dir() -> Path:
-    """搜索结果缓存目录（§7.11）。与状态文件、结构缓存同处一个家目录。"""
+    """**全仓唯一**的检索结果缓存目录（§7.11）。与状态文件、结构缓存同处一个家目录。
+
+    用它的有四个模块：`rsearch`（RCSB 属性搜 / 文本搜 / 批量配体）、`complexes`
+    （P0 复合物检索）、`literature`（PubMed）、`websearch`（联网摘要）。原先
+    `complexes` 自带一份 `~/.opencode_tui/rcsb/search/`，两处写的逻辑一样、
+    目录不同——同一个 Uniprot 连问两遍也互相看不见。合并之后只认这一处，
+    键由 `_cache_path(kind, payload)` 算，**不同模块的同类请求算出来的键必须一致**。
+    """
     return Path.home() / ".opencode_tui" / "search"
 
 
@@ -234,6 +245,10 @@ def search_entries(
 
     **命中总数与 id 列表一起给**：只报列出来的那几条，用户会以为一共就这么多
     （`complexes.py` 的 `total` / `used` 是同一条道理）。
+
+    **`complexes.list_complexes` 走的是同一条路**：它只负责造自己的查询体，
+    请求、缓存、错误分档都在这里。零命中也进缓存（204 归一成空响应），
+    所以「查了确实没有」这个结论一天内不会反复打接口。
     """
     path = _cache_path("search", query)
     if use_cache:
@@ -249,7 +264,12 @@ def search_entries(
         # 把它一起吞了，于是「查了、确实没有」被写成「这次没搜成」——模型读到之后
         # 以为工具坏了，换个说法反复重试（现场：`ses_0037` 第 5~9 步连试四种说法，
         # 步数就是这么烧掉的）。当成空结果往下走，正文与 `meta.reason` 会分开说。
-        body = {}
+        #
+        # **归一成带 `result_set` 的空响应再进缓存**：204 本身没有响应体，
+        # 不写一份的话同一个「确实没有」每次都要再打一次接口。缓存里放的是
+        # 一份形状与真实响应一致的记录（`_ids_from` / `_total_from` 都吃得下），
+        # 而不是那个 `{}`——读回来的人和写下去的人看到的是同一种东西。
+        body = {"result_set": [], "total_count": 0}
     except RetryableToolError:
         # **瞬时故障不在这里变成永久失败。** `http` 已经按「重试还有没有意义」
         # 分过档（429 / 5xx / 连不上是可重试），再包成 `SearchError` 就等于

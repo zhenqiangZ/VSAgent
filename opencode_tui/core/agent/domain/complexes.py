@@ -9,6 +9,9 @@
 
 1. **搜**（`list_complexes`）：RCSB 属性搜，条件 `UniProt accession == <AC>`
    加 `nonpolymer_entity_count > 0`。实测 ABL1（`P00519`）→ 69 个条目。
+   **请求本身交给 `rsearch.search_entries`**——两条路打的是同一个 RCSB 接口，
+   原先各写了一份「什么算这次没搜成 / 结果缓在哪 / 怎么解 id」，两份迟早会漂。
+   现在只有一份实现、一个缓存目录（`~/.opencode_tui/search/`）。
 2. **排**（`pick_top`）：分辨率 → 实验方法 → 配体像不像真配体 → 同名去重，取前 N（默认 12）。
 3. **下**（`download_entry`）：`https://files.rcsb.org/download/<ID>.pdb`，实测平均 0.24 MB。
    走 `http.py`，写进 `~/.opencode_tui/rcsb/`，失败的不计入、继续下一个。
@@ -19,33 +22,24 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..tools import RetryableToolError, ToolError
-from . import http
+from . import http, rsearch
 
 __all__ = [
     "ComplexEntry",
     "ComplexError",
-    "RCSB_SEARCH_URL",
     "RCSB_DOWNLOAD_URL",
-    "SEARCH_CACHE_TTL",
     "download_entry",
     "list_complexes",
     "pick_top",
     "rcsb_cache_dir",
-    "search_cache_dir",
 ]
 
-RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 RCSB_DOWNLOAD_URL = "https://files.rcsb.org/download"
-
-SEARCH_CACHE_TTL = 24 * 3600
-"""搜索结果的时效（秒）。一天——新结构发布是低频事件，一天足够新鲜。"""
 
 DEFAULT_TOP_N = 12
 """P0 下载上限。按 §7.9 拍定；返回里要报 `total` / `used`，只报 `used`
@@ -104,54 +98,14 @@ _METHOD_RANK = {
 # 缓存
 # ---------------------------------------------------------------------------
 def rcsb_cache_dir() -> Path:
-    """下载下来的坐标存放处（§7.9）。与状态文件、结构缓存同处一个家目录。"""
+    """下载下来的坐标存放处（§7.9）。与状态文件、结构缓存同处一个家目录。
+
+    **只放坐标**。搜索结果的缓存不在这里，在 `rsearch.search_dir()` 的
+    `~/.opencode_tui/search/`——两个模块共用那一处（见本模块开头第 1 条）。
+    旧版本曾把搜索结果写在 `rcsb/search/` 下，那份缓存没有对应的查询体可以搬迁，
+    只好让它自然过期：时效一天，超过一天的文件本来也不会再被读到。
+    """
     return Path.home() / ".opencode_tui" / "rcsb"
-
-
-def search_cache_dir() -> Path:
-    """搜索结果的缓存目录（§7.9 第二条）。"""
-    return Path.home() / ".opencode_tui" / "rcsb" / "search"
-
-
-def _cache_path(query: Any) -> Path:
-    blob = json.dumps(query, ensure_ascii=False, sort_keys=True)
-    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
-    return search_cache_dir() / f"{digest}.json"
-
-
-def _read_cache(path: Path) -> Any | None:
-    """读缓存。**过期或损坏都当没有**——损坏的缓存不能变成一次假结果。"""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        payload = json.loads(text)
-    except ValueError:
-        return None
-    if not isinstance(payload, dict) or "saved_at" not in payload:
-        return None
-    import time
-
-    if time.time() - float(payload["saved_at"]) > SEARCH_CACHE_TTL:
-        return None
-    return payload.get("body")
-
-
-def _write_cache(path: Path, body: Any) -> None:
-    """写缓存。**失败不影响主流程**——缓存是加速用的，不是真相。"""
-    import time
-
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps({"saved_at": time.time(), "body": body}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        tmp.replace(path)
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +168,10 @@ def list_complexes(
 
     返回的第二个值是原始响应（给判据与排查看），**不要写进 `meta.json`**。
 
-    **零命中回 `([], {})` 而不是抛错**——RCSB 在零结果时回 204 无内容（`http.EmptyResult`），
-    那是「查了、确实没有」。这条与「没查成」在调用方那里说出的话相反
-    （前者该转预测，后者该重试），所以它在同一条路上必须分得开。
+    **零命中回 `([], 空响应)` 而不是抛错**——RCSB 在零结果时回 204 无内容
+    （`http.EmptyResult`），那是「查了、确实没有」。这条与「没查成」在调用方那里
+    说出的话相反（前者该转预测，后者该重试），所以它在同一条路上必须分得开。
+    空响应也进缓存（`rsearch` 那边统一处理）：同一个 204 不必一天里问很多遍。
     其余失败抛 `ComplexError`——调用方把它读成「这一侧不可用」，不重试到底。
     """
     accession = (uniprot or "").strip()
@@ -224,30 +179,17 @@ def list_complexes(
         raise ComplexError("没有 UniProt 编号，搜不了复合物")
 
     query = _accession_query(accession)
-    path = _cache_path(query)
-    if use_cache:
-        cached = _read_cache(path)
-        if cached is not None:
-            return _ids_from(cached), cached
-
     try:
-        body = http.post_json(RCSB_SEARCH_URL, query, timeout=timeout)
-    except http.EmptyResult:
-        # 查了、没有。缓存一份空的，省得同一个目标反复去打同一个 204。
-        empty: dict[str, Any] = {"result_set": [], "total_count": 0}
-        if use_cache:
-            _write_cache(path, empty)
-        return [], empty
-    except RetryableToolError:
-        # 429 / 5xx / 连不上是瞬时故障，交给循环层重试；包成 ComplexError 就
-        # 等于替它做了「别再试」的决定，而它并不知道网络刚刚抖了一下。
-        raise
-    except Exception as error:  # 其余（响应形状不对、4xx）归为「这一侧不可用」
-        raise ComplexError(f"RCSB 检索没成：{error}") from error
-
-    if use_cache:
-        _write_cache(path, body)
-    return _ids_from(body), body
+        ids, _total, body = rsearch.search_entries(
+            query, use_cache=use_cache, timeout=timeout
+        )
+    except rsearch.SearchError as error:
+        # 错误文案原样带过来：两份实现里写的就是同一句「RCSB 检索没成：…」，
+        # 这里只把类型翻译成调用方认识的 `ComplexError`。
+        # `RetryableToolError`（429 / 5xx / 连不上）穿过这两层，由循环层重试——
+        # 在这里包一层就等于替它决定了「别再试」。
+        raise ComplexError(str(error)) from error
+    return ids, body
 
 
 def _ids_from(body: Any) -> list[str]:
@@ -256,17 +198,11 @@ def _ids_from(body: Any) -> list[str]:
     **只认 `result_set[].identifier`**，不顺手把别的字段也解出来——
     「没解出 `polymer_entity_count` 之类的旁支字段」是一条判据，多解一项就多一种
     把响应形状的偶然当成约定的可能。
+
+    合并缓存之后与 `rsearch._ids_from` 是同一个函数（并进那份的唯一理由是
+    「两个模块对同一条响应必须解得一模一样」）。这里留个名字给老调用点与判据。
     """
-    if not isinstance(body, dict):
-        return []
-    result_set = body.get("result_set")
-    if not isinstance(result_set, list):
-        return []
-    ids: list[str] = []
-    for item in result_set:
-        if isinstance(item, dict) and isinstance(item.get("identifier"), str):
-            ids.append(item["identifier"])
-    return ids
+    return rsearch._ids_from(body)
 
 
 # ---------------------------------------------------------------------------

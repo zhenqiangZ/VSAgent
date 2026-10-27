@@ -1,9 +1,9 @@
 """领域工具的调试入口：**直接跑，不用敲任何参数**。
 
 放在仓库根目录，不放在 `opencode_tui/core/agent/domain/` 里：它是开发期用的东西，
-不该和那 24 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
+不该和那 42 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
 
-    # 一、全跑：13 个模块、24 个工具，按依赖顺序一个接一个（不需要任何参数）
+    # 一、全跑：19 个模块、42 个工具，按依赖顺序一个接一个（不需要任何参数）
     .venv/Scripts/python.exe debug_tools.py
 
     # 二、只跑一个模块（10 个工具模块末尾的块就是这么用的）
@@ -87,9 +87,20 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("fetch_target", {"accession": "P00533"}),
     # 取一份远端结构（1M17，EGFR 激酶域），登记成 raw 的受体
     ("fetch_structure", {"pdb_id": "1M17"}),
+    # 先看一眼这套结构能不能用：方法、分辨率、缺口、交替构象
+    ("assess_structure", {"structure": "{receptor:raw}"}),
+    # 口袋：先看这份结构自带的口袋（离线，不联网），再选一处。
+    # 1M17 带 AQ4，所以 sources=auto 走 ligand 那一层就够。
+    ("detect_pockets", {"receptor": "{receptor:raw}"}),
+    ("define_pocket", {"pockets": "{artifact:pockets}", "index": 1}),
     # 把它准备成可以直接对接的受体，再设为当前受体。1M17 是单链但带交替构象，
-    # 所以只给 altloc；confirm 打开才真写盘与登记
-    ("prepare_receptor", {"structure": "{receptor:raw}", "confirm": True, "altloc": "A"}),
+    # 所以只给 altloc；盒子来自上一步的口袋，不再由共晶配体现算。
+    ("prepare_receptor", {
+        "structure": "{receptor:raw}",
+        "pocket": "{artifact:pocket}",
+        "confirm": True,
+        "altloc": "A",
+    }),
     ("switch_receptor", {"receptor": "{receptor:prepared}"}),
     # 导一份本机坐标（全库唯一收路径的动作）。**排在这里是为了让 `{receptor:raw}`
     # 仍指向 1M17**：它也会登记一条 raw 受体，排在准备受体之前就会被换掉
@@ -97,6 +108,8 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     # 导入一份本机配体文件（第二个收路径的动作）：.smi 每行 `SMILES 名字`。
     # 里面的盐会被去掉、无效 SMILES 会被跳过并逐条报出来。
     ("import_ligandset", {"path": "tests/fixtures/ligands.smi"}),
+    # 过第一道闸：PAINS / Brenk / 去重 / 性质窗口。夹具里 4 条，能筛掉几条。
+    ("curate_ligands", {"ligands": "{ligandset:raw}", "max_mw": 500}),
     # 把它准备成 PDBQT：真跑 ETKDGv3 + Meeko，3 个分子通常几秒
     ("prepare_ligands", {"ligands": "{ligandset:raw}", "confirm": True, "limit": 10}),
     # 真跑 Vina：需要 PATH 里有 vina 或设置 VSA_VINA_BIN；没有时这一步会照实失败。
@@ -116,6 +129,53 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "ligands": "{ligandset:prepared}",
         "limit": 3,
         "timeout": 300,
+    }),
+    # 多路合成候选表：把上面两路分数对齐、转秩、分档。只读产物，不跑引擎。
+    # 上一步没跑成（没有 DTA 环境）时这一条会照实失败并说清缺哪个 handle。
+    ("rank_candidates", {
+        "sources": "{artifact:docking},{artifact:affinity}",
+        "top": 5,
+    }),
+    # 看某一条的接触依据：只读，不登记。分子用 id（夹具里的名字，不是序号）。
+    ("analyze_pose", {"docking": "{artifact:docking}", "molecule": "aspirin"}),
+    # 参考活性集：导一份带 pChEMBL 的 CSV（第三个收路径的动作），按活性下限筛一遍。
+    # 4 条里 1 条低于 6、1 条命中 PAINS（只标不删），所以参考集只有 3 条 → too_small。
+    ("import_ligandset", {"path": "tests/fixtures/actives.csv"}),
+    ("build_reference_set", {"actives": "{ligandset:raw}", "min_pchembl": 6}),
+    # 两条不看靶点的通道：2D 指纹（毫秒级）与 3D 形状（读已备的 PDBQT）。
+    # 库用筛过的那一份；`{ligandset:raw}` 现在指向刚导入的活性集，别用错了。
+    ("screen_similarity", {
+        "query": "{ligandset:reference}",
+        "library": "{ligandset:curated}",
+        "top": 5,
+    }),
+    ("screen_shape", {
+        "query": "{receptor:prepared}",
+        "library": "{ligandset:prepared}",
+        "top": 5,
+    }),
+    # 类药性：在同一份筛过的库上算规则层指标（不需要 3D、不需要引擎）
+    ("predict_admet", {"ligands": "{ligandset:curated}", "endpoints": "solubility,veber,bbb,cyp"}),
+    # 构效关系：先分组，再找匹配分子对，最后用第一组枚举一批类似物。
+    # 候选表来自 rank_candidates；那一步没跑成时这几条会照实失败。
+    ("scaffold_analysis", {"source": "{artifact:candidates}", "min_size": 1}),
+    ("matched_pairs", {"source": "{artifact:candidates}", "min_delta": 0.5}),
+    ("enumerate_analogs", {"scaffold": "{artifact:scaffolds}", "group": 1, "max": 10}),
+    # 药效团：一份同系列 6 个分子（前一节的参考集只有 3 条，凑不出共识）。
+    # 这一步要 MCS 叠合，所以用同一个系列的夹具，而不是化学型五花八门的那批。
+    ("import_ligandset", {"path": "tests/fixtures/series.csv"}),
+    ("align_ligands", {"ligands": "{ligandset:raw}"}),
+    ("build_pharmacophore", {"actives": "{ligandset:aligned}", "min_support": 0.5}),
+    ("screen_pharmacophore", {
+        "pharmacophore": "{artifact:pharmacophore}",
+        "library": "{ligandset:raw}",
+        "top": 5,
+    }),
+    # 实验回填（第四个收路径的动作）：夹具里 3 条可解析、1 条写成 n/a
+    ("record_assay", {
+        "file": "tests/fixtures/assay.csv",
+        "campaign": "debug",
+        "assay": "IC50",
     }),
     # 两个搜索工具：只给候选、不给结论
     ("search_pdb", {"query": "EGFR kinase", "limit": 5}),
@@ -158,7 +218,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {name: arguments for name, arguments in CA
 
 # 参数里的占位：`{receptor}` = 最新的受体，`{receptor:raw}` = 最新的、阶段是 raw 的受体。
 # 阶段读条目的 `meta["stage"]`（`structure` 登记 raw、`prepare_receptor` 登记 prepared）。
-PLACEHOLDER = re.compile(r"^\{([a-z]+)(?::([a-z]+))?\}$")
+# 占位可以整段是一个，也可以夹在一串里（`rank_candidates` 的 sources 要两三个 handle）。
+INLINE = re.compile(r"\{([a-z]+)(?::([a-z]+))?\}")
 
 # 本文件就在仓库根目录。
 REPO_ROOT = Path(__file__).resolve().parent
@@ -194,7 +255,7 @@ def main(module_name: str, tools: list[Tool], argv: list[str] | None = None) -> 
 def root_main(argv: list[str] | None = None) -> int:
     """根目录那一侧的入口：第一个词是模块名就用它，是工具名就去找它在哪个模块。
 
-    不带参数时按模块表把 13 个模块、24 个工具全跑一遍。
+    不带参数时按模块表把 19 个模块、42 个工具全跑一遍。
     """
     load_env()
     args = list(sys.argv[1:] if argv is None else argv)
@@ -273,7 +334,7 @@ def _tool_modules() -> list[tuple[str, list[Tool]]]:
 
     模块名不写成一串常量：新加一个领域模块时，只要它在 `domain/__init__.py` 的 `__all__`
     里，这里自动就能看到它。没有 `domain_tools()` 的辅助模块（http / chemistry /
-    pdbtext / complexes / prankweb / pockets）自然被跳过。
+    pdbtext / complexes / prankweb / products）自然被跳过。
 
     顺序也是**全跑时的顺序**，`__all__` 里就是依赖顺序。
     """
@@ -288,7 +349,7 @@ def _tool_modules() -> list[tuple[str, list[Tool]]]:
 
 
 def _run_batch(groups: list[tuple[str, list[Tool]]]) -> int:
-    """全跑：`CALLS` 里那 24 个工具依次跑一遍，最后给一张表。
+    """全跑：`CALLS` 里那 42 个工具依次跑一遍，最后给一张表。
 
     开跑前清空登记表：全跑的价值在于「一条链从头串到尾」，起点必须是同一份空表。
     单个工具失败不打断后面的——调试要看的正是「哪一个不行、为什么」。
@@ -391,25 +452,33 @@ def _resolve_handles(
 ) -> tuple[dict[str, Any], str]:
     """把参数里的 `{receptor:raw}` 这类占位换成登记表里现成的那一条 handle。
 
-    只有整段值就是占位时才替换（`"receptor#1"`、`"CHEMBL25"` 这些原样留着）。
+    占位可以整段是一个（`"receptor": "{receptor:raw}"`），也可以夹在一串里
+    （`"sources": "{artifact:docking},{artifact:affinity}"`）——后者是
+    `rank_candidates` 这类「收一串 handle」的工具要的。不含 `{` 的值原样留着，
+    所以 `"receptor#1"`、`"CHEMBL25"` 这些不受影响。
     表里还没有这样的条目时返回一条说明——那多半是前置没跑，照实报出来比让它去猜好。
     """
     resolved = dict(arguments)
     for key, value in arguments.items():
-        if not isinstance(value, str):
+        if not isinstance(value, str) or "{" not in value:
             continue
-        found = PLACEHOLDER.match(value.strip())
-        if found is None:
-            continue
-        kind, stage = found.group(1), found.group(2) or ""
-        entry = _latest_entry(ledger, kind, stage)
-        if entry is None:
-            want = f"{kind}/{stage}" if stage else kind
-            return {}, (
-                f"{key} 要的是 {value}，但登记表里还没有这样的条目（{want}）——"
-                "先把它跑出来，或者直接给一个具体的 handle"
-            )
-        resolved[key] = str(entry.handle)
+        error: list[str] = []
+
+        def replace(match: re.Match[str]) -> str:
+            kind, stage = match.group(1), match.group(2) or ""
+            entry = _latest_entry(ledger, kind, stage)
+            if entry is None:
+                want = f"{kind}/{stage}" if stage else kind
+                error.append(
+                    f"{key} 要的是 {match.group(0)}，但登记表里还没有这样的条目（{want}）——"
+                    "先把它跑出来，或者直接给一个具体的 handle"
+                )
+                return match.group(0)
+            return str(entry.handle)
+
+        resolved[key] = INLINE.sub(replace, value)
+        if error:
+            return {}, error[0]
     return resolved, ""
 
 

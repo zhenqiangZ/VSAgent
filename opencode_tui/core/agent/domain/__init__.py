@@ -36,7 +36,7 @@
 | `uniprot.py` | 靶点检索与取详情（2 个工具） |
 | `pdbtext.py` | PDB 纯文本编辑层（零第三方依赖，不登记工具） |
 | `preprocess.py` | 结构清洗与杂原子组几何筛查（不登记工具） |
-| `structure.py` | 取结构、导结构（2 个工具） |
+| `structure.py` | 取结构、导结构、结构评估（3 个工具） |
 | `chembl.py` | 已知活性与类似物（3 个工具） |
 | `chemistry.py` | 可选化学依赖的守门人（不登记工具） |
 | `export.py` | 从坐标算口袋的纯几何（第 1 步）+ `write_run` / `open_viewer` 两个工具（第 4 步） |
@@ -44,14 +44,19 @@
 | `docking.py` | AutoDock Vina 对接（1 个工具） |
 | `prankweb.py` | P1 副选：prankweb.cz 的 p2rank 预测（状态轮询 + 缓存，不登记工具） |
 | `products.py` | 内容寻址产物目录、`params.json` 提交标记、原子写盘（不登记工具） |
-| `pockets.py` | 四层口袋来源的装配点，产出 `meta.json` 的 `pockets[]`（不登记工具） |
+| `pockets.py` | 四层口袋来源的装配点 + `detect_pockets` / `define_pocket` 两个工具（第 2 步） |
+| `analysis.py` | 把多路分数合成候选表：对齐、平均秩、分档（第 4 步之后） |
+| `screen.py` | 不看靶点的通道：2D 指纹相似度 + 3D 形状（USR），两个工具 |
+| `admet.py` | 类药性规则层：ESOL / Veber / BBB / CYP 警示（1 个工具） |
+| `sar.py` | 构效关系：骨架分组、匹配分子对、类似物枚举、实验回填（4 个工具） |
+| `pharmacophore.py` | 共识药效团：从活性里提炼特征点 + 按距离指纹筛库（2 个工具） |
 | `align.py` | 先验清单的取证与叠合：核序列、按 CA 把配体搬进受体参考系（不登记工具） |
 | `rsearch.py` | 搜索工具（一）：RCSB 文本/属性搜 + GraphQL 批量取配体（1 个工具） |
 | `literature.py` | 搜索工具（二）：PubMed E-utilities 文献检索（1 个工具） |
 | `websearch.py` | 搜索工具（三）：联网搜索与单页抓取（2 个工具，结果落进本地语料） |
 | `corpus.py` | 本地语料：入库 / 检索 / 按页读原文（3 个工具，免费离线；检索是三路 RRF） |
 | `receptor.py` | 准备受体（1 个工具） |
-| `ligand.py` | 导入配体集 + 准备配体（2 个工具） |
+| `ligand.py` | 导入 / 准备 / 筛库 / 参考集 / 叠合（5 个工具） |
 | `listing.py` | 浏览登记表（3 个工具） |
 | `all_tools.py` | 把上面各模块的工具合成一份，供应用一次装完 |
 
@@ -62,8 +67,10 @@
 from __future__ import annotations
 
 __all__ = [
+    "admet",
     "affinity",
     "align",
+    "analysis",
     "chembl",
     "chemistry",
     "complexes",
@@ -75,12 +82,15 @@ __all__ = [
     "listing",
     "literature",
     "pdbtext",
+    "pharmacophore",
     "pockets",
     "prankweb",
     "preprocess",
     "products",
     "receptor",
     "rsearch",
+    "sar",
+    "screen",
     "structure",
     "uniprot",
     "websearch",

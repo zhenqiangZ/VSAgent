@@ -63,6 +63,9 @@ MAX_CPU = 256
 DEFAULT_ENERGY_RANGE = 3.0
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
+# offset 是「配体集里的第几条」，上限跟导入上限同量级（库最多 5 万条）。
+# 与 limit 绑定会让 500 之后的分子永远对不到——那正是这次要修的问题。
+MAX_OFFSET = 50_000
 DEFAULT_TIMEOUT = 300.0
 MIN_TIMEOUT = 10.0
 MAX_TIMEOUT = 3600.0
@@ -103,6 +106,7 @@ class DockParams:
     cpu: int = DEFAULT_CPU
     energy_range: float = DEFAULT_ENERGY_RANGE
     limit: int = DEFAULT_LIMIT
+    offset: int = 0
     timeout: float = DEFAULT_TIMEOUT
 
     def as_dict(self) -> dict[str, Any]:
@@ -113,6 +117,7 @@ class DockParams:
             "cpu": self.cpu,
             "energy_range": self.energy_range,
             "limit": self.limit,
+            "offset": self.offset,
             "timeout": self.timeout,
         }
 
@@ -575,6 +580,9 @@ def _render_docked(
         f"可打分 {counts.get('docked', 0)}、转出 PDB {counts.get('pdb', 0)}、"
         f"失败 {counts.get('failed', 0)}、未处理 {counts.get('remaining', 0)}。"
     )
+    offset = int((manifest.get("params") or {}).get("offset") or 0)
+    if offset:
+        lines.append(f"本批从第 {offset + 1} 个配体开始（offset={offset}）。")
     if results:
         best = results[0]
         efficiency = best.get("ligand_efficiency")
@@ -703,6 +711,7 @@ def _dock_params(arguments: dict[str, Any]) -> DockParams:
             arguments, "energy_range", DEFAULT_ENERGY_RANGE, 0.1, 100.0
         ),
         limit=_int_argument(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT),
+        offset=_int_argument(arguments, "offset", 0, 0, MAX_OFFSET),
         timeout=_float_argument(
             arguments, "timeout", DEFAULT_TIMEOUT, MIN_TIMEOUT, MAX_TIMEOUT
         ),
@@ -725,6 +734,8 @@ class DockTool(Tool):
             "默认 exhaustiveness=8、num_modes=9、limit=50、单配体超时 300 秒；"
             "参数由用户决定，不要自己替用户改。缺 Vina 可执行文件时返回安装指引，不抛异常。"
             "单条失败（超时/非零退出/没有结果）不中断整批，失败原因逐条写进 manifest。"
+            "**大库用 offset 分批**：limit 是这一批多少个、offset 从第几个开始，两批不重叠；"
+            "offset 进缓存键，不同批次是两个产物目录。"
             "受体必须来自 prepare_receptor 的 confirm=true，配体集必须来自 "
             "prepare_ligands 的 confirm=true；盒子从受体的 box.txt 读，不收模型传的坐标。"
         ),
@@ -762,6 +773,10 @@ class DockTool(Tool):
                 "limit": {
                     "type": "integer",
                     "description": f"本次最多对接多少个配体，默认 {DEFAULT_LIMIT}，上限 {MAX_LIMIT}",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几个配体开始对接（按配体集顺序），默认 0；大库分批用",
                 },
                 "timeout": {
                     "type": "number",
@@ -843,8 +858,16 @@ class DockTool(Tool):
             )
 
         requested = len(records)
-        selected = records[: params.limit]
-        remaining = requested - len(selected)
+        selected = records[params.offset : params.offset + params.limit]
+        remaining = max(requested - params.offset - len(selected), 0)
+        if not selected:
+            return ToolResult(
+                output=(
+                    f"offset={params.offset} 已经越过末尾：可对接的配体一共 {requested} 个，"
+                    f"从第 {params.offset + 1} 个开始没有可用的。"
+                ),
+                failed=True,
+            )
 
         cache_params: dict[str, Any] = {
             "receptor_fingerprint": str(receptor_entry.fingerprint or ""),

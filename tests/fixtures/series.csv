@@ -1,0 +1,7 @@
+﻿id,name,smiles
+a1,series-1,c1ccc(OCC(=O)N)cc1
+a2,series-2,c1ccc(OCCC(=O)N)cc1
+a3,series-3,Cc1ccc(OCC(=O)N)cc1
+a4,series-4,Clc1ccc(OCC(=O)N)cc1
+a5,series-5,c1ccc(OCC(=O)NC)cc1
+a6,series-6,c1ccc(OCC(=O)NCC)cc1

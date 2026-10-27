@@ -25,15 +25,20 @@ TOOLS_FILE = "tools.toml"
 DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock", "score_affinity"})
 # Plan 方式下一律拒绝的工具。一条命令会不会改动看不出来，所以 bash 也算在里面
 #
-# 领域工具里只有 prepare_receptor 与 write_run 进这一档：它们会往磁盘上写一组产物
-# （结构、引擎参数、体检报告 / 运行目录）并登记成新条目——Plan 方式是「只看不改」，
-# 这两步不该在它下面跑。
+# 领域工具里进这一档的是「会落一份新产物并登记成新条目」的那些：准备受体 / 配体、
+# 对接、打分、写运行目录，以及口袋集与候选表。Plan 方式是「只看不改」，
+# 这些不该在它下面跑。**纯读的不进**——`analyze_pose` 要沿血缘取受体坐标，
+# 但它一个字节都不写，挡掉它等于让 Plan 方式连「这条为什么排第一」都问不了。
 # 其余领域工具都不进：浏览登记表、查 UniProt / ChEMBL、取结构、搜索、开结构页
 # 都是读或取；取结构固然会写盘，但那是**把远端的东西拿回来**（下载缓存），
 # 与「改动用户的工程」不是一回事；把它们一并挡掉会让 Plan 方式连查资料都做不到。
 PLAN_DENY = frozenset(
     {"write", "patch", "bash", "prepare_receptor", "prepare_ligands", "dock",
-     "score_affinity", "write_run"}
+     "score_affinity", "write_run", "detect_pockets", "define_pocket",
+     "rank_candidates", "curate_ligands", "screen_similarity", "screen_shape",
+     "validate_docking", "build_reference_set", "predict_admet", "scaffold_analysis",
+     "matched_pairs", "enumerate_analogs", "record_assay",
+     "build_pharmacophore", "screen_pharmacophore", "align_ligands"}
 )
 
 # 按次计费的联网工具：5 元 / 1000 次成功请求（`docs/knowledge-plan.md` §5.1）。

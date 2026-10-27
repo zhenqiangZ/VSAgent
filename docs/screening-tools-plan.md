@@ -901,3 +901,40 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
    倾向后者——计算侧只能证明「没达门槛」，证明不了「不结合」。
 5. **RCSB 缓存合并**：`search_pdb` 与 `complexes` 的两套缓存目录是否在 P0 一并合并？
    倾向合并，否则同一个 UniProt 在一次会话里会被查两次。
+
+---
+
+### 11.1 结账（2026-10-27 晚）
+
+第 1–4 条的落地结果：产物目录按倾向放在 `~/.opencode_tui/{pockets,candidates,scaffolds}/`；
+`record_assay` 收 `file` 路径（`§6.5` 的理由成立，`domain/__init__.py` 的「收 handle」纪律
+因此从三个例外变成四个）；最低档叫 `below_cutoff`；**第 3 条与倾向相反**——
+`rank_candidates` 进了 `PLAN_DENY`，因为它写产物（候选表要落盘才排得出来），
+而 Plan 模式那句判据是「只读」，不是「不联网」。
+
+第 5 条已做（`complexes.list_complexes` 改为调 `rsearch.search_entries`，
+`complexes` 自己的 `search_cache_dir` / `_cache_path` / `_read_cache` / `_write_cache` /
+`_ids_from` / `SEARCH_CACHE_TTL` 六样全删）。**但要说清它买到了什么**：
+
+- 买到的是**一份实现**：错误分档（4xx → `ComplexError`、429/5xx/连不上 → `RetryableToolError`
+  穿过去）、id 解析、原子写、时效，原先两份一样但不保证一直一样。
+- 买到的是**一个目录**（`~/.opencode_tui/search/`）与**一套键**：同一条查询换个模块走，
+  第二遍不发请求（`check_complexes` 里那条「同一条查询换条路走也命中同一份缓存」）。
+- **没买到**的是「同一个 UniProt 只查一次」：`search_pdb(uniprot=X)` 与
+  `list_complexes(X)` 问的不是同一件事——后者多一个 `nonpolymer_entity_count > 0`、
+  `rows` 是 1000 不是 50。把它们当成一条查询复用，等于用带配体的子集回答
+  「这个蛋白一共有多少结构」，那是错答案。要真的省掉这一次，得先把
+  「无过滤 / 有配体 / 分页」拆成三条显式查询再谈合并，代价是缓存里多一层
+  「从全量里过滤」，本轮不做。
+
+三条注入实测（都只红不崩）：
+
+| 注入 | 响应断言 |
+|---|---|
+| `list_complexes` 给查询加一个盐（键算法不同） | 「同一条查询换条路走也命中同一份缓存」→ 2 次请求 |
+| 空响应回到 `{}` 而不是 `{"result_set": [], "total_count": 0}` | 「空响应归一成与真实响应同形的一份」 |
+| `complexes._ids_from` 抄回一份实现 | 「解 id 转给 rsearch 那一份」 |
+
+第三条**第一次是绿的**：判的是源码里有没有 `rsearch._ids_from`，而函数的 docstring
+里本来就写着这个名字，注入进去的副本照样命中。改成剥掉 docstring 再判才红——
+和 §9.3 里那个「夹具正好压在阈值上」是同一类问题：**断言写得太宽，注入才看得见**。

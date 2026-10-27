@@ -6962,6 +6962,80 @@ def check_complexes() -> None:
         bad = str(error)
     check(bad is not None and "UniProt" in bad, f"空编号直接报错：{bad}")
 
+    # ---- 缓存只有一套：这一条是合并的判据，不是风格 ----
+    from opencode_tui.core.agent.domain import http as http_module
+    from opencode_tui.core.agent.domain import rsearch as rsearch_module
+
+    for gone in ("search_cache_dir", "_cache_path", "_read_cache", "_write_cache"):
+        check(
+            not hasattr(complexes_module, gone),
+            f"complexes 不再自带第二份搜索缓存（{gone} 已经收掉）",
+        )
+    check(
+        not hasattr(complexes_module, "SEARCH_CACHE_TTL"),
+        "时效只有 rsearch 那一处定义，complexes 不再抄一份",
+    )
+    # 判「转发」要看**去掉 docstring 之后**的源码：文档里本来就写着 `rsearch._ids_from`，
+    # 不剥掉的话，抄回一份实现也照样能命中这个字符串（实测：注入一次是绿的）。
+    ids_source = inspect.getsource(complexes_module._ids_from).split('"""')[-1]
+    check(
+        "rsearch._ids_from" in ids_source
+        and complexes_module._ids_from({"result_set": [{"identifier": "1ABC"}]}) == ["1ABC"],
+        f"解 id 转给 rsearch 那一份（转发，不是第二个实现）：{ids_source.strip()[:60]}",
+    )
+
+    tmp = PROBE / "rcsb_search_merged"
+    shutil.rmtree(tmp, ignore_errors=True)
+    original_search_dir = rsearch_module.search_dir
+    original_post = http_module.post_json
+    rsearch_module.search_dir = lambda: tmp
+    posts: list[dict[str, Any]] = []
+
+    def fake_post(url, payload, **kwargs):
+        posts.append(payload)
+        return {"result_set": [{"identifier": "1IEP"}], "total_count": 1}
+
+    try:
+        http_module.post_json = fake_post
+        ids, _body = complexes_module.list_complexes("P00519")
+        check(ids == ["1IEP"], f"合并后照样搜得出条目：{ids}")
+        check(len(posts) == 1, f"第一次真的发了请求：{len(posts)}")
+        files = sorted(p.name for p in tmp.glob("*.json"))
+        check(
+            len(files) == 1 and files[0].startswith("search-"),
+            f"缓存落在 rsearch 的目录里，一份：{files}",
+        )
+
+        # 另一条路（`search_pdb` 用的 `search_entries`）拿着**同一条查询**再来一次：
+        # 不许再发请求。这条断言就是「两套缓存已经并成一套」的行为证据——
+        # 目录合并但键算法不同的话，这里会变成 2。
+        complexes_module.list_complexes("P00519")
+        rsearch_module.search_entries(complexes_module._accession_query("P00519"))
+        check(len(posts) == 1, f"同一条查询换条路走也命中同一份缓存：{len(posts)} 次请求")
+
+        # 零命中也要缓存：同一个 204 不该一天里问很多遍。
+        def empty_post(url, payload, **kwargs):
+            posts.append(payload)
+            raise http_module.EmptyResult("接口正常应答，但结果为空（HTTP 204）")
+
+        http_module.post_json = empty_post
+        empty_ids, empty_body = complexes_module.list_complexes("Q99999")
+        check(empty_ids == [], f"零命中给空表不抛：{empty_ids}")
+        check(
+            empty_body == {"result_set": [], "total_count": 0},
+            f"空响应归一成与真实响应同形的一份：{empty_body}",
+        )
+        before = len(posts)
+        again_ids, _ = complexes_module.list_complexes("Q99999")
+        check(
+            again_ids == [] and len(posts) == before,
+            f"零命中进缓存，第二次不再打接口：{len(posts) - before} 次请求",
+        )
+    finally:
+        http_module.post_json = original_post
+        rsearch_module.search_dir = original_search_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
     # ---- 排：顺序确定、可复现 ----
     entries = [
         complexes_module.ComplexEntry(

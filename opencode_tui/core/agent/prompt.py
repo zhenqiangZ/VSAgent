@@ -63,19 +63,10 @@ SUMMARY_INSTRUCTION = (
 # 其余字符更少，所以字符数不超，token 数就不会超。
 SUMMARY_INPUT_LIMIT = 60_000
 
-# 事件摘要的指令。与摘要的四段刻意错开：摘要写「整段对话的结论」，
+# 事件摘要的指令。与摘要的八段刻意错开：摘要写「整段对话的结论」，
 # 事件写「这一段做了什么、留下了什么」，所以产物与未决项必须单列。
-# 第一行固定成 `标题：…`：调用方按这一行切标题与正文，省掉一次额外请求。
-EVENT_TITLE_INSTRUCTION = "第一行只写标题，格式是「标题：不超过 40 字」，不要加引号。\n"
-EVENT_INSTRUCTION = (
-    "把下面这段对话收口成一条事件，第一行写标题，其余写四段，每段一个小标题：\n"
-    "一、这一段做了什么（按顺序写清用了什么工具）\n"
-    "二、结果与产物（handle、文件路径、关键数字；写不准就写「未产出」，不要编）\n"
-    "三、遇到的问题（失败原因、被否掉的方案）\n"
-    "四、留给下一步（还有什么没做）\n"
-    f"{EVENT_TITLE_INSTRUCTION}"
-    "总共不超过 600 字。只写内容，不要寒暄，不要复述这段指令，不要调用工具。"
-)
+# 它不再是一次独立请求的 system 消息——模型调 `record_event` 时自己写摘要，
+# 四段结构写在工具说明里（`event_log.RecordEventTool.spec`），离调用点更近。
 
 # bash 工具的执行方式说明。
 #
@@ -360,6 +351,9 @@ EVENT_DISCIPLINE = (
     "一件工作告一段落、准备换下一件时，用 record_event 把它收口成一条事件："
     "标题写「这一段做了什么」，摘要写结果、产物与未决。收口之后那一段原文不再逐条发给你，"
     "只留一行索引；需要细节时用 recall_event 按编号取回原文。\n"
+    "触发条件是「话题换了」，不是「做完了」：用户提了新目标，或者你要开始做一件与这一段"
+    "无关的事，就先收口上一段。别等到上下文装不下才想起来——那时是内核代你收的，"
+    "标题只能用工具名和用户原话拼出来，这一段得出了什么结论它写不出来。\n"
     "不要把还在进行中的那一步收口——收口的位置是「这条消息之前」，"
     "当前正在写的这一步本来就不在范围内。"
 )
@@ -476,17 +470,6 @@ def summary_messages(session: Session, upto: int) -> list[dict[str, Any]]:
         )
     messages.append({"role": "user", "content": transcript})
     return messages
-
-
-def event_messages(session: Session, start: int, end: int) -> list[dict[str, Any]]:
-    """造一次事件摘要请求的消息：只喂 `[start, end)` 这一段。"""
-    transcript = _transcript(session, end, start)
-    if len(transcript) > SUMMARY_INPUT_LIMIT:
-        transcript = _cut_middle(transcript, SUMMARY_INPUT_LIMIT // 2)
-    return [
-        {"role": "system", "content": EVENT_INSTRUCTION},
-        {"role": "user", "content": transcript},
-    ]
 
 
 def _transcript(session: Session, upto: int, start: int = 0) -> str:

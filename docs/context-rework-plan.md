@@ -374,13 +374,13 @@ class Event:
 
 **2.3 工具**（新建 `core/agent/event_log.py`）
 
-- `EventRuntime{session, current_index, summarize, is_cancelled}`，通过 `Tool.event_argument` 注入。
-- `record_event(title?, summary?)`：
+- `EventRuntime{session, current_index}`，通过 `Tool.event_argument` 注入。
+- `record_event(title, summary)`：
   - `end = current_index`；`while messages[end-1].role == "user": end -= 1`；当前消息永不覆盖。
   - `start = 最后一条 manual 的 end，否则 summary_upto`；`end <= start` → no-op。
   - 删除 `start >= 锚点` 的 `auto/local` 事件（手动吞自动）。
-  - 两者都不给 → 调摘要器；`ProviderError/空文本/取消` → 确定性本地事件（`degraded=True`），
-    `failed=False`；取消不写。
+  - **两个都必填**：缺一个就退回让模型补（错误说明回灌），内核不代写、不另发请求。
+    （原先是「只给 title 时再请求一次让模型补摘要」，实测那是把刚看过的原文再发一遍。）
   - 输出只回 `evt_id + 标题 + 区间 + 产物/未决条数`，不回灌整段摘要。
 - `recall_event(event?, offset?, limit?)`：无参列清单；有 id 返回详情 + 原文；未知 id 列可用编号。
 - 自动事件：溢出时 `record_local_event(session, min(dropped_upto, 边界), kind="auto")`，
@@ -405,7 +405,7 @@ class Event:
 **判据**：
 - 事件覆盖 `[0,6)` 时原文不在 `built.messages`，事件标题在，`usage[EVENT] > 0`，`dropped==0`，N 个事件只多 1 条消息。
 - `summary + events + moved=0` 时摘要仍在。
-- `record_event` 显式 title/summary 不调模型；取消不写；`ProviderError` 落本地事件且 `failed=False`。
+- `record_event` 标题与摘要必填、缺一个就退回，全程不调模型；小窗口 + 已有事件溢出时请求数不增加，`_summarize` 未被调用。
 - 小窗口 + 已有事件溢出：请求数不增加，`_summarize` 未被调用。
 - 原有 `summary-compaction` 仍绿（无事件会话走旧路径；四段保留）。
 

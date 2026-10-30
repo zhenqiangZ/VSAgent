@@ -46,7 +46,7 @@ class StatusBar(Container):
     """底部状态栏：左端项目路径，右端用量与快捷键提示。"""
 
     # 右端常驻的快捷键提示，与实际按键绑定保持一致。
-    KEYS_HINT = "ctrl+p commands"
+    KEYS_HINT = "ctrl+p 命令"
 
     def __init__(self) -> None:
         super().__init__(id="status-bar")

@@ -3,7 +3,7 @@
 用 pywinpty 起一个 ConPTY，用 pyte 当终端模拟器。这样能在没有真实终端的环境里
 确认打包产物的界面与交互仍然正常（样式文件、懒加载的 widget 是否进包）。
 
-    python tests/verify_exe.py              验证 dist/opencode-tui.exe
+    python tests/verify_exe.py              验证 dist/VSAgent.exe
     python tests/verify_exe.py <exe 路径>   验证指定的可执行文件
     python tests/verify_exe.py --source     验证源码直接运行（用于与打包产物对照）
 
@@ -23,7 +23,7 @@ tests/fixtures/marker_editor.cmd，用它判断挂起、外部进程、恢复这
 跑一次约 25 秒，画面写入 tests/output/。
 
 pyte 与 pywinpty 装在打包环境里（requirements-pack.txt），.venv 里没有，所以要用
-`C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/opencode_tui_pack/Scripts/python.exe`
+`C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/vsagent_pack/Scripts/python.exe`
 来跑这个脚本。
 """
 
@@ -50,14 +50,14 @@ from fake_model_server import (  # noqa: E402
     usage_chunk,
 )
 
-DEFAULT_EXE = PROJECT_ROOT / "dist" / "opencode-tui.exe"
+DEFAULT_EXE = PROJECT_ROOT / "dist" / "VSAgent.exe"
 OUTPUT_DIR = PROJECT_ROOT / "tests" / "output"
 EDITOR_FIXTURE = PROJECT_ROOT / "tests" / "fixtures" / "marker_editor.cmd"
-# 应用把会话持久化到 ~/.opencode_tui/state.toml。抓帧要复现同一个画面，就得每次都从空状态
+# 应用把会话持久化到 ~/.vsagent/state.toml。抓帧要复现同一个画面，就得每次都从空状态
 # 启动：不隔离的话历史会话越攒越长，源码那一轮与冻结产物那一轮看到的滚动窗口差几行。
 SCRATCH_HOME = PROJECT_ROOT / ".probe" / "verify-home"
-STATE_FILE = SCRATCH_HOME / ".opencode_tui" / "state.toml"
-CONNECTION_FILE = SCRATCH_HOME / ".opencode_tui" / "connection.toml"
+STATE_FILE = SCRATCH_HOME / ".vsagent" / "state.toml"
+CONNECTION_FILE = SCRATCH_HOME / ".vsagent" / "connection.toml"
 
 
 def write_connection(base_url: str, model: str) -> None:
@@ -84,7 +84,7 @@ def write_connection(base_url: str, model: str) -> None:
     )
 
 ROWS, COLS = 34, 100
-LOGO_MARK = "(_)_ __"
+LOGO_MARK = "|____/"
 REPLY_MARK = "抓帧用的回复"
 EDITOR_MARK = "[marker-editor]"
 SIDEBAR_MARK = "引用文件"
@@ -179,16 +179,45 @@ def script_reply(server: FakeModelServer) -> None:
 def parse_args() -> tuple[list[str], str]:
     """返回要执行的命令与服务前缀。"""
     if len(sys.argv) > 1 and sys.argv[1] == "--source":
-        return [sys.executable, "-m", "opencode_tui"], "source"
+        return [sys.executable, "-m", "vsagent"], "source"
     exe = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else DEFAULT_EXE
     return [str(exe)], "frozen"
+
+
+def check_rules_copy(exe: Path) -> str:
+    """打包产物旁边的 `AGENTS.md` 必须与仓库根逐字节相同。
+
+    `prompt.rules_directory()` 打包后按 **exe 位置**找规则文件，所以
+    `dist/AGENTS.md` 才是真正被读的那一份。它靠人工复制，而实测 `dist/` 里那份
+    落后了八天、少两处 `import_documents` 规则——程序一切正常，只是规则不对（P2-5）。
+
+    这条比在 spec 里加 `datas` 可靠：它能抓住「spec 改了但没重打包」。
+    返回空串表示没问题。
+    """
+    packaged = exe.parent / "AGENTS.md"
+    source = PROJECT_ROOT / "AGENTS.md"
+    if not source.is_file():
+        return ""
+    if not packaged.is_file():
+        return f"{packaged} 不存在——打包时没有把 AGENTS.md 放进去"
+    if packaged.read_bytes() != source.read_bytes():
+        return (
+            f"{packaged} 与仓库根那份不一致（{packaged.stat().st_size} 对 "
+            f"{source.stat().st_size} 字节）——重新打包，或把根目录那份复制过去"
+        )
+    return ""
 
 
 def main() -> int:
     command, prefix = parse_args()
     if command[0] != sys.executable and not Path(command[0]).exists():
-        print(f"找不到 {command[0]}，请先执行 pyinstaller --clean opencode_tui.spec")
+        print(f"找不到 {command[0]}，请先执行 pyinstaller --clean vsagent.spec")
         return 1
+    if prefix == "frozen":
+        problem = check_rules_copy(Path(command[0]))
+        if problem:
+            print("失败：", problem)
+            return 1
 
     child_env = dict(os.environ)
     child_env["EDITOR"] = str(EDITOR_FIXTURE)

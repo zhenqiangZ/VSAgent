@@ -8,18 +8,18 @@ from textual.screen import ModalScreen
 from textual.widgets import Static
 
 SAMPLE_DIFF = """\
---- a/opencode_tui/app.py
-+++ b/opencode_tui/app.py
+--- a/vsagent/app.py
++++ b/vsagent/app.py
 @@ -1,6 +1,8 @@
  from textual.app import App
 
 +from .core.event_bus import EventBus
 +from .core.session_manager import SessionManager
 
- class OpenCodeApp(App):
+ class VSAgentApp(App):
 -    CSS_PATH = "styles/app.tcss"
 +    CSS_PATH = "styles/app.tcss"
-+    TITLE = "opencode tui"
++    TITLE = "VSAgent"
 """
 
 

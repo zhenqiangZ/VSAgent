@@ -14,7 +14,7 @@ from textual.widgets import Markdown, Static
 from ..core.models import Message, Part, PartType, ToolStatus
 
 if TYPE_CHECKING:
-    from ..app import OpenCodeApp
+    from ..app import VSAgentApp
 
 STATUS_ICON = {
     ToolStatus.PENDING: "○",
@@ -49,7 +49,7 @@ TOOL_ICON = {
     "fetch_structure": "⇣",
     "search_actives": "⌕",
     "find_analogs": "≈",
-    "describe_molecule": "⬡",
+    "lookup_compound": "⬡",
     "search_pdb": "⌕",
     "search_literature": "⌕",
     "search_web": "⌕",
@@ -527,7 +527,7 @@ class PatchPartView(SimplePartView):
 
     def on_click(self) -> None:
         """点击后打开 Diff 覆盖层。"""
-        app = cast(OpenCodeApp, self.app)
+        app = cast(VSAgentApp, self.app)
         app.show_diff(self.part_text)
 
     @property

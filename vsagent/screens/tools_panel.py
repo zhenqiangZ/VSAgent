@@ -44,7 +44,7 @@ class ToolEntry:
 class ToolsPanelScreen(ModalScreen[None]):
     """工具管理面板：逐条开关，改完立刻生效。
 
-    开关写进项目侧的 `.opencode_tui/tools.toml`，与手改那份文件是同一个东西；
+    开关写进项目侧的 `.vsagent/tools.toml`，与手改那份文件是同一个东西；
     面板只是让它不必去翻文件、也不必重启——关掉的工具不装进注册表，
     下一次发问的请求体里就没有它。
 

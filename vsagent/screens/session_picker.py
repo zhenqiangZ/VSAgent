@@ -132,6 +132,11 @@ class SessionPickerScreen(ModalScreen[str | None]):
         view = self.query_one("#session-list", ListView)
         view.clear()
         self._ids = []
+        if not self.sessions:
+            # 空列表画一行空态，而不是留一块空白：空白看起来像没加载完。
+            view.append(ListItem(Static("还没有会话 · 输入 /new 新建一个", classes="session-row-meta")))
+            self.query_one("#picker-title", Static).update(self._title_text())
+            return
         current = self.app.session_manager.current_session_id
         for session in self.sessions:
             is_current = session.id == current

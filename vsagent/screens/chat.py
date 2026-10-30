@@ -66,6 +66,30 @@ class AgentOptionList(OptionList):
             editor.focus_input()
 
 
+class SidebarToggle(Static):
+    """标题栏右端的侧栏开关：点一下折叠、再点一下展开。
+
+    单独一个类而不是在 `ChatScreen.on_click` 里按坐标判断：认的是消息而不是位置，
+    侧栏宽度、标题长度怎么变都不会点到别的东西上。文字也由它自己换——
+    「◧ 侧栏」是关着时按下去会打开，「◨ 收起」是开着时按下去会收起。
+    """
+
+    class Toggled(TextualMessage):
+        """用户点了这个按钮。"""
+
+    def __init__(self) -> None:
+        super().__init__("", id="side-toggle", markup=False)
+
+    def render_state(self, visible: bool) -> None:
+        """按侧栏当前是否可见改写标签。"""
+        self.update("◨ 收起" if visible else "◧ 侧栏")
+        self.set_class(visible, "-open")
+
+    def on_click(self) -> None:
+        """点一下就把这一下交给聊天界面。"""
+        self.post_message(self.Toggled())
+
+
 class SidePanel(Vertical):
     """会话右栏：子 agent 列表在上，上下文信息在下。
 
@@ -240,6 +264,8 @@ class ChatScreen(Screen):
     allowed_commands: frozenset[str] | None = None
     # 子 agent 界面设成 False：Build/Plan 跟着父会话走，不能在这里改。
     allow_agent_switch = True
+    # 子 agent 的返回栏里已经有会话名，标题栏就不必再写一遍。
+    show_chat_title = True
 
     def __init__(
         self,
@@ -255,6 +281,7 @@ class ChatScreen(Screen):
         self._session_id = session_id
         self._busy = False
         self._unsubscribes: list[object] = []
+        self._title_written = ""
 
     @property
     def session(self) -> Session:
@@ -286,6 +313,12 @@ class ChatScreen(Screen):
 
     def compose(self) -> ComposeResult:
         with Vertical():
+            # 标题栏：左边是这一屏正在看的会话，右边是侧栏开关。
+            # 它只占一行，换来两件事——不用打开侧栏就知道自己在哪条会话里，
+            # 以及折叠侧栏不必先记住 /sidebar。
+            with Horizontal(id="chat-header"):
+                yield Static("", id="chat-title", markup=False)
+                yield SidebarToggle()
             with Horizontal(id="chat-body"):
                 yield MessagesPane(self._stop_consuming)
                 yield SidePanel(id="side-panel")
@@ -305,6 +338,7 @@ class ChatScreen(Screen):
             bus.subscribe("agent.status", self._on_agent_changed),
         ]
         self.rebuild()
+        self.side_toggle.render_state(self.side_panel.has_class("-visible"))
         self.editor.focus_input()
         self.refresh_status()
         # 后台可能已经跑完了一轮：进屏幕时按真实状态校准一次 busy，
@@ -367,6 +401,11 @@ class ChatScreen(Screen):
         """右侧的上下文侧栏组件。"""
         return self.query_one(SidePanel)
 
+    @property
+    def side_toggle(self) -> SidebarToggle:
+        """标题栏右端的侧栏开关。"""
+        return self.query_one(SidebarToggle)
+
     def rebuild(self) -> None:
         """按当前会话内容重建消息列表。"""
         session = self.session
@@ -376,8 +415,9 @@ class ChatScreen(Screen):
         self.refresh_status()
 
     def refresh_status(self) -> None:
-        """刷新状态栏、输入框状态行与右栏的会话上下文。"""
+        """刷新状态栏、输入框状态行、标题栏与右栏的会话上下文。"""
         session = self.session
+        self._refresh_title(session)
         self.status.update_status(
             tokens=session.total_tokens(),
             cost=session.total_cost(),
@@ -399,16 +439,41 @@ class ChatScreen(Screen):
             session.id,
         )
 
-    def toggle_sidebar(self) -> bool:
-        """显示或隐藏上下文侧栏，返回切换后的可见状态。
+    def _refresh_title(self, session: Session) -> None:
+        """把会话名写进标题栏。内容没变就不写。
 
-        显示时必须在这里补一次刷新：侧栏关着的时候它的内容是被跳过的。
+        `refresh_status` 在一轮生成里会被调到很多次，而标题几乎从不变化；
+        每次都 `update()` 会白走一遍整屏重新布局。
+        **子 agent 界面留空但不隐藏**：这一格是 1fr，隐藏了开关会滑到最左边。
+        """
+        if not self.show_chat_title:
+            return
+        if session.title == self._title_written:
+            return
+        self._title_written = session.title
+        self.query_one("#chat-title", Static).update(session.title)
+
+    def set_sidebar(self, visible: bool) -> bool:
+        """设定侧栏可见性，返回设定之后的状态。
+
+        三条路都走这里：`/sidebar` 命令、点标题栏那个开关、子 agent 刚建出来时自动打开。
+        各写一份的话，按钮上的字会跟实际状态对不上——「收起」两个字配着一条关着的侧栏。
         """
         panel = self.side_panel
-        visible = not panel.has_class("-visible")
         panel.set_class(visible, "-visible")
+        self.side_toggle.render_state(visible)
+        # 侧栏关着的时候内容是被跳过的，打开时必须在这里补一次刷新。
         self.refresh_status()
         return visible
+
+    def toggle_sidebar(self) -> bool:
+        """显示或隐藏上下文侧栏，返回切换后的可见状态。"""
+        return self.set_sidebar(not self.side_panel.has_class("-visible"))
+
+    def on_sidebar_toggle_toggled(self, event: SidebarToggle.Toggled) -> None:
+        """点了标题栏右端的开关。"""
+        event.stop()
+        self.toggle_sidebar()
 
     def on_editor_pane_submitted(self, event: EditorPane.Submitted) -> None:
         """处理编辑器提交的输入。"""
@@ -600,7 +665,7 @@ class ChatScreen(Screen):
         # 刚建出来的那一条：把右栏打开。用户不必先摸到 /sidebar 才看得到
         # 自己刚派出去的东西——这是「创建后右侧栏就会出现」的落点。
         if data.get("parent_id"):
-            self.side_panel.set_class(True, "-visible")
+            self.set_sidebar(True)
         status = str(data.get("status", ""))
         if session_id == self.session.id:
             self._busy = status == "running"

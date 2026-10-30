@@ -7,6 +7,9 @@
 2. **筛杂原子组**（`screen_ligands`）——在名字名单之外，再用三条几何判据
    判断一个 `HETATM` 组到底像不像配体：重原子太少、与蛋白共价连接、
    蛋白接触的残基太少。
+3. **筛脂质**（`screen_lipids`）——长碳链、几乎不带极性原子、或者带磷酸头的组
+   （胆固醇、脂肪酸、磷脂、去垢剂）不是配体。它单独一个函数，因为只有算口袋时
+   才这么判：准备后的受体留着膜成分是有用的，删掉反而让用户看不到。
 
 **为什么要有第 2 步。** 名字名单永远收不全：同一个结晶条件在不同实验室里
 可能写成 `SO4` / `PO4` / `ACT`，也可能是某个没见过的商品缓冲液。名单漏一个，
@@ -28,11 +31,16 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Sequence
 
 from . import pdbtext
-from .pdbtext import HeteroGroup, PdbDocument, ResidueKey, is_heavy
+from .pdbtext import HeteroGroup, PdbDocument, ResidueKey, element_of, is_heavy
 
 __all__ = [
     "COVALENT_CUTOFF",
     "CONTACT_CUTOFF",
+    "LIPID_MAX_POLAR",
+    "LIPID_MIN_CARBONS",
+    "LIPID_MIN_EXTENT",
+    "LIPID_MIN_HEAVY_ATOMS",
+    "LIPID_NAMES",
     "MIN_CONTACT_RESIDUES",
     "MIN_LIGAND_HEAVY_ATOMS",
     "LigandScreen",
@@ -41,6 +49,7 @@ __all__ = [
     "clean_structure",
     "polymer_chains",
     "screen_ligands",
+    "screen_lipids",
 ]
 
 MIN_LIGAND_HEAVY_ATOMS = 4
@@ -67,6 +76,53 @@ MIN_CONTACT_RESIDUES = 3
 
 只碰到一两个残基的杂原子组基本是贴在表面的结晶添加剂；真正的配体在口袋里
 会被三面以上的残基围住。取 3 而不是更高，是为了不把浅槽里的小片段筛掉。
+"""
+
+LIPID_MIN_CARBONS = 8
+"""整组碳数达到这个值，才可能按脂质或去垢剂处理。
+
+8 是去垢剂碳链的下沿（辛基糖苷 8 个碳），也是短链脂肪酸的上端。真正的药物分子
+碳数常在 15–30，所以这条单独不够，要和下面三条一起用。
+"""
+
+LIPID_MAX_POLAR = 2
+"""整组 N / O / S 原子数的上限。脂质是「长碳链 + 一两个极性头」：胆固醇 1 个 O、
+硬脂酸 2 个 O、视黄醇 1 个 O。磷脂是例外（磷酸头带 5–10 个 O），由「含 P」那一条放行。
+
+这条把「碳链长的药」与「脂质」分开：布洛芬 2 个 O 但只有 13 个重原子，
+阿米替林 1 个 N 但形状紧凑，都过不了下面两条。
+"""
+
+LIPID_MIN_HEAVY_ATOMS = 16
+"""整组重原子数的下限。
+
+13–15 个重原子是口服小分子的常见体量（布洛芬 13、萘普生 14），而脂质在 18 以上
+（硬脂酸 18、油酸 20、胆固醇 28、二肉豆蔻酰磷脂酰胆碱 50 以上）。取 16 留一格余量。
+"""
+
+LIPID_MIN_EXTENT = 16.0
+"""整组包围盒最长边的下限（埃）。
+
+**这一条是类固醇药物的分界线。** 睾酮、雌二醇、地塞米松也是「碳数够、极性原子少」，
+但四个并环把它们压成 11–13 埃的团块；胆固醇多一条异辛基尾、脂肪酸是直的碳链，
+最长边都在 17 埃以上。核受体结构里的共晶类固醇是真正要留的配体，不能被当成膜成分筛掉。
+"""
+
+LIPID_NAMES = frozenset(
+    {
+        # 去垢剂与糖脂：碳链够长、极性头也够多，几何那三条拦不住
+        "DDM",  # 正十二烷基-β-D-麦芽糖苷
+        "UDM",  # 十一烷基麦芽糖苷
+        "BOG",  # 正辛基-β-D-吡喃葡萄糖苷
+        "LDAO",  # 十二烷基二甲基氧化胺
+    }
+)
+"""按代号直接判为去垢剂/糖脂的那几个。**这条与下面四条判据并列，不参与「全中」**。
+
+名单短是刻意的：几何那四条（碳数、极性原子、重原子数、伸展长度）已经把脂质的主力
+挡住了，这里补的是「极性头很多、形状也长」的一类——它们几何上像药物
+（DDM 24 个碳、11 个氧），只能按代号认。收错了的后果是某个真配体消失，
+所以拿不准的代号一个都不收。
 """
 
 
@@ -313,6 +369,60 @@ def screen_ligands(
             continue
         kept.append(group)
 
+    return LigandScreen(kept=tuple(kept), excluded=tuple(excluded))
+
+
+def _extent(atoms: Sequence[pdbtext.AtomRecord]) -> float:
+    """一组原子的包围盒最长边（埃）。"""
+    if not atoms:
+        return 0.0
+    spans: list[float] = []
+    for axis in (0, 1, 2):
+        values = [atom.coord[axis] for atom in atoms]
+        spans.append(max(values) - min(values))
+    return max(spans)
+
+
+def _lipid_like(group: HeteroGroup, heavy: Sequence[pdbtext.AtomRecord]) -> bool:
+    """这一组像不像脂质或去垢剂。代号名单先判，名单不中的再看四条几何判据。
+
+    碳数、极性原子数、重原子数、伸展长度，理由各自写在常量上。磷脂是几何那四条里
+    唯一的例外：磷酸头带 5–10 个 O，靠「含 P」放行，所以那一条写成
+    `polar > 上限 and 没有 P`。
+    """
+    if group.resname.upper() in LIPID_NAMES:
+        return True
+    if len(heavy) < LIPID_MIN_HEAVY_ATOMS:
+        return False
+    elements = [element_of(atom) for atom in heavy]
+    carbons = sum(1 for name in elements if name == "C")
+    if carbons < LIPID_MIN_CARBONS:
+        return False
+    polar = sum(1 for name in elements if name in {"N", "O", "S"})
+    if polar > LIPID_MAX_POLAR and "P" not in elements:
+        return False
+    return _extent(heavy) >= LIPID_MIN_EXTENT
+
+
+def screen_lipids(groups: Iterable[HeteroGroup]) -> LigandScreen:
+    """把脂质、磷脂、去垢剂从「可当配体的组」里剔掉。
+
+    **只在算口袋时用，不进 `screen_ligands`。** 那个函数同时决定
+    `clean_structure` 留下哪些杂原子——准备后的受体把胆固醇、磷脂删掉，等于让用户
+    看不到本来该看到的膜成分，而 `prepare_receptor` 有自己的 `keep_hetero` 管这件事。
+
+    漏掉一个脂质的后果是页面上多一个假口袋（用户看得见）；错杀一个真配体的后果是
+    那个口袋整块消失（用户看不见）。所以代号名单之外还要四条几何判据全中才排除，
+    且排除原因与个数一律回报——这条与 `screen_ligands` 的取舍方向一致。
+    """
+    kept: list[HeteroGroup] = []
+    excluded: list[tuple[str, str]] = []
+    for group in groups:
+        heavy = [atom for atom in group.atoms if is_heavy(atom)]
+        if _lipid_like(group, heavy):
+            excluded.append((group.resname, "脂质或去垢剂"))
+            continue
+        kept.append(group)
     return LigandScreen(kept=tuple(kept), excluded=tuple(excluded))
 
 

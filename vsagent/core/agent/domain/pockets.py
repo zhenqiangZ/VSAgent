@@ -102,6 +102,8 @@ class _Cluster3D:
     coords: tuple[tuple[float, float, float], ...]
     residues: tuple[export.PocketResidue, ...]
     origin: dict[str, Any]
+    atoms: tuple[pdbtext.AtomRecord, ...] = ()
+    """这一簇配体的原子。画像要按元素数它，只有坐标数不出来。"""
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +158,10 @@ def complex_pockets(
     chosen, total = complexes.pick_top(
         entries,
         top_n=top_n,
-        excluded_ligands=export.MONATOMIC_IONS | export.BUFFER_LIKE,
+        # 去垢剂代号也算「不像真配体」：只有 DDM 或 LDAO 的条目排在后面，
+        # 免得一整个膜蛋白的检索结果都被去垢剂结构占满。几何那四条在这里用不了
+        # ——排序时手上只有配体代号，没有坐标。
+        excluded_ligands=export.MONATOMIC_IONS | export.BUFFER_LIKE | preprocess.LIPID_NAMES,
     )
     if not chosen:
         return PocketBundle(
@@ -243,12 +248,17 @@ def _clusters_from_structures(
         # **按复合物自己的全部聚合物链判接触**：不同条目的链号未必与受体一致，
         # 传受体链号会把整条配体误判成「接触不足」。
         screened = preprocess.screen_ligands(doc, filtered.kept)
+        # 脂质与去垢剂在聚簇之前剔掉：膜蛋白的结构里它们贴着疏水螺旋、接触残基也多，
+        # 几何筛查一条都拦不住，而聚成簇之后就是一处看着很像口袋的膜面。
+        degreased = preprocess.screen_lipids(screened.kept)
         for reason, count in filtered.counts.items():
             excluded[reason] = excluded.get(reason, 0) + count
         for reason, count in screened.counts.items():
             excluded[reason] = excluded.get(reason, 0) + count
+        for reason, count in degreased.counts.items():
+            excluded[reason] = excluded.get(reason, 0) + count
 
-        for cluster in export.cluster_ligands(screened.kept):
+        for cluster in export.cluster_ligands(degreased.kept):
             residues = export.pocket_residues(doc, cluster.coords, radius, chains=chains)
             if not residues:
                 continue
@@ -261,6 +271,7 @@ def _clusters_from_structures(
                     "ligand": "+".join(cluster.resnames),
                     "resolution": facts.resolution,
                 },
+                atoms=tuple(atom for group in cluster.groups for atom in group.atoms),
             )
             index += 1
 
@@ -325,6 +336,10 @@ def _merge(clusters: dict, *, radius: float) -> list[dict[str, Any]]:
                     best[key] = residue
 
         ordered = sorted(best.values(), key=lambda r: (r.min_distance, r.chain, r.number, r.icode))
+        # 画像按**合并后**的残基集合算：同一个位点在几份结构里支持的残基略有出入，
+        # 用户要看的是这一处口袋整体的样子，不是某一份结构的。配体原子取第一份
+        # （成员已按支持数排过序），其余几份的配体只影响残基集合，不改画像。
+        primary = items[members[0]]
         pockets.append(
             {
                 "center": export.ligand_center(points) if points else items[members[0]].center,
@@ -334,6 +349,11 @@ def _merge(clusters: dict, *, radius: float) -> list[dict[str, Any]]:
                 "source": "ligand",
                 "residues": [r.as_dict() for r in ordered],
                 "complexes": [_complex_entry(o) for o in origins],
+                "profile": build_profile(
+                    [r.as_dict() for r in ordered],
+                    ligand_atoms=primary.atoms,
+                    ligand_names=(str(primary.origin.get("ligand") or ""),),
+                ),
             }
         )
 
@@ -352,6 +372,219 @@ def _complex_entry(origin: dict[str, Any]) -> dict[str, Any]:
     if origin.get("rmsd") is not None:
         entry["rmsd"] = origin["rmsd"]
     return entry
+
+
+# ---------------------------------------------------------------------------
+# 口袋画像
+#
+# 用户要挑一处口袋去打，而「18 个残基、中心在这里」回答不了「这是一处什么口袋」。
+# 画像补的就是那一句：壁由哪几类残基围成、配体长什么样、四周围得紧不紧。
+# **全部由残基名与坐标算出来，不给分**——实验定位没有打分这回事，与口袋集同一口径。
+# ---------------------------------------------------------------------------
+AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP", "HIS"})
+HYDROPHOBIC_RESIDUES = frozenset({"ALA", "VAL", "ILE", "LEU", "MET", "PRO", "GLY"})
+POLAR_RESIDUES = frozenset({"SER", "THR", "ASN", "GLN", "CYS"})
+CHARGED_RESIDUES = frozenset({"ASP", "GLU", "LYS", "ARG"})
+"""壁的四种残基。**四类互不重叠**，计数加起来正好等于残基总数——
+重叠的话「芳香 5、带电 2」会读成「有 7 个残基」，而实际可能只有 5 个。"""
+
+TIGHT_CONTACT = 3.5
+"""「贴得紧」的距离口径（埃）。重原子之间 3.5 埃以内已经进了范德华距离，
+再远就是围一圈而不是贴着。"""
+
+
+def _residue_class(name: str) -> str:
+    if name in AROMATIC_RESIDUES:
+        return "aromatic"
+    if name in CHARGED_RESIDUES:
+        return "charged"
+    if name in POLAR_RESIDUES:
+        return "polar"
+    if name in HYDROPHOBIC_RESIDUES:
+        return "hydrophobic"
+    return "other"
+
+
+def _ligand_facts(atoms: Sequence[pdbtext.AtomRecord]) -> dict[str, Any]:
+    """配体的元素组成与形状。**只数原子，不猜化学**：没有 SMILES 就不说环数与可旋转键。"""
+    heavy = [atom for atom in atoms if pdbtext.is_heavy(atom)]
+    if not heavy:
+        return {}
+    counts: dict[str, int] = {}
+    for atom in heavy:
+        element = pdbtext.element_of(atom) or "?"
+        counts[element] = counts.get(element, 0) + 1
+    spans = sorted(
+        (
+            max(atom.coord[axis] for atom in heavy) - min(atom.coord[axis] for atom in heavy)
+            for axis in (0, 1, 2)
+        ),
+        reverse=True,
+    )
+    # 每个边长都有下限：平面分子的厚度只有 3.4 埃，直接相除会把「一块平板」算成
+    # 「一根长条」。取「最长边 ÷ 另外两边乘积的平方根」，那是截面平均直径，
+    # 平板（12×8×3.4）得 2.3、团块（9×8×7）得 1.2，与直觉一致。
+    longest, middle, shortest = (max(value, 0.5) for value in spans)
+    return {
+        "atoms": len(heavy),
+        "elements": counts,
+        "carbons": counts.get("C", 0),
+        "polar": counts.get("N", 0) + counts.get("O", 0) + counts.get("S", 0),
+        "extent": [round(value, 1) for value in spans],
+        "elongation": round(longest / (middle * shortest) ** 0.5, 1),
+    }
+
+
+def _profile_verdict(profile: dict[str, Any]) -> str:
+    """把数字折成一句判断。**只用已经算出来的那几项**，不引入新的推断。"""
+    parts: list[str] = []
+    ligand = profile.get("ligand") or {}
+    elongation = ligand.get("elongation")
+    if isinstance(elongation, float):
+        if elongation >= 2.5:
+            parts.append("窄长")
+        elif elongation <= 1.4:
+            parts.append("团块状")
+    walls = profile.get("walls") or {}
+    named = int(walls.get("named") or 0)
+    if named:
+        dominant = max(
+            (("aromatic", "芳香残基夹持"), ("hydrophobic", "以疏水壁为主"),
+             ("polar", "极性壁"), ("charged", "带电壁")),
+            key=lambda pair: int(walls.get(pair[0]) or 0),
+        )
+        if int(walls.get(dominant[0]) or 0) > 0:
+            parts.append(dominant[1])
+    total = int(profile.get("residues") or 0)
+    measured = int(profile.get("measured") or 0)
+    tight = int(profile.get("tight") or 0)
+    # 距离缺失时（预测来源、手给残基）不谈贴得紧不紧：0 个贴紧是「没量」，
+    # 写成「只有少数残基贴近」是把没量过的当成量过了。
+    if total and measured == total:
+        if tight * 10 >= total * 6:
+            parts.append("四周围得紧")
+        elif tight * 10 <= total * 3:
+            parts.append("只有少数残基贴近")
+    polar = ligand.get("polar")
+    if isinstance(polar, int):
+        if polar == 0:
+            parts.append("配体全疏水")
+        elif polar >= 4:
+            parts.append("配体偏极性")
+    return "、".join(parts)
+
+
+def build_profile(
+    residues: Sequence[dict[str, Any]],
+    *,
+    ligand_atoms: Sequence[pdbtext.AtomRecord] = (),
+    ligand_names: Sequence[str] = (),
+) -> dict[str, Any]:
+    """一处口袋的画像。
+
+    `residues` 是 `PocketResidue.as_dict()` 那种形状；预测来源只有编号、没有残基名，
+    那时 `walls.named` 会小于总数，壁的组成**照实说算不出来**，不按编号猜残基。
+
+    `ligand_atoms` 为空（预测口袋、用户手给残基的口袋）时画像只有壁那一半——
+    没有配体就没有「配体长什么样」这一项，留空而不是编一个。
+    """
+    if not residues:
+        return {}
+    walls = {"aromatic": 0, "hydrophobic": 0, "polar": 0, "charged": 0, "other": 0}
+    named = 0
+    measured = 0
+    tight = 0
+    closest: tuple[float, dict[str, Any]] | None = None
+    for item in residues:
+        name = str(item.get("resname") or "").upper()
+        if name:
+            named += 1
+        walls[_residue_class(name)] += 1
+        distance = item.get("min_distance")
+        if isinstance(distance, (int, float)):
+            measured += 1
+            value = float(distance)
+            if closest is None or value < closest[0]:
+                closest = (value, item)
+            if value <= TIGHT_CONTACT:
+                tight += 1
+
+    profile: dict[str, Any] = {
+        "residues": len(residues),
+        "measured": measured,
+        "tight": tight,
+        "walls": {
+            "aromatic": walls["aromatic"],
+            "hydrophobic": walls["hydrophobic"],
+            "polar": walls["polar"],
+            "charged": walls["charged"],
+            "other": walls["other"],
+            "named": named,
+        },
+    }
+    if closest is not None:
+        distance, item = closest
+        profile["closest"] = {
+            "label": f"{item.get('chain')}:{item.get('resseq')}",
+            "resname": str(item.get("resname") or ""),
+            "distance": round(distance, 2),
+        }
+    facts = _ligand_facts(ligand_atoms)
+    if facts:
+        names = [name for name in ligand_names if name]
+        if names:
+            facts["names"] = names
+        profile["ligand"] = facts
+    profile["verdict"] = _profile_verdict(profile)
+    return profile
+
+
+def profile_lines(profile: dict[str, Any]) -> list[str]:
+    """画像的三行文字。口袋集与单个口袋共用这一份，两处各写一份必然漂移。"""
+    if not profile:
+        return []
+    lines: list[str] = []
+    ligand = profile.get("ligand") or {}
+    if ligand:
+        names = "、".join(ligand.get("names") or []) or "配体"
+        elements = " ".join(
+            f"{name}{count}"
+            for name, count in sorted(
+                (ligand.get("elements") or {}).items(), key=lambda pair: (-pair[1], pair[0])
+            )
+        )
+        extent = ligand.get("extent") or [0.0, 0.0, 0.0]
+        lines.append(
+            f"    配体 {names}：{ligand.get('atoms')} 个重原子（{elements}），"
+            f"伸展 {extent[0]:g}×{extent[1]:g}×{extent[2]:g} 埃"
+        )
+    walls = profile.get("walls") or {}
+    total = int(profile.get("residues") or 0)
+    named = int(walls.get("named") or 0)
+    if named:
+        wall_text = (
+            f"    壁 芳香 {walls.get('aromatic')} · 疏水 {walls.get('hydrophobic')}"
+            f" · 极性 {walls.get('polar')} · 带电 {walls.get('charged')}"
+        )
+        if named < total:
+            wall_text += f"（另有 {total - named} 个残基没有残基名）"
+    else:
+        wall_text = f"    壁 {total} 个残基，残基名缺失，算不出组成"
+    closest = profile.get("closest") or {}
+    if closest:
+        wall_text += (
+            f"；最近 {closest.get('label')} {closest.get('resname') or ''}"
+            f" {closest.get('distance')} 埃"
+        )
+    wall_text += (
+        f"；≤{TIGHT_CONTACT:g} 埃 {profile.get('tight')} 个"
+        if int(profile.get("measured") or 0) == total
+        else "；这一层没有距离，贴紧程度算不出来"
+    )
+    lines.append(wall_text)
+    if profile.get("verdict"):
+        lines.append(f"    画像：{profile['verdict']}")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -418,12 +651,15 @@ def prior_pockets(
         # 候选结构里的链号未必与受体一致（叠合按序列配对，不按链号），
         # 所以这里按**它自己的全部聚合物链**判接触，不传受体链号。
         screened = preprocess.screen_ligands(doc, filtered.kept)
+        degreased = preprocess.screen_lipids(screened.kept)
         for reason, count in filtered.counts.items():
             excluded[reason] = excluded.get(reason, 0) + count
         for reason, count in screened.counts.items():
             excluded[reason] = excluded.get(reason, 0) + count
+        for reason, count in degreased.counts.items():
+            excluded[reason] = excluded.get(reason, 0) + count
 
-        moved = align.moved_groups(screened.kept, transform)
+        moved = align.moved_groups(degreased.kept, transform)
         for cluster in export.cluster_ligands(moved):
             residues = export.pocket_residues(
                 receptor_doc, cluster.coords, radius, chains=chains
@@ -442,6 +678,7 @@ def prior_pockets(
                     "resolution": facts.resolution,
                     "rmsd": round(verdict.rmsd, 3) if verdict.rmsd is not None else None,
                 },
+                atoms=tuple(atom for group in cluster.groups for atom in group.atoms),
             )
             index += 1
 
@@ -613,6 +850,8 @@ def _pockets_from_prediction(
             "radius": radius,
             "source": "p2rank",
             "residues": residues,
+            # 预测只给残基编号，画像的壁那一半照实说算不出来，不按编号猜残基名。
+            "profile": build_profile(residues),
         }
         score = _as_float(item.get("score"))
         probability = _as_float(item.get("probability"))
@@ -817,6 +1056,11 @@ def _ligand_bundle(
         "complexes": [
             {"pdb_id": pdb_id, "ligand": ligand_label, "resolution": None}
         ],
+        "profile": build_profile(
+            [item.as_dict() for item in residues],
+            ligand_atoms=tuple(atom for atom in ligand_doc.atoms if pdbtext.is_heavy(atom)),
+            ligand_names=(ligand_label,),
+        ),
     }
     return PocketBundle(
         pockets=[pocket],
@@ -922,7 +1166,7 @@ def _normalize_pockets(
                 "source": "radius",
             },
         }
-        for key in ("score", "probability", "label", "id"):
+        for key in ("score", "probability", "label", "id", "profile"):
             if key in item:
                 pocket[key] = item[key]
         out.append(pocket)
@@ -1020,6 +1264,7 @@ def _render_pockets(
             line += f" · 支持 {support['complexes']} 个复合物"
         line += f" · 盒子 {size[0]:g}×{size[1]:g}×{size[2]:g}"
         lines.append(line)
+        lines.extend(profile_lines(pocket.get("profile") or {}))
     rest = total - min(shown, total)
     if rest > 0:
         lines.append(
@@ -1043,6 +1288,9 @@ class DetectPocketsTool(Tool):
             "p2rank 预测（pdb_id）。中心、半径与盒子一律现算，**不接受模型传的坐标**。\n"
             "sources=auto（默认）按上述顺序取**第一个非空的来源**，不会白跑网络；"
             "要叠加来源就显式写 `ligand,complex`。\n"
+            "脂质、磷脂、去垢剂不算配体，算口袋前就剔掉，剔了几个会写在结论里。\n"
+            "每处口袋附一份**画像**：配体的元素组成与伸展尺寸、壁按芳香/疏水/极性/带电"
+            "分四类计数、最近残基与 3.5 埃内的个数、一句判断。画像里**没有分数**。\n"
             "空集不是失败：会分清「查了确实没有」与「没查成」，并说明缺哪个参数才能再试。\n"
             "下一步用 define_pocket 选一处，把它的 handle 交给 prepare_receptor 的 pocket。"
         ),
@@ -1191,6 +1439,7 @@ class DetectPocketsTool(Tool):
 
         collected: list[dict[str, Any]] = []
         notes: list[str] = []
+        excluded_total: dict[str, int] = {}
         for layer in plan:
             if auto and collected:
                 break
@@ -1209,12 +1458,22 @@ class DetectPocketsTool(Tool):
                 return bundle
             if bundle.note:
                 notes.append(bundle.note)
+            # 排掉了什么要说出来：用户看不到的就是没发生的。脂质那一类尤其要报，
+            # 否则「这处口袋怎么没了」与「这份结构本来就没有配体」分不开。
+            for reason, count in (bundle.excluded or {}).items():
+                excluded_total[reason] = excluded_total.get(reason, 0) + count
             if bundle.pockets:
                 collected.extend(
                     _normalize_pockets(
                         bundle.pockets, layer=layer, radius=radius, padding=padding
                     )
                 )
+
+        if excluded_total:
+            detail = "、".join(
+                f"{reason} {count} 个" for reason, count in sorted(excluded_total.items())
+            )
+            notes.append(f"筛掉的杂原子组：{detail}")
 
         if not collected:
             return ToolResult(
@@ -1796,6 +2055,8 @@ class DefinePocketTool(Tool):
                     "size": [round(value, 3) for value in size],
                     "source": "residues",
                 },
+                # 用户手给残基的口袋没有配体，画像只有壁那一半。
+                "profile": build_profile(residues),
             }
             source = "residues"
 
@@ -1930,6 +2191,7 @@ class DefinePocketTool(Tool):
             )
             rest = len(residues) - 8
             lines.append(f"残基：{shown}" + (f" 等 {len(residues)} 个" if rest > 0 else ""))
+        lines.extend(profile_lines(pocket.get("profile") or {}))
         lines.append(
             f"下一步：prepare_receptor(structure=<raw 受体>, pocket={handle}, confirm=...)"
         )

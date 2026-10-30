@@ -40,6 +40,7 @@ __all__ = [
     "ResidueKey",
     "altloc_residues",
     "calc_box",
+    "element_of",
     "format_box",
     "hetero_groups",
     "is_heavy",
@@ -173,6 +174,29 @@ def is_heavy(atom: AtomRecord) -> bool:
     if element:
         return element not in _HYDROGEN_NAMES
     return not (atom.name or "").strip().upper().startswith(("H", "D"))
+
+
+def element_of(atom: AtomRecord) -> str:
+    """原子的元素符号（大写）。元素列为空时按原子名推断。
+
+    **元素列读不到时退一步，不是猜化学。** 有些文件（旧坐标、被别的程序重写过的
+    坐标）第 77–78 列是空的，而按原子名推断只认两件事：名字去掉序号后首字母大写、
+    第二个字母小写的是两字母元素（`Cl` / `Fe` / `Zn`），其余取首字母。这样
+    `C1` → C、`O2'` → O、`Cl` → CL；`CL1` 这种全大写写法会读成 C，是已知的漏。
+    漏的后果是「这一组少数几个碳」，只影响阈值判断，不会把分子认成另一个分子。
+
+    与 `is_heavy` 分开：那一个只回答「是不是氢」，判错的方向刻意朝「算重原子」让；
+    这一个回答「是哪种元素」，判错就没有方向可让，只能退回首字母。
+    """
+    element = (atom.element or "").strip().upper()
+    if element:
+        return element
+    core = (atom.name or "").strip().rstrip("'").rstrip("0123456789")
+    if not core:
+        return ""
+    if len(core) >= 2 and core[1].islower():
+        return core[:2].upper()
+    return core[0].upper()
 
 
 @dataclass(frozen=True)

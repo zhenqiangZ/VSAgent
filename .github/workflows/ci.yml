@@ -41,6 +41,9 @@ jobs:
       - run: pip install -r requirements.txt -r requirements-chem.txt
       # 独立脚本，不是 pytest：末尾打印「通过 N 项检查」，失败时抛 AssertionError。
       - run: python tests/test_agent.py
+      # 前缀判据：预算、点名工具首步可见性、越界参数表与工具 schema 一致、Plan 类别覆盖。
+      # 它要装全部 68 个工具、读真实的 AGENTS.md，比 test_agent 里那一组贵，所以单独跑。
+      - run: python tools/check_prefix.py
 
   ui:
     name: 界面 + 内核

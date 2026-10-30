@@ -8,9 +8,9 @@ root = Path(SPECPATH)
 # 加进 `datas` 之后冻结产物里才有它——`service.web_root()` 按 `sys._MEIPASS` 找。
 # 漏了它的话服务照常起来，只是页面 404，而 `open_viewer` 仍给得出地址，
 # 现象看着像「前端没写」，实际是没打进去。所以打包后要查
-# `build/opencode_tui/Analysis-00.toc`（不是 `strings`，PKG 段是压缩的）。
+# `build/vsagent/Analysis-00.toc`（不是 `strings`，PKG 段是压缩的）。
 datas = [
-    (str(root / "opencode_tui" / "styles" / "app.tcss"), "opencode_tui/styles"),
+    (str(root / "vsagent" / "styles" / "app.tcss"), "vsagent/styles"),
     (str(root / "web"), "web"),
 ]
 
@@ -26,7 +26,7 @@ datas = [
 datas += collect_data_files("meeko", subdir="data")
 
 a = Analysis(
-    [str(root / "opencode_tui" / "__main__.py")],
+    [str(root / "vsagent" / "__main__.py")],
     pathex=[str(root)],
     binaries=[],
     datas=datas,
@@ -46,7 +46,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="opencode-tui",
+    name="VSAgent",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

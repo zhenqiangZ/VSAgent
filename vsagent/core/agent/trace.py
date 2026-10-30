@@ -14,8 +14,8 @@ LOG_DIRECTORY = "logs"
 def log_directory_for(state_path: Path) -> Path:
     """按状态文件的位置给出日志目录。
 
-    生产环境的状态文件在 `~/.opencode_tui/state.toml`，日志于是写到
-    `~/.opencode_tui/logs/`；测试里状态文件在项目内，日志跟着它走，
+    生产环境的状态文件在 `~/.vsagent/state.toml`，日志于是写到
+    `~/.vsagent/logs/`；测试里状态文件在项目内，日志跟着它走，
     不会写进用户目录。
     """
     return state_path.parent / LOG_DIRECTORY

@@ -10,6 +10,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+from ..paths import config_home
+
 # 换名在目标文件正被别的进程打开时会被系统拒绝，隔几毫秒重试。
 REPLACE_ATTEMPTS = 40
 REPLACE_RETRY_DELAY = 0.005
@@ -950,7 +952,7 @@ def _replace_with_retry(staged: Path, target: Path) -> None:
 
 def ledger_root() -> Path:
     """登记表快照的默认根目录，与状态文件的位置惯例一致。"""
-    return Path.home() / ".opencode_tui" / "ledgers"
+    return config_home() / "ledgers"
 
 
 def default_snapshot_path(session_id: str) -> Path | None:

@@ -14,6 +14,7 @@ from .core.agent.domain.export import runs_dir
 from .core.web.service import WebService, web_root
 from .core.agent.hooks import HookRunner, default_hooks_paths, load_hooks
 from .core.agent.host import AgentHost
+from .core.agent.hypothesis import HypothesisTool
 from .core.agent.ledger import SessionLedger
 from .core.agent.loop import AgentLoop, max_steps_from_env
 from .core.agent.memory import MemoryStore, RecallTool, RememberTool
@@ -26,6 +27,7 @@ from .core.agent.permission import (
     default_permission_paths,
     load_permissions,
     load_tool_switches,
+    project_config_directory,
     save_disabled,
     tools_config_path,
 )
@@ -49,7 +51,11 @@ from .core.agent.trace import TraceWriter, log_directory_for
 from .core.command_registry import CommandRegistry
 from .core.connection import Connection, connection_path_for, load_connection, save_connection
 from .core.event_bus import EventBus
-from .core.file_log import PROJECT_LOG_DIRECTORY, configure as configure_file_log
+from .core.file_log import (
+    PROJECT_LOG_DIRECTORY,
+    configure as configure_file_log,
+    record as log_read,
+)
 from .core.exporter import export_filename, render_session_markdown
 from .core.external_editor import (
     editor_buffer_path,
@@ -60,6 +66,7 @@ from .core.external_editor import (
 )
 from .core.keybind_manager import KeybindManager
 from .core.models import EFFORTS, Message, Session, ToolStatus
+from .core.paths import Migration, migrate_legacy_config
 from .core.project_scan import merge_agents_md, scan_project
 from .core.session_manager import SessionManager
 from .env import load_env
@@ -84,11 +91,11 @@ ARGUMENT_COMMANDS = frozenset(
 )
 
 
-class OpenCodeApp(App[None]):
-    """opencode TUI 的应用入口，持有核心层并管理屏幕切换。"""
+class VSAgentApp(App[None]):
+    """VSAgent 的应用入口，持有核心层并管理屏幕切换。"""
 
     CSS_PATH = "styles/app.tcss"
-    TITLE = "opencode tui"
+    TITLE = "VSAgent"
     TOAST_SECONDS = 3.0
     # 关掉 Textual 自带的命令面板，改用本项目实现的 CommandPalette
     ENABLE_COMMAND_PALETTE = False
@@ -103,6 +110,27 @@ class OpenCodeApp(App[None]):
     ) -> None:
         super().__init__()
         self.root = root or Path.cwd()
+        # 文件读取日志落在项目自己的 logs/ 下：它跟着仓库走，换项目就换一份，
+        # 不像 trace 那样跟着 state.toml 跑去用户目录。
+        # **要排在迁移之前**：迁移那一行也要记进这份日志，否则「搬没搬」没有线索。
+        configure_file_log(self.root / PROJECT_LOG_DIRECTORY)
+
+        # 改名前用户目录叫 `~/.opencode_tui`。走默认状态文件时先把它整体改名过来，
+        # 否则老会话、connection.toml 与登记表快照会在升级后一起「消失」。
+        # 显式传了 state_path（测试、脚本）就不去动用户目录。
+        if state_path is None:
+            self._log_migration(migrate_legacy_config())
+        # 项目侧那份配置目录也换了名字（`<项目>/.vsagent`）。它装的是工具开关、
+        # 判定规则与钩子——不搬的话模型会突然多出几个本该关掉的工具，而界面上
+        # 一切正常，看不出是「配置没读到」。显式传了 root（测试、脚本）就不碰。
+        #
+        # **搬的是 `project_config_directory()` 的上一级，不是 `self.root`**：
+        # 打包后配置目录跟着 exe 走（`sys.executable.parent`），而 `self.root` 是
+        # 启动目录——从别的目录启动时两者不是一个地方，搬 cwd 会搬到用户没在看的地方。
+        if root is None:
+            self._log_migration(
+                migrate_legacy_config(project_config_directory(self.root).parent)
+            )
         self.session_manager = SessionManager(state_path)
         # 接口参数与状态文件同目录。没有这份文件时应用照常起来，
         # 只是发消息之前要先用 `/model` 填一遍。
@@ -117,9 +145,6 @@ class OpenCodeApp(App[None]):
             lambda: self.session_manager.current_session_id,
             trace_directory,
         )
-        # 文件读取日志落在项目自己的 logs/ 下：它跟着仓库走，换项目就换一份，
-        # 不像 trace 那样跟着 state.toml 跑去用户目录。
-        configure_file_log(self.root / PROJECT_LOG_DIRECTORY)
         self._policy = policy
         self._hooks = hooks
         self._disabled: frozenset[str] | None = None
@@ -149,6 +174,22 @@ class OpenCodeApp(App[None]):
         # 用户答完一个才看得见下一个，否则最上面那个关掉之前下面那个一直灰着。
         self._permission_queue: deque[dict[str, object]] = deque()
         self._permission_active = False
+
+    @staticmethod
+    def _log_migration(migration: Migration | None) -> None:
+        """迁移了就在文件读取日志里留一行。没迁移什么都不写。
+
+        迁移是**静默**的：搬错目录、只搬了一半，界面上完全看不出来——
+        模型只是「多出几个本该关掉的工具」。这条日志是唯一能事后对上的线索，
+        所以 `purpose` 单列成 `config.migrate`，grep 一下就只看迁移。
+        """
+        if migration is None:
+            return
+        log_read(
+            migration.target,
+            purpose="config.migrate",
+            detail=migration.describe(),
+        )
 
     @property
     def agent(self) -> AgentLoop:
@@ -313,7 +354,7 @@ class OpenCodeApp(App[None]):
         每加一个领域模块都回来改一次装配，漏掉一处的结果就是「工具写了但模型看不见」。
         记忆工具与任务状态工具同属内核，排在领域工具之前。
 
-        `.opencode_tui/tools.toml` 里标了关的工具**根本不装进来**：不装进注册表就
+        `.vsagent/tools.toml` 里标了关的工具**根本不装进来**：不装进注册表就
         不会出现在请求体的 `tools` 数组里，模型连它存在都不知道。这与权限层的
         `deny` 是两件事——那一层工具照旧可见，只是调用时被拦。
 
@@ -334,6 +375,9 @@ class OpenCodeApp(App[None]):
         registry.register(RecallTool(memory))
         # 任务状态不用传东西进来：它挂在会话上，由循环层每次调用现取。
         registry.register(TaskTool())
+        # 假设也挂在会话上（`task_state.hypotheses`），同样由内核注入。
+        # 它是**产出单位**：没有它，模型交上来的是排名而不是可检验的判断。
+        registry.register(HypothesisTool())
         # 取回被归档/被移出的原文。与任务状态同理：会话由内核注入。
         registry.register(ReadTurnTool())
         # 事件收口与召回：把做完的一段压成标题 + 摘要，需要细节再按编号取回。
@@ -352,7 +396,7 @@ class OpenCodeApp(App[None]):
         return registry
 
     def _disabled_tools(self) -> frozenset[str]:
-        """`.opencode_tui/tools.toml` 里关掉的工具名。
+        """`.vsagent/tools.toml` 里关掉的工具名。
 
         启动时读一次就缓存下来：装配路径上一个会话要走几十次，每次重读文件没有必要。
         `/tools` 面板改完会自己把缓存换掉（见 `toggle_tool`），所以不必重启。
@@ -941,7 +985,12 @@ class OpenCodeApp(App[None]):
             self.show_toast("这一段已经压过了", "info")
             return
         self.refresh_chat()
-        self.show_toast(f"已压缩，之后这一轮只带最近 {left} 条发给模型", "success")
+        # `left` 为 0 是常态：压完连最新一段的原文也让位了，RECENT 里只剩
+        # 事件流水。写成「只带最近 0 条」会让人以为出了错。
+        if left:
+            self.show_toast(f"已压缩，之后这一轮只带最近 {left} 条发给模型", "success")
+        else:
+            self.show_toast("已压缩，原文全部让位给阶段流水", "success")
 
     def _command_connect(self) -> None:
         """显示当前连的是哪一家，以及配置存在哪里。"""
@@ -1089,7 +1138,7 @@ class OpenCodeApp(App[None]):
     def _command_events(self, arguments: str) -> None:
         """列出本会话的事件；带编号时看详情。
 
-        事件是「已经收口的阶段」：原文不再进上下文，这里看得到它被压成了什么。
+        阶段是「已经封存的一大步」：原文不再进上下文，这里看得到它的流水与结论。
         想看原文用 `/events <编号>` 或让模型调 `recall_event`。
         """
         session = self.active_session

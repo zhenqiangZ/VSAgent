@@ -18,8 +18,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from ..models import Event, Message, Part, PartType, Session, TaskState, ToolStatus
+from ..models import Event, Message, Part, PartType, Session, Step, TaskState, ToolStatus
 from .prompt import (
+    EMPTY_REASONING,
     EVENT_NOTICE,
     MEMORY_NOTICE,
     OMISSION_MARK,
@@ -88,12 +89,23 @@ REFS_TURN_LIMIT = 20
 REFS_TOKEN_LIMIT = 600
 # 摘要小于这么多 token 时不再「砍半」：省不下额度，却会把一句结论砍成半句。
 SUMMARY_SHRINK_MIN = 300
-# 事件块的上限。`min(1800, max(200, available // 6))`：窗口大时封在 1800
-# （二十来条事件），窗口很小时按六分之一给，至少 200。
-EVENT_LIMIT_MAX = 1800
+# 事件块的上限。`min(6000, max(200, available // 6))`：窗口大时封在 6000
+# （约六个阶段铺满流水），窗口很小时按六分之一给，至少 200。
+#
+# 1800 → 6000 是因为事件从「一条一行」变成了「一个阶段一块」：十二步的流水
+# 大约两三百 token，旧上限连一个阶段都放不下，会立刻触发 `event_layer`
+# 把整段历史丢掉。6000 是按「六七个阶段」量的，再多就交给
+# `event_step_detail` 压成一阶段一行。
+EVENT_LIMIT_MAX = 6000
 EVENT_LIMIT_MIN = 200
 # 事件摘要进索引行时的长度上限。完整的摘要留在 `recall_event` 里。
 EVENT_SUMMARY_LIMIT = 160
+# 一个阶段铺多少步。超过 12 步只留「前 3 + 后 3」，中间那些用
+# `recall_event evt_0003 step=7` 取——流水的作用是看出「怎么走到这里的」，
+# 不是把三十步原样列一遍。
+STEPS_INLINE = 12
+STEPS_HEAD = 3
+STEPS_TAIL = 3
 # 给模型输出留的额度，以及协议本身（角色、工具调用外壳）的开销
 OUTPUT_RESERVE = 4096
 PROTOCOL_OVERHEAD = 256
@@ -101,6 +113,12 @@ PROTOCOL_OVERHEAD = 256
 MIN_AVAILABLE = 512
 # 无论如何都要保留的最近交互组数
 MIN_RECENT_TURNS = 1
+# 本阶段走到第几步才在尾部提示「该收口了」。
+#
+# 3 是 `close_phase` 自己的触发线（「这一大步跑了 3 步以上」）：两三轮的小事
+# 用本地标题就够，提示只会让模型为一次记账多跑一个往返。提示本身是尾部的
+# 一行字，不碰前缀缓存。
+CLOSE_PHASE_AFTER = 3
 # 装配结果的估算值降到窗口的这个比例以内就算合格
 CONTEXT_RATIO = 0.8
 
@@ -157,6 +175,7 @@ DEGRADE_ORDER: tuple[str, ...] = (
     "evidence_detail",     # 证据层收掉正文，只留 ref 与摘要
     "history_summary",     # 摘要缩一档
     "recent_tool_clear",   # 旧工具结果正文换成一行占位（可用 read_turn 取回）
+    "event_step_detail",   # 阶段流水压成一阶段一行（标题与结论还在）
     "event_layer",         # 丢掉最旧的事件（可用 recall_event 取回）
     "memory",              # 常驻记忆缩一档
     "recent_turns",        # 整组移出最旧的交互组
@@ -260,12 +279,36 @@ def one_line(text: str, limit: int) -> str:
     return flat[: max(1, limit - 1)] + "…"
 
 
-def event_line(event: Event) -> str:
-    """一条事件在上下文里占的一行：编号、标题、区间、摘要。"""
-    span = f"（第 {event.start + 1}–{event.end} 条）"
+def event_head(event: Event) -> str:
+    """一个阶段在上下文里的标题行：编号、阶段号、标题、步数与归档量。
+
+    不带结论：结论单独一行（`结论：…`），两者分开读才看得出「这一大步
+    走到了哪、怎么走到的」。
+    """
     title = one_line(event.title or "（未命名）", 40)
+    meta = f"{len(event.steps)} 步"
+    if event.tokens:
+        meta += f" · 原文 {max(1, event.tokens // 1000)}K token 已归档"
+    return f"- {event.id} 阶段 {event.phase_index or '?'}：{title}（{meta}）"
+
+
+def event_line(event: Event) -> str:
+    """一条事件的索引行：标题行 + 结论。`/events` 与 `recall_event` 清单用它。"""
     summary = one_line(event.summary, EVENT_SUMMARY_LIMIT)
-    return f"- {event.id} {title}{span}：{summary}"
+    return f"{event_head(event)}：{summary}" if summary else event_head(event)
+
+
+def render_step_line(step: Step) -> str:
+    """流水里的一行：步号 + 这一步做了什么 + 结果。
+
+    失败长在它发生的那一步上（「1. 查链 · 失败：目录不存在」），而不是塞进
+    一个单独的 `issues` 列表——「第 1 步失败了，所以第 2 步换了个做法」
+    这个因果只有并排才看得出来。
+    """
+    body = step.intent or "（没有记录）"
+    if step.result:
+        body += " · " + step.result
+    return f"  {step.seq}. {body}"
 
 
 def evidence_ref(tool_name: str, tool_input: Any) -> str:
@@ -561,6 +604,42 @@ def split_turns(messages: list[Message]) -> list[Turn]:
 def turns_tokens(turns: list[Turn]) -> int:
     """估算一组交互组占多少 token。"""
     return sum(turn.tokens() for turn in turns)
+
+
+def placeholder_stale_reasoning(turns: list[Turn], messages: list[Message]) -> int:
+    """把**更早轮次**的推理换成占位符，返回换掉了几条 assistant 项。
+
+    DeepSeek 的不变式是「只要请求带 tools，每条 assistant 消息都要有
+    `reasoning_content`」，缺了直接 400——所以字段必须在。但**内容**不必是原文：
+    跨轮之后任务目标已经写在 TASK 与 FOCUS 里，旧推理只是冗余。
+    实测一次 37 步的会话里，推理占模型可见正文的 62%（63.5K 字符），
+    而它每一步都随历史重发一遍。
+
+    **按轮切而不是按步**：同一轮内模型需要看到自己上一步的推理来保持连贯
+    （「刚才决定用 A，现在验证它」）；跨轮之后那条链已经断了，留着只是占地方。
+
+    只改 `turns` 里的模型消息（`translate_message` 每次现造的新字典），
+    不动 `Message` / `Part`——`read_turn` 取回的仍是逐字节原文。
+    """
+    current = max(
+        (index for index, message in enumerate(messages) if message.role == "user"),
+        default=-1,
+    )
+    replaced = 0
+    for turn in turns:
+        # 当前轮 = 最后一条 user 消息之后的 assistant；没有 user 消息时全都算旧轮。
+        if current >= 0 and turn.message_index > current:
+            continue
+        for item in turn.messages:
+            if item.get("role") != "assistant":
+                continue
+            value = item.get("reasoning_content")
+            # 空推理（`EMPTY_REASONING`）本来就短，换成占位反而失真：这一步确实没推理。
+            if not value or value in (EMPTY_REASONING, REASONING_PLACEHOLDER):
+                continue
+            item["reasoning_content"] = REASONING_PLACEHOLDER
+            replaced += 1
+    return replaced
 
 
 def turn_at(session: Session, index: int) -> Turn | None:
@@ -877,21 +956,30 @@ class ContextAssembler:
             )
 
         turns = split_turns(session.messages)
-        # 事件覆盖到哪儿，RECENT 就从哪儿开始。两者取大：`compact_upto` 是手动
-        # 压缩推出来的位置，事件是自动/手动收口推出来的，谁在后面听谁的。
-        compact = max(session.compact_upto, session.event_end)
+        # 跨轮的推理只留占位。**在估算之前**做：否则预算按原文算、实际发出去的是
+        # 占位，`total` 会虚高，降级链可能为了「装不下」白削一层。
+        reasoning_placeholder = placeholder_stale_reasoning(turns, session.messages)
+        # RECENT 从哪儿开始。`compact_upto` 是手动/强行压缩推出来的硬边界；
+        # 事件是自动封存推出来的软边界。**最近一个阶段留在 RECENT 里**
+        # （`keep_last_phase_raw = 1`）：刚做完的事要逐字可查，不必靠流水回读。
+        # 更早的阶段只留流水，所以事件块只铺 `end <= compact` 的那些。
+        keep_raw = session.events[-1].start if session.events else 0
+        compact = max(session.compact_upto, keep_raw)
         compacted = [turn for turn in turns if turn.message_index < compact]
         live = [turn for turn in turns if turn.message_index >= compact]
+        archived = [event for event in session.events if event.end <= compact]
 
         # 各层先按软配额取一份。软配额只决定「先给谁」，装不下由降级链兜。
         # 被配额削过的层一样记进 `degraded`——削了就是削了，不能因为
         # 「不是降级链那一步削的」就不算，否则 `degraded` 反映不出真实用量。
         raw_memory = memory_block(memory_text)
         memory = _cap_memory(raw_memory)
+        # 进度提示只在本阶段够长时出现（见 `CLOSE_PHASE_AFTER`）。
+        progress = self._progress_block(session)
         # 事件块按可用额度的六分之一封顶：它比 RECENT 稳定，但也只是索引，
-        # 不该把「最近发生了什么」挤掉。上限 1800 是量出来的——二十来条事件。
+        # 不该把「最近发生了什么」挤掉。上限 6000 是量出来的——六七个阶段的流水。
         event_limit = min(EVENT_LIMIT_MAX, max(EVENT_LIMIT_MIN, available // 6))
-        events, event_block = self._cap_events(list(session.events), event_limit)
+        events, event_block = self._cap_events(archived, event_limit)
         fixed = (
             estimate_tokens(stable_prefix)
             + estimate_tokens(memory)
@@ -924,7 +1012,7 @@ class ContextAssembler:
             degraded.append("memory")
         if summary != session.summary:
             degraded.append("history_summary")
-        if len(events) < len(session.events):
+        if len(events) < len(archived):
             degraded.append("event_layer")
 
         live_ids = {turn.index for turn in recent}
@@ -948,6 +1036,7 @@ class ContextAssembler:
                 summary,
                 evidence,
                 bool(session.events),
+                progress_text=progress,
             )
 
         messages, usage = compose()
@@ -970,11 +1059,18 @@ class ContextAssembler:
             degraded.append("recent_tool_clear")
             messages, usage = compose()
             total = sum(usage.values())
+        # 阶段流水先压成「一阶段一行」：标题与结论还在，丢的是过程。
+        # 它比整块丢掉事件温和，所以排在 `event_layer` 之前。
+        if total > available and any(event.steps for event in events):
+            events, event_block = self._cap_events(archived, event_limit, detail=False)
+            degraded.append("event_step_detail")
+            messages, usage = compose()
+            total = sum(usage.values())
         # 旧事件丢掉：它也「可逆」（recall_event 取回原文），但丢掉的是整段结论，
         # 比一行占位贵，所以排在工具结果清理之后、记忆之前。
         while total > available and events:
             events.pop(0)
-            event_block = self._event_block(events, len(session.events) - len(events))
+            event_block = self._event_block(events, len(archived) - len(events))
             degraded.append("event_layer")
             messages, usage = compose()
             total = sum(usage.values())
@@ -1051,6 +1147,7 @@ class ContextAssembler:
                 "memory_entries": memory_entry_count(memory),
                 "evidence_entries": len(evidence),
                 "events": len(events),
+                "reasoning_placeholder": reasoning_placeholder,
             },
         )
 
@@ -1158,6 +1255,25 @@ class ContextAssembler:
                 cleared += 1
         return cleared
 
+    def _progress_block(self, session: Session) -> str:
+        """本阶段走到第几步——够长了才提示收口。
+
+        为什么需要这一句：`close_phase` 的两个触发时机里，「换事之前」模型自己能判断，
+        「收尾之前」要它知道**这一大步已经几步了**。实测四轮真跑、三次机会、
+        一次都没调（§4.13）：光在提示词里写「3 步以上就调」，模型手上没有这个数。
+        把它摆到模型眼前，条件才是可执行的。
+
+        为什么放尾部：它每步都变，进 header 就等于每步改写第 1 条消息。
+        尾部是纯追加，不碰前缀缓存（这一条在 §4.13 量过）。
+        """
+        steps = len(session.pending_steps)
+        if steps < CLOSE_PHASE_AFTER:
+            return ""
+        return (
+            f"（本阶段已 {steps} 步。收尾前调一次 close_phase 给这一大步起个名字、写一句结论："
+            "标题写做成了什么，结论写结果与还差什么。阶段仍在一轮结束时封存，它只负责命名。）"
+        )
+
     def _focus_block(self, state: TaskState) -> str:
         """最后一条用户消息前面那段「目标复述」。
 
@@ -1202,6 +1318,7 @@ class ContextAssembler:
         summary: str,
         evidence: list[Evidence],
         has_events: bool = False,
+        progress_text: str = "",
     ) -> tuple[list[dict[str, Any]], dict[Layer, int]]:
         """按固定布局把各层拼成消息，并给出每层的估算用量。"""
         header = self._task_header(
@@ -1228,18 +1345,25 @@ class ContextAssembler:
         evidence_block = self._evidence_block(evidence)
         if evidence_block:
             messages.append({"role": "user", "content": evidence_block})
+        # 进度提示放**最后一条**：它每步都变（「已 3 步」→「已 4 步」），
+        # 放进 header 就等于每步把第 1 条消息改一遍，整条前缀缓存作废
+        # （§4.13 量过：那正是长会话命中率掉下来的原因）。放在尾部是纯追加，
+        # 前面一个字节都不动；而它是模型做决定的最后一屏，位置反而最对。
+        if progress_text:
+            messages.append({"role": "user", "content": progress_text})
 
         usage = {
             Layer.PREFIX: estimate_tokens(stable_prefix),
             Layer.MEMORY: estimate_tokens(memory),
             # 工作区索引算进 TASK 层：它与任务状态同为「这一步的工作前提」，
             # 同样 pinned、同样每步重算。单开一层要改 `Layer` 与降级链，
-            # 而它的额度只有百来个 token，不值那一圈。
+            # 而它的额度只有百来个 token，不值那一圈。进度提示同理。
             Layer.TASK: (
                 estimate_tokens(task_text)
                 + estimate_tokens(digest_text)
                 + estimate_tokens(env_text)
                 + estimate_tokens(focus_text)
+                + estimate_tokens(progress_text)
             ),
             Layer.EVENT: estimate_tokens(event_block),
             Layer.RECENT: turns_tokens(recent),
@@ -1328,8 +1452,34 @@ class ContextAssembler:
             return "、".join(names)
         return "用户消息" if turn.messages[0].get("role") == "user" else "助手回复"
 
-    def _event_block(self, events: list[Event], dropped: int = 0) -> str:
-        """事件层：每个事件一行，从旧到新。空列表时是空串。
+    def _event_lines(self, event: Event, detail: bool = True) -> list[str]:
+        """一个阶段铺成几行：标题、流水、结论、未决。
+
+        `detail=False` 时只剩标题与结论——那是 `event_step_detail` 那一档，
+        丢掉的是「怎么走到的」，留下的是「走到了哪」。
+        """
+        lines = [event_head(event)]
+        if detail and event.steps:
+            steps = event.steps
+            if len(steps) <= STEPS_INLINE:
+                lines.extend(render_step_line(step) for step in steps)
+            else:
+                hidden = len(steps) - STEPS_HEAD - STEPS_TAIL
+                lines.extend(render_step_line(step) for step in steps[:STEPS_HEAD])
+                lines.append(
+                    f"  … 中间省略 {hidden} 步（recall_event {event.id} step=<步号> 取回）"
+                )
+                lines.extend(render_step_line(step) for step in steps[-STEPS_TAIL:])
+        if event.summary:
+            lines.append("  结论：" + one_line(event.summary, EVENT_SUMMARY_LIMIT))
+        if detail and event.issues:
+            lines.append("  未决：" + one_line("；".join(event.issues[:3]), EVENT_SUMMARY_LIMIT))
+        return lines
+
+    def _event_block(
+        self, events: list[Event], dropped: int = 0, detail: bool = True
+    ) -> str:
+        """事件层：每个阶段一块，从旧到新。空列表时是空串。
 
         `dropped` 是被裁掉的条数。**必须说出来**：被裁的事件覆盖的消息既不在
         事件块里，也不在 RECENT 里（`compact` 已经推到事件末端），不提示的话
@@ -1337,14 +1487,18 @@ class ContextAssembler:
         """
         if not events:
             return ""
-        lines = [EVENT_NOTICE, *(event_line(event) for event in events)]
+        lines = [EVENT_NOTICE]
+        for event in events:
+            lines.extend(self._event_lines(event, detail))
         if dropped:
             lines.append(
-                f"（更早还有 {dropped} 条事件没放下；recall_event 不带参数可以列清单）"
+                f"（更早还有 {dropped} 个阶段没放下；recall_event 不带参数可以列清单）"
             )
         return "\n".join(lines)
 
-    def _cap_events(self, events: list[Event], limit: int) -> tuple[list[Event], str]:
+    def _cap_events(
+        self, events: list[Event], limit: int, detail: bool = True
+    ) -> tuple[list[Event], str]:
         """按 token 上限保留事件，从新往旧留。
 
         丢掉的是**最旧的**：它们离当前最远，而 `recall_event` 仍然取得回来。
@@ -1353,13 +1507,13 @@ class ContextAssembler:
         kept: list[Event] = []
         used = 0
         for event in reversed(events):
-            cost = estimate_tokens(event_line(event)) + 1
+            cost = estimate_tokens("\n".join(self._event_lines(event, detail))) + 1
             if kept and used + cost > limit:
                 break
             kept.append(event)
             used += cost
         kept.reverse()
-        return kept, self._event_block(kept, len(events) - len(kept))
+        return kept, self._event_block(kept, len(events) - len(kept), detail)
 
     def _evidence_block(self, evidence: list[Evidence]) -> str:
         """证据层：先给 summary，再按剩余额度展开 detail。"""

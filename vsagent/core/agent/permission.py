@@ -13,16 +13,17 @@ from pathlib import Path
 from typing import Iterable
 
 from ..file_log import record as log_read
+from ..paths import CONFIG_DIRECTORY
 from .tools import Tool
 
-# 项目配置所在目录，与状态文件的位置惯例一致
-CONFIG_DIRECTORY = ".opencode_tui"
+# 项目配置所在目录，与状态文件的位置惯例一致。
+# 定义在 `core/paths.py` 里（`~/.vsagent`），这里重新导出：`hooks.py` 从本模块取它。
 PERMISSIONS_FILE = "permissions.toml"
 # 工具开关所在的文件。与权限规则分开放：权限管「调用时放不放行」，
 # 开关管「装配时装不装进来」——后者决定工具在不在请求体的 tools 数组里。
 TOOLS_FILE = "tools.toml"
 # 默认策略下要问一次的工具：会改动文件或运行命令的那些
-DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock", "score_affinity"})
+DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock", "score_affinity", "fit_affinity"})
 # Plan 方式下一律拒绝的工具。一条命令会不会改动看不出来，所以 bash 也算在里面
 #
 # 领域工具里进这一档的是「会落一份新产物并登记成新条目」的那些：准备受体 / 配体、
@@ -34,7 +35,7 @@ DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock", "score_affinity"})
 # 与「改动用户的工程」不是一回事；把它们一并挡掉会让 Plan 方式连查资料都做不到。
 PLAN_DENY = frozenset(
     {"write", "patch", "bash", "prepare_receptor", "prepare_ligands", "dock",
-     "score_affinity", "write_run", "detect_pockets", "define_pocket",
+     "score_affinity", "fit_affinity", "write_run", "detect_pockets", "define_pocket",
      "rank_candidates", "curate_ligands", "screen_similarity", "screen_shape",
      "validate_docking", "build_reference_set", "predict_admet", "scaffold_analysis",
      "matched_pairs", "enumerate_analogs", "record_assay",
@@ -51,9 +52,9 @@ BILLED_ASK_AFTER = 10
 # 因此可以拿它的参数去判「这一步是不是踩到了工作目录之外」。
 # 参数名参照各工具的 `primary_argument`，一个工具可能有多个可选参数。
 PATH_ARGUMENTS: dict[str, tuple[str, ...]] = {
-    "read": ("path", "filePath"),
-    "write": ("path", "filePath"),
-    "patch": ("path", "filePath"),
+    "read": ("path",),
+    "write": ("path",),
+    "patch": ("path",),
     "grep": ("path", "pattern"),
     "import_structure": ("path",),
     "import_ligandset": ("path",),
@@ -104,7 +105,7 @@ _URL = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://\S+")
 #
 # 这些是「本来就不属于用户工程」的位置：临时目录、系统目录、程序自己的
 # 数据目录、用户的个人配置目录。模型经常要往临时目录写中间文件，
-# 也要读自己下载到 `~/.opencode_tui` 下的结构与靶点，这些都算正常动作。
+# 也要读自己下载到 `~/.vsagent` 下的结构与靶点，这些都算正常动作。
 # 不放过它们的话，越界询问会响得太频繁，用户很快就会条件反射地一直按 y。
 _ESCAPE_PREFIXES: tuple[str, ...] = (
     os.environ.get("TEMP", ""),

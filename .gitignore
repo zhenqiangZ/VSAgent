@@ -12,6 +12,10 @@ __pycache__/
 # （索引删了能重建，原件才是真相；原件可能有版权，不该跟着仓库走）
 corpus/
 
+# docs/ 下的论文原件：体量大、有版权，结论写进正文，原件不进库。
+# 不写 `*.pdf`：`tests/fixtures/` 里那两份是解析用的夹具，要跟着代码走。
+docs/*.pdf
+
 # 外部模型（VCrossFormer）：代码 54MB、自带的 .venv 1.6GB、权重 15GB，全部不入库。
 # 它放在 models/ 而不是包内，是因为 check_chemistry_gate 会扫 vsagent/ 下所有
 # .py 的顶层 import，DTA 有 45 处 import torch/rdkit。装法见 models/DTA/README.md。

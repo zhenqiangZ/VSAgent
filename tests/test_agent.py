@@ -8329,6 +8329,327 @@ async def check_pocket_tools() -> None:
         chemistry_module._probe_deps = original_probe
 
 
+def _chain_group(
+    serial: int,
+    resname: str,
+    number: int,
+    count: int,
+    step: float,
+    *,
+    extra: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """沿 x 轴摆一条锯齿链：`count` 个碳，间距 `step`，y/z 上交替偏移。
+
+    y/z 上必须有偏移：全摆成一条直线时包围盒另外两边是 0，形状那一项就没有意义。
+    """
+    lines = [
+        _pdb_atom(
+            serial + index,
+            "C1",
+            resname,
+            "A",
+            number,
+            index * step,
+            0.8 if index % 2 else -0.8,
+            0.6 if index % 3 else -0.6,
+            kind="HETATM",
+        )
+        for index in range(count)
+    ]
+    for offset, (name, element) in enumerate(extra):
+        lines.append(
+            _pdb_atom(
+                serial + count + offset,
+                name,
+                resname,
+                "A",
+                number,
+                offset * 1.2,
+                2.4,
+                -1.2,
+                kind="HETATM",
+                element=element,
+            )
+        )
+    return "".join(lines)
+
+
+def _lipid_fixture() -> str:
+    """一份带脂质、磷脂、去垢剂与三种药物的坐标。"""
+    receptor = "".join(
+        _pdb_atom(
+            index * 3 + 1,
+            "CA",
+            "LEU" if index % 2 else "PHE",
+            "A",
+            index + 1,
+            index * 3.0,
+            -5.0,
+            0.5 * index,
+        )
+        for index in range(10)
+    )
+    receptor += "".join(
+        _pdb_atom(
+            100 + index,
+            "CB",
+            "LEU",
+            "A",
+            index + 1,
+            index * 3.0,
+            -3.4,
+            0.5 * index,
+        )
+        for index in range(10)
+    )
+    text = receptor
+    text += _chain_group(1000, "CLR", 20, 26, 0.7, extra=(("O1", " O"),))
+    text += _chain_group(2000, "STE", 21, 16, 1.2, extra=(("O1", " O"), ("O2", " O")))
+    text += _chain_group(
+        3000,
+        "PC",
+        22,
+        20,
+        1.0,
+        extra=(("P1", " P"),) + tuple((f"O{index}", " O") for index in range(2, 9)),
+    )
+    text += _chain_group(
+        4000,
+        "DDM",
+        23,
+        12,
+        1.0,
+        extra=tuple((f"O{index}", " O") for index in range(2, 10)),
+    )
+    text += _chain_group(5000, "TES", 24, 17, 0.6, extra=(("O1", " O"), ("O2", " O")))
+    text += _chain_group(6000, "IBP", 25, 11, 0.7, extra=(("O1", " O"), ("O2", " O")))
+    text += _chain_group(
+        7000,
+        "LG1",
+        26,
+        20,
+        0.5,
+        extra=(("N1", " N"), ("N2", " N"), ("N3", " N"), ("N4", " N"),
+               ("O1", " O"), ("O2", " O")),
+    )
+    return text
+
+
+async def check_lipid_screen() -> None:
+    """脂质筛查：四条判据各挡一类，类固醇药与短链药留下，准备受体不受影响。"""
+    text = _lipid_fixture()
+    doc = pdbtext.parse(text)
+    filtered = export_module.ligand_groups(doc)
+    # 名字名单里没有这些脂质，它们一路进到几何筛查——正是「掺进来看不出」的那一类。
+    screened = preprocess_module.screen_ligands(doc, filtered.kept)
+    check(
+        {group.resname for group in screened.kept} >= {"CLR", "STE", "PC", "DDM"},
+        f"几何筛查拦不住脂质：{[group.resname for group in screened.kept]}",
+    )
+
+    degreased = preprocess_module.screen_lipids(screened.kept)
+    kept = [group.resname for group in degreased.kept]
+    check(sorted(kept) == ["IBP", "LG1", "TES"], f"脂质筛之后只剩三个药：{kept}")
+    check(
+        {reason for _name, reason in degreased.excluded} == {"脂质或去垢剂"},
+        f"排除理由只有一类：{degreased.excluded}",
+    )
+    check(
+        degreased.counts == {"脂质或去垢剂": 4},
+        f"四组被排掉：{degreased.counts}",
+    )
+
+    # 碳数那条的边界只有含磷的组能测到：其余组要靠「极性原子 ≤ 2」，
+    # 而 16 个重原子、极性原子 ≤ 2 的组必然有 15 个以上碳，永远过得了碳数那一关。
+    seven_carbons = pdbtext.parse(
+        _chain_group(
+            8000,
+            "PL7",
+            30,
+            7,
+            2.7,
+            extra=(("P1", " P"),) + tuple((f"O{index}", " O") for index in range(2, 10)),
+        )
+    )
+    check(
+        [group.resname for group in preprocess_module.screen_lipids(
+            export_module.ligand_groups(seven_carbons).kept
+        ).kept] == ["PL7"],
+        "7 个碳的磷酸化合物不算脂质（碳数那条拦住）",
+    )
+    eight_carbons = pdbtext.parse(
+        _chain_group(
+            8500,
+            "PL8",
+            32,
+            8,
+            2.4,
+            extra=(("P1", " P"),) + tuple((f"O{index}", " O") for index in range(2, 10)),
+        )
+    )
+    check(
+        preprocess_module.screen_lipids(export_module.ligand_groups(eight_carbons).kept).kept == (),
+        "8 个碳、含磷、够长的组按磷脂排掉",
+    )
+
+    compact = pdbtext.parse(_chain_group(9000, "STD", 31, 18, 0.6, extra=(("O1", " O"),)))
+    check(
+        [group.resname for group in preprocess_module.screen_lipids(
+            export_module.ligand_groups(compact).kept
+        ).kept] == ["STD"],
+        "18 个碳但只有 10 埃的类固醇骨架不算脂质",
+    )
+
+    # 磷脂靠「含 P」放行：极性原子 7 个，其余三条都满足。
+    check("PC" not in [group.resname for group in degreased.kept], "含磷的组按磷脂排掉")
+
+    # 准备受体这一步不跟着变：胆固醇写着 HETATM，删掉等于让用户看不到膜成分。
+    cleaned = preprocess_module.clean_structure(text)
+    check("CLR" in cleaned.text, "清洗结构仍然保留胆固醇（脂质筛只管算口袋）")
+
+    # 元素列缺失时按原子名推断。
+    fallback = pdbtext.parse(
+        _pdb_atom(1, "Cl", "LG1", "A", 1, 0.0, 0.0, 0.0, kind="HETATM", element="")
+        + _pdb_atom(2, "C1", "LG1", "A", 1, 1.5, 0.0, 0.0, kind="HETATM", element="")
+        + _pdb_atom(3, "O2'", "LG1", "A", 1, 3.0, 0.0, 0.0, kind="HETATM", element="")
+        + _pdb_atom(4, "FE", "LG1", "A", 1, 4.5, 0.0, 0.0, kind="HETATM", element=" O")
+    )
+    check(
+        [pdbtext.element_of(atom) for atom in fallback.atoms] == ["CL", "C", "O", "O"],
+        f"元素列缺失时按原子名推断：{[pdbtext.element_of(atom) for atom in fallback.atoms]}",
+    )
+
+    # ---- 端到端：`detect_pockets` 只把药当成口袋，并把排掉的脂质报出来 ----
+    work = PROBE / "lipid_screen"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    original_dir = pockets_module.pockets_dir
+    pockets_module.pockets_dir = lambda: work / "pockets"
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        path = work / "receptor.pdb"
+        path.write_text(text, encoding="utf-8")
+        raw = ledger.add(
+            "receptor",
+            path=path,
+            summary="夹具",
+            fingerprint=fingerprint_text(text),
+            meta={"stage": "raw", "pdb_id": "1ABC", "chains": [{"chain_id": "A"}]},
+        )
+        result = await pockets_module.DetectPocketsTool().execute(
+            {"receptor": str(raw.handle), "sources": "ligand"}, context=ledger
+        )
+        check(not result.failed, f"口袋工具跑通：{result.output}")
+        # 三个药在夹具里挨得近，聚成一簇；四组脂质一个都没进来。
+        check(
+            result.meta.get("count") == 1
+            and all(code in result.output for code in ("LG1", "TES", "IBP")),
+            f"只剩三组药聚成的那一处口袋：{result.output}",
+        )
+        check(
+            not any(code in result.output for code in ("CLR", "STE", "DDM", "PC")),
+            f"脂质没有进结果：{result.output}",
+        )
+        check(
+            "脂质或去垢剂 4 个" in result.output,
+            f"排掉几个要写在结论里：{result.output}",
+        )
+    finally:
+        pockets_module.pockets_dir = original_dir
+
+
+def check_pocket_profile() -> None:
+    """口袋画像：壁的组成、配体形状、距离缺失时不编「贴得紧」。"""
+    text = _lipid_fixture()
+    doc = pdbtext.parse(text)
+    ligand = next(
+        group
+        for group in export_module.ligand_groups(doc).kept
+        if group.resname == "LG1"
+    )
+    residues = export_module.pocket_residues(doc, ligand.coords, 5.0)
+    rows = [item.as_dict() for item in residues]
+    profile = pockets_module.build_profile(
+        rows, ligand_atoms=tuple(ligand.atoms), ligand_names=("LG1",)
+    )
+    walls = profile["walls"]
+    check(
+        sum(walls[name] for name in ("aromatic", "hydrophobic", "polar", "charged", "other"))
+        == profile["residues"],
+        f"壁的四类互不重叠、加起来等于残基数：{walls}",
+    )
+    check(walls["named"] == profile["residues"], f"残基名都在：{walls}")
+    check(walls["aromatic"] > 0 and walls["hydrophobic"] > 0, f"夹具里两种壁都有：{walls}")
+    check(
+        profile["ligand"]["atoms"] == 26 and profile["ligand"]["carbons"] == 20,
+        f"配体按元素数出来：{profile['ligand']}",
+    )
+    check(
+        profile["ligand"]["polar"] == 6,
+        f"极性原子是 N+O：{profile['ligand']['polar']}",
+    )
+    check(profile["measured"] == profile["residues"], f"每个残基都有距离：{profile['measured']}")
+    check("score" not in profile, "画像里没有分数")
+    check(profile["verdict"].startswith("窄长"), f"长链配体判成窄长：{profile['verdict']}")
+
+    lines = pockets_module.profile_lines(profile)
+    check(len(lines) == 3, f"画像三行：{lines}")
+    check(any("画像：" in line for line in lines), f"最后一行是判断：{lines}")
+    check(any("26 个重原子" in line for line in lines), f"配体那一行写重原子数：{lines}")
+
+    # 没有配体：画像只有壁那一半，不编一个空的 ligand 项。
+    bare = pockets_module.build_profile(rows)
+    check("ligand" not in bare, f"没有配体就没有 ligand 项：{bare}")
+    check(len(pockets_module.profile_lines(bare)) == 2, "没有配体时画像两行")
+
+    # 预测口袋只有残基编号：残基名缺失时照实说算不出来，且不谈贴得紧不紧。
+    predicted = pockets_module._pockets_from_prediction(
+        {
+            "pockets": [
+                {
+                    "name": "p1",
+                    "score": "9.1",
+                    "residues": ["A_2", "A_3", "A_4"],
+                    "center": [1.0, 2.0, 3.0],
+                }
+            ]
+        },
+        receptor_chains=("A",),
+        radius=5.0,
+    )
+    predicted_profile = predicted[0]["profile"]
+    check(predicted_profile["walls"]["named"] == 0, f"预测没有残基名：{predicted_profile['walls']}")
+    predicted_lines = pockets_module.profile_lines(predicted_profile)
+    check(
+        any("残基名缺失" in line for line in predicted_lines),
+        f"算不出组成要说出来：{predicted_lines}",
+    )
+    check(
+        "四周围得紧" not in predicted_profile["verdict"],
+        f"没量过距离就不谈贴紧：{predicted_profile['verdict']}",
+    )
+
+    # P0 那条路（`_merge`）出来的口袋自带画像，且 P0 不给分。
+    cluster = pockets_module._Cluster3D(
+        center=export_module.ligand_center(ligand.coords),
+        coords=ligand.coords,
+        residues=residues,
+        origin={"pdb_id": "1ABC", "ligand": "LG1", "resolution": 2.0},
+        atoms=tuple(ligand.atoms),
+    )
+    merged = pockets_module._merge({0: cluster}, radius=5.0)
+    check(len(merged) == 1, f"一处口袋：{merged}")
+    check("profile" in merged[0] and merged[0]["profile"]["ligand"]["atoms"] == 26,
+          f"合并之后画像还在：{merged[0].get('profile')}")
+    check("score" not in merged[0], "P0 口袋仍然不给分")
+
+    # 归一化不能把画像丢掉：`detect_pockets` 走的就是这一层。
+    normalized = pockets_module._normalize_pockets(
+        merged, layer="ligand", radius=5.0, padding=8.0
+    )
+    check("profile" in normalized[0], f"归一化保留画像：{normalized[0].keys()}")
+
+
 async def check_rank_candidates() -> None:
     """候选表：方向、平均秩、缺路留空、对齐、分档、复用。
 
@@ -20418,6 +20739,8 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("prankweb", check_prankweb),
     ("pockets", check_pockets),
     ("pocket-tools", check_pocket_tools),
+    ("lipid-screen", check_lipid_screen),
+    ("pocket-profile", check_pocket_profile),
     ("rank-candidates", check_rank_candidates),
     ("analyze-pose", check_analyze_pose),
     ("contact-map", check_contact_map),

@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .paths import config_home
+
 WINDOWS = sys.platform == "win32"
 WINDOWS_FALLBACK = "notepad"
 UNIX_FALLBACKS = ("nano", "vi")
@@ -14,7 +16,7 @@ UNIX_FALLBACKS = ("nano", "vi")
 
 def editor_buffer_path() -> Path:
     """外部编辑器使用的暂存文件路径。"""
-    return Path.home() / ".opencode_tui" / "editor-buffer.md"
+    return config_home() / "editor-buffer.md"
 
 
 def resolve_editor() -> str | None:

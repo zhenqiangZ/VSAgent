@@ -12,7 +12,7 @@ FENCE = "```"
 
 def export_filename(session: Session) -> str:
     """导出对话时使用的文件名。"""
-    return f"opencode-export-{session.id}.md"
+    return f"vsagent-export-{session.id}.md"
 
 
 def render_session_markdown(session: Session) -> str:

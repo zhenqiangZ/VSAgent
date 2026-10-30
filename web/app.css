@@ -620,6 +620,9 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 .pocket-id { font-weight: 600; }
 .pocket-score { color: var(--muted); font-size: 11.5px; }
 .pocket-meta { margin-top: 4px; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+/* 口袋画像：一行判断 + 一行壁的组成。旧运行目录的 pockets[] 里没有 profile，
+   那一项根本不挂——不写「未知」，与来源徽标同一处理。 */
+.pocket-profile { margin-top: 2px; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
 .pocket-ref { color: var(--hot); font-size: 11px; margin-left: 6px; }
 
 /* 口袋来源徽标。三种来源用颜色区分，文字由 JS 给（见 structure.js 的

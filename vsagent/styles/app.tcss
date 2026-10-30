@@ -22,6 +22,8 @@ ModalScreen {
     align: center middle;
 }
 
+/* 字标：与输入框同宽、逐行居中。`home.py` 把每行补齐到同一宽度再拼，
+   所以逐行居中等于整块居中；不补齐的话短的那几行会各自右移一格。 */
 #home-logo {
     width: 82;
     max-width: 100%;
@@ -30,12 +32,23 @@ ModalScreen {
     height: auto;
 }
 
+/* 字标下方那行一句话定位：与字标同宽、居中，暗灰不与字标抢注意力 */
+#home-tagline {
+    width: 82;
+    max-width: 100%;
+    height: 1;
+    margin-top: 1;
+    margin-bottom: 1;
+    text-align: center;
+    color: #666666;
+}
+
 #home-box {
     width: 82;
     max-width: 100%;
     height: auto;
     background: #1A1A1A;
-    margin-top: 2;
+    margin-top: 0;
 }
 
 /* 文本框自身也加一条聚焦规则，让 Textual 在焦点变化时重算整块子树 */
@@ -128,6 +141,43 @@ ModalScreen {
 }
 
 /* Chat 屏幕 */
+/* 标题栏：一行，左边会话名、右边侧栏开关。底色比消息区亮一档，
+   不画分隔线——一条 1 像素的横线要单独占一行，而这一行本来就在。 */
+#chat-header {
+    height: 1;
+    background: #0A0A0A;
+    padding: 0 1;
+}
+
+#chat-title {
+    width: 1fr;
+    height: 1;
+    color: #8B949E;
+    /* 长标题截成一行加省略号。不写 nowrap 的话它会在 1 行高的格子里折行，
+       第二行被裁掉，看起来像标题里混进了半截字。 */
+    text-wrap: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 侧栏开关：未展开时暗灰、展开时亮蓝，鼠标移上去有底色。
+   宽度取 auto，文字在「◧ 侧栏」与「◨ 收起」之间切换时不会跳位太厉害。 */
+#side-toggle {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    color: #666666;
+}
+
+#side-toggle:hover {
+    background: #1E3A5F;
+    color: #FFFFFF;
+}
+
+#side-toggle.-open {
+    color: #4A9EFF;
+}
+
 #chat-body {
     height: 1fr;
 }
@@ -491,10 +541,33 @@ ModalScreen {
     padding: 0 1;
 }
 
-/* 工具面板：同样两行一条，关掉的用灰字——一列扫下去先看见还开着哪些 */
+/* 工具面板：同样两行一条，关掉的用灰字——一列扫下去先看见还开着哪些。
+   它比别的弹窗宽：说明是一整句话，70% 宽在 100 列的终端里只剩 70 格，
+   后半句一律被省略号吃掉，而「这个工具到底干什么」正是打开面板要看的东西。 */
+#tools-panel {
+    width: 86%;
+    max-width: 120;
+}
+
 #tools-list ListItem {
     height: auto;
     padding: 0 1;
+}
+
+/* 主题列表：一条一行，当前主题亮蓝加粗，与会话列表同一套标记法 */
+#theme-list ListItem {
+    height: auto;
+    padding: 0 1;
+}
+
+.theme-row {
+    height: 1;
+    color: #CCCCCC;
+}
+
+.theme-row.-current {
+    color: #4A9EFF;
+    text-style: bold;
 }
 
 .tool-row {

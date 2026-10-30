@@ -21,17 +21,31 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="theme-selector"):
-            yield Static("Themes", id="theme-title")
+            yield Static("主题", id="theme-title")
             yield ListView(id="theme-list")
-            yield Static("enter 应用   esc 关闭", id="theme-hint")
+            yield Static("enter 应用   esc 关闭   ▸ 当前主题", id="theme-hint")
 
     def on_mount(self) -> None:
-        """填充主题列表并聚焦。"""
+        """填充主题列表并聚焦。
+
+        当前主题画 ▸ 并高亮：列表有二十多个，不标出来的话打开面板得先记住自己
+        现在用的是哪一个，而 `enter` 是立刻生效的——选错就是整屏换色。
+        """
         view = self.query_one("#theme-list", ListView)
+        current = self.app.theme
         for name in self.themes:
-            view.append(ListItem(Label(name, markup=False)))
+            # 标记位与会话列表同一套：有标记画 ▸、没有留一个空格，名字列才对得齐。
+            row = Label(
+                f"{'▸' if name == current else ' '} {name}",
+                markup=False,
+                classes="theme-row",
+            )
+            if name == current:
+                row.add_class("-current")
+            view.append(ListItem(row))
         if self.themes:
-            view.index = 0
+            view.index = self.themes.index(current) if current in self.themes else 0
+        self.query_one("#theme-title", Static).update(f"主题　当前 {current}")
         view.focus()
 
     def action_select_theme(self) -> None:

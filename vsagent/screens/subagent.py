@@ -79,6 +79,8 @@ class SubagentChatScreen(ChatScreen):
 
     # 身份跟着父会话走：这里不提供 Build/Plan 切换。
     allow_agent_switch = False
+    # 返回栏里已经写了会话名，标题栏只留右侧那个侧栏开关。
+    show_chat_title = False
     # 命令入口按白名单收敛；新增命令默认不出现。
     allowed_commands = ALLOWED_COMMANDS
 

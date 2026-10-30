@@ -6,7 +6,7 @@
 2. 弹窗外侧仍看得见聊天界面的文字，说明遮罩没有把下一层完全盖住；
 3. 弹窗外侧那些文字的背景色被遮罩改暗，说明走的是半透明叠加而不是覆盖。
 
-    python tests/verify_modal_transparency.py              验证 dist/opencode-tui.exe
+    python tests/verify_modal_transparency.py              验证 dist/VSAgent.exe
     python tests/verify_modal_transparency.py <exe 路径>   验证指定的可执行文件
     python tests/verify_modal_transparency.py --source     验证源码直接运行（用于与打包产物对照）
 
@@ -17,7 +17,7 @@
 回复内容固定，弹窗打开前后的两屏才对得上。
 
 pyte 与 pywinpty 装在打包环境里（requirements-pack.txt），.venv 里没有，所以要用
-`C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/opencode_tui_pack/Scripts/python.exe`
+`C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/vsagent_pack/Scripts/python.exe`
 来跑这个脚本，verify_exe.py 同理。
 """
 
@@ -44,13 +44,13 @@ from fake_model_server import (  # noqa: E402
     usage_chunk,
 )
 
-DEFAULT_EXE = PROJECT_ROOT / "dist" / "opencode-tui.exe"
+DEFAULT_EXE = PROJECT_ROOT / "dist" / "VSAgent.exe"
 OUTPUT_DIR = PROJECT_ROOT / "tests" / "output"
 EDITOR_FIXTURE = PROJECT_ROOT / "tests" / "fixtures" / "marker_editor.cmd"
 # 与 verify_exe.py 一致：会话状态隔离到临时目录，每轮从空状态启动
 SCRATCH_HOME = PROJECT_ROOT / ".probe" / "verify-home"
-STATE_FILE = SCRATCH_HOME / ".opencode_tui" / "state.toml"
-CONNECTION_FILE = SCRATCH_HOME / ".opencode_tui" / "connection.toml"
+STATE_FILE = SCRATCH_HOME / ".vsagent" / "state.toml"
+CONNECTION_FILE = SCRATCH_HOME / ".vsagent" / "connection.toml"
 
 
 def write_connection(base_url: str, model: str) -> None:
@@ -179,7 +179,7 @@ def locate_dialog(recorder: Recorder) -> tuple[int, int, int, int]:
 def parse_args() -> tuple[list[str], str]:
     """返回要执行的命令与输出前缀。"""
     if len(sys.argv) > 1 and sys.argv[1] == "--source":
-        return [sys.executable, "-m", "opencode_tui"], "source"
+        return [sys.executable, "-m", "vsagent"], "source"
     exe = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else DEFAULT_EXE
     return [str(exe)], "frozen"
 
@@ -261,7 +261,7 @@ def run_app(command: list[str], prefix: str) -> tuple[Recorder, dict[str, object
 def main() -> int:
     command, prefix = parse_args()
     if command[0] != sys.executable and not Path(command[0]).exists():
-        print(f"找不到 {command[0]}，请先执行 pyinstaller --clean opencode_tui.spec")
+        print(f"找不到 {command[0]}，请先执行 pyinstaller --clean vsagent.spec")
         return 1
 
     recorder, shots = run_app(command, prefix)

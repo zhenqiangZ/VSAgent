@@ -11,8 +11,8 @@ from textual.pilot import Pilot  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
 from textual.widgets import Label, Static  # noqa: E402
 
-from opencode_tui.app import OpenCodeApp  # noqa: E402
-from opencode_tui.widgets.editor_pane import EditorPane  # noqa: E402
+from vsagent.app import VSAgentApp  # noqa: E402
+from vsagent.widgets.editor_pane import EditorPane  # noqa: E402
 
 OUTPUT_DIR = ROOT / "tests" / "output"
 WIDTH = 100
@@ -32,7 +32,7 @@ def describe(widget: object) -> str:
     return f"{name:<20} id={widget_id:<18} {region_text:<14} [{classes}] {content}"
 
 
-def dump(app: OpenCodeApp, title: str) -> str:
+def dump(app: VSAgentApp, title: str) -> str:
     """导出当前屏幕的组件布局文本。"""
     lines = [f"=== {title} ({WIDTH}x{HEIGHT}) ==="]
     for widget in app.screen.walk_children(with_self=True):
@@ -59,7 +59,7 @@ async def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     state = ROOT / ".probe" / "layout_state.toml"
     state.unlink(missing_ok=True)
-    app = OpenCodeApp(state_path=state)
+    app = VSAgentApp(state_path=state)
     async with app.run_test(size=(WIDTH, HEIGHT)) as pilot:
         await pilot.pause()
         (OUTPUT_DIR / "home.txt").write_text(dump(app, "HomeScreen"), encoding="utf-8")

@@ -16,17 +16,21 @@ from ..widgets.command_autocomplete import CommandAutocomplete
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import COMMAND_TOKEN, ScrollingTextArea
 
-ASCII_LOGO = (
-    r" __     ___      _               _ ____                           _             " "\n"
-    r" \ \   / (_)_ __| |_ _   _  __ _| / ___|  ___ _ __ ___  ___ _ __ (_)_ __   __ _ " "\n"
-    r"  \ \ / /| | '__| __| | | |/ _` | \___ \ / __| '__/ _ \/ _ \ '_ \| | '_ \ / _` |" "\n"
-    r"   \ V / | | |  | |_| |_| | (_| | |___) | (__| | |  __/  __/ | | | | | | | (_| |" "\n"
-    r"    \_/  |_|_|   \__|\__,_|\__,_|_|____/ \___|_|  \___|\___|_| |_|_|_| |_|\__, |" "\n"
-    r"                                                                          |___/ "
+# 字标逐行写、最后补齐到同一宽度再拼起来。**不能省掉补齐**：`#home-logo` 是
+# `text-align: center`，每行各自居中，长短不一的几行会互相错开一格，整块看着是歪的。
+_LOGO_ROWS = (
+    r" __     __   ____       _       ____   _____   _   _   _____",
+    r" \ \   / /  / ___|     / \     / ___| | ____| | \ | | |_   _|",
+    r"  \ \ / /   \___ \    / _ \   | |  _  |  _|   |  \| |   | |",
+    r"   \ V /     ___) |  / ___ \  | |_| | | |___  | |\  |   | |",
+    r"    \_/     |____/  /_/   \_\  \____| |_____| |_| \_|   |_|",
 )
+_LOGO_WIDTH = max(len(row) for row in _LOGO_ROWS)
+ASCII_LOGO = "\n".join(row.ljust(_LOGO_WIDTH) for row in _LOGO_ROWS)
 
-PLACEHOLDER = "Ask anything... 'What is this project built with?'"
-HELP_TEXT = "tab agents    ctrl+p commands    / 列出命令"
+TAGLINE = "虚拟筛选 Agent　·　查靶点 · 取结构 · 定口袋 · 对接 · 亲和力"
+PLACEHOLDER = "说一件事，例如「EGFR 的 ATP 口袋在哪」"
+HELP_TEXT = "tab 切换 Agent    ctrl+p 命令面板    / 列出命令"
 
 
 class HomeInput(ScrollingTextArea):
@@ -75,6 +79,7 @@ class HomeScreen(Screen):
         with Vertical(id="home-frame"):
             with Vertical(id="home-center"):
                 yield Static(ASCII_LOGO, id="home-logo")
+                yield Static(TAGLINE, id="home-tagline", markup=False)
                 with Horizontal(id="home-box"):
                     yield Static("", id="home-accent-bar")
                     with Vertical(id="home-box-main"):

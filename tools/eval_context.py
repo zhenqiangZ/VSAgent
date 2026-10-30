@@ -41,7 +41,7 @@ from types import SimpleNamespace
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from opencode_tui.core.agent.context import (  # noqa: E402
+from vsagent.core.agent.context import (  # noqa: E402
     EVIDENCE_REF_LIMIT,
     TOOL_ARCHIVE_MARK,
     ContextAssembler,
@@ -50,19 +50,19 @@ from opencode_tui.core.agent.context import (  # noqa: E402
     Layer,
     evidence_ref_of,
 )
-from opencode_tui.core.agent.domain.all_tools import domain_tools  # noqa: E402
-from opencode_tui.core.agent.event_log import domain_tools as event_tools  # noqa: E402
-from opencode_tui.core.agent.ledger import SessionLedger  # noqa: E402
-from opencode_tui.core.agent.memory import MemoryStore, RecallTool, RememberTool  # noqa: E402
-from opencode_tui.core.agent.prompt import (  # noqa: E402
+from vsagent.core.agent.domain.all_tools import domain_tools  # noqa: E402
+from vsagent.core.agent.event_log import domain_tools as event_tools  # noqa: E402
+from vsagent.core.agent.ledger import SessionLedger  # noqa: E402
+from vsagent.core.agent.memory import MemoryStore, RecallTool, RememberTool  # noqa: E402
+from vsagent.core.agent.prompt import (  # noqa: E402
     estimate_tokens,
     is_key_line,
     stable_prefix,
 )
-from opencode_tui.core.agent.spawn import AgentStatusTool, SpawnAgentTool  # noqa: E402
-from opencode_tui.core.agent.task import TaskTool  # noqa: E402
-from opencode_tui.core.agent.toolset import LoadToolsTool, hidden_names  # noqa: E402
-from opencode_tui.core.agent.tools import (  # noqa: E402
+from vsagent.core.agent.spawn import AgentStatusTool, SpawnAgentTool  # noqa: E402
+from vsagent.core.agent.task import TaskTool  # noqa: E402
+from vsagent.core.agent.toolset import LoadToolsTool, hidden_names  # noqa: E402
+from vsagent.core.agent.tools import (  # noqa: E402
     BashTool,
     GrepTool,
     PatchTool,
@@ -72,9 +72,9 @@ from opencode_tui.core.agent.tools import (  # noqa: E402
     ToolRegistry,
     WriteTool,
 )
-from opencode_tui.core.agent.workspace import Workspace  # noqa: E402
-from opencode_tui.core.models import Message, Part, PartType, Session, ToolStatus  # noqa: E402
-from opencode_tui.core.session_manager import SessionManager, default_state_path  # noqa: E402
+from vsagent.core.agent.workspace import Workspace  # noqa: E402
+from vsagent.core.models import Message, Part, PartType, Session, ToolStatus  # noqa: E402
+from vsagent.core.session_manager import SessionManager, default_state_path  # noqa: E402
 
 DEFAULT_WINDOW = 128_000
 """与常见模型的窗口一致；量别的模型时用 `--window` 覆盖。"""

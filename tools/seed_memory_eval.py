@@ -32,7 +32,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from opencode_tui.core.agent.memory import MemoryStore  # noqa: E402
+from vsagent.core.agent.memory import MemoryStore  # noqa: E402
 
 # 台账正文。`(正文, 引用)`；引用是相对台账根的真实文件，agent 写入时它必须存在。
 FACTS: tuple[tuple[str, tuple[str, ...]], ...] = (

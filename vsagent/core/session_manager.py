@@ -10,6 +10,7 @@ import tomli_w
 
 from .file_log import record as log_read
 from .models import Session, new_session_id, sync_sequences
+from .paths import config_home
 
 STATE_VERSION = 2
 
@@ -240,7 +241,7 @@ class SessionManager:
 
 def default_state_path() -> Path:
     """返回默认状态文件路径。"""
-    return Path.home() / ".opencode_tui" / "state.toml"
+    return config_home() / "state.toml"
 
 
 def _replace_with_retry(staged: Path, target: Path) -> None:

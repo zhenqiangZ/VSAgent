@@ -43,7 +43,7 @@ __all__ = [
     "probe",
 ]
 # 表明身份是这些公共接口的公平使用要求
-USER_AGENT = "opencode-tui/0.1 (virtual screening; +https://rest.uniprot.org)"
+USER_AGENT = "VSAgent/0.1 (virtual screening; +https://rest.uniprot.org)"
 
 DEFAULT_TIMEOUT = 45.0
 TEXT_PREVIEW = 200

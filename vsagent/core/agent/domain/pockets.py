@@ -696,7 +696,7 @@ KNOWN_LAYERS = tuple(LAYER_PRIORITY)
 
 def pockets_dir() -> Path:
     """口袋产物的根目录。与状态文件、结构缓存同处一个家目录。"""
-    return Path.home() / ".opencode_tui" / POCKETS_DIR_NAME
+    return Path.home() / ".vsagent" / POCKETS_DIR_NAME
 
 
 def _number_argument(

@@ -5,14 +5,15 @@
 
 - 需要知道「UniProt 编号长什么样」「口袋残基怎么算」「配体效率怎么定义」的 → 这里
 - 只需要知道「有个文件、有段文字」的 → 内核那批
-## 八条纪律
+## 九条纪律
 
 这些不是风格喜好，是踩过的坑。新加领域工具时逐条对一遍：
 
 1. **收 handle，不收路径。** 模型编不出 `ligandset#3`，却编得出 `D:/data/lib.csv`——
-   后者可能不存在、可能是上一次那个文件、可能是它在上一轮编的。全库只允许三个动作
-   收路径（`import_structure`、`import_ligandset`、`import_documents`，因为这三下
-   真的需要人给出文件），其余一律收登记表里的 handle 或语料的引用号。
+   后者可能不存在、可能是上一次那个文件、可能是它在上一轮编的。只有确实需要人给出
+   文件的少数动作才收路径，这类动作在自己的描述第一段写明「收路径」，其余一律收
+   登记表里的 handle 或语料的引用号。**别在这里列名单**：列过两次，两次都漂了
+   （`record_assay` 破了例之后没人回头改），要确认就以工具 schema 为准。
 2. **纯查询不声明 `context_argument`。** 查完不留东西的工具挂了登记表，会让模型以为
    它留下了什么，然后在后面的步骤里引用一个不存在的 handle。
 3. **失败返回结果，不抛异常。** `ToolResult(failed=True, output=原因)`：错误文本要能
@@ -27,6 +28,9 @@
    它算不对，而且算错时看上去很像对的。
 8. **可选依赖不许在顶层 import。** RDKit / Meeko 这类在函数体里延迟导入，
    缺依赖时返回一条带安装指令的错误，而不是让整个程序起不来。
+9. **方法按需升级。** 2D 能分辨的事不要上 3D：先看骨架与性质，再上形状与药效团，
+   最后才对接、打分、微调。每升一级，调用前要能说出「简单方法为什么不够」——
+   说不出来就是还没到那一步。升级不是更严谨，只是更贵；而贵的结论一样会错。
 
 ## 模块
 
@@ -36,8 +40,10 @@
 | `uniprot.py` | 靶点检索与取详情（2 个工具） |
 | `pdbtext.py` | PDB 纯文本编辑层（零第三方依赖，不登记工具） |
 | `preprocess.py` | 结构清洗与杂原子组几何筛查（不登记工具） |
-| `structure.py` | 取结构、导结构、结构评估（3 个工具） |
-| `chembl.py` | 已知活性与类似物（3 个工具） |
+| `structure.py` | 取结构（实验 PDB / AlphaFold 预测）、导结构、结构评估（4 个工具） |
+| `chembl.py` | 已知活性与类似物（2 个工具；分子画像的库函数在这里，入口在 `pubchem.py`） |
+| `pubchem.py` | 化合物身份（PubChem + ChEMBL 两半）、全库相似检索（2 个工具） |
+| `opentargets.py` | 靶点可成药性 / 化学探针 / 安全性 / 疾病关联，疾病 → 候选靶点（2 个工具） |
 | `chemistry.py` | 可选化学依赖的守门人（不登记工具） |
 | `export.py` | 从坐标算口袋的纯几何（第 1 步）+ `write_run` / `open_viewer` 两个工具（第 4 步） |
 | `complexes.py` | P0 主来源：搜该蛋白所有复合物 → 排序 → 下载坐标（不登记工具） |
@@ -45,16 +51,18 @@
 | `prankweb.py` | P1 副选：prankweb.cz 的 p2rank 预测（状态轮询 + 缓存，不登记工具） |
 | `products.py` | 内容寻址产物目录、`params.json` 提交标记、原子写盘（不登记工具） |
 | `pockets.py` | 四层口袋来源的装配点 + `detect_pockets` / `define_pocket` 两个工具（第 2 步） |
-| `analysis.py` | 把多路分数合成候选表：对齐、平均秩、分档（第 4 步之后） |
+| `analysis.py` | 把多路分数合成候选表（对齐、平均秩、分档）、看位姿的接触与 PLIP 指纹、拆疏水（HP/HM/脱水账）、效率体检（LE/LELP/LLE）、重对接验证；5 个工具 |
 | `screen.py` | 不看靶点的通道：2D 指纹相似度 + 3D 形状（USR），两个工具 |
 | `admet.py` | 类药性规则层：ESOL / Veber / BBB / CYP 警示（1 个工具） |
 | `sar.py` | 构效关系：骨架分组、匹配分子对、类似物枚举、实验回填（4 个工具） |
 | `pharmacophore.py` | 共识药效团：从活性里提炼特征点 + 按距离指纹筛库（2 个工具） |
 | `align.py` | 先验清单的取证与叠合：核序列、按 CA 把配体搬进受体参考系（不登记工具） |
 | `rsearch.py` | 搜索工具（一）：RCSB 文本/属性搜 + GraphQL 批量取配体（1 个工具） |
-| `literature.py` | 搜索工具（二）：PubMed E-utilities 文献检索（1 个工具） |
+| `literature.py` | 搜索工具（二）：PubMed 检索 + Europe PMC 检索与开放全文（3 个工具） |
 | `websearch.py` | 搜索工具（三）：联网搜索与单页抓取（2 个工具，结果落进本地语料） |
 | `corpus.py` | 本地语料：入库 / 检索 / 按页读原文（3 个工具，免费离线；检索是三路 RRF） |
+| `finetune.py` | 用已测活性微调 VCrossFormer（1 个工具） |
+| `fit_train.py` | 训练脚本本体（不登记工具，交给 DTA 环境跑） |
 | `receptor.py` | 准备受体（1 个工具） |
 | `ligand.py` | 导入 / 准备 / 筛库 / 参考集 / 叠合（5 个工具） |
 | `listing.py` | 浏览登记表（3 个工具） |
@@ -77,16 +85,19 @@ __all__ = [
     "corpus",
     "docking",
     "export",
+    "finetune",
     "http",
     "ligand",
     "listing",
     "literature",
+    "opentargets",
     "pdbtext",
     "pharmacophore",
     "pockets",
     "prankweb",
     "preprocess",
     "products",
+    "pubchem",
     "receptor",
     "rsearch",
     "sar",

@@ -5,7 +5,7 @@
 那些判断要过 `export.py` 的口径（排除水 / 修饰残基 / 单原子离子 / 常见缓冲液），
 是 `write_run` 的活（方案稿 §2.3.11）。
 
-**搜索结果不写进 `meta.json`。** 只缓存到 `~/.opencode_tui/search/`（时效一天）；
+**搜索结果不写进 `meta.json`。** 只缓存到 `~/.vsagent/search/`（时效一天）；
 要进页面仍走 `write_run` 的口径。
 
 三条纪律：
@@ -112,11 +112,11 @@ def search_dir() -> Path:
 
     用它的有四个模块：`rsearch`（RCSB 属性搜 / 文本搜 / 批量配体）、`complexes`
     （P0 复合物检索）、`literature`（PubMed）、`websearch`（联网摘要）。原先
-    `complexes` 自带一份 `~/.opencode_tui/rcsb/search/`，两处写的逻辑一样、
+    `complexes` 自带一份 `~/.vsagent/rcsb/search/`，两处写的逻辑一样、
     目录不同——同一个 Uniprot 连问两遍也互相看不见。合并之后只认这一处，
     键由 `cache_path(kind, payload)` 算，**不同模块的同类请求算出来的键必须一致**。
     """
-    return Path.home() / ".opencode_tui" / "search"
+    return Path.home() / ".vsagent" / "search"
 
 
 def cache_path(kind: str, payload: Any) -> Path:

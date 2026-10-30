@@ -53,6 +53,55 @@ VINA_INSTALL_HINT = (
     f"或用 {VINA_ENV} 指向它的绝对路径。对接引擎不随本应用打包。"
 )
 
+AUTOGRID_ENV = "VSA_AUTOGRID_BIN"
+AUTOGRID_INSTALL_HINT = (
+    "AD4 打分要先用 autogrid4 算亲和力图，而本机没有找到它。"
+    "装 ADFR Suite 或 AutoDock-GPU（两者都带 autogrid4）并放进 PATH，"
+    f"或用 {AUTOGRID_ENV} 指向它的绝对路径。装不上就先改用 scoring=vina / vinardo——"
+    "它们不需要图，跑的仍是同一个 vina 可执行文件。"
+)
+
+SCORINGS: tuple[str, ...] = ("vina", "vinardo", "ad4")
+"""三种力场。**分数互相不可比**（官方文档原话：AutoDock 与 Vina 的分数不能互相比）。
+
+- `vina` / `vinardo`：vina 自己算网格，只要受体 + 盒子。
+- `ad4`：AutoDock4 力场。要先 `autogrid4` 把亲和力图算出来，vina 只读图
+  （`--maps`，**不能再给 `--receptor` 或盒子参数**）。
+"""
+DEFAULT_SCORING = "vina"
+
+AD4_MAX_BOX_EDGE = 40.0
+"""`ad4` 的盒子边长上限。**这是 autogrid 的代价，不是 Vina 的限制。**
+
+网格点数是 `边长 / 0.375`，三边相乘再乘图的张数。2026-10-29 用 1M17-A 实测：
+
+| 盒子 | 点数 | autogrid 耗时 | 图占盘 | autogrid 峰值内存 |
+|---|---|---|---|---|
+| 26 Å | 68³ | 5.5 s | 16 MB | — |
+| 39 Å | 104³ | 17.1 s | 50 MB | 7.8 MB |
+| 126 Å（Vina 上限） | 336³ | ≈10 分钟（外推） | ≈1.7 GB | 未知 |
+
+注意内存几乎不随盒子涨（autogrid 边算边写盘），涨的是**时间与磁盘**。
+40 Å 这个数取的是「典型口袋 ≤ 30 Å、留一点余量」：再大就该先想清楚是不是盒子画错了。
+
+**2026-10-29 决定：先留着 40 Å。** 实测 39 Å 只花 17 秒、50 MB，说明这个上限偏保守
+——真需要时改这一个常数就够（60 Å 约 1 分钟）。留着的理由不是性能，而是「超过 40 Å
+绝大多数是盒子画错了」；放宽它等于把这个提醒也一起删掉。
+"""
+GRID_SPACING = 0.375
+
+# autogrid 的 `receptor_types` 声明。与 meeko 的 `mk_prepare_receptor.py` 用同一份超集：
+# 不存在的类型 autogrid 会自己跳过，写全了才不会漏掉金属。
+AD4_RECEPTOR_TYPES: tuple[str, ...] = (
+    "HD", "C", "A", "N", "NA", "OA", "F", "P", "SA", "S",
+    "Cl", "Br", "I", "Mg", "Ca", "Mn", "Fe", "Zn",
+)
+GRID_MARKER = "receptor.maps.fld"
+
+FORCEFIELD_LABELS = {"vina": "Vina", "vinardo": "Vinardo", "ad4": "AutoDock4"}
+"""给人看的力场名。产物、返回、报告里都用它，别把 `ad4` 原样印出去——模型会把它
+当成另一个引擎，而实际上跑的还是同一个 vina 可执行文件。"""
+
 DEFAULT_EXHAUSTIVENESS = 8
 MAX_EXHAUSTIVENESS = 64
 DEFAULT_NUM_MODES = 9
@@ -69,6 +118,9 @@ MAX_OFFSET = 50_000
 DEFAULT_TIMEOUT = 300.0
 MIN_TIMEOUT = 10.0
 MAX_TIMEOUT = 3600.0
+GRID_TIMEOUT = 600.0
+"""autogrid4 的超时。与单个配体的超时分开：它是**一次算一整套图**，
+40 Å 的盒子要几十秒到几分钟，跟「一个配体多久」不是一个量级。"""
 
 MAX_BOX_EDGE = 126.0
 MAX_LOG_CHARS = 512 * 1024
@@ -100,6 +152,7 @@ class Box:
 
 @dataclass(frozen=True, slots=True)
 class DockParams:
+    scoring: str = DEFAULT_SCORING
     exhaustiveness: int = DEFAULT_EXHAUSTIVENESS
     num_modes: int = DEFAULT_NUM_MODES
     seed: int = DEFAULT_SEED
@@ -111,6 +164,7 @@ class DockParams:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "scoring": self.scoring,
             "exhaustiveness": self.exhaustiveness,
             "num_modes": self.num_modes,
             "seed": self.seed,
@@ -140,7 +194,7 @@ class VinaRun:
 
 def dockings_dir() -> Path:
     """对接产物的根。测试替换它，避免写用户家目录。"""
-    return Path.home() / ".opencode_tui" / "docking"
+    return Path.home() / ".vsagent" / "docking"
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +249,141 @@ async def vina_version(binary: str) -> str:
 
     text = decode_output(raw or b"").strip()
     return text.splitlines()[0] if text else "unknown"
+
+
+def grids_dir() -> Path:
+    """AD4 亲和力图的根。测试替换它，避免写用户家目录。
+
+    图只依赖受体与盒子，与「这一批是哪些配体」无关，所以放在对接产物之外复用：
+    换一份配体库重跑不该再花一次 autogrid 的时间。
+    """
+    return Path.home() / ".vsagent" / "grids"
+
+
+def resolve_autogrid() -> str:
+    """`VSA_AUTOGRID_BIN` 优先，否则 PATH 里的 `autogrid4`。与 `resolve_vina` 同一套规矩：
+    显式设了却不可用就直接失败，不静默回退——否则排查会指向错误的那个程序。"""
+    raw = os.environ.get(AUTOGRID_ENV, "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            raise ToolError(f"{AUTOGRID_ENV} 指向的文件不存在：{path}。{AUTOGRID_INSTALL_HINT}")
+        if os.name != "nt" and not os.access(path, os.X_OK):
+            raise ToolError(f"{AUTOGRID_ENV} 指向的文件不可执行：{path}。{AUTOGRID_INSTALL_HINT}")
+        return str(path)
+
+    found = shutil.which("autogrid4")
+    if not found:
+        raise ToolError(AUTOGRID_INSTALL_HINT)
+    return found
+
+
+def pdbqt_types(path: Path) -> list[str]:
+    """一份 PDBQT 里出现过的原子类型（第 77–78 列），按出现顺序去重。
+
+    GPF 的 `ligand_types` 决定 autogrid 要算哪几张图，少写一张那一类原子就没有图，
+    autogrid 会报错；多写一张只是白算一张。
+    """
+    types: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise ToolError(f"读配体 PDBQT 失败（{type(error).__name__}：{error}）") from error
+    for line in text.splitlines():
+        if line[:6].strip() not in {"ATOM", "HETATM"} or len(line) < 79:
+            continue
+        name = line[77:79].strip()
+        if name and name not in types:
+            types.append(name)
+    return types
+
+
+GRID_PARAM_FILE = "boron-silicon-atom_par.dat"
+"""autogrid 的参数文件。meeko 自带这一份（只含 B 与 Si），GPF 用 `parameter_file` 指过去；
+不写它，autogrid 会去当前目录找 `ad4_parameters.dat` 然后报「找不到参数文件」。"""
+
+
+async def prepare_grids(
+    *,
+    autogrid: str,
+    receptor_pdbqt: Path,
+    box: Box,
+    ligand_types: Sequence[str],
+    cache_key: dict[str, Any],
+) -> tuple[Path, bool]:
+    """算（或复用）一套 AD4 亲和力图，返回 `(地图前缀, 是否复用)`。
+
+    产出目录里要同时有：`receptor.pdbqt`（GPF 里写的是它的**文件名**，autogrid 在 cwd
+    里找）、`receptor.gpf`、参数文件、`receptor.maps.fld` 与每类原子一张 `.map`。
+    `receptor.maps.fld` 是「这套图算完了」的标记——它不存在就当没算过重来。
+    """
+    stem = products.safe_stem(f"{receptor_pdbqt.parent.name}-ad4")
+    try:
+        target, reused = products.content_dir(
+            grids_dir(), stem, cache_key, (GRID_MARKER,)
+        )
+    except OSError as error:
+        raise ToolError(f"亲和力图目录失败（{type(error).__name__}：{error}）") from error
+    prefix = target / "receptor"
+    if reused:
+        return prefix, True
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(receptor_pdbqt, target / "receptor.pdbqt")
+        # 只在函数体里导入 RDKit 那一家（纪律 8 的同一条理由；meeko 会连带拉起 RDKit）
+        from meeko import gridbox
+
+        (target / GRID_PARAM_FILE).write_text(
+            gridbox.boron_silicon_atompar, encoding="utf-8"
+        )
+        gpf, _npts = gridbox.get_gpf_string(
+            box.center,
+            box.size,
+            "receptor.pdbqt",
+            list(AD4_RECEPTOR_TYPES),
+            list(ligand_types),
+            ff_param_fname=GRID_PARAM_FILE,
+        )
+        (target / "receptor.gpf").write_text(gpf, encoding="utf-8")
+    except OSError as error:
+        raise ToolError(f"写 autogrid 输入失败（{type(error).__name__}：{error}）") from error
+
+    log_path = target / "autogrid.log"
+    run = await run_autogrid(
+        [autogrid, "-p", "receptor.gpf", "-l", "autogrid.log"],
+        cwd=target,
+        timeout=GRID_TIMEOUT,
+        log_path=log_path,
+    )
+    if run.timed_out:
+        raise ToolError(
+            f"autogrid4 超过 {GRID_TIMEOUT:g} 秒还没算完（盒子 {box.size[0]:g}×"
+            f"{box.size[1]:g}×{box.size[2]:g} Å）。缩小盒子，或先用 scoring=vina。"
+        )
+    if run.returncode != 0:
+        raise ToolError(
+            f"autogrid4 非零退出（{run.returncode}）。{_log_excerpt(run.output)}"
+        )
+    if not (target / GRID_MARKER).is_file():
+        raise ToolError(
+            "autogrid4 退出 0，但没有写出 receptor.maps.fld。"
+            f"{_log_excerpt(run.output)}"
+        )
+    missing = [name for name in ligand_types if not (target / f"receptor.{name}.map").is_file()]
+    if missing:
+        raise ToolError(
+            f"autogrid4 算完了，但缺这几张图：{'、'.join(missing)}。"
+            "通常是受体 PDBQT 里没有该类型的原子——检查配体 PDBQT 的类型列。"
+        )
+    # **最后写**：`content_dir` 靠它判断「这份产物是不是用同一套参数算的」，缺它永远
+    # 不会复用（每次都重算一遍 autogrid）。放在校验之后写，崩溃在半路时它不存在，
+    # 于是下一次会重算，而不是拿半套图去对接。
+    try:
+        products.write_json_atomic(target / PARAMS_FILE, cache_key)
+    except OSError as error:
+        raise ToolError(f"写图的参数文件失败（{type(error).__name__}：{error}）") from error
+    return prefix, False
 
 
 def read_box(receptor_dir: Path, meta: dict[str, Any]) -> Box:
@@ -280,14 +469,48 @@ def build_command(
     out_pdbqt: Path,
     box: Box,
     params: DockParams,
+    *,
+    maps: str = "",
 ) -> list[str]:
-    """命令行数组。**不要**把它拼成一个字符串交给 shell。"""
+    """命令行数组。**不要**把它拼成一个字符串交给 shell。
+
+    `ad4` 走另一条形态：vina 只读 `--maps <前缀>`（读 `<前缀>.maps.fld`），
+    **既不能给 `--receptor`，也不能给盒子参数**——盒子已经烘进图里了，再给一遍会被
+    当成参数冲突。其余参数两边一样。
+    """
+    tail = [
+        "--num_modes",
+        str(params.num_modes),
+        "--seed",
+        str(params.seed),
+        "--cpu",
+        str(params.cpu),
+        "--energy_range",
+        f"{params.energy_range:g}",
+        "--out",
+        str(out_pdbqt),
+    ]
+    if params.scoring == "ad4":
+        return [
+            binary,
+            "--ligand",
+            str(ligand_pdbqt),
+            "--maps",
+            maps,
+            "--scoring",
+            "ad4",
+            "--exhaustiveness",
+            str(params.exhaustiveness),
+            *tail,
+        ]
     return [
         binary,
         "--receptor",
         str(receptor_pdbqt),
         "--ligand",
         str(ligand_pdbqt),
+        "--scoring",
+        params.scoring,
         "--center_x",
         f"{box.center[0]:.3f}",
         "--center_y",
@@ -302,16 +525,7 @@ def build_command(
         f"{box.size[2]:.3f}",
         "--exhaustiveness",
         str(params.exhaustiveness),
-        "--num_modes",
-        str(params.num_modes),
-        "--seed",
-        str(params.seed),
-        "--cpu",
-        str(params.cpu),
-        "--energy_range",
-        f"{params.energy_range:g}",
-        "--out",
-        str(out_pdbqt),
+        *tail,
     ]
 
 
@@ -319,6 +533,20 @@ async def run_vina(
     argv: Sequence[str], *, cwd: Path, timeout: float, log_path: Path
 ) -> VinaRun:
     """跑一次 Vina。超时/取消都终止整棵进程树，输出落到日志文件。"""
+    return await _run_subprocess(argv, cwd=cwd, timeout=timeout, log_path=log_path)
+
+
+async def run_autogrid(
+    argv: Sequence[str], *, cwd: Path, timeout: float, log_path: Path
+) -> VinaRun:
+    """跑一次 autogrid4。与 `run_vina` 的进程管理完全一样，分开命名是为了让测试能各自打桩
+    （把图生成的成功当成配体对接的成功，会让「图没算出来」这类故障在断言里消失）。"""
+    return await _run_subprocess(argv, cwd=cwd, timeout=timeout, log_path=log_path)
+
+
+async def _run_subprocess(
+    argv: Sequence[str], *, cwd: Path, timeout: float, log_path: Path
+) -> VinaRun:
     extra: dict[str, Any] = {} if sys.platform == "win32" else {"start_new_session": True}
     process = await asyncio.create_subprocess_exec(
         *argv,
@@ -569,12 +797,23 @@ def _render_docked(
     else:
         lines = [f"已对接 {counts.get('docked', 0)} 个配体，登记为 {handle}。"]
 
+    scoring = str(engine.get("scoring") or "vina")
+    forcefield = FORCEFIELD_LABELS.get(scoring, scoring)
+    name = str(engine.get("name") or "vina")
+    version = str(engine.get("version") or "unknown")
+    # vina 的 `--version` 输出是 "AutoDock Vina v1.2.5"，名字已经在里面了，
+    # 再拼一次会变成 "vina AutoDock Vina v1.2.5"。
+    label = version if name.lower() in version.lower() else f"{name} {version}"
     center = box.get("center") or [0, 0, 0]
     size = box.get("size") or [0, 0, 0]
     lines.append(
-        f"引擎：{engine.get('name') or 'vina'} {engine.get('version') or 'unknown'}；"
+        f"引擎：{label}（{forcefield} 力场）；"
         f"盒子中心 ({center[0]:g}, {center[1]:g}, {center[2]:g})，"
         f"边长 ({size[0]:g}, {size[1]:g}, {size[2]:g})。"
+    )
+    lines.append(
+        f"分数是 {forcefield} 的，**不能**和另外两种力场的分数比较；换力场等于换一套数，"
+        "要整批重跑再比。"
     )
     lines.append(
         f"可打分 {counts.get('docked', 0)}、转出 PDB {counts.get('pdb', 0)}、"
@@ -699,8 +938,24 @@ def _float_argument(
     return number
 
 
+def _scoring_argument(arguments: dict[str, Any]) -> str:
+    """力场。写错**不回落**：三个力场的分数互不可比，猜错一个得到的是另一套数，
+    而产物里看不出区别。"""
+    value = arguments.get("scoring")
+    if value is None:
+        return DEFAULT_SCORING
+    text = str(value).strip().lower()
+    if text not in SCORINGS:
+        raise ToolError(
+            f"参数 scoring 只能是 {' / '.join(SCORINGS)}（现在是 {value!r}）。"
+            "三者的分数不能互相比较。"
+        )
+    return text
+
+
 def _dock_params(arguments: dict[str, Any]) -> DockParams:
     return DockParams(
+        scoring=_scoring_argument(arguments),
         exhaustiveness=_int_argument(
             arguments, "exhaustiveness", DEFAULT_EXHAUSTIVENESS, 1, MAX_EXHAUSTIVENESS
         ),
@@ -728,8 +983,13 @@ class DockTool(Tool):
         name="dock",
         description=(
             "用 AutoDock Vina 把一个**已准备**的受体与一组**已准备**的配体对接。"
-            "分数**越低越好**（kcal/mol），只能在同一受体、同一盒子内比较，"
-            "不是结合自由能，也不能跨靶点比较。"
+            "分数**越低越好**（kcal/mol），只能在同一受体、同一盒子、**同一力场**内比较，"
+            "不是结合自由能，也不能跨靶点比较。\n"
+            "scoring 选力场：vina（默认）/ vinardo / ad4（AutoDock4 力场）。"
+            "**三种力场的分数互不可比**——官方文档明写 AutoDock 与 Vina 的分数不能互相比。"
+            "换力场重跑是另一个产物目录，不会覆盖旧的。"
+            "ad4 要先用 autogrid4 算亲和力图（缺它时返回安装指引，vina/vinardo 不受影响），"
+            "且盒子边长限 40 Å（图的代价是三次方）；vina 与 vinardo 只要受体与盒子。"
             f"{CHEM_TOOL_DESCRIPTION_NOTE}"
             "默认 exhaustiveness=8、num_modes=9、limit=50、单配体超时 300 秒；"
             "参数由用户决定，不要自己替用户改。缺 Vina 可执行文件时返回安装指引，不抛异常。"
@@ -749,6 +1009,14 @@ class DockTool(Tool):
                 "ligands": {
                     "type": "string",
                     "description": "已准备的配体集 handle，例如 ligandset#3；不要传原始配体集",
+                },
+                "scoring": {
+                    "type": "string",
+                    "enum": list(SCORINGS),
+                    "description": (
+                        "力场，默认 vina。vinardo 是 vina 的改良版；ad4 是 AutoDock4 力场"
+                        "（要 autogrid4 先算图）。三者分数不能互相比较"
+                    ),
                 },
                 "exhaustiveness": {
                     "type": "integer",
@@ -869,6 +1137,61 @@ class DockTool(Tool):
                 failed=True,
             )
 
+        # AD4 要先有亲和力图。放在这里而不是 run 的开头：图只依赖「受体 + 盒子 + 这一批
+        # 配体的原子类型」，所以要先知道 selected 才谈得上复用。
+        grid_prefix: Path | None = None
+        if params.scoring == "ad4":
+            oversized = [edge for edge in box.size if edge > AD4_MAX_BOX_EDGE]
+            if oversized:
+                return ToolResult(
+                    output=(
+                        f"AD4 的盒子边长上限是 {AD4_MAX_BOX_EDGE:g} Å，现在是 "
+                        f"({box.size[0]:g}, {box.size[1]:g}, {box.size[2]:g})。"
+                        "图的代价是边长的三次方：26 Å 的盒子 autogrid 要 5.5 秒、16 MB，"
+                        "39 Å 要 17 秒、50 MB，再往上就是分钟级与 GB 级。"
+                        "缩小盒子，或改用 scoring=vina / vinardo"
+                        "（它们不需要图，盒子可以到 Vina 的 126 Å）。"
+                    ),
+                    failed=True,
+                )
+            try:
+                autogrid = resolve_autogrid()
+                ligand_types: list[str] = []
+                for record in selected:
+                    for name in pdbqt_types(record["source"]):
+                        if name not in ligand_types:
+                            ligand_types.append(name)
+                if not ligand_types:
+                    return ToolResult(
+                        output=(
+                            "配体的 PDBQT 里读不出原子类型（第 77–78 列为空）。"
+                            "重新跑 prepare_ligands。"
+                        ),
+                        failed=True,
+                    )
+                grid_prefix, grid_reused = await prepare_grids(
+                    autogrid=autogrid,
+                    receptor_pdbqt=receptor_pdbqt,
+                    box=box,
+                    ligand_types=ligand_types,
+                    cache_key={
+                        "receptor_fingerprint": str(receptor_entry.fingerprint or ""),
+                        "center": [round(item, 3) for item in box.center],
+                        "size": [round(item, 3) for item in box.size],
+                        "ligand_types": sorted(ligand_types),
+                        "spacing": GRID_SPACING,
+                    },
+                )
+            except ToolError as error:
+                return ToolResult(output=str(error), failed=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                return ToolResult(
+                    output=f"算 AD4 亲和力图失败（{type(error).__name__}：{error}）",
+                    failed=True,
+                )
+
         cache_params: dict[str, Any] = {
             "receptor_fingerprint": str(receptor_entry.fingerprint or ""),
             "ligandset_fingerprint": str(ligand_entry.fingerprint or ""),
@@ -876,7 +1199,7 @@ class DockTool(Tool):
                 "center": [round(item, 3) for item in box.center],
                 "size": [round(item, 3) for item in box.size],
             },
-            "engine": {"name": "vina", "version": version},
+            "engine": {"name": "vina", "version": version, "scoring": params.scoring},
             **params.as_dict(),
         }
         stem = products.safe_stem(
@@ -930,7 +1253,13 @@ class DockTool(Tool):
             log_path = target / LOG_DIR / f"{safe_name}.log"
             log_relative = _relative(target, log_path)
             argv = build_command(
-                binary.path, receptor_pdbqt, record["source"], out_pdbqt, box, params
+                binary.path,
+                receptor_pdbqt,
+                record["source"],
+                out_pdbqt,
+                box,
+                params,
+                maps=str(grid_prefix) if grid_prefix is not None else "",
             )
 
             try:
@@ -1074,6 +1403,12 @@ class DockTool(Tool):
                 "name": "vina",
                 "binary": binary.path,
                 "version": version,
+                "scoring": params.scoring,
+                **(
+                    {"maps": str(grid_prefix.parent), "grid_reused": grid_reused}
+                    if grid_prefix is not None
+                    else {}
+                ),
             },
             "receptor": {
                 "handle": str(receptor_entry.handle),
@@ -1125,19 +1460,27 @@ class DockTool(Tool):
 
 def _docking_summary(manifest: dict[str, Any]) -> str:
     counts = manifest.get("counts") or {}
+    engine = manifest.get("engine") or {}
+    scoring = str(engine.get("scoring") or "vina")
+    label = FORCEFIELD_LABELS.get(scoring, scoring)
     best = counts.get("best_score")
     if isinstance(best, (int, float)):
-        return f"对接产物 · {counts.get('docked', 0)} 个结果 · 最佳 {best:.2f} kcal/mol"
-    return f"对接产物 · {counts.get('docked', 0)} 个结果"
+        return (
+            f"对接产物（{label}）· {counts.get('docked', 0)} 个结果 · "
+            f"最佳 {best:.2f} kcal/mol"
+        )
+    return f"对接产物（{label}）· {counts.get('docked', 0)} 个结果"
 
 
 def _docking_meta_result(
     manifest: dict[str, Any], handle: str, fingerprint: str, reused: bool
 ) -> dict[str, Any]:
     counts = manifest.get("counts") or {}
+    engine = manifest.get("engine") or {}
     return {
         "handle": handle,
         "fingerprint": fingerprint,
+        "scoring": str(engine.get("scoring") or "vina"),
         "docked": counts.get("docked", 0),
         "pdb": counts.get("pdb", 0),
         "failed": counts.get("failed", 0),

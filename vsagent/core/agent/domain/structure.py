@@ -45,6 +45,13 @@ sidecar 元数据。这些解析都用不上化学依赖——固定列文本而
 指纹缓存的下游动作，整条链会以一种看不出病因的方式重新跑一遍。顺带还让「远端取的」与
 「本地导的」写进同一个目录，用户在磁盘上找东西只需要看一个地方。
 
+**预测模型是另一条来源，但登记成同一种东西。** `fetch_alphafold` 按 UniProt 编号取
+AlphaFold DB 的单体预测，解析、写盘、登记与 `fetch_structure` 完全一样（都是 `receptor`、
+都是 `stage="raw"`），差别只在摘要里必须把「这是猜的」说到位：没有密度图、没有配体、
+没有分辨率，侧链取向与柔性区都是模型算出来的。它同时把 **pLDDT 逐残基**算出来
+（AF 的 PDB 把 pLDDT 写在 B 因子列）——那是下游唯一能拿到的质量信号，不报出来，
+模型就会把一段 pLDDT 30 的 loop 当成真实构象去解释结合。
+
 **本地导入只收 PDB 坐标（`.pdb` / `.ent`），mmCIF 明确拒绝。** 远端那条路能转，
 是因为 RCSB 的 mmCIF 是我们自己下的、格式可信；用户手里的 `.cif` 可能是任何变体，
 静默转换失败比当场拒绝更糟。拒绝时必须给出可走的路（先转格式，或换一个小一些的
@@ -54,7 +61,7 @@ sidecar 元数据。这些解析都用不上化学依赖——固定列文本而
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -62,11 +69,12 @@ from typing import Any, Sequence
 from ..ledger import SessionLedger, fingerprint_bytes, fingerprint_text
 from ..tools import Tool, ToolResult, ToolSpec
 from ...file_log import record as log_read
-from . import http
+from . import http, uniprot
 from .pdbtext import (
     ATOM_ALT_LOC,
     ATOM_CHAIN,
     ATOM_INSERTION_CODE,
+    ATOM_NAME,
     ATOM_RESIDUE_NAME,
     ATOM_RESIDUE_NUMBER,
     WATER_RESIDUES,
@@ -76,6 +84,13 @@ from .pdbtext import (
 # 常量
 # ---------------------------------------------------------------------------
 BASE_URL = "https://files.rcsb.org/download"
+ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api/prediction"
+ALPHAFOLD_ENTRY_URL = "https://alphafold.ebi.ac.uk/entry/{entry_id}"
+"""AlphaFold DB 的两个地址：一个按 UniProt 编号列出模型，一个是给人看的条目页。"""
+
+AF_ENTRY_PATTERN = re.compile(r"^AF-(.+)-F\d+$")
+"""`AF-P00533-F1` 这种模型编号。用户（与模型）会把它当成「编号」直接交上来，
+所以这里顺手接受，剥掉前后缀再走 UniProt 校验。"""
 
 RCSB_ENTRY_URL = "https://www.rcsb.org/structure/{pdb_id}"
 """给人看的条目页。本地导入没有这一项，所以它由调用方显式传入，不进 meta 的默认值。"""
@@ -125,7 +140,7 @@ UNSAFE_STEM = re.compile(r"[^0-9A-Za-z._-]+")
 
 def structure_dir() -> Path:
     """结构文件的存放处，与状态文件、靶点缓存同处一个家目录。"""
-    return Path.home() / ".opencode_tui" / "structures"
+    return Path.home() / ".vsagent" / "structures"
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +170,13 @@ WRAPPED_TEXT = slice(10, 80)
 SEQRES_CHAIN = 11
 SEQRES_LENGTH = slice(13, 17)
 MODRES_RESIDUE_NAME = slice(12, 15)
+
+ATOM_B_FACTOR = slice(60, 66)
+"""原子行的 B 因子列（规范里的 61–66 列）。
+
+实验结构里它是温度因子，**AlphaFold 的 PDB 把它当 pLDDT 用**（每个原子都写同一个
+按残基算出来的值）。同一个列位装两种含义，所以只能由调用方决定怎么解释——
+`parse_pdb` 不读它，`_plddt_facts` 只对预测模型读。"""
 
 RESOLUTION_PATTERN = re.compile(r"RESOLUTION\.\s+([0-9.]+)\s+ANGSTROM")
 
@@ -425,20 +447,23 @@ def _structure_path(pdb_id: str) -> Path:
     return structure_dir() / f"{pdb_id}.pdb"
 
 
-CIF_CONVERTED_MARKER = (
-    "REMARK 999 本文件由 RCSB mmCIF 转换而来（原始条目超出 PDB 格式上限）"
-)
+CIF_CONVERTED_PREFIX = "REMARK 999 本文件由 "
+CIF_CONVERTED_MARKER = f"{CIF_CONVERTED_PREFIX}mmCIF 转换而来（原始坐标只有 mmCIF）"
 """转换过的文件在开头留一行 REMARK。
 
 为什么不留一个 sidecar 文件：缓存只按 `<编号>.pdb` 一份文件存放，多了旁挂文件就有
 「文件与旁挂不同步」的新状态。写在正文里，重新读盘时也认得出它从哪来——
 `_source_format` 读的就是这一行。
+
+**判定用前缀而不是整行**：这一行的措辞改过（早先写的是「由 RCSB mmCIF 转换」），
+而按整行比对会让老缓存一夜之间变成「原生 PDB」——只影响一个 meta 字段，但那种错
+刚好是没人会去看的那种。
 """
 
 
 def _source_format(text: str) -> str:
     """这份坐标原本是什么格式。转换过的会有那行 REMARK。"""
-    return "mmCIF" if text.startswith(CIF_CONVERTED_MARKER) else "PDB"
+    return "mmCIF" if text.startswith(CIF_CONVERTED_PREFIX) else "PDB"
 
 
 def _cif_to_pdb(cif_text: str) -> str:
@@ -694,13 +719,15 @@ def _render(
     return "\n".join(lines)
 
 
-def _entry_summary(facts: StructureFacts, *, source: str = "rcsb") -> str:
+def _entry_summary(facts: StructureFacts, *, source: str = "rcsb", label: str = "") -> str:
     """登记表条目的一行摘要。它会被别的工具在列表里复读，所以要能独立读懂。
 
     `source` 进摘要而不只进 meta：列表里可能同时躺着「远端取的 1M17」和「本地导入的
     突变体」，而它们都是 receptor、都是 stage="raw"，只靠序号分不出哪个是哪个。
+    预测模型的编号（`AF-P00533-F1`）不是 PDB 编号，所以由调用方用 `label` 顶掉
+    「原始结构 PDB …」那半句——`pdb_id` 对它来说是空的。
     """
-    head = f"原始结构 PDB {facts.pdb_id}" if facts.pdb_id else "原始结构（本地文件）"
+    head = label or (f"原始结构 PDB {facts.pdb_id}" if facts.pdb_id else "原始结构（本地文件）")
     parts = [head, facts.method or "方法未知"]
     if source != "rcsb":
         parts.append(f"来源 {source}")
@@ -891,6 +918,418 @@ class FetchStructureTool(Tool):
             meta={
                 "pdb_id": code,
                 "fingerprint": fingerprint,
+                "chains": list(facts.polymer_chains),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# AlphaFold 预测模型
+# ---------------------------------------------------------------------------
+PLDDT_VERY_LOW = 50.0
+PLDDT_LOW = 70.0
+PLDDT_CONFIDENT = 90.0
+"""pLDDT 的四档，跟 AlphaFold 自己的口径一致（<50 / 50–70 / 70–90 / ≥90）。
+
+**70 是唯一有下游含义的那条线**：低于它的区段不该拿来说明结合——那段坐标本身就是
+猜的，而猜出来的形状一样能算出「3.1 Å、两个氢键」，看上去跟真的一样。"""
+
+MIN_LOW_SEGMENT = 10
+"""低置信区段至少要连续这么多残基才报出来。
+
+短于此的多半是 loop 上的一个转角；把它们逐条列出来，真正要紧的那几段
+（整个结构域、整条末端尾巴）就会被挤到看不见的地方。"""
+
+MAX_LOW_SEGMENTS = 3
+
+
+@dataclass(frozen=True)
+class PlddtFacts:
+    """逐残基 pLDDT 的汇总。**不是**从接口的 globalMetricValue 抄的——那个数只覆盖
+    整个模型，回答不了「我要用的这段残基可不可信」。"""
+
+    residues: int
+    mean: float
+    very_low: float
+    low: float
+    confident: float
+    very_high: float
+    segments: tuple[tuple[str, int, int, int, float], ...]
+    """`(链, 起始残基, 结束残基, 残基数, 均值)`，按长度降序，最多 `MAX_LOW_SEGMENTS` 段。"""
+
+
+def _plddt_facts(text: str) -> PlddtFacts | None:
+    """从 AlphaFold 的 PDB 里读逐残基 pLDDT。
+
+    **按 CA 取、按残基去重**：一个残基十几个原子共用同一个 B 因子，按原子平均等于
+    按侧链长度加权，得到的数跟 AlphaFold 自己报的 globalMetricValue 对不上；按残基
+    平均才是同一个口径。没有 CA 的文件返回 None，由调用方跳过这一段——
+    报一个 0 会被读成「置信度极低」，那是另一个意思。
+    """
+    per_residue: dict[tuple[str, int], float] = {}
+    for line in text.splitlines():
+        if line[:6] != "ATOM  " or line[ATOM_NAME].strip() != "CA":
+            continue
+        try:
+            value = float(line[ATOM_B_FACTOR])
+        except (IndexError, ValueError):
+            continue
+        try:
+            number = int(line[ATOM_RESIDUE_NUMBER])
+        except ValueError:
+            continue
+        per_residue.setdefault((line[ATOM_CHAIN], number), value)
+    if not per_residue:
+        return None
+
+    values = list(per_residue.values())
+    total = len(values)
+
+    def share(below: float, above: float) -> float:
+        return sum(1 for value in values if below <= value < above) / total
+
+    segments: list[tuple[str, int, int, int, float]] = []
+    for chain in sorted({chain for chain, _ in per_residue}):
+        numbers = sorted(number for key, number in per_residue if key == chain)
+        run: list[tuple[int, float]] = []
+
+        def close(current: list[tuple[int, float]], chain_id: str = chain) -> None:
+            if len(current) < MIN_LOW_SEGMENT:
+                return
+            segments.append(
+                (
+                    chain_id,
+                    current[0][0],
+                    current[-1][0],
+                    len(current),
+                    sum(score for _, score in current) / len(current),
+                )
+            )
+
+        for number in numbers:
+            score = per_residue[(chain, number)]
+            if score < PLDDT_LOW and run and number == run[-1][0] + 1:
+                run.append((number, score))
+                continue
+            close(run)
+            run = [(number, score)] if score < PLDDT_LOW else []
+        close(run)
+
+    segments.sort(key=lambda item: (-item[3], item[0], item[1]))
+    return PlddtFacts(
+        residues=total,
+        mean=sum(values) / total,
+        very_low=share(0.0, PLDDT_VERY_LOW),
+        low=share(PLDDT_VERY_LOW, PLDDT_LOW),
+        confident=share(PLDDT_LOW, PLDDT_CONFIDENT),
+        very_high=sum(1 for value in values if value >= PLDDT_CONFIDENT) / total,
+        segments=tuple(segments[:MAX_LOW_SEGMENTS]),
+    )
+
+
+def _plddt_lines(facts: PlddtFacts | None) -> list[str]:
+    if facts is None:
+        return ["  pLDDT：这份坐标里没有 CA 原子，读不出置信度"]
+    lines = [
+        f"  pLDDT（按 CA 逐残基，{facts.residues} 个）：均值 {facts.mean:.1f} · "
+        f"<50 {facts.very_low * 100:.0f}% · 50–70 {facts.low * 100:.0f}% · "
+        f"70–90 {facts.confident * 100:.0f}% · ≥90 {facts.very_high * 100:.0f}%"
+    ]
+    if facts.segments:
+        listed = "、".join(
+            f"链 {chain} {start}–{end}（{count} aa，均值 {mean:.0f}）"
+            for chain, start, end, count, mean in facts.segments
+        )
+        lines.append(f"  低置信区段（pLDDT<70 且连续 ≥{MIN_LOW_SEGMENT} 残基）：{listed}")
+        lines.append(
+            "  这些区段里没有可信构象：不要用它们解释结合，也别按它们划盒子"
+            "（口袋残基先看它在这个列表里占了多少）。"
+        )
+    else:
+        lines.append(f"  低置信区段：没有连续 ≥{MIN_LOW_SEGMENT} 残基的 <70 区段")
+    return lines
+
+
+def _af_path(entry_id: str) -> Path:
+    """预测模型的本地缓存。文件名就是模型编号（`AF-P00533-F1.pdb`）。"""
+    return structure_dir() / f"{UNSAFE_STEM.sub('_', entry_id)}.pdb"
+
+
+def _af_accession(raw: str) -> str:
+    """把用户/模型交上来的东西收敛成 UniProt 编号。
+
+    两种写法都收：`P00533` 与 `AF-P00533-F1`。**在联网之前就拦**——
+    交上来基因名（EGFR）或 PDB 编号（1M17）时，AFDB 只会回一个 404，
+    而那条错说不清该怎么办。
+    """
+    text = str(raw).strip().upper()
+    match = AF_ENTRY_PATTERN.match(text)
+    if match:
+        text = match.group(1)
+    return uniprot.normalize_accession(text)
+
+
+def _af_entries(accession: str) -> list[dict[str, Any]]:
+    """按编号列出 AlphaFold DB 的模型。一次请求就够——它同时给出同工型与片段。"""
+    try:
+        payload = http.get_json(f"{ALPHAFOLD_API}/{accession}", timeout=DOWNLOAD_TIMEOUT)
+    except http.NotFound:
+        raise http.ToolError(
+            f"AlphaFold DB 里没有 {accession} 这个条目。先确认它确实是 UniProt 编号"
+            "（fetch_target 的返回值里会写这个靶点有没有 AlphaFold 模型）"
+        ) from None
+    if not isinstance(payload, list) or not payload:
+        raise http.ToolError(
+            f"{accession} 在 AlphaFold DB 里没有可用模型。少于 16 个残基的肽段、"
+            "超长蛋白与被撤下的条目都不建模——这时只能用实验结构（fetch_structure），"
+            "或自备同源模型后 import_structure"
+        )
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def _pick_entry(entries: Sequence[dict[str, Any]], accession: str) -> dict[str, Any]:
+    """从同一条编号的多个模型里挑一个。
+
+    **必须是精确的那个编号**：一个 UniProt 编号会回来好几个条目（同工型 `-2` / `-3`、
+    超长蛋白的片段 `-F1` / `-F2`）。按「第一个」拿，遇到同工型排在前面时会静默地给
+    模型换一条序列——对接算出来的一切都不再对应这个靶点。
+    """
+    wanted = f"AF-{accession}-F1"
+    for item in entries:
+        if str(item.get("entryId") or "") == wanted:
+            return item
+    for item in entries:
+        if str(item.get("entryId") or "").endswith("-F1"):
+            return item
+    return entries[0]
+
+
+def _af_fragment_count(entries: Sequence[dict[str, Any]], accession: str) -> int:
+    """同一条编号被切成几个片段模型（超长蛋白才有）。"""
+    pattern = re.compile(rf"^AF-{re.escape(accession)}-F(\d+)$")
+    counts = [
+        int(match.group(1))
+        for item in entries
+        if (match := pattern.match(str(item.get("entryId") or "")))
+    ]
+    return max(counts) if counts else 1
+
+
+def _af_download(entry: dict[str, Any], *, timeout: float) -> tuple[str, str]:
+    """取坐标文本，返回 `(PDB 文本, 原始格式)`。
+
+    优先 `pdbUrl`；它缺失或取回来不是坐标（CDN 偶尔回一页 HTML）时退回 `cifUrl`
+    现场用 gemmi 转——与实验结构那条路完全一样的两档处理。
+    """
+    pdb_url = str(entry.get("pdbUrl") or "")
+    if pdb_url:
+        text = http.get_text_or_none(
+            pdb_url, {}, timeout=timeout, headers={"Accept": "text/plain"}
+        )
+        if text is not None and ("ATOM  " in text or "HETATM" in text):
+            return text, "PDB"
+
+    cif_url = str(entry.get("cifUrl") or "")
+    if not cif_url:
+        raise http.ToolError(
+            "AlphaFold DB 的元数据里没有可下载的坐标地址（pdbUrl / cifUrl 都为空）。"
+            "这多半是接口改版；要现在就用，去条目页手动下载后走 import_structure"
+        )
+    cif_text = http.get_text_or_none(
+        cif_url, {}, timeout=timeout, headers={"Accept": "text/plain"}
+    )
+    if cif_text is None:
+        raise http.ToolError(
+            f"下载 {cif_url} 失败（404）。这个条目的坐标文件可能已被撤下，"
+            "换一个编号或用实验结构"
+        )
+    try:
+        return _cif_to_pdb(cif_text), "mmCIF"
+    except ImportError:
+        raise http.ToolError(
+            "这个模型超出 PDB 格式上限，AlphaFold DB 只提供 mmCIF，而受体准备读不了 "
+            "mmCIF。装上化学依赖（gemmi，见 requirements-chem.txt）后重试"
+        ) from None
+    except Exception as error:
+        raise http.ToolError(
+            f"把 {cif_url} 转成 PDB 失败（{type(error).__name__}：{error}）。"
+            "换一个编号，或手动下载转换后走 import_structure"
+        ) from None
+
+
+class FetchAlphafoldTool(Tool):
+    """按 UniProt 编号取 AlphaFold 预测模型，登记成一个原始受体。"""
+
+    spec = ToolSpec(
+        name="fetch_alphafold",
+        description=(
+            "按 UniProt 编号取 AlphaFold DB 的单体预测模型，写盘并登记成一个**受体**"
+            "（状态：原始结构，还没准备）。**这是预测结构，不是实验结构**：没有密度图、"
+            "没有配体、没有水、没有分辨率，侧链取向与柔性区都是模型算出来的。返回逐残基 "
+            "pLDDT（均值、四档占比、最长的几段低置信区）——口袋残基普遍低于 70 时，"
+            "后面的对接位姿只能当排序参考，不能当结合模式。一个编号可能对应多个模型"
+            "（同工型 / 片段），本工具只取 `AF-<编号>-F1`；坐标文件第二次调用读本地缓存"
+            "（元数据仍查一次接口，refresh=true 会连坐标一起重下）。"
+            "编号形如 P00533，也接受 AF-P00533-F1；不知道编号就先用 search_targets，"
+            "fetch_target 的返回值里会写明这个靶点有没有 AlphaFold 模型。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "uniprot_id": {
+                    "type": "string",
+                    "description": "UniProt 编号（P00533）或模型编号（AF-P00533-F1）",
+                },
+                "refresh": {
+                    "type": "boolean",
+                    "description": "true 时忽略本地坐标重新下载（AFDB 发了新版本才用）",
+                },
+            },
+            "required": ["uniprot_id"],
+        },
+    )
+    primary_argument = "uniprot_id"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：fetch_alphafold 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+        try:
+            accession = _af_accession(str(arguments.get("uniprot_id") or ""))
+        except ValueError as error:
+            return ToolResult(output=str(error), failed=True)
+
+        try:
+            entries = _af_entries(accession)
+        except http.RetryableToolError as error:
+            return ToolResult(output=str(error), failed=True)
+        except http.ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+
+        model = _pick_entry(entries, accession)
+        entry_id = str(model.get("entryId") or f"AF-{accession}-F1")
+        version = model.get("latestVersion")
+        path = _af_path(entry_id)
+
+        refresh = bool(arguments.get("refresh"))
+        text = None if refresh else _read_structure(path)
+        source_format = _source_format(text) if text else ""
+        if text is None:
+            try:
+                text, source_format = _af_download(model, timeout=DOWNLOAD_TIMEOUT)
+            except http.RetryableToolError as error:
+                return ToolResult(output=str(error), failed=True)
+            except http.ToolError as error:
+                return ToolResult(output=str(error), failed=True)
+            try:
+                _write_structure(path, text)
+            except OSError as error:
+                return ToolResult(
+                    output=f"写盘 {_relative(path)} 失败（{type(error).__name__}：{error}）",
+                    failed=True,
+                )
+            origin = "已下载并写盘"
+        else:
+            origin = "读自本地缓存（未重新下载；要换版本用 refresh=true）"
+
+        facts = parse_pdb(text)
+        # AF 的 PDB 没有 EXPDTA 段，直接解析会得到「方法未知」。填上这一句是为了
+        # 让列表、meta 与后续会话都看得出「这份是算出来的」——那是最容易被忘掉的一条。
+        # HEADER 里那个日期也清掉：对实验结构它是沉积日期，对预测模型只是文件生成日期，
+        # 印成「沉积于」会把一份算出来的模型说成一条实验记录。
+        facts = replace(
+            facts,
+            method=f"AlphaFold 预测模型 v{version}" if version else "AlphaFold 预测模型",
+            deposition_date="",
+        )
+        plddt = _plddt_facts(text)
+        fingerprint = fingerprint_text(text)
+        size = len(text.encode("utf-8"))
+
+        start = model.get("uniprotStart")
+        end = model.get("uniprotEnd")
+        fragments = _af_fragment_count(entries, accession)
+
+        extra: dict[str, Any] = {
+            "source_format": source_format,
+            "alphafold_id": entry_id,
+            "alphafold_version": version,
+            "uniprot_accession": accession,
+            "coverage": [start, end] if start and end else None,
+            "fragments": fragments,
+            "gene": model.get("gene") or "",
+            "organism": model.get("organismScientificName") or "",
+            "model_created": str(model.get("modelCreatedDate") or "")[:10],
+            "plddt_mean": round(plddt.mean, 1) if plddt else None,
+        }
+
+        existing = ledger.find(kind="receptor", fingerprint=fingerprint, include_archived=True)
+        if existing:
+            registered = f"登记表里已有同一份：{existing[0].handle}（未重复登记）"
+        else:
+            item = ledger.add(
+                "receptor",
+                path=path,
+                summary=_entry_summary(
+                    facts, source="alphafold", label=f"AlphaFold 模型 {entry_id}"
+                ),
+                fingerprint=fingerprint,
+                meta=_entry_meta(
+                    facts,
+                    path,
+                    source="alphafold",
+                    source_url=ALPHAFOLD_ENTRY_URL.format(entry_id=entry_id),
+                    extra=extra,
+                ),
+            )
+            registered = f"已登记 {item.handle}"
+
+        lines = [
+            _render(
+                facts,
+                path=path,
+                fingerprint=fingerprint,
+                origin=origin,
+                registered=registered,
+                size=size,
+                label=f"AlphaFold {entry_id}",
+            )
+        ]
+        if start and end:
+            created = str(model.get("modelCreatedDate") or "")[:10]
+            lines.append(
+                f"  覆盖 UniProt {start}–{end} 位"
+                f"（{model.get('gene') or accession}，"
+                f"{model.get('organismScientificName') or '物种未知'}）"
+                + (f"；模型建于 {created}，版本变了坐标也会变" if created else "")
+            )
+        wanted = f"AF-{accession}-F1"
+        if entry_id != wanted:
+            lines.append(
+                f"  注意：AlphaFold DB 没有 {wanted}，这里给的是 {entry_id}——"
+                "先确认这条序列就是你想用的那条（同工型与片段都会走到这里）"
+            )
+        lines.extend(_plddt_lines(plddt))
+        lines.append(
+            "  这是预测模型：没有共晶配体可借，detect_pockets 会退到预测层（联网）或"
+            "等你用 define_pocket 手工给盒子；评估里的几何检查能跑，但它说明不了构象对不对。"
+        )
+        if fragments > 1:
+            lines.append(
+                f"  这个蛋白超出单模型上限，AFDB 把它切成 {fragments} 段；本工具只取第 1 段，"
+                "其余片段本应用取不到——要全长得自己下载后逐段 import_structure。"
+            )
+
+        return ToolResult(
+            output="\n".join(lines),
+            meta={
+                "alphafold_id": entry_id,
+                "fingerprint": fingerprint,
+                "plddt_mean": round(plddt.mean, 1) if plddt else None,
                 "chains": list(facts.polymer_chains),
             },
         )
@@ -1341,8 +1780,17 @@ class AssessStructureTool(Tool):
 
 
 def domain_tools() -> list[Tool]:
-    """这组模块登记的全部工具，按装配顺序。"""
-    return [FetchStructureTool(), ImportStructureTool(), AssessStructureTool()]
+    """这组模块登记的全部工具，按装配顺序。
+
+    两条取结构的工具排在一起、实验结构在前：有实验结构时就不该用预测模型，
+    模型看到的顺序本身就是这个偏好。
+    """
+    return [
+        FetchStructureTool(),
+        FetchAlphafoldTool(),
+        ImportStructureTool(),
+        AssessStructureTool(),
+    ]
 
 if __name__ == "__main__":
     from debug_tools import main

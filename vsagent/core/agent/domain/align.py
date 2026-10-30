@@ -7,7 +7,8 @@
 
 1. **取序列**（`sequences`）——一份坐标里每条聚合物链的一字母序列。
 2. **核对并配对**（`best_pair`）——受体的链与候选的链两两比，取同一性最高的一对。
-   同一性低于 `IDENTITY_FLOOR` 就是「这不是同一个蛋白」，该剔除。
+   同一性低于 `IDENTITY_FLOOR`、或覆盖度低于 `COVERAGE_FLOOR`，就是「这不是同一个蛋白」，
+   该剔除。两道闸门各管一件事，理由见 `identity` 与 `COVERAGE_FLOOR`。
 3. **叠合**（`superpose`）——按那一对链的 CA 原子求变换，把候选搬到受体的参考系里。
 
 `moved_groups` 再把候选的配体坐标用这个变换搬过去。**搬进受体参考系是有意的**：
@@ -27,12 +28,14 @@ from ..tools import ToolError
 from .chemistry import CHEM_INSTALL_HINT
 
 __all__ = [
+    "COVERAGE_FLOOR",
     "IDENTITY_FLOOR",
     "Verdict",
     "align_candidate",
     "best_pair",
     "identity",
     "moved_groups",
+    "same_protein",
     "sequences",
     "superpose",
 ]
@@ -40,13 +43,26 @@ __all__ = [
 IDENTITY_FLOOR = 0.7
 """同一性低于这个值就当「不是同一个蛋白」，剔除。
 
-分母取**较长的那条链**，不是比对上的残基对数：同源但结构域边界不同的两条链
-（受体是激酶域、候选是更长的构建体）在比对区里可能一模一样，按比对区算会得到 1.0，
-而按长的那条算才看得出「候选多出一大截」。这里宁可把话说保守。
+分母取**较短的那条链**（见 `identity`）。这里曾经取较长的那条，理由是
+「候选多出一大截时要看得出来」——但那个判断该由**覆盖度**回答，不该由同一性回答。
+按长的那条算，208 aa 的表达构建体对 394 aa 的全长链会得到 0.528，
+明明是 208 个残基一个不差，却被判成「另一个蛋白」（实测踩过：9QTN 对 8V8A）。
 
 阈值 0.7 的来处是实测的两个点，不是拍的：同一份结构的受体与候选是 1.000，
 而 EGFR（1M17）对 ABL（1IEP）这两条同科不同蛋白的链是 0.356。中间留了很宽的余量，
 所以同源突变体（同一性通常在 0.95 以上）不会被误杀。
+"""
+
+COVERAGE_FLOOR = 0.5
+"""覆盖度低于这个值也剔除。
+
+**同一性只回答「比对区里像不像」，不回答「比上了多少」**。只覆盖两成的片段
+哪怕 100% 相同，也不足以拿它的共晶配体当这个受体的口袋先验——配体完全可能
+落在那没比上的八成上。所以两道闸门必须同时过：同一性挡住另一个蛋白，
+覆盖度挡住「同一个蛋白的一小段」。
+
+下限取 0.5 而不是 0.7：激酶域、ECD 这类构建体常常只有全长的一半上下，
+真实场景里 208/394 = 0.53 就是应当放行的形状。
 """
 
 
@@ -67,6 +83,13 @@ class Verdict:
     """配对的形式，形如 `A→A`。没走到配对这一步时留空。"""
 
     identity: float | None = None
+    coverage: float | None = None
+    """比对覆盖了**较短那条**的多少，取值 0–1。
+
+    与 `identity` 并列输出而不是折成一个数：208/394 的构建体是「同一性 1.00、
+    覆盖 0.53」，读者要自己判断这个覆盖够不够，工具不替他判断。
+    """
+
     rmsd: float | None = None
     ligands: tuple[str, ...] = ()
 
@@ -121,30 +144,63 @@ def sequences(text: str) -> dict[str, str]:
     return out
 
 
-def identity(left: str, right: str) -> float:
-    """两条序列的同一性：比对上的相同残基占**较长那条**的比例。分母的取法见 `IDENTITY_FLOOR`。"""
+def identity(left: str, right: str) -> tuple[float, float]:
+    """两条序列的 (同一性, 覆盖度)。
+
+    同一性 = 比对上的相同残基 / **较短那条**的长度，回答「比对区里像不像」；
+    覆盖度 = 较短 / 较长，回答「比上了多少」。两个数要一起看：
+
+    | 情形 | 同一性 | 覆盖度 |
+    | --- | --- | --- |
+    | 同一个蛋白 | 1.00 | 1.00 |
+    | 截短构建体（208 对 394） | 1.00 | 0.53 |
+    | 同家族的另一条链 | 0.36 | 1.00 |
+    | 只比上一小段（40 对 274） | 1.00 | 0.15 |
+
+    只报一个数的话，第一行与第二行分不开（这正是把正确结论改错的那次事故），
+    第二行与第四行也分不开。分母用 `min()` 还有一个好处：等长序列的结果
+    与旧实现（分母取 `max()`）**逐位相同**，换口径不会动到已经验过的那些样本。
+    """
     if not left or not right:
-        return 0.0
+        return 0.0, 0.0
     gemmi = _gemmi()
     result = gemmi.align_string_sequences(list(left), list(right), [])
     matches = sum(1 for char in result.match_string if char == "|")
-    return matches / max(len(left), len(right))
+    short, long = sorted((len(left), len(right)))
+    return matches / short, short / long
+
+
+def same_protein(
+    identity_value: float,
+    coverage: float,
+    *,
+    floor: float = IDENTITY_FLOOR,
+    coverage_floor: float = COVERAGE_FLOOR,
+) -> bool:
+    """两道闸门都过才算同一个蛋白。判据只有这一处，调用方不要自己写比较。"""
+    return identity_value >= floor and coverage >= coverage_floor
 
 
 def best_pair(
     receptor: dict[str, str], candidate: dict[str, str]
-) -> tuple[str, str, float] | None:
-    """两边的链两两比，取同一性最高的一对。任一边没有聚合物链时返回 None。
+) -> tuple[str, str, float, float] | None:
+    """两边的链两两比，取同一性最高的一对，返回 (受体链, 候选链, 同一性, 覆盖度)。
+
+    任一边没有聚合物链时返回 None。
 
     **配成对的链要报出来**：受体是多聚体、候选是复合物时，「拿哪条链比的」
     决定了这个结论能不能信——不报出来，读者无从复核。
+
+    排序按 (同一性, 覆盖度) 字典序：同一性打平时取覆盖更全的那一对。
+    这在候选是复合物时很要紧——里面可能既有受体的完整同源链，又有一小段
+    恰好也 100% 相同的肽；只按同一性排会留下那段肽，然后拿它的配体去圈口袋。
     """
-    best: tuple[str, str, float] | None = None
+    best: tuple[str, str, float, float] | None = None
     for receptor_chain, receptor_seq in receptor.items():
         for candidate_chain, candidate_seq in candidate.items():
-            score = identity(receptor_seq, candidate_seq)
-            if best is None or score > best[2]:
-                best = (receptor_chain, candidate_chain, score)
+            score, coverage = identity(receptor_seq, candidate_seq)
+            if best is None or (score, coverage) > (best[2], best[3]):
+                best = (receptor_chain, candidate_chain, score, coverage)
     return best
 
 
@@ -174,6 +230,7 @@ def align_candidate(
     pdb_id: str,
     *,
     floor: float = IDENTITY_FLOOR,
+    coverage_floor: float = COVERAGE_FLOOR,
 ) -> tuple[Verdict, Any | None]:
     """核对一份候选是不是这个受体，并给出叠合变换。返回 (结论, 变换或 None)。
 
@@ -195,18 +252,35 @@ def align_candidate(
 
     pair = best_pair(receptor_seqs, candidate_seqs)
     assert pair is not None  # 两边都非空，best_pair 必有结果
-    receptor_chain, candidate_chain, score = pair
+    receptor_chain, candidate_chain, score, coverage = pair
     label = f"{receptor_chain}→{candidate_chain}"
+    short, long = sorted(
+        (len(receptor_seqs[receptor_chain]), len(candidate_seqs[candidate_chain]))
+    )
+    span = f"{short}/{long} 个残基（{coverage:.2f}）"
 
-    if score < floor:
+    if not same_protein(score, coverage, floor=floor, coverage_floor=coverage_floor):
+        # 两道闸门分开说。混成一句「对不上」的话，模型会以为是同一性不够，
+        # 转头去找「更完整」的编号——而这次的问题恰恰是构建体本来就该短。
+        if score < floor:
+            detail = (
+                f"链序列与受体对不上：最高同一性只有 {score:.3f}（{label}），"
+                f"低于门槛 {floor:.2f}——这一份多半是另一个蛋白"
+            )
+        else:
+            detail = (
+                f"比对区里一模一样（同一性 {score:.3f}，{label}），但只覆盖 {span}，"
+                f"低于覆盖度下限 {coverage_floor:.2f}——比对上的只是这个蛋白的一小段，"
+                "它的配体不能代表受体口袋"
+            )
         return (
             Verdict(
                 pdb_id,
                 "mismatch",
-                f"链序列与受体对不上：最高同一性只有 {score:.3f}（{label}），"
-                f"低于门槛 {floor:.2f}——这一份多半是另一个蛋白",
+                detail,
                 pair=label,
                 identity=score,
+                coverage=coverage,
             ),
             None,
         )
@@ -216,15 +290,26 @@ def align_candidate(
             receptor_text, candidate_text, receptor_chain, candidate_chain
         )
     except ToolError as error:
-        return Verdict(pdb_id, "mismatch", f"叠合没成：{error}", pair=label, identity=score), None
+        return (
+            Verdict(
+                pdb_id,
+                "mismatch",
+                f"叠合没成：{error}",
+                pair=label,
+                identity=score,
+                coverage=coverage,
+            ),
+            None,
+        )
 
     return (
         Verdict(
             pdb_id,
             "ok",
-            f"同一性 {score:.3f}（{label}），叠合 rmsd {rmsd:.3f} 埃",
+            f"同一性 {score:.3f}（{label}），覆盖 {span}，叠合 rmsd {rmsd:.3f} 埃",
             pair=label,
             identity=score,
+            coverage=coverage,
             rmsd=rmsd,
         ),
         transform,

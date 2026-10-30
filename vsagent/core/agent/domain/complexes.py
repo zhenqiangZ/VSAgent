@@ -11,10 +11,10 @@
    加 `nonpolymer_entity_count > 0`。实测 ABL1（`P00519`）→ 69 个条目。
    **请求本身交给 `rsearch.search_entries`**——两条路打的是同一个 RCSB 接口，
    原先各写了一份「什么算这次没搜成 / 结果缓在哪 / 怎么解 id」，两份迟早会漂。
-   现在只有一份实现、一个缓存目录（`~/.opencode_tui/search/`）。
+   现在只有一份实现、一个缓存目录（`~/.vsagent/search/`）。
 2. **排**（`pick_top`）：分辨率 → 实验方法 → 配体像不像真配体 → 同名去重，取前 N（默认 12）。
 3. **下**（`download_entry`）：`https://files.rcsb.org/download/<ID>.pdb`，实测平均 0.24 MB。
-   走 `http.py`，写进 `~/.opencode_tui/rcsb/`，失败的不计入、继续下一个。
+   走 `http.py`，写进 `~/.vsagent/rcsb/`，失败的不计入、继续下一个。
 
 **不编条目。** 搜索/下载任一环失败就留空——**不造一个看着合理的 PDB 编号填进去**
 （那是方案稿 §2.2 说的最危险的一类错误：不报错、不崩，只是整页数据都是假的）。
@@ -101,11 +101,11 @@ def rcsb_cache_dir() -> Path:
     """下载下来的坐标存放处（§7.9）。与状态文件、结构缓存同处一个家目录。
 
     **只放坐标**。搜索结果的缓存不在这里，在 `rsearch.search_dir()` 的
-    `~/.opencode_tui/search/`——两个模块共用那一处（见本模块开头第 1 条）。
+    `~/.vsagent/search/`——两个模块共用那一处（见本模块开头第 1 条）。
     旧版本曾把搜索结果写在 `rcsb/search/` 下，那份缓存没有对应的查询体可以搬迁，
     只好让它自然过期：时效一天，超过一天的文件本来也不会再被读到。
     """
-    return Path.home() / ".opencode_tui" / "rcsb"
+    return Path.home() / ".vsagent" / "rcsb"
 
 
 # ---------------------------------------------------------------------------

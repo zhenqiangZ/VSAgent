@@ -99,7 +99,7 @@ def default_dta_root() -> Path:
     """仓根的 `models/DTA`。
 
     **模型代码不在包内**：`check_chemistry_gate` 用 `rglob("*.py")` 扫整个
-    `opencode_tui/`，DTA 有 45 处顶层的 torch / rdkit 导入，放进包里那条断言
+    `vsagent/`，DTA 有 45 处顶层的 torch / rdkit 导入，放进包里那条断言
     当场就红；PyInstaller 还会顺着 collect 把 54MB 数据拖进 exe。放 `models/`
     是为了既不进包、又不散落在仓库外面——整个目录被 `.gitignore` 挡住。
     """
@@ -145,7 +145,7 @@ def dta_python() -> str:
 
 def scorings_dir() -> Path:
     """打分产物的根。测试替换它，避免写用户家目录。"""
-    return Path.home() / ".opencode_tui" / "affinity"
+    return Path.home() / ".vsagent" / "affinity"
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +302,33 @@ def _receptor_inputs(entry: Any) -> tuple[Path, tuple[float, float, float]]:
 
     box = read_box(directory, meta)
     return pdb, box.center
+
+
+def _model_inputs(
+    ledger: SessionLedger, raw: Any
+) -> tuple[Any, Path | None, Path | None]:
+    """解析可选参数 `model`：返回 (模型条目, 推理配置, 训练时的口袋)。
+
+    微调出来的模型必须用它**自己**那两份文件：`config.infer.yaml` 指向微调出来的
+    checkpoint（训练配置指向的是基座权重，拿错就是「微调前后完全一致」），
+    `pocket.pdb` 是训练时截的那一份（换口袋模型见到的输入与训练不一致）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None, None, None
+    entry = ledger.get(text)
+    if str(entry.meta.get("kind") or "") != "model":
+        raise ToolError(
+            f"{entry.handle} 不是模型（kind={entry.meta.get('kind')!r}）。"
+            "用 list_workspace kind=artifact 找 fit_affinity 登记的那一条。"
+        )
+    config = Path(str(entry.meta.get("config") or ""))
+    pocket = Path(str(entry.meta.get("pocket") or ""))
+    if not config.is_file():
+        raise ToolError(f"模型的推理配置不在了：{config}。重新跑 fit_affinity。")
+    if not pocket.is_file():
+        raise ToolError(f"模型训练时的口袋不在了：{pocket}。重新跑 fit_affinity。")
+    return entry, config, pocket
 
 
 def _ligand_records(entry: Any) -> tuple[str, list[dict[str, str]]]:
@@ -557,7 +584,8 @@ class ScoreAffinityTool(Tool):
             "**分数越高越好**（pK 越大结合越强），与 dock 的 kcal/mol 方向相反；"
             "只能在同一受体、同一 aff_unit 条件下比较，不能跨靶点比较。"
             "这是模型预测值，不是实验值，也不是对接打分。"
-            "需要 DTA 的独立 Python 环境（torch + dgl）；缺环境时返回安装指引，不抛异常。"
+            "需要 DTA 的独立 Python 环境（torch + dgl）；缺环境时返回安装指引，不抛异常。\n"
+            "可以用 `model` 换成 fit_affinity 微调出来的模型（同靶点、同口袋的那一份）。"
             "默认 aff_unit=Ki、pocket_radius=10、limit=50、整批超时 900 秒；"
             "参数由用户决定，不要自己改。"
             "单条失败不中断整批，失败原因逐条写进 manifest。"
@@ -600,6 +628,13 @@ class ScoreAffinityTool(Tool):
                     "type": "string",
                     "enum": ["auto", "cpu", "cuda"],
                     "description": "推理设备，默认 auto（有 GPU 用 GPU，否则 CPU）",
+                },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "可选：用 fit_affinity 微调出来的模型（artifact#7，kind=model）。"
+                        "给出时用它自己的权重与口袋打分，而不是预训练权重"
+                    ),
                 },
             },
             "required": ["receptor", "ligands"],
@@ -647,6 +682,9 @@ class ScoreAffinityTool(Tool):
             root = dta_root()
             receptor_pdb, center = _receptor_inputs(receptor_entry)
             source_kind, records = _ligand_records(ligand_entry)
+            model_entry, model_config, model_pocket = _model_inputs(
+                ledger, arguments.get("model")
+            )
         except Exception as error:          # LedgerError / ToolError / OSError
             return ToolResult(output=str(error), failed=True)
 
@@ -664,6 +702,8 @@ class ScoreAffinityTool(Tool):
             "ligands_fingerprint": str(ligand_entry.fingerprint or ""),
             "ligands_kind": source_kind,
             "ligand_ids": [item["id"] for item in selected],
+            "model": str(model_entry.handle) if model_entry is not None else "",
+            "model_fingerprint": str(model_entry.fingerprint or "") if model_entry else "",
             "pocket": {"center": [round(value, 3) for value in center],
                        "radius": params.pocket_radius},
             "engine": {"name": "vcrossformer", "device": params.device},
@@ -706,13 +746,20 @@ class ScoreAffinityTool(Tool):
             return ToolResult(
                 output=f"写任务清单失败（{type(error).__name__}：{error}）", failed=True)
 
+        pocket_args = (
+            ["--pocket", str(model_pocket)]
+            if model_pocket is not None
+            else [
+                "--receptor", str(receptor_pdb),
+                "--pocket-center", ",".join(f"{value:g}" for value in center),
+                "--pocket-radius", f"{params.pocket_radius:g}",
+            ]
+        )
         argv = [
             python,
             str(root / "virtual_screen.py"),
-            "--config", str(root / "config" / "configall.yaml"),
-            "--receptor", str(receptor_pdb),
-            "--pocket-center", ",".join(f"{value:g}" for value in center),
-            "--pocket-radius", f"{params.pocket_radius:g}",
+            "--config", str(model_config or (root / "config" / "configall.yaml")),
+            *pocket_args,
             "--tasks", str(tasks_path),
             "--output", str(target / SCORES_FILE),
             "--aff_unit", params.aff_unit,
@@ -793,6 +840,11 @@ class ScoreAffinityTool(Tool):
             },
             "params": params.as_dict(),
             "params_fingerprint": fingerprint_parts(cache_params, length=16),
+            "model": (
+                {"handle": str(model_entry.handle),
+                 "fingerprint": str(model_entry.fingerprint or "")}
+                if model_entry is not None else None
+            ),
             "counts": counts,
             "results": results,
             "failures": failures,

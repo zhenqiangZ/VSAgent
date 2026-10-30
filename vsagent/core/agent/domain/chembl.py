@@ -12,9 +12,14 @@ UniProt 回答「这是什么蛋白」，ChEMBL 回答「什么东西能结合�
 `search_actives` 回答「这个靶点有哪些已知配体」，一次调用同时给出上面三样东西：
 一行摘要、一个 `ligandset` 句柄、一份写盘的完整活性表。
 
-另外两个入口回答另一半问题：`find_analogs` 拿一个分子去问「还有什么东西长得像它」
-（新颖性检查与骨架跃迁），`describe_molecule` 拿一个编号去问「它是个什么分子」
-（成药状态、类药性、已知作用靶点、适应症）。三个工具共用同一套网络与错误分级。
+另一个工具 `find_analogs` 回答「还有什么东西长得像它」（新颖性检查与骨架跃迁）。
+
+**「这个分子是什么来头」不在本模块出工具**：那个问题要同时问两个库——PubChem 给身份
+与计算性质，ChEMBL 给成药状态、类药性与适应症——所以它归 `pubchem.py` 的
+`lookup_compound` 一个入口（见那里的合并说明）。本模块只提供两段库函数供它调用：
+`find_by_inchikey`（InChIKey → 编号，两个库之间唯一可靠的桥）与 `describe_molecule`
+（编号 → 画像文本 + meta）。原先这里是第三个工具 `describe_molecule`，2026-10 合并掉了：
+模型得先判断「手里是编号还是 SMILES」再挑工具，判错就是一次白跑。
 
 **ChEMBL 的接口有几处会静默出错的地方，处理都收在这个模块内部：**
 
@@ -298,7 +303,7 @@ meta 会被别的工具整段回注，把一千多个分子塞进去的结果是
 
 def chembl_cache_dir() -> Path:
     """ChEMBL 数据的本地缓存目录，与靶点缓存、结构目录同处一个家目录。"""
-    return Path.home() / ".opencode_tui" / "chembl"
+    return Path.home() / ".vsagent" / "chembl"
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +804,81 @@ def _indications(molecule_id: str, *, timeout: float) -> tuple[list[dict[str, An
     )
     total = int((payload.get("page_meta") or {}).get("total_count") or 0)
     return [dict(item) for item in (payload.get("drug_indications") or [])], total
+
+
+# ---------------------------------------------------------------------------
+# 画像：一个编号对应的完整分子档案
+# ---------------------------------------------------------------------------
+def find_by_inchikey(inchikey: str, *, timeout: float = TIMEOUT) -> str:
+    """InChIKey → ChEMBL 分子编号；ChEMBL 里没有这个结构时回空串。
+
+    **这是 PubChem 与 ChEMBL 之间唯一可靠的桥。** PubChem 不直接给 ChEMBL 编号
+    （同义词里偶尔混进来一个，不可依赖），而 ChEMBL 的
+    `molecule_structures__standard_inchi_key__iexact` 实测精确命中：阿司匹林的
+    `BSYNRYMUTXBXSQ-UHFFFAOYSA-N` 回且只回 `CHEMBL25`。
+
+    键取 InChIKey 而不是 SMILES，是因为同一个结构在两个库里规范化出来的写法未必逐字
+    相同，而 InChIKey 是哈希——比字符串相等可靠。
+    """
+    key = (inchikey or "").strip().upper()
+    if not key:
+        return ""
+    payload = _request_json(
+        MOLECULE_URL,
+        {
+            "molecule_structures__standard_inchi_key__iexact": key,
+            "only": "molecule_chembl_id",
+            "limit": "1",
+        },
+        timeout=timeout,
+    )
+    for row in payload.get("molecules") or []:
+        code = str((row or {}).get("molecule_chembl_id") or "").strip()
+        if code:
+            return code
+    return ""
+
+
+def describe_molecule(code: str, *, timeout: float = TIMEOUT) -> tuple[str, dict[str, Any]]:
+    """按 ChEMBL 编号取一份完整画像，返回 `(文本, meta)`。
+
+    编号不存在时抛 `http.ToolError`——调用方要么是「用户给的编号」，要么是
+    「InChIKey 刚查出来的编号」，两种情况下查不到都说明这一步本身失败了，不该当成
+    「这个分子没有画像」静默吞掉。
+
+    meta 里带 `inchikey` / `smiles`：合并入口要靠它把两半接起来（PubChem 那半按
+    InChIKey 反查 CID），只回一段文本的话调用方还得再查一次。
+    """
+    molecule_id = normalize_molecule_id(code)
+    record = _request_json(
+        f"{MOLECULE_URL}/{molecule_id}.json", {"only": MOLECULE_ONLY}, timeout=timeout
+    )
+    if not isinstance(record, Mapping) or not record.get("molecule_chembl_id"):
+        raise http.ToolError(
+            f"ChEMBL 里没有分子编号 {molecule_id}。"
+            "编号取自 search_actives / find_analogs 的输出，不要凭印象写一个"
+        )
+    mechanisms, targets = _mechanisms(molecule_id, timeout=timeout)
+    indications, indication_total = _indications(molecule_id, timeout=timeout)
+    structures = record.get("molecule_structures") or {}
+    text = _render_molecule(
+        record,
+        mechanisms=mechanisms,
+        targets=targets,
+        indications=indications,
+        indication_total=indication_total,
+        # 说明这是现查的：同一个编号再问一次会重新联网，结果可能因远端更新而变
+        origin="数据取自 ChEMBL 分子库（每次调用现查，不写盘缓存）",
+    )
+    return text, {
+        "molecule_chembl_id": molecule_id,
+        "pref_name": str(record.get("pref_name") or ""),
+        "max_phase": _as_float(record.get("max_phase")),
+        "inchikey": str(structures.get("standard_inchi_key") or ""),
+        "smiles": str(structures.get("canonical_smiles") or ""),
+        "mechanism_count": len(mechanisms),
+        "indication_count": indication_total,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2178,84 +2258,9 @@ class FindAnalogsTool(Tool):
         )
 
 
-class DescribeMoleculeTool(Tool):
-    """查一个 ChEMBL 分子编号的画像。**纯查询，登记表里不留东西。**"""
-
-    spec = ToolSpec(
-        name="describe_molecule",
-        description=(
-            "查一个 ChEMBL 分子编号的**画像**：是不是已知药物、类药性如何、作用于哪些靶点、"
-            "治什么病。用在「拿到一个命中分子，先搞清楚它是什么来头」这一步——"
-            "**max_phase 到 4 就是已上市药物**（那这个「新发现」并不新），已撤市与黑框警告"
-            "是比活性数值更该先看的信号，Lipinski 违反项与 QED 给出类药性快照，"
-            "作用机制那一栏是脱靶风险的线索。它**只认 ChEMBL 分子编号**；对接产生的新结构在"
-            " ChEMBL 里没有编号，那种情况用 find_analogs 按结构串查相似分子（顺带回答"
-            "「这个结构是不是已知的」）。本工具**不在登记表里留条目**——它是一次查询，"
-            "不是产物。每次调用联网现查，约 2–4 秒。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "molecule": {
-                    "type": "string",
-                    "description": (
-                        "ChEMBL 分子编号，形如 CHEMBL939"
-                        "（取自 search_actives / find_analogs 的输出）"
-                    ),
-                }
-            },
-            "required": ["molecule"],
-        },
-    )
-    primary_argument = "molecule"
-
-    async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        try:
-            code = normalize_molecule_id(str(arguments.get("molecule") or ""))
-        except http.ToolError as error:
-            return ToolResult(output=str(error), failed=True)
-
-        try:
-            record = _request_json(
-                f"{MOLECULE_URL}/{code}.json", {"only": MOLECULE_ONLY}, timeout=TIMEOUT
-            )
-            if not isinstance(record, Mapping) or not record.get("molecule_chembl_id"):
-                return ToolResult(
-                    output=(
-                        f"ChEMBL 里没有分子编号 {code}。"
-                        "编号取自 search_actives / find_analogs 的输出，"
-                        "不要凭印象写一个"
-                    ),
-                    failed=True,
-                )
-            mechanisms, targets = _mechanisms(code, timeout=TIMEOUT)
-            indications, indication_total = _indications(code, timeout=TIMEOUT)
-        except http.ToolError as error:
-            return ToolResult(output=str(error), failed=True)
-
-        return ToolResult(
-            output=_render_molecule(
-                record,
-                mechanisms=mechanisms,
-                targets=targets,
-                indications=indications,
-                indication_total=indication_total,
-                # 说明这是现查的：同一个编号再问一次会重新联网，结果可能因远端更新而变
-                origin="数据取自 ChEMBL 分子库（每次调用现查，不写盘缓存）",
-            ),
-            meta={
-                "molecule_chembl_id": code,
-                "pref_name": str(record.get("pref_name") or ""),
-                "max_phase": _as_float(record.get("max_phase")),
-                "mechanism_count": len(mechanisms),
-                "indication_count": indication_total,
-            },
-        )
-
-
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具，按装配顺序。"""
-    return [SearchActivesTool(), FindAnalogsTool(), DescribeMoleculeTool()]
+    return [SearchActivesTool(), FindAnalogsTool()]
 
 if __name__ == "__main__":
     from debug_tools import main

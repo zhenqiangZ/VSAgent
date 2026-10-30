@@ -18,7 +18,7 @@
 3. **模型名随行存**。换模型必须整表重建——两个模型的向量混在一起，距离没有意义。
 
 存储：`vectors(chunk_id, model, dim, vec)`，`vec` 是 `<f4` 小端。**这张表是派生物**，
-删掉用 `python -m opencode_tui.core.embed index` 重建。
+删掉用 `python -m vsagent.core.embed index` 重建。
 
 模型名与仓库名**不是一回事**：ONNX 版在 `Qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q`。
 缓存目录按仓库名拼（`_repo_id`），按模型名拼会永远找不到已下载的文件。
@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 from . import index
+from .paths import config_home
 
 __all__ = [
     "BATCH",
@@ -93,8 +94,8 @@ _MATRIX_CACHE: dict[tuple[str, str, int], tuple[object, list[int]]] = {}
 
 
 def models_dir() -> Path:
-    """模型缓存目录：`~/.opencode_tui/models/`。不进 exe、不进仓。"""
-    return Path.home() / ".opencode_tui" / "models"
+    """模型缓存目录：`~/.vsagent/models/`。不进 exe、不进仓。"""
+    return config_home() / "models"
 
 
 def _repo_id(model: str) -> str:
@@ -142,7 +143,7 @@ def missing_reason(model: str) -> str:
     if not available(model):
         return (
             f"语义通道未启用：模型 {model} 还没下载（约 220MB）。\n"
-            "  python -m opencode_tui.core.embed download\n"
+            "  python -m vsagent.core.embed download\n"
             "（不会自动下载：不该让一次检索顺手拉一个 220MB 的文件。）"
         )
     return ""
@@ -509,12 +510,12 @@ def download_hint() -> str:
         return (
             f"当前 HF_ENDPOINT={endpoint}。换一个端点，或检查网络与代理后重试；\n"
             "镜像走 Xet 后端时常回 401，那就再关掉它：\n"
-            "  HF_HUB_DISABLE_XET=1 python -m opencode_tui.core.embed download"
+            "  HF_HUB_DISABLE_XET=1 python -m vsagent.core.embed download"
         )
     return (
         "连不上 huggingface.co 时（国内常见），先设镜像再重试：\n"
         "  HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 \\\n"
-        "    python -m opencode_tui.core.embed download\n"
+        "    python -m vsagent.core.embed download\n"
         "（镜像的 Xet 后端会回 401，所以要关掉它，走普通 HTTP 下载。）"
     )
 
@@ -522,7 +523,7 @@ def download_hint() -> str:
 def _main(argv: list[str]) -> int:
     model = (os.environ.get("VSA_EMBED_MODEL") or "").strip() or DEFAULT_MODEL
     if not argv or argv[0] not in ("download", "index"):
-        print("用法：python -m opencode_tui.core.embed download | index")
+        print("用法：python -m vsagent.core.embed download | index")
         return 2
     if argv[0] == "download":
         return download(model)

@@ -5,7 +5,7 @@
   改了一处忘了另一处，页面上的字段会悄悄少一个，而两边各自的判据都是绿的。
 - `service.py` 把同一份路由跑在**应用进程的后台线程**里，随应用启停。
 
-为什么服务要进包：`opencode_tui.spec` 的 `datas` 早先只有 `app.tcss`，
+为什么服务要进包：`vsagent.spec` 的 `datas` 早先只有 `app.tcss`，
 `tools/` 与 `web/` 都不在冻结产物里——「agent 起 `serve_web.py` 子进程」这条路
 在 exe 上根本不存在。路由与静态资产都得进 `datas`，见方案稿 §0.3。
 """

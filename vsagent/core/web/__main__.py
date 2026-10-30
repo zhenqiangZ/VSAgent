@@ -1,4 +1,4 @@
-"""`python -m opencode_tui.core.web`：把包内服务当独立进程起。
+"""`python -m vsagent.core.web`：把包内服务当独立进程起。
 
 应用里的服务跑在后台线程（`service.WebService`），但有两处场合需要进程级入口：
 人工查看、以及 `tools/check_web_api.py` 的判据——判据要能 `terminate()` 掉服务，
@@ -17,7 +17,7 @@ from .service import HOST, default_port
 
 
 def _project_root() -> Path:
-    """工程根：本文件位于 `<root>/opencode_tui/core/web/` 下。"""
+    """工程根：本文件位于 `<root>/vsagent/core/web/` 下。"""
     return Path(__file__).resolve().parents[3]
 
 

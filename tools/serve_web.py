@@ -1,7 +1,7 @@
 """独立命令行入口：起一个只读的会话历史与结构查看服务。
 
 **这里不写路由**。路由、JSON 形状与状态文件的等待读取都在
-`opencode_tui.core.web.routes` 里（唯一真相），包内的常驻服务走的是同一份。
+`vsagent.core.web.routes` 里（唯一真相），包内的常驻服务走的是同一份。
 两边各写一遍时，改了一处忘另一处，页面上的字段会悄悄少一个，
 而两边各自的判据都是绿的。
 
@@ -25,9 +25,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from opencode_tui.core.session_manager import default_state_path  # noqa: E402
-from opencode_tui.core.web.routes import WebServer  # noqa: E402
-from opencode_tui.core.web.service import default_port  # noqa: E402
+from vsagent.core.session_manager import default_state_path  # noqa: E402
+from vsagent.core.web.routes import WebServer  # noqa: E402
+from vsagent.core.web.service import default_port  # noqa: E402
 
 
 def main() -> None:

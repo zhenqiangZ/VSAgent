@@ -39,8 +39,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from opencode_tui.core import corpus, embed, index  # noqa: E402
-from opencode_tui.core.agent.domain import corpus as corpus_tools  # noqa: E402
+from vsagent.core import corpus, embed, index  # noqa: E402
+from vsagent.core.agent.domain import corpus as corpus_tools  # noqa: E402
 
 DEFAULT_QUESTIONS = PROJECT_ROOT / "corpus" / "eval" / "questions.jsonl"
 
@@ -284,7 +284,7 @@ def main(argv: list[str]) -> int:
             print(f"  {tag}: {count}")
         return 0
 
-    from opencode_tui.core import corpus_config
+    from vsagent.core import corpus_config
 
     config = corpus_config.load()
     model = args.model or config.embed_model

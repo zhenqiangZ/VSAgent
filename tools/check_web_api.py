@@ -12,7 +12,7 @@ S2 起还有一组语料库判据：上传 / 改名 / 删除，以及三类「�
 另有一组切块判据（分页接续、翻过头、`limit` 夹取、删掉的源、索引未建），
 它们排在语料组之后，因为那一组会把其中一份删掉。
 
-**服务跑在包内**（`opencode_tui/core/web/`）。判据原先起的是 `tools/serve_web.py`
+**服务跑在包内**（`vsagent/core/web/`）。判据原先起的是 `tools/serve_web.py`
 这个独立脚本，现在起的是包内服务——那个脚本已经不发请求了，它只做命令行参数解析，
 路由全靠导入。判据要盯的是**真正被应用使用的那个实现**，否则测的是壳不是里。
 
@@ -34,9 +34,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from opencode_tui.core import index
-from opencode_tui.core.models import PartType
-from opencode_tui.core.session_manager import SessionManager, default_state_path
+from vsagent.core import index
+from vsagent.core.models import PartType
+from vsagent.core.session_manager import SessionManager, default_state_path
 
 FIXTURE_DIR = PROJECT_ROOT / ".probe" / "web-runs"
 STATE_COPY = PROJECT_ROOT / ".probe" / "web-state" / "state.toml"
@@ -167,6 +167,24 @@ def pick_link_session(state_path):
     return max(reference.values(), key=lambda session: len(session.messages)).id
 
 
+def ensure_other_session(state_path, link_session):
+    """副本里至少要有一个**没有运行**的会话，返回它的编号。
+
+    「没有对应运行的会话 runId 为空」这条判据原本写死 `ses_0001`。状态文件是活的：
+    本机只剩一条会话时，它同时就是关联目标，正反两条断言互相矛盾，报出来的却是
+    「关联错了」。所以这里在副本里补一条空会话——判据不依赖真实状态里有几条会话。
+    """
+    manager = SessionManager(state_path)
+    if not manager.load_from_toml():
+        return ""
+    others = [item for item in manager.sessions.values() if item.id != link_session]
+    if others:
+        return max(others, key=lambda session: len(session.messages)).id
+    extra = manager.create_session("（判据用：没有运行的会话）")
+    manager.save_to_toml(state_path)
+    return extra.id
+
+
 def make_link_run(runs_dir, session_id):
     """用真实构建脚本产出 web-linked，并就地复制一份 mismatched。"""
     linked = runs_dir / "web-linked"
@@ -194,7 +212,7 @@ def make_link_run(runs_dir, session_id):
 def start_service(state_path, runs_dir, port):
     """起一个**包内服务**并等它就绪。
 
-    用 `-m opencode_tui.core.web` 起，走的是应用里同一个 `WebService`——
+    用 `-m vsagent.core.web` 起，走的是应用里同一个 `WebService`——
     起独立脚本就测不到「路由只有一份」这件事了。
 
     服务的输出写进日志文件。写进管道而不读会出事：每处理一次请求，
@@ -206,7 +224,7 @@ def start_service(state_path, runs_dir, port):
         process = subprocess.Popen(
             [
                 sys.executable,
-                "-m", "opencode_tui.core.web",
+                "-m", "vsagent.core.web",
                 "--state", str(state_path),
                 "--runs", str(runs_dir),
                 "--corpus", str(CORPUS_DIR),
@@ -239,7 +257,7 @@ def load_reference(state_path):
     return {session.id: session for session in manager.list_sessions()}
 
 
-def run_checks(base, state_path, runs_dir, link_session):
+def run_checks(base, state_path, runs_dir, link_session, other_session):
     status, listing = request(f"{base}/api/sessions")
     reference = load_reference(state_path)
     sessions = listing["sessions"]
@@ -396,11 +414,11 @@ def run_checks(base, state_path, runs_dir, link_session):
         f"应为 [('{link_session}', 'web-linked')]",
     )
 
-    status, other = request(f"{base}/api/sessions/ses_0001")
+    status, other = request(f"{base}/api/sessions/{other_session}")
     check(
         "没有对应运行的会话 runId 为空",
         status == 200 and other["runId"] is None,
-        f"ses_0001 runId={other['runId']}",
+        f"{other_session} runId={other['runId']}",
     )
 
     # ---- 反向核对 ----
@@ -671,7 +689,7 @@ def run_chunk_checks(base):
     正好用来核对「删掉的源查不到切块」——切块与列表必须同时消失，否则页面上
     点得进一个已经不在的源。
     """
-    from opencode_tui.core.web.routes import CHUNK_PAGE, CHUNK_PAGE_MAX, chunks_payload
+    from vsagent.core.web.routes import CHUNK_PAGE, CHUNK_PAGE_MAX, chunks_payload
 
     status, payload = request(f"{base}/api/library/doc:cccccccccc/chunks")
     items = payload.get("items") or []
@@ -757,14 +775,14 @@ def run_chunk_checks(base):
 def run_ingest_checks(base, corpus_dir):
     """入库：网页只转交，不自己写索引；独立服务拒绝；重复投递幂等。
 
-    `base` 是**独立进程**起的服务（`-m opencode_tui.core.web`）——它没有入库
+    `base` 是**独立进程**起的服务（`-m vsagent.core.web`）——它没有入库
     回调，必须回 503，而不是退化成第二个写者。真正入库那一组在这里另起一个
     带 `ingest` 的 `WebServer`（同进程、同线程模型，与应用里一样）。
     """
     import threading
 
-    from opencode_tui.core.agent.domain.corpus import ingest_files
-    from opencode_tui.core.web.routes import WebServer
+    from vsagent.core.agent.domain.corpus import ingest_files
+    from vsagent.core.web.routes import WebServer
 
     status, payload = post_json(f"{base}/api/library/ingest", {}, WRITE_HEADER)
     check(
@@ -964,6 +982,7 @@ def main():
         return 1
     if link_session != LINK_SESSION:
         print(f"状态文件里没有 {LINK_SESSION}，本次改用 {link_session} 核对关联")
+    other_session = ensure_other_session(state_path, link_session)
     make_link_run(runs_dir, link_session)
 
     # 干净的一份留在这里。并发检查会把副本写到半途，之后要拿这份干净的恢复。
@@ -974,7 +993,7 @@ def main():
     print("")
 
     try:
-        run_checks(base, state_path, runs_dir, link_session)
+        run_checks(base, state_path, runs_dir, link_session, other_session)
         run_library_checks(base)
         run_chunk_checks(base)
         run_ingest_checks(base, CORPUS_DIR)

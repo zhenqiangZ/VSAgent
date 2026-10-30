@@ -1,7 +1,7 @@
 """语料的两个开关。
 
 一个文件、两个开关、三个环境变量——**不引入第三套配置机制**（方案稿 §10）。
-位置与 `tools.toml` 同目录（项目侧 `.opencode_tui/`），已 gitignore。
+位置与 `tools.toml` 同目录（项目侧 `.vsagent/`），已 gitignore。
 
 | 设置 | 环境变量 | 默认 | 作用 |
 |---|---|---|---|
@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import corpus
 from .embed import DEFAULT_MODEL as DEFAULT_EMBED_MODEL
+from .paths import CONFIG_DIRECTORY
 
 __all__ = [
     "CORPUS_FILE",
@@ -36,7 +37,6 @@ __all__ = [
 ]
 
 CORPUS_FILE = "corpus.toml"
-CONFIG_DIRECTORY = ".opencode_tui"
 
 ENV_INDEX_WEB = "VSA_CORPUS_INDEX_WEB"
 ENV_EMBED = "VSA_CORPUS_EMBED"
@@ -54,7 +54,7 @@ class CorpusConfig:
 
 
 def config_path(root: Path | None = None) -> Path:
-    """项目侧那份配置文件的位置：`<仓根>/.opencode_tui/corpus.toml`。"""
+    """项目侧那份配置文件的位置：`<仓根>/.vsagent/corpus.toml`。"""
     base = Path(root) if root is not None else corpus.corpus_root().parent
     return base / CONFIG_DIRECTORY / CORPUS_FILE
 

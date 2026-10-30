@@ -169,7 +169,7 @@
 > 五条 bash 全是 POSIX 写法（`date`、`cat`、`ls`、`for d in ...`），没有一条
 > `dir` / `findstr` / `netstat -ano`；模型第一条命令就去了环境块给的状态目录。
 > 这一轮 35 秒、输入 59.8K、命中 77.9%——比上一次低，是因为第二问本身就是在
-> 翻目录（模型还去 `$HOME/.opencode_tui` 找登记表，那是我把「ledgers/ 也在这里」
+> 翻目录（模型还去 `$HOME/.vsagent` 找登记表，那是我把「ledgers/ 也在这里」
 > 写错了半句，已经改掉）。
 >
 > 顺带发现：F2 的真因不是「缺一条环境信息」，是 `SHELL_DISCIPLINE` 里那句

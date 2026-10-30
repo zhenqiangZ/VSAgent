@@ -1,6 +1,6 @@
 # 会话历史与结构查看的网页端架构
 
-这一版给 opencode_tui 配一个本地网页端，两个页面：会话历史、结构查看。
+这一版给 vsagent 配一个本地网页端，两个页面：会话历史、结构查看。
 
 ## 一、数据来源
 
@@ -8,8 +8,8 @@
 
 | 位置 | 内容 |
 |---|---|
-| `~/.opencode_tui/state.toml` | 全部会话：标题、消息、内容单元、模型、token、成本 |
-| `~/.opencode_tui/logs/<会话>.jsonl` | 事件轨迹，每写一条刷盘 |
+| `~/.vsagent/state.toml` | 全部会话：标题、消息、内容单元、模型、token、成本 |
+| `~/.vsagent/logs/<会话>.jsonl` | 事件轨迹，每写一条刷盘 |
 | `runs/<运行>/meta.json` | 结构查看的数据：靶点、口袋清单、候选分子 |
 | `runs/<运行>/` 其余文件 | `receptor.pdb`、`ligands/*.pdb`、Mol* 库 |
 
@@ -42,7 +42,7 @@ flowchart LR
     S -->|"/runs/[id]/..."| T
 ```
 
-服务复用 `opencode_tui.core.session_manager.SessionManager` 读取状态文件，会话数据的读取只有一份实现。启动参数：`--state`（状态文件路径，默认取 `default_state_path()`）、`--runs`（运行目录，默认项目根的 `runs/`）、`--web`（网页文件目录，默认项目根的 `web/`）、`--port`（默认 8860）。只绑定 `127.0.0.1`。
+服务复用 `vsagent.core.session_manager.SessionManager` 读取状态文件，会话数据的读取只有一份实现。启动参数：`--state`（状态文件路径，默认取 `default_state_path()`）、`--runs`（运行目录，默认项目根的 `runs/`）、`--web`（网页文件目录，默认项目根的 `web/`）、`--port`（默认 8860）。只绑定 `127.0.0.1`。
 
 ### 接口
 
@@ -122,7 +122,7 @@ flowchart LR
           "type": "tool",
           "toolName": "read",
           "toolStatus": "completed",
-          "toolInput": { "path": "opencode_tui/app.py" },
+          "toolInput": { "path": "vsagent/app.py" },
           "toolOutput": "……",
           "permission": "allow"
         },

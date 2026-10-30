@@ -16,7 +16,7 @@
 | F1 | `load_tools` 把被关掉的工具报成「已装入」，模型调它拿到「请改用别的办法」，于是 bash 自建 RCSB 客户端 | ~20 步 / 300K 输入 | `toolset.py:95`（列的是 `catalog()` 而非注册表）+ `loop.py:130`（禁用文案） | 否 |
 | F2 | 模型在 Linux 上写 Windows 命令 | 2 步 | `prompt.py` 的 `SHELL_DISCIPLINE` 写死「这套环境是 Windows」 | 否 |
 | F3 | 猜错 handle 编号，`open_viewer` 失败 | 1 步 | 上下文里没有「当前有哪些 handle」的索引 | 否 |
-| F4 | 模型不知道状态目录在哪，先试 `./.opencode_tui` | 2 步 | 上下文里没有工作目录 / 状态目录 | 否 |
+| F4 | 模型不知道状态目录在哪，先试 `./.vsagent` | 2 步 | 上下文里没有工作目录 / 状态目录 | 否 |
 
 ## F1 · 装族说「装好了」，那个工具其实是被关掉的
 
@@ -26,7 +26,7 @@
 它没有再试别的领域工具，而是 `bash` + `urllib` 自己写脚本拉 RCSB，连写三个
 `.probe/*.py`，第 1 轮因此用满 `MAX_STEPS=24`。
 
-**证据**：`.opencode_tui/tools.toml:12` 写着 `search_pdb = false`（同一份还关了
+**证据**：`.vsagent/tools.toml:12` 写着 `search_pdb = false`（同一份还关了
 `search_literature`、`switch_receptor`）。装配时它们**不进注册表**
 （`app._build_registry`），但 `LoadToolsTool` 列的是 `catalog()` 里的名字——
 那是「有哪些工具」，不是「装进来了哪些」。于是它把一件永远装不进来的工具报成
@@ -36,7 +36,7 @@
 
 ```
 load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出现在清单里，参数按各工具的说明给。
-模型看到的话： search_pdb 已被禁用（配置在 .opencode_tui/tools.toml 里，可在 /tools 面板里打开），
+模型看到的话： search_pdb 已被禁用（配置在 .vsagent/tools.toml 里，可在 /tools 面板里打开），
               本次会话不会提供这个工具，重试无用，请改用别的办法或告诉用户。
 ```
 
@@ -87,7 +87,7 @@ load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出�
 **复测**（同日，干净家目录，两问：取 4HJO 登记成受体 → 状态目录在哪、列出来、今天几号）：
 五条 bash 全是 POSIX 写法（`date`、`cat`、`ls`、`for d in ...`），
 **没有一条 `dir` / `findstr` / `netstat -ano`**。同一台机器上改之前是
-`dir .opencode_tui\structures 2>nul`，还顺手在仓库根建了个 `nul` 文件。
+`dir .vsagent\structures 2>nul`，还顺手在仓库根建了个 `nul` 文件。
 
 **建议**：~~与 Phase 4 的 ENV 块合并解决~~——已按上面的方式修掉。`bash` 失败回执
 里补「当前平台是 linux」这条退路不用做了：根因在提示，不在回执。
@@ -136,11 +136,11 @@ load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出�
 ## F4 · 不知道状态目录在哪
 
 **现象**：第 1 次会话第 1 轮，模型执行
-`bash("cd .opencode_tui/targets && python -c ...")`，失败（相对路径没有这个目录），
-随后 `ls ~/.opencode_tui` 才找到。
+`bash("cd .vsagent/targets && python -c ...")`，失败（相对路径没有这个目录），
+随后 `ls ~/.vsagent` 才找到。
 
 **根因**：这次实验的状态目录在 `/tmp/vsa-lazy-session`，模型默认它在
-`./.opencode_tui`。它没有「状态目录 / 工作目录是哪个」的任何信息，只能猜。
+`./.vsagent`。它没有「状态目录 / 工作目录是哪个」的任何信息，只能猜。
 
 **建议**：并入 ENV 块（工作目录 + 状态目录 + 平台 + 日期）。注意必须放在
 **易变区**：日期进了 `PREFIX` 就每天击穿一次缓存，还会红掉
@@ -157,15 +157,15 @@ load_tools 说： 已装入 rsearch：search_pdb。下一步起这些工具出�
 
 - **只写日期不写时分**：带上时间的话这一头每一步都和上一步不同，缓存从这一条起
   全部作废——那正是把 `Workspace.state_text` 从系统提示里搬走的理由。
-- **不写「ledgers/ 也在这里」**：登记表快照固定落在 `~/.opencode_tui/ledgers`，
+- **不写「ledgers/ 也在这里」**：登记表快照固定落在 `~/.vsagent/ledgers`，
   与 `state_path` 无关；`state_path` 被改到别处时（测试与脚本常这么干）那句话就是假的。
-  复测里模型正是照着我写错的那半句去 `$HOME/.opencode_tui` 找登记表的。
+  复测里模型正是照着我写错的那半句去 `$HOME/.vsagent` 找登记表的。
 - 判据：`--only env-block`（日期只到天、两个目录都在、不进前缀、`system` 逐字节不变、
   TASK 用量变大、应用确实把状态目录交给了循环层）。
 
 **复测**（与 F2 同一次会话）：环境块写着 `/tmp/vsa-env-session`，模型**第一条**
-bash 就去那里读 `connection.toml`，没有再 `cd .opencode_tui`。它随后还翻了
-`$HOME/.opencode_tui`——那是在找「登记表」放哪儿，属于上面那半句写错导致的，
+bash 就去那里读 `connection.toml`，没有再 `cd .vsagent`。它随后还翻了
+`$HOME/.vsagent`——那是在找「登记表」放哪儿，属于上面那半句写错导致的，
 不是没看见状态目录。
 
 ## 已修 · 重试语义一直没接线

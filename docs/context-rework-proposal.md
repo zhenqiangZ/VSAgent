@@ -1,6 +1,6 @@
 # 上下文重构建议（v2）
 
-> 分析对象：`opencode_tui` 当前的 `ContextAssembler` 装配链路。
+> 分析对象：`vsagent` 当前的 `ContextAssembler` 装配链路。
 > 代码依据：`core/agent/context.py`(729) / `prompt.py`(485) / `loop.py`(950) / `core/agent/tools.py`(1006)。
 > 行号按 2026-10-24 的工作区。外部资料见文末附录。
 > 本文只提**建议与改动口径**，不含实施代码。

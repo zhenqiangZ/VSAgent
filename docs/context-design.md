@@ -42,7 +42,7 @@
 
 ## 三、数据结构
 
-新增文件 `opencode_tui/core/agent/context.py`。以下为设计稿。
+新增文件 `vsagent/core/agent/context.py`。以下为设计稿。
 
 ### 3.1 层与策略
 

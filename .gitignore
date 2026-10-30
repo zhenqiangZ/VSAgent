@@ -13,7 +13,7 @@ __pycache__/
 corpus/
 
 # 外部模型（VCrossFormer）：代码 54MB、自带的 .venv 1.6GB、权重 15GB，全部不入库。
-# 它放在 models/ 而不是包内，是因为 check_chemistry_gate 会扫 opencode_tui/ 下所有
+# 它放在 models/ 而不是包内，是因为 check_chemistry_gate 会扫 vsagent/ 下所有
 # .py 的顶层 import，DTA 有 45 处 import torch/rdkit。装法见 models/DTA/README.md。
 models/DTA/
 
@@ -26,7 +26,7 @@ web/vendor/
 .env
 
 # 导出的会话记录
-opencode-export-*.md
+vsagent-export-*.md
 
 # 内部工作文档：调试记录、设计讨论与编码规范，不进公开分支
 # （AGENTS.md 例外：它是给协作模型读的项目约定，跟着代码走，见 prompt.rules_directory）
@@ -40,6 +40,10 @@ PLAN.md
 .VSCodeCounter/
 
 # 本机运行状态与编辑器配置
+.vsagent/
+# 改名前那份项目侧配置（tools.toml / permissions.toml / hooks.toml）。
+# 启动时会被 `paths.migrate_legacy_config()` 改名成 `.vsagent/`；
+# 这里留着只是不让它在搬迁之前把 `git status` 弄脏。
 .opencode_tui/
 .vscode/
 .vsmemory/

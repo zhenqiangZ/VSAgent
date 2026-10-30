@@ -31,7 +31,7 @@
 | --- | --- |
 | 解释器 | 跑应用、跑断言、跑判据一律 `.venv/Scripts/python.exe`；打包、抓帧用 pack python |
 | 改动后流程 | `test_agent.py` → `test_smoke.py` → `check_banned_chars.py` → 判据四段 → 打包 → 成对抓帧 |
-| 命令单一真相 | `opencode_tui/core/command_registry.py`（命令名、别名、说明都在这里） |
+| 命令单一真相 | `vsagent/core/command_registry.py`（命令名、别名、说明都在这里） |
 | 原子写 | 复用 `SessionManager.save_to_toml` 的临时文件 + `fsync` + `os.replace` + 重试模式 |
 | 新增界面元素 | 若引入新的 Part 类型或视图，要同步多处白名单（见 `memory-design` 之外的既有约定） |
 | 判据 | 放 `.probe/`，自检要能证明判据本身有效 |
@@ -68,7 +68,7 @@
 任务清单见 `TaskList`。分四组：
 
 **A. 数据与存储（M1-1 ~ M1-4）**
-- 新增 `opencode_tui/core/agent/memory.py`
+- 新增 `vsagent/core/agent/memory.py`
 - `MemoryKind` / `MemoryEntry` / `MemoryStore`
 - 存储：`entries.json`（真相）+ `memory.md`（人读）双份，`save()` 保持一致
 - 原子写：临时文件 + `fsync` + `os.replace` + 重试
@@ -102,7 +102,7 @@ M1-1 ~ M1-11 已实施并验证：
 
 | 项 | 位置 | 验证 |
 | --- | --- | --- |
-| 数据结构与存储 | `opencode_tui/core/agent/memory.py` | `check_memory` 往返、对账、原子写 |
+| 数据结构与存储 | `vsagent/core/agent/memory.py` | `check_memory` 往返、对账、原子写 |
 | 工具 | `RememberTool` / `RecallTool` | `check_memory` 工具段 + 装配断言 |
 | 命令 | `/remember` `/forget` `/memory` | `test_smoke` 命令段（含多条命中、按编号删） |
 | 上下文接入 | `prompt.build_model_messages(memory_text=...)` | `check_prompt` 记忆段（含预算计入） |

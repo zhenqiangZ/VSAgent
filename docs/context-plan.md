@@ -10,7 +10,7 @@
 **目标**：把 `context-design.md` 的分层方案写成代码，**先交付第 1 期（正确性）**。
 
 **第 1 期范围**
-- 新增 `opencode_tui/core/agent/context.py`：`Layer` / `LAYER_POLICY` / `Turn` / `Evidence` / `ContextBundle` / `ContextAssembler`
+- 新增 `vsagent/core/agent/context.py`：`Layer` / `LAYER_POLICY` / `Turn` / `Evidence` / `ContextBundle` / `ContextAssembler`
 - **交互组切分**：`tool_call` 与它的结果以 `Turn` 为单位原子进出
 - **前缀稳定分离**：`stable_prefix()`（身份/纪律/规则）与 `task_header()`（记忆/任务状态/摘要/引用）分开；`workspace.state_text` 的当前时间移出 `PREFIX`
 - **`MEMORY` 层归位**：把已接入的 `memory_text` 从「直接拼在 `system` 之后」改到 `PREFIX` 之后，纳入统一预算与降级链
@@ -56,7 +56,7 @@
 任务清单见 `TaskList`（C1-*）。分三组：
 
 **A. 数据结构（C1-1 ~ C1-2）**
-- 新增 `opencode_tui/core/agent/context.py`：`Layer` / `LAYER_POLICY` / `Turn` / `Evidence` / `ContextBundle`
+- 新增 `vsagent/core/agent/context.py`：`Layer` / `LAYER_POLICY` / `Turn` / `Evidence` / `ContextBundle`
 - `Turn` 的切分：`prompt._translate_message` → 按 `STEP_START` 切出 `list[Turn]`，保证 `tool_call` 与结果同组
 
 **B. 装配器（C1-3 ~ C1-5）**
@@ -83,14 +83,14 @@ C1-1 ~ C1-8 已实施并验证：
 
 | 项 | 位置 | 验证 |
 | --- | --- | --- |
-| 数据结构 | `opencode_tui/core/agent/context.py` | `check_context` 各节 |
+| 数据结构 | `vsagent/core/agent/context.py` | `check_context` 各节 |
 | 交互组切分 | `context.split_turns` | 判据第 1 条 + 自检（切散必报孤儿） |
 | 前缀稳定分离 | `prompt.stable_prefix` | 判据第 2 条；`build_system_prompt` 输出逐字节不变 |
 | 装配器 | `context.ContextAssembler.build` | 判据第 3~7 条 |
 | 接入 | `loop._assemble` / `_run_steps` / `_ask_wrap_up` | `test_agent` 循环层 |
 | 判据 | `.probe/check_context.py` | 已登记进 `run_all_checks.sh`（61 → 62 条） |
 | 文档 | `source-map.md` §3.2 / §3.11 / §六、`HARNESS.md` | 已同步 |
-| 打包 | `dist/opencode-tui.exe`（15:01） | `PYZ-00.toc` 含 `agent.context` / `.prompt` / `.loop` |
+| 打包 | `dist/VSAgent.exe`（15:01） | `PYZ-00.toc` 含 `agent.context` / `.prompt` / `.loop` |
 | 抓帧 | 七帧成对一致 | 冻结侧 `reply` 帧含真实回复，即新装配器在产物里跑过 |
 
 读数：`test_agent` 1107 项、`test_smoke` 1627 项全绿；判据 62 条全绿；`check_banned_chars` 0 处；
@@ -133,7 +133,7 @@ C1-1 ~ C1-8 已实施并验证：
 | 用户那条路 | `/task`（`app.ARGUMENT_COMMANDS` 已加）、`command_registry` 一条 | `test_smoke`、`check_command_coverage` |
 | 进 TASK 层 | `loop._task_text` → `ContextAssembler.build(task_text=)` | 判据第 4 条 |
 | 判据 | `.probe/check_task_state.py` | 已登记进 `run_all_checks.sh`（62 → 63 条） |
-| 打包 | `dist/opencode-tui.exe`（18:36） | `PYZ-00.toc` 含 `agent.task` / `agent.context` / `core.models` |
+| 打包 | `dist/VSAgent.exe`（18:36） | `PYZ-00.toc` 含 `agent.task` / `agent.context` / `core.models` |
 | 抓帧 | 七帧成对一致 | 与第 1 期同法 |
 | 产物功能 | `.probe/capture_frozen_task.py` | 冻结产物与源码两侧都通过：`/task` 真写进了状态文件 |
 
@@ -177,7 +177,7 @@ C1-1 ~ C1-8 已实施并验证：
 | 装配失败上报 | `ContextAssemblyError` 消息带各层用量（`describe_usage`） | 判据第 7 条 |
 | 事件可观测 | `loop._trace_context` → `context.assembled`（真削过才发） | `test_agent::check_selective_compression` 第七节 |
 | 判据 | `.probe/check_compression.py` | 已登记进 `run_all_checks.sh`（63 → 64 条） |
-| 打包 | `dist/opencode-tui.exe`（19:31:54，15,516,996 字节） | `PYZ-00.toc` 含 `agent.prompt` / `agent.context` / `agent.loop`（agent 子模块共 13 个都在） |
+| 打包 | `dist/VSAgent.exe`（19:31:54，15,516,996 字节） | `PYZ-00.toc` 含 `agent.prompt` / `agent.context` / `agent.loop`（agent 子模块共 13 个都在） |
 | 抓帧 | 七帧成对一致 | 本期只动数据，画面应当一个字不变——一致本身就是结论 |
 | 产物功能 | `.probe/capture_frozen_task.py` | 冻结产物与源码两侧都通过：`/task` 真写进了状态文件 |
 
@@ -263,7 +263,7 @@ C1-1 ~ C1-8 已实施并验证：
 | `test_smoke` | 2092 项全绿（界面层 536 + 循环层 1556） | |
 | 判据 | 65 条全绿 | `.probe/check_evidence.py` 新增 |
 | 禁用字 | 0 处（304 文件） | |
-| 打包 | `dist/opencode-tui.exe`：2026-10-07 21:31:49，15,521,616 字节（旧产物归档到 `.probe/opencode-tui-20261007d.exe`） | `PYZ-00.toc` 含 `agent.prompt` / `agent.context` / `agent.loop` 等 13 个子模块 |
+| 打包 | `dist/VSAgent.exe`：2026-10-07 21:31:49，15,521,616 字节（旧产物归档到 `.probe/VSAgent-20261007d.exe`） | `PYZ-00.toc` 含 `agent.prompt` / `agent.context` / `agent.loop` 等 13 个子模块 |
 | 抓帧 | 七帧成对一致 | 本期只动数据，画面应当一个字不变——一致本身就是结论 |
 | 产物功能 | 两侧都通过 | `.probe/capture_frozen_task.py`（会走到新的提炼与装配） |
 
@@ -286,7 +286,7 @@ C1-1 ~ C1-8 已实施并验证：
 | 角色 | `core/agent/prompt.py` + `loop.py` | `explore`：身份说明多一个分支；工具清单去掉 `PLAN_DENY ∪ {delegate}` |
 | 权限冒泡 | `loop.py` + `screens/chat.py` | `permission.ask` 补 `tool` / `argument` / `agent`；界面优先读事件、回退查 Part |
 | 收工误判 | `screens/chat.py` | `_on_turn_done` 补会话判断（防将来给子代理加 `_finish`） |
-| 装配 | `opencode_tui/app.py` | `_build_registry` 注册 `DelegateTool`；`permission.PLAN_DENY` 加 `delegate` |
+| 装配 | `vsagent/app.py` | `_build_registry` 注册 `DelegateTool`；`permission.PLAN_DENY` 加 `delegate` |
 | 判据 | `.probe/check_subagent.py` | 七节（含反空转自检） |
 | 测试 | `tests/test_agent.py::check_subagent_isolation` | 七节 |
 | 文档 | `source-map.md` / `HARNESS.md` | 新增文件与通道；判据清单 65 → 66 条 |

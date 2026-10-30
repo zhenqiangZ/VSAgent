@@ -40,7 +40,7 @@ ChEMBL CSV ───────────────────┘
                           prepare_ligands (confirm)
                                    ▼
                          ligandset#2 (prepared)
-                         ~/.opencode_tui/ligands/prepared/<tag>/ligands/*.pdbqt
+                         ~/.vsagent/ligands/prepared/<tag>/ligands/*.pdbqt
                                    │
 receptor#2 (prepared) ─────── dock ──▶ artifact#3 (docking)
   receptor.pdbqt + box.txt              poses/*.pdbqt + poses/*.pdb + logs/
@@ -58,9 +58,9 @@ receptor#2 (prepared) ─────── dock ──▶ artifact#3 (docking)
 
 | 文件 | 职责 |
 | --- | --- |
-| `opencode_tui/core/agent/domain/products.py` | 内容寻址产物目录、`params.json` 提交标记、原子写 JSON/文本。只放库函数，不登记工具。 |
-| `opencode_tui/core/agent/domain/ligand.py` | `ImportLigandsetTool`、`PrepareLigandsTool`；文件解析、去盐、去重、ETKDGv3、Meeko。 |
-| `opencode_tui/core/agent/domain/docking.py` | `DockTool`；定位 Vina、读盒子、构造命令、跑子进程、解析分数、PDBQT→PDB。 |
+| `vsagent/core/agent/domain/products.py` | 内容寻址产物目录、`params.json` 提交标记、原子写 JSON/文本。只放库函数，不登记工具。 |
+| `vsagent/core/agent/domain/ligand.py` | `ImportLigandsetTool`、`PrepareLigandsTool`；文件解析、去盐、去重、ETKDGv3、Meeko。 |
+| `vsagent/core/agent/domain/docking.py` | `DockTool`；定位 Vina、读盒子、构造命令、跑子进程、解析分数、PDBQT→PDB。 |
 | `tests/fixtures/ligands.smi` | 给 `debug_tools.py` 的固定配体样例（含一条盐、一条无效 SMILES，第一条伊马替尼是 1IEP 的共晶配体本身——`validate_docking` 靠它才比得出 RMSD）。 |
 | `tools/check_docking_ui.js` | 对接排名与详情降级的前端判据（Playwright，手工跑）。 |
 
@@ -94,7 +94,7 @@ def write_text_atomic(path: Path, text: str) -> None
 | `requirements-chem.txt` | 头注释说明配体准备与 pose 转换也要它；Vina 是外部二进制。 |
 | `tools/check_web_api.py` | `prepare_runs()` 改用 `tests/fixtures/1iep.pdb` 作为 `receptor_full.pdb`，修掉对不存在的 `runs/1iep-demo` 的依赖。 |
 
-不改：`core/web/routes.py`（`/runs/<id>/poses/*` 已能静态服务）、`viz/`、`opencode_tui.spec`。
+不改：`core/web/routes.py`（`/runs/<id>/poses/*` 已能静态服务）、`viz/`、`vsagent.spec`。
 
 ## 4. 工具接口
 
@@ -171,7 +171,7 @@ def write_text_atomic(path: Path, text: str) -> None
 ### 5.1 raw 配体集
 
 ```text
-~/.opencode_tui/ligands/raw/<stem>-<sha8>/
+~/.vsagent/ligands/raw/<stem>-<sha8>/
   ligands.csv
   manifest.json
   params.json          # 最后写
@@ -186,7 +186,7 @@ def write_text_atomic(path: Path, text: str) -> None
 ### 5.2 prepared 配体集
 
 ```text
-~/.opencode_tui/ligands/prepared/<stem>-<sha8>/
+~/.vsagent/ligands/prepared/<stem>-<sha8>/
   ligands/<id>.pdbqt
   manifest.json
   params.json          # 最后写
@@ -215,7 +215,7 @@ def write_text_atomic(path: Path, text: str) -> None
 ### 5.3 docking artifact
 
 ```text
-~/.opencode_tui/docking/<receptor-tag>-<ligandset-tag>-<sha8>/
+~/.vsagent/docking/<receptor-tag>-<ligandset-tag>-<sha8>/
   poses/<id>_out.pdbqt
   poses/<id>.pdb
   logs/<id>.log

@@ -10,7 +10,7 @@
 | 项 | 内容 |
 |---|---|
 | 新增工具 | 5 个：`search_web` / `fetch_webpage` / `import_documents` / `search_corpus` / `read_source` |
-| 新增存储 | `<repo>/corpus/`（项目级，gitignore）、`<repo>/.opencode_tui/corpus.toml`（两个开关） |
+| 新增存储 | `<repo>/corpus/`（项目级，gitignore）、`<repo>/.vsagent/corpus.toml`（两个开关） |
 | 检索 | 词法两路（`unicode61` + `trigram`）+ 向量一路（e5-small 384d）→ RRF → 按节聚合 |
 | 引用 | `doc#ab12cd34ef §3.2 p.7` / `web#ab12cd34ef`，只认工具返回值 |
 | 依赖变化 | 主依赖 +`pypdf`；语义通道另装 `requirements-embed.txt`（fastembed） |
@@ -178,7 +178,7 @@ CREATE TABLE vectors (
 
 | 存什么 | 在哪 | 生命周期 | 用途 |
 |---|---|---|---|
-| **查询 → 结果**（原始响应） | `~/.opencode_tui/search/web-*.json` | **不过期** | 同一 query 不重复计费；旧结果的档案 |
+| **查询 → 结果**（原始响应） | `~/.vsagent/search/web-*.json` | **不过期** | 同一 query 不重复计费；旧结果的档案 |
 | **URL → 页面**（正文/摘要） | `<repo>/corpus/web/<id>/` | 直到用户删除 | 参与检索、可引用、离线可用 |
 
 查询归档回答"这句话我搜过、当时返回了什么"；语料回答"这个页面有什么、能不能引用"。
@@ -364,14 +364,14 @@ corpus → websearch → receptor → ligand → docking → affinity → export
 | 运行时 | `fastembed`（onnxruntime + tokenizers） | CPU 可跑、不依赖 torch |
 | 模型 | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`，384d，**255MB**（ONNX 在 `Qdrant/…-onnx-Q`，模型名与仓库名不同） | 中英兼顾；fastembed 清单里唯一合适的 384 维多语言模型 |
 | 备选 | `BAAI/bge-small-zh-v1.5`，512d，90MB | 纯中文语料更准，`VSA_EMBED_MODEL` 手动切 |
-| 存放 | `~/.opencode_tui/models/` | 不进 exe、不进仓；显式下载 |
+| 存放 | `~/.vsagent/models/` | 不进 exe、不进仓；显式下载 |
 | 依赖 | **`requirements-embed.txt`** | 主依赖只多一个 pypdf；不装只掉语义通道 |
 
 不做自动选模型：同一个库混两种模型的向量，距离没有意义。
 
 ### 8.2 生命周期
 
-- **下载**：`python -m opencode_tui.core.embed download`，打印大小与进度。
+- **下载**：`python -m vsagent.core.embed download`，打印大小与进度。
   第一次用到且没有模型时返回一句「语义通道未启用：运行 … download」，**不自动下载**。
 - **入库时算**：`passage:` 编码，批量 16；50 页 PDF 约 300 块，CPU 数秒，同步完成并报耗时。
 - **换模型**：`vectors.model` 不匹配的行整批删除重建；`sources` / `chunks` 不动。
@@ -417,7 +417,7 @@ S3 实测体积与启动时间；超 +80MB 改成「exe 内不带，用户另装
 把 inbox 里的文件交给装配时注入的 `ingest` 回调（应用传 `ingest_files`，与模型调
 `import_documents` 同一个入口）。它**只认 inbox 里已有的文件名**，不认路径——这个
 入口的影响面从「写一个文件」变成「改索引」，不能顺带变成「让索引读任意路径」。
-独立运行的服务（`serve_web.py`、`python -m opencode_tui.core.web`）没有回调，明确回
+独立运行的服务（`serve_web.py`、`python -m vsagent.core.web`）没有回调，明确回
 503，而不是退化成第二个写者。切块 + 算向量要十几秒，所以回 202、后台线程跑，页面
 轮询 `GET /api/library` 的 `ingest` 字段收进度与结果。
 
@@ -446,7 +446,7 @@ S3 实测体积与启动时间；超 +80MB 改成「exe 内不带，用户另装
 
 一个配置文件、两个开关、三个环境变量。**不引入第三套配置机制**。
 
-`<repo>/.opencode_tui/corpus.toml`（项目级，与 `tools.toml` 同目录，gitignore）：
+`<repo>/.vsagent/corpus.toml`（项目级，与 `tools.toml` 同目录，gitignore）：
 
 ```toml
 [corpus]
@@ -471,10 +471,10 @@ embed = true
   web 只允许写 `inbox/` 与 `labels.json`。
 
 **清理**：不自动删。`/library` 顶部显示 `查询归档 N 条 / 语料 M 份 / 占用 X MB`，
-并提供命令 `python -m opencode_tui.core.corpus prune --summary`（只清 `depth=summary`
+并提供命令 `python -m vsagent.core.corpus prune --summary`（只清 `depth=summary`
 的网页源，`full` 与 `doc` 不动）。
 
-索引重建：`python -m opencode_tui.core.index reindex`——改过切分参数、或从 S0 升上来
+索引重建：`python -m vsagent.core.index reindex`——改过切分参数、或从 S0 升上来
 要回填 `corpus/web/` 时跑它。索引是派生物，删掉整个 `.index/` 再跑一遍就回来了。
 
 ---
@@ -496,7 +496,7 @@ S0 先做：纯增量、无写入风险、当天可验收。S1 是真正的工�
 - S0：两个联网工具、查询归档、`corpus/web/` 落盘、`http.py` 三处小改。
   `python tests/test_agent.py --only websearch` 绿；真实 key 跑通一次 search + fetch（约 0.01 元）。
 - S1：`core/parse.py` / `core/chunker.py` / `core/index.py` / `core/corpus_config.py`、
-  三个本地工具、`corpus/web/` 回填（`python -m opencode_tui.core.index reindex`）、
+  三个本地工具、`corpus/web/` 回填（`python -m vsagent.core.index reindex`）、
   `pypdf` 进主依赖、两份 PDF 夹具。`python tests/test_agent.py --only corpus` 绿，
   「重建两次逐字相同」已验证。真实网页正文回填后自动认出 `## 鉴权`、`### 请求` 这类小节，
   说明反转义那一步是有效的。
@@ -563,7 +563,7 @@ S0 先做：纯增量、无写入风险、当天可验收。S1 是真正的工�
 `core/corpus_config.py`（模型默认值改为 `embed.DEFAULT_MODEL`）、
 `core/agent/domain/corpus.py`（第三路 + 入库时算向量）、
 `core/agent/domain/websearch.py`（落盘即入索引）、`tests/test_agent.py`（`--only embed`）。
-`opencode_tui.spec` **不动**：模型 255MB，超过 +80MB 预算，走「exe 内不带、用户另装」。
+`vsagent.spec` **不动**：模型 255MB，超过 +80MB 预算，走「exe 内不带、用户另装」。
 
 ---
 

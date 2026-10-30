@@ -1,5 +1,12 @@
 # 事件层设计（EVENT）
 
+> **2026-10-28 注**：本文的**触发语义已被取代**——§4 的「`record_event` 的 title 与
+> summary 必填」与 §5 的「只在 `context.dropped > 0` 时自动收口」不再成立。
+> 原因是 1M 窗口下 `dropped` 恒为 0、任务只做一件事时话题永不换，三条入口互等，
+> 实测一次 37 步的会话产出 **0 条事件**。新语义（Phase → Step 流水、内核每步自动记、
+> 模型只命名）见 [`session-review-plan.md`](session-review-plan.md) §4。
+> 本文 §3 的三条不变式、§2 的「动作与产物由代码数」、§4 的「收口不花请求」仍然有效。
+>
 > 实施日期：2026-10-25。代码：`core/agent/event_log.py`、`core/agent/context.py`
 > （`Layer.EVENT`）、`core/models.py`（`Event` / `Session.events`）。
 > 总计划见 [`context-rework-plan.md`](context-rework-plan.md)。

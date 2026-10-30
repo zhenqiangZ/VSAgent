@@ -1,7 +1,7 @@
 # 领域工具接入计划（轮 1：工作区 + 既有领域工具）
 
 本文件是「把参考实现 `D:/1Store/VirtualScreenAgent/src/vsa/tools/` 里的领域工具接入本项目
-`opencode_tui`」这一轮的实施方案与执行清单。动笔之前先把**已核对过的事实**列清楚，
+`vsagent`」这一轮的实施方案与执行清单。动笔之前先把**已核对过的事实**列清楚，
 本轮的每个判断都建立在这些读数上。
 
 ## 0. 已核对的事实
@@ -10,14 +10,14 @@
 
 | 项 | 现状 | 位置 |
 |---|---|---|
-| 工具基类 | 有。`ToolSpec` + `Tool`(ABC) + `ToolRegistry` + `argument_error` | `opencode_tui/core/agent/tools.py` |
+| 工具基类 | 有。`ToolSpec` + `Tool`(ABC) + `ToolRegistry` + `argument_error` | `vsagent/core/agent/tools.py` |
 | 现有工具 | 5 个：`bash` / `read` / `write` / `patch` / `grep` | 同上 |
 | 工作目录 | **有，但只做两件事**：给出 root、往系统提示写一段状态文字 | `core/agent/workspace.py`（38 行） |
 | 登记表 / handle / 血缘 / 指纹 | **没有** | — |
 | 判定层 | 有。`PermissionPolicy` + `Tool.primary_argument` + `Verdict` | `core/agent/permission.py`（193 行） |
 | 钩子层 | 有。`HookRunner` 三个事件，接在 `_execute_tool` 上 | `core/agent/hooks.py` |
 | 工具执行的唯一出口 | `AgentLoop._execute_tool(session, message, part, explicit)` | `core/agent/loop.py:454` |
-| 工具注册处 | `OpenCodeApp._build_registry()`，逐条 `registry.register(...)` | `app.py:132` |
+| 工具注册处 | `VSAgentApp._build_registry()`，逐条 `registry.register(...)` | `app.py:132` |
 | 系统提示 | `build_system_prompt(workspace, session)`，每 step 重建 | `core/agent/prompt.py:124` |
 | 参数校验 | `argument_error(spec, arguments)` 按 JSON Schema 手写校验 | `tools.py:184` |
 | **`runs/<run_id>/` 数据约定** | **有**。`meta.json` 的 target / pockets / molecules / contacts；Mol\* 前端与 `serve_web.py` 已按它读 | `runs/1iep-demo/`、`docs/web-frontend-architecture.md` |
@@ -71,23 +71,23 @@
 
 ```
 新增：
-  opencode_tui/core/agent/ledger.py          登记表：Handle / Entry / SessionLedger / 指纹
-  opencode_tui/core/agent/domain/__init__.py 领域工具装配入口
-  opencode_tui/core/agent/domain/http.py     共用的 HTTP 出口（供测试整体替换）
-  opencode_tui/core/agent/domain/chemistry.py 可选化学依赖守门人
-  opencode_tui/core/agent/domain/pdbtext.py  PDB 纯文本层（零依赖）
-  opencode_tui/core/agent/domain/uniprot.py  2 个工具
-  opencode_tui/core/agent/domain/chembl.py   3 个工具
-  opencode_tui/core/agent/domain/structure.py 2 个工具
-  opencode_tui/core/agent/domain/receptor.py  1 个工具
-  opencode_tui/core/agent/domain/listing.py  工作区浏览工具 3 个
-  opencode_tui/core/agent/domain/all_tools.py 把各模块的工具合成一份（应用只装一次）
+  vsagent/core/agent/ledger.py          登记表：Handle / Entry / SessionLedger / 指纹
+  vsagent/core/agent/domain/__init__.py 领域工具装配入口
+  vsagent/core/agent/domain/http.py     共用的 HTTP 出口（供测试整体替换）
+  vsagent/core/agent/domain/chemistry.py 可选化学依赖守门人
+  vsagent/core/agent/domain/pdbtext.py  PDB 纯文本层（零依赖）
+  vsagent/core/agent/domain/uniprot.py  2 个工具
+  vsagent/core/agent/domain/chembl.py   3 个工具
+  vsagent/core/agent/domain/structure.py 2 个工具
+  vsagent/core/agent/domain/receptor.py  1 个工具
+  vsagent/core/agent/domain/listing.py  工作区浏览工具 3 个
+  vsagent/core/agent/domain/all_tools.py 把各模块的工具合成一份（应用只装一次）
 
 修改：
-  opencode_tui/core/agent/tools.py   Ctx 标记 + ToolResult.meta + context 注入
-  opencode_tui/core/agent/loop.py    _execute_tool 传 context；会话绑定 ledger
-  opencode_tui/app.py                装配 ledger 与领域工具
-  opencode_tui/core/agent/prompt.py  身份段加「收 handle 不收路径」纪律
+  vsagent/core/agent/tools.py   Ctx 标记 + ToolResult.meta + context 注入
+  vsagent/core/agent/loop.py    _execute_tool 传 context；会话绑定 ledger
+  vsagent/app.py                装配 ledger 与领域工具
+  vsagent/core/agent/prompt.py  身份段加「收 handle 不收路径」纪律
   requirements.txt                   可选化学依赖（单列一个包文件）
 ```
 
@@ -140,7 +140,7 @@
 | 系统提示 | `prompt.py` 的身份段增加一句「引用产物一律用 handle，不要手写路径」 |
 | 工具注册 | `app.py:_build_registry()` 里加 `domain_tools()` |
 | Plan 方式 | `PLAN_DENY` 目前是 `{write, patch, bash}`。改动类领域工具（`prepare_receptor`）**要加进去**，否则 Plan 下能跑准备受体 |
-| 写盘 | 登记表快照写到 `~/.opencode_tui/ledgers/<session_id>.json`，**原子换名**（沿用 `SessionManager.save_to_toml` 那套：临时文件 + fsync + os.replace + 占用重试） |
+| 写盘 | 登记表快照写到 `~/.vsagent/ledgers/<session_id>.json`，**原子换名**（沿用 `SessionManager.save_to_toml` 那套：临时文件 + fsync + os.replace + 占用重试） |
 
 ### 3.4 与 `runs/` 的接轨（本项目独有，参考实现没有）
 
@@ -235,7 +235,7 @@
    会让后续「准备受体」拿到一份 JSON 当结构用。真正的 `receptor` 条目由第 5 步的
    `fetch_structure` 产生（它取回的是坐标）。靶点记录按 `artifact` 登记。
 
-2. **缓存目录定在 `~/.opencode_tui/targets/`**，与登记表快照同处；测试里把这个函数
+2. **缓存目录定在 `~/.vsagent/targets/`**，与登记表快照同处；测试里把这个函数
    换成临时目录，不污染真实缓存。
 
 ### 第 4 步　pdbtext（纯文本层）
@@ -499,7 +499,7 @@ agent 层从 931 涨到 **1001**，冒烟层同步到 1498。
 
 ## 6. 待确认
 
-1. **登记表写盘位置**：`~/.opencode_tui/ledgers/<session_id>.json`（与状态文件同处）
+1. **登记表写盘位置**：`~/.vsagent/ledgers/<session_id>.json`（与状态文件同处）
    还是项目内 `runs/<run_id>/workspace.json`？
    倾向前者——它是会话级状态，与 `state.toml` 同类；`runs/` 只收交付物。
 2. **HTTP 出口的测试注入点**：照参考实现用「模块级 `_get_json` + monkeypatch」，

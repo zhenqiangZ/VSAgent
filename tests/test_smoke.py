@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import opencode_tui  # noqa: E402
+import vsagent  # noqa: E402
 import re  # noqa: E402
 from textual import events  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
@@ -22,19 +22,19 @@ from textual.scrollbar import ScrollTo  # noqa: E402
 from textual.widget import Widget  # noqa: E402
 from textual.widgets import Input, ListView  # noqa: E402
 
-from opencode_tui.app import OpenCodeApp  # noqa: E402
-from opencode_tui.core.agent.memory import MemoryStore  # noqa: E402
-from opencode_tui.core.agent.permission import PermissionPolicy, Verdict  # noqa: E402
-from opencode_tui.core.agent.prompt import KEEP_MESSAGES  # noqa: E402
-from opencode_tui.core.command_registry import CommandRegistry  # noqa: E402
-from opencode_tui.core.connection import (  # noqa: E402
+from vsagent.app import VSAgentApp  # noqa: E402
+from vsagent.core.agent.memory import MemoryStore  # noqa: E402
+from vsagent.core.agent.permission import PermissionPolicy, Verdict  # noqa: E402
+from vsagent.core.agent.prompt import KEEP_MESSAGES  # noqa: E402
+from vsagent.core.command_registry import CommandRegistry  # noqa: E402
+from vsagent.core.connection import (  # noqa: E402
     Connection,
     connection_path_for,
     save_connection,
 )
-from opencode_tui.core.event_bus import EventBus  # noqa: E402
-from opencode_tui.core.exporter import export_filename, render_session_markdown  # noqa: E402
-from opencode_tui.core.external_editor import (  # noqa: E402
+from vsagent.core.event_bus import EventBus  # noqa: E402
+from vsagent.core.exporter import export_filename, render_session_markdown  # noqa: E402
+from vsagent.core.external_editor import (  # noqa: E402
     build_command,
     editor_buffer_path,
     read_buffer,
@@ -42,31 +42,31 @@ from opencode_tui.core.external_editor import (  # noqa: E402
     split_editor_command,
     write_buffer,
 )
-from opencode_tui.core.file_refs import resolve_file_refs  # noqa: E402
-from opencode_tui.core.models import EFFORTS, Message, Part, PartType, ToolStatus  # noqa: E402
-from opencode_tui.core.project_scan import BEGIN_MARK, END_MARK  # noqa: E402
-from opencode_tui.core.session_manager import SessionManager  # noqa: E402
-from opencode_tui.screens.chat import ChatScreen, SidePanel  # noqa: E402
-from opencode_tui.screens.connection_form import ConnectionFormScreen  # noqa: E402
-from opencode_tui.screens.help import HelpScreen  # noqa: E402
-from opencode_tui.screens.home import HomeInput, HomeScreen  # noqa: E402
-from opencode_tui.screens.message import MessageScreen  # noqa: E402
-from opencode_tui.screens.permission import PermissionDialog  # noqa: E402
-from opencode_tui.screens.session_picker import (  # noqa: E402
+from vsagent.core.file_refs import resolve_file_refs  # noqa: E402
+from vsagent.core.models import EFFORTS, Message, Part, PartType, ToolStatus  # noqa: E402
+from vsagent.core.project_scan import BEGIN_MARK, END_MARK  # noqa: E402
+from vsagent.core.session_manager import SessionManager  # noqa: E402
+from vsagent.screens.chat import ChatScreen, SidePanel  # noqa: E402
+from vsagent.screens.connection_form import ConnectionFormScreen  # noqa: E402
+from vsagent.screens.help import HelpScreen  # noqa: E402
+from vsagent.screens.home import HomeInput, HomeScreen  # noqa: E402
+from vsagent.screens.message import MessageScreen  # noqa: E402
+from vsagent.screens.permission import PermissionDialog  # noqa: E402
+from vsagent.screens.session_picker import (  # noqa: E402
     ConfirmDialog,
     RenameDialog,
     SessionPickerScreen,
 )
-from opencode_tui.screens.theme_selector import ThemeSelectorScreen  # noqa: E402
-from opencode_tui.screens.tools_panel import ToolsPanelScreen  # noqa: E402
-from opencode_tui.widgets.agent_autocomplete import AGENTS  # noqa: E402
-from opencode_tui.widgets.command_palette import CommandPalette  # noqa: E402
-from opencode_tui.widgets.editor_pane import (  # noqa: E402
+from vsagent.screens.theme_selector import ThemeSelectorScreen  # noqa: E402
+from vsagent.screens.tools_panel import ToolsPanelScreen  # noqa: E402
+from vsagent.widgets.agent_autocomplete import AGENTS  # noqa: E402
+from vsagent.widgets.command_palette import CommandPalette  # noqa: E402
+from vsagent.widgets.editor_pane import (  # noqa: E402
     IGNORED_DIRS,
     EditorPane,
     search_files,
 )
-from opencode_tui.widgets.messages_pane import (  # noqa: E402
+from vsagent.widgets.messages_pane import (  # noqa: E402
     HISTORY_PAGE,
     MAX_MOUNTED,
     MessagesPane,
@@ -75,14 +75,14 @@ from opencode_tui.widgets.messages_pane import (  # noqa: E402
     TextPartView,
     ToolCard,
 )
-from opencode_tui.widgets.status_bar import (  # noqa: E402
+from vsagent.widgets.status_bar import (  # noqa: E402
     StatusBar,
     format_tokens,
     git_branch,
     shorten_path,
 )
 
-import opencode_tui.widgets.status_bar as status_bar_module  # noqa: E402
+import vsagent.widgets.status_bar as status_bar_module  # noqa: E402
 
 # test_agent 与本文件同目录。按文件路径加载本文件时（`.probe/check_command_coverage.py`
 # 就是这么做的）`tests` 不在搜索路径上，这里自己补一次。
@@ -119,14 +119,14 @@ CHUNK_DELAY = 0.004
 CHECKS: list[str] = []
 
 
-def build_app(state_path: Path, **options: object) -> OpenCodeApp:
+def build_app(state_path: Path, **options: object) -> VSAgentApp:
     """冒烟测试用的应用：判定层不拦任何工具。
 
     这一组断言验的是界面。默认策略会让 bash 停下来等答复，而这里排的应答脚本
     带一个 bash 工具调用，界面上没有东西去答复它。判定那一条链由 test_agent.py 验，
     弹窗自己那几条断言在第 4 步单独开，那一条自己传 policy。
     """
-    return OpenCodeApp(
+    return VSAgentApp(
         root=ROOT,
         state_path=state_path,
         policy=PermissionPolicy(default_ask=frozenset()),
@@ -189,7 +189,7 @@ def rendered_lines(widget: Widget) -> list[str]:
     ]
 
 
-async def wait_idle(app: OpenCodeApp, pilot, timeout: float = 8.0) -> None:
+async def wait_idle(app: VSAgentApp, pilot, timeout: float = 8.0) -> None:
     """等待当前生成任务结束。"""
     waited = 0.0
     while waited < timeout:
@@ -206,7 +206,7 @@ async def type_text(pilot, text: str) -> None:
     await pilot.press(*list(text))
 
 
-def latest_toast(app: OpenCodeApp) -> str:
+def latest_toast(app: VSAgentApp) -> str:
     """取最近一条提示的文字。
 
     断言带上它才分得清两种情形：命令根本没走到（提示是别的内容），
@@ -242,7 +242,7 @@ def declared_bindings() -> list[tuple[type, str, str]]:
     Textual 不会报错，按下去也没有任何反应，所以要把这个对应关系静态查一遍。
     """
     found: list[tuple[type, str, str]] = []
-    for info in pkgutil.walk_packages(opencode_tui.__path__, "opencode_tui."):
+    for info in pkgutil.walk_packages(vsagent.__path__, "vsagent."):
         module = importlib.import_module(info.name)
         for value in vars(module).values():
             if not isinstance(value, type) or value.__module__ != info.name:
@@ -265,7 +265,7 @@ def action_exists(cls: type, action: str) -> bool:
     （`app.quit`），两种都要剥掉再查方法名。屏幕上是 `app.` 开头的动作由 App 提供。
     """
     name = action.split("(", 1)[0].rsplit(".", 1)[-1]
-    return hasattr(cls, f"action_{name}") or hasattr(OpenCodeApp, f"action_{name}")
+    return hasattr(cls, f"action_{name}") or hasattr(VSAgentApp, f"action_{name}")
 
 
 # 只在某个弹窗开着时才生效的按键，不算快捷键表里的一行。
@@ -286,11 +286,11 @@ SIMPLE_PART_TYPES = [
 
 # 循环层只产出 TEXT / REASONING / TOOL / STEP_START / STEP_FINISH，剩下的类型靠这里的样本过一遍渲染分支。
 PART_SAMPLES: dict[PartType, Part] = {
-    PartType.FILE: Part(type=PartType.FILE, file_path="opencode_tui/app.py", text="1\n2\n3"),
+    PartType.FILE: Part(type=PartType.FILE, file_path="vsagent/app.py", text="1\n2\n3"),
     PartType.AGENT: Part(type=PartType.AGENT, agent_name="Build"),
     PartType.STEP_START: Part(type=PartType.STEP_START, text="start"),
     PartType.STEP_FINISH: Part(type=PartType.STEP_FINISH, text="finish"),
-    PartType.PATCH: Part(type=PartType.PATCH, text="opencode_tui/app.py", patch_added=12, patch_removed=3),
+    PartType.PATCH: Part(type=PartType.PATCH, text="vsagent/app.py", patch_added=12, patch_removed=3),
     PartType.SUBTASK: Part(type=PartType.SUBTASK, agent_name="explore", text="找一下入口"),
     PartType.RETRY: Part(type=PartType.RETRY, text="第 2 次"),
     PartType.COMPACTION: Part(type=PartType.COMPACTION, text="省略了 3 条"),
@@ -354,16 +354,16 @@ async def run_tools_panel_checks() -> None:
     """`/tools` 面板：列出全部工具、逐条开关、改完立刻生效。
 
     单独开一个应用，`root` 指向 `.probe/` 下的一份副本：面板会写
-    `root/.opencode_tui/tools.toml`，用仓库根那个会把开发机上的真实开关冲掉。
+    `root/.vsagent/tools.toml`，用仓库根那个会把开发机上的真实开关冲掉。
     """
     root = ROOT / ".probe" / "tools_panel"
     shutil.rmtree(root, ignore_errors=True)
-    config = root / ".opencode_tui"
+    config = root / ".vsagent"
     config.mkdir(parents=True, exist_ok=True)
     tools_file = config / "tools.toml"
     tools_file.write_text("[tools]\nsearch_pdb = false\n", encoding="utf-8")
 
-    app = OpenCodeApp(
+    app = VSAgentApp(
         root=root,
         state_path=root / "state.toml",
         policy=PermissionPolicy(default_ask=frozenset()),
@@ -578,7 +578,7 @@ PERMISSION_CASES: list[tuple[str, ToolStatus, str]] = [
 ]
 
 
-async def wait_for_screen(app: OpenCodeApp, pilot, kind: type, timeout: float = 8.0) -> object:
+async def wait_for_screen(app: VSAgentApp, pilot, kind: type, timeout: float = 8.0) -> object:
     """等某一类屏幕成为最上面那一层，并且已经铺好内容。
 
     `App._push_screen` 先把屏幕同步放进 `_screen_stack`，再等挂载完成
@@ -618,7 +618,7 @@ def dialog_text(dialog: PermissionDialog) -> str:
     )
 
 
-def last_tool_part(app: OpenCodeApp) -> Part:
+def last_tool_part(app: VSAgentApp) -> Part:
     """当前会话里最后一张工具卡片对应的 Part。"""
     for message in reversed(app.session_manager.current.messages):
         for part in reversed(message.parts):
@@ -632,7 +632,7 @@ async def run_permission_round(server: FakeModelServer, key: str) -> tuple[ToolS
     server.clear()
     script_reply(server)
     PERMISSION_STATE_PATH.unlink(missing_ok=True)
-    app = OpenCodeApp(root=ROOT, state_path=PERMISSION_STATE_PATH)
+    app = VSAgentApp(root=ROOT, state_path=PERMISSION_STATE_PATH)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         await type_text(pilot, "run it")
@@ -1088,7 +1088,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"快捷键提示靠右贴边：右端 {keys.region.right}，屏幕宽 {app.size.width}",
         )
         check(
-            str(keys.render()) == "ctrl+p commands",
+            str(keys.render()) == "ctrl+p 命令",
             f"右端提示为命令面板快捷键：{keys.render()}",
         )
         usage_text = str(usage.render())
@@ -1779,10 +1779,39 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             panel._written == {},
             f"侧栏关着时不计算内容：{sorted(panel._written)}",
         )
+        # 标题栏：左边是当前会话名，右边是侧栏开关。开关必须能点——
+        # /sidebar 是一条要记住的命令，而折叠侧栏是随时会做一下的动作。
+        header = chat.query_one("#chat-header")
+        title_label = chat.query_one("#chat-title")
+        toggle = chat.query_one("#side-toggle")
+        check(
+            str(title_label.render()) == app.session_manager.current.title,
+            f"标题栏写着当前会话名：{title_label.render()}",
+        )
+        check(header.region.height == 1, f"标题栏只占一行：{header.region.height}")
+        check(
+            toggle.region.right == app.size.width - 1,
+            f"侧栏开关贴在标题栏右端：右端 {toggle.region.right}，屏幕宽 {app.size.width}",
+        )
+        check("侧栏" in str(toggle.render()), f"侧栏关着时开关写「侧栏」：{toggle.render()}")
+        await pilot.click(toggle)
+        await pilot.pause()
+        check(panel.has_class("-visible"), "点开关打开侧栏")
+        check("收起" in str(toggle.render()), f"侧栏开着时开关写「收起」：{toggle.render()}")
+        check(pane.region.width == pane_width - 30, "点开关打开时消息区同样让出宽度")
+        await pilot.click(toggle)
+        await pilot.pause()
+        check(not panel.has_class("-visible"), "再点一下把侧栏收起来")
+        check("侧栏" in str(toggle.render()), f"收起后开关回到「侧栏」：{toggle.render()}")
+        check(pane.region.width == pane_width, "收起后消息区恢复原宽")
         await type_text(pilot, "/sidebar")
         await pilot.press("enter")
         await pilot.pause()
         check(panel.has_class("-visible"), "/sidebar 打开上下文侧栏")
+        check(
+            "收起" in str(toggle.render()),
+            f"/sidebar 打开之后开关的字也跟着变（两条路要一致）：{toggle.render()}",
+        )
         check(str(panel.styles.display) == "block", "侧栏打开后参与布局")
         check(panel.region.width == 30, "侧栏宽 30 列")
         check(panel.region.right == app.size.width, "侧栏贴在屏幕右边缘")
@@ -1816,6 +1845,10 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.press("enter")
         await pilot.pause()
         check(not panel.has_class("-visible"), "/sidebar 关闭上下文侧栏")
+        check(
+            "侧栏" in str(toggle.render()),
+            f"/sidebar 关闭之后开关的字也跟着变：{toggle.render()}",
+        )
         check(pane.region.width == pane_width, "关闭侧栏后消息区恢复原宽")
         check(
             "上下文侧栏：隐藏" in latest_toast(app),
@@ -2253,8 +2286,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         # 换一段超过一屏的再看上下键，这两条断言才说明得了问题。
         long_diff = "\n".join(
             [
-                "--- a/opencode_tui/app.py",
-                "+++ b/opencode_tui/app.py",
+                "--- a/vsagent/app.py",
+                "+++ b/vsagent/app.py",
                 "@@ -1,3 +1,3 @@",
                 *[f"+第 {index} 行新增的内容" for index in range(1, 80)],
             ]
@@ -2282,7 +2315,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         app.save_state()
         check(STATE_PATH.exists(), "状态写入 TOML 文件")
 
-        export_target = ROOT / f"opencode-export-{app.session_manager.current_session_id}.md"
+        export_target = ROOT / f"vsagent-export-{app.session_manager.current_session_id}.md"
         export_target.unlink(missing_ok=True)
         app.execute_command("export")
         await pilot.pause()
@@ -2328,7 +2361,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             actual = split_editor_command(spec)
             check(actual == expected, f"分开 EDITOR={spec!r}：得到 {actual}，期望 {expected}")
 
-        spaced_buffer = Path("C:/Users/me/.opencode_tui/editor-buffer.md")
+        spaced_buffer = Path("C:/Users/me/.vsagent/editor-buffer.md")
         command_cases = [
             ("notepad", f'"notepad" "{spaced_buffer}"'),
             ("code --wait", f'"code" "--wait" "{spaced_buffer}"'),
@@ -2356,7 +2389,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         buffer_probe.unlink()
 
         check(
-            editor_buffer_path() == Path.home() / ".opencode_tui" / "editor-buffer.md",
+            editor_buffer_path() == Path.home() / ".vsagent" / "editor-buffer.md",
             f"暂存文件路径：{editor_buffer_path()}",
         )
         os.environ.pop("VISUAL", None)
@@ -2375,7 +2408,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             shorten_path(plain_path) == str(plain_path),
             f"路径没超过上界时原样返回：{shorten_path(plain_path)}",
         )
-        long_path = Path("D:/1Store/VSAgent/opencode_tui/widgets/messages_pane.py")
+        long_path = Path("D:/1Store/VSAgent/vsagent/widgets/messages_pane.py")
         shortened = shorten_path(long_path)
         check(len(shortened) == 28, f"路径过长时截到 28 个字符：{len(shortened)}")
         check(shortened == "…" + str(long_path)[-27:], f"截出来的样子：{shortened}")
@@ -2427,7 +2460,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         bus.clear()
         check(bus.publish("part.add", {"part_id": "prt_9999"}) == 0, "clear 之后没有人再收到事件")
 
-        located = ROOT / "opencode_tui" / "app.py"
+        located = ROOT / "vsagent" / "app.py"
         text, refs = resolve_file_refs(f"看一下 @{located} 与 @ 还有 @no-such-file.txt", ROOT)
         check(
             [part.file_path for part in refs] == [str(located)],
@@ -2441,17 +2474,17 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         for sample in PART_SAMPLES.values():
             sample_message.add_part(sample)
         exported_session.add_message(sample_message)
-        check(export_filename(exported_session) == f"opencode-export-{exported_session.id}.md", "导出文件名用会话编号")
+        check(export_filename(exported_session) == f"vsagent-export-{exported_session.id}.md", "导出文件名用会话编号")
         exported_text = render_session_markdown(exported_session)
         check(exported_text.startswith(f"# {exported_session.title}"), f"导出以会话标题开头：{exported_text.splitlines()[0]}")
         check(exported_text.endswith("\n") and not exported_text.endswith("\n\n"), "导出正文以单个换行收尾")
         # 这些 Part 类型由样本喂给渲染分支，导出里的这几行没走过真实一轮。
         exported_markers = {
-            PartType.FILE: "引用文件 `opencode_tui/app.py`",
+            PartType.FILE: "引用文件 `vsagent/app.py`",
             PartType.AGENT: "已派发子 agent「Build」",
             PartType.STEP_START: "── 步骤开始 start",
             PartType.STEP_FINISH: "── 步骤结束 finish",
-            PartType.PATCH: "补丁 `opencode_tui/app.py`",
+            PartType.PATCH: "补丁 `vsagent/app.py`",
             PartType.SUBTASK: "子任务 `explore` 找一下入口",
             PartType.RETRY: "重试 第 2 次",
             PartType.COMPACTION: "上下文已压缩 省略了 3 条",
@@ -2625,7 +2658,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             await pilot.pause()
             check(isinstance(app.screen, ChatScreen), f"关闭{label}后回到聊天界面")
 
-        export_target = ROOT / f"opencode-export-{app.session_manager.current_session_id}.md"
+        export_target = ROOT / f"vsagent-export-{app.session_manager.current_session_id}.md"
         export_target.unlink(missing_ok=True)
         await type_text(pilot, "/export")
         await pilot.press("enter")
@@ -2633,7 +2666,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(export_target.exists(), "/export 导出 Markdown 文件")
         export_target.unlink()
 
-        # /compact：消息够多时压掉前面一段，位置记在会话上。
+        # /compact：整段封成一个阶段，原文让位给流水，位置记在会话上。
         session = app.session_manager.current
         while len(session.messages) <= KEEP_MESSAGES:
             filler = session.add_message(Message(role="user", session_id=session.id))
@@ -2642,8 +2675,11 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.press("enter")
         await pilot.pause()
         check(session.compact_upto > 0, f"/compact 把压缩位置往前推：{session.compact_upto}")
-        kept_now = len(session.messages) - session.compact_upto
-        check(kept_now == KEEP_MESSAGES, f"压完之后留下的条数：{kept_now}")
+        check(
+            session.compact_upto == len(session.messages),
+            f"/compact 把这一段整段让位给流水：{session.compact_upto}/{len(session.messages)}",
+        )
+        check(bool(session.events), "/compact 封出了一个阶段")
 
         # /init：往项目根写一份 AGENTS.md，已有内容一个字都不动。
         # 项目里本来就有一份，先备份再恢复，测试跑完那一个字节也不能变。
@@ -3051,7 +3087,10 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.press(*list("这一轮要打断"))
         await pilot.press("enter")
         unfinished: list[Part] = []
-        for _ in range(400):
+        # 等的是「工具已经在跑」这个状态，不是它多快出现，所以预算给到 10 秒。
+        # 原来按 400×2ms（0.8 秒）算，两台机器上并发跑测试时这台抢不到 CPU，
+        # 工具卡片还没建出来就先判失败——那是机器慢，不是回归。
+        for _ in range(500):
             unfinished = [
                 part
                 for part in last_parts()
@@ -3060,7 +3099,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             ]
             if unfinished:
                 break
-            await pilot.pause(0.002)
+            await pilot.pause(0.02)
         check(
             bool(unfinished),
             f"打断的时机取在工具执行期间，这条检查才说明得了问题："

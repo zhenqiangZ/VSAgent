@@ -7,11 +7,14 @@ import csv
 import inspect
 import io
 import json
+import math
 import os
+import re
 import shutil
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,8 +24,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from textual.widgets import Input, TextArea  # noqa: E402
 
-from opencode_tui.app import OpenCodeApp  # noqa: E402
-from opencode_tui.core.agent.hooks import (  # noqa: E402
+from vsagent.app import VSAgentApp  # noqa: E402
+from vsagent.core.agent.hooks import (  # noqa: E402
     POST_TOOL_USE,
     PRE_TOOL_USE,
     STOP,
@@ -30,8 +33,8 @@ from opencode_tui.core.agent.hooks import (  # noqa: E402
     HookRunner,
     load_hooks,
 )
-from opencode_tui.core.agent.host import AgentHost  # noqa: E402
-from opencode_tui.core.agent.loop import (  # noqa: E402
+from vsagent.core.agent.host import AgentHost  # noqa: E402
+from vsagent.core.agent.loop import (  # noqa: E402
     MAX_RETRIES,
     MAX_STEPS,
     MAX_STOP_RETRIES,
@@ -40,7 +43,7 @@ from opencode_tui.core.agent.loop import (  # noqa: E402
     AgentLoop,
     missing_tool_reason,
 )
-from opencode_tui.core.agent.permission import (  # noqa: E402
+from vsagent.core.agent.permission import (  # noqa: E402
     BILLED_ASK_AFTER,
     CONFIG_DIRECTORY,
     PLAN_DENY,
@@ -54,7 +57,7 @@ from opencode_tui.core.agent.permission import (  # noqa: E402
     project_config_directory,
     save_disabled,
 )
-from opencode_tui.core.agent.memory import (  # noqa: E402
+from vsagent.core.agent.memory import (  # noqa: E402
     MEMORY_DIR_NAME,
     RESIDENT_LIMIT,
     MemoryError,
@@ -64,7 +67,7 @@ from opencode_tui.core.agent.memory import (  # noqa: E402
     RememberTool,
     memory_root,
 )
-from opencode_tui.core.agent.context import (  # noqa: E402
+from vsagent.core.agent.context import (  # noqa: E402
     CONTEXT_RATIO,
     DEGRADE_ORDER,
     EVIDENCE_LIMIT,
@@ -73,6 +76,7 @@ from opencode_tui.core.agent.context import (  # noqa: E402
     FOCUS_CONSTRAINTS,
     FOCUS_LIMIT,
     HISTORY_MAX,
+    REFS_TURN_LIMIT,
     TOOL_ARCHIVE_MARK,
     ContextAssembler,
     ContextAssemblyError,
@@ -89,17 +93,21 @@ from opencode_tui.core.agent.context import (  # noqa: E402
     render_range,
     split_turns,
 )
-from opencode_tui.core.agent.event_log import (  # noqa: E402
+from vsagent.core.agent.event_log import (  # noqa: E402
+    PHASE_SOFT_LIMIT,
+    ClosePhaseTool,
     EventRuntime,
     RecallEventTool,
-    RecordEventTool,
-    build_local_event,
     event_boundary,
-    record_local_event,
+    phase_start,
+    phase_tokens,
+    record_step,
+    seal_phase,
     render_event_detail,
 )
-from opencode_tui.core.agent.task import TaskTool  # noqa: E402
-from opencode_tui.core.agent.spawn import (  # noqa: E402
+from vsagent.core.agent.task import TaskTool  # noqa: E402
+from vsagent.core.agent.hypothesis import HypothesisTool  # noqa: E402
+from vsagent.core.agent.spawn import (  # noqa: E402
     REPORT_TOKENS,
     AgentStatusTool,
     SpawnAgentTool,
@@ -109,14 +117,14 @@ from opencode_tui.core.agent.spawn import (  # noqa: E402
     recent_start,
     task_preamble,
 )
-from opencode_tui.core.connection import (  # noqa: E402
+from vsagent.core.connection import (  # noqa: E402
     Connection,
     connection_path_for,
     load_connection,
     save_connection,
 )
-from opencode_tui.core.session_manager import SessionManager  # noqa: E402
-from opencode_tui.core.agent.prompt import (  # noqa: E402
+from vsagent.core.session_manager import SessionManager  # noqa: E402
+from vsagent.core.agent.prompt import (  # noqa: E402
     DEEP_MARK,
     EMPTY_REASONING,
     KEEP_MESSAGES,
@@ -125,10 +133,9 @@ from opencode_tui.core.agent.prompt import (  # noqa: E402
     OMISSION_MARK,
     REASONING_PLACEHOLDER,
     RULES_DIR_ENV,
-    RULES_LIMIT,
     SUMMARY_INSTRUCTION,
     SUMMARY_NOTICE,
-    build_system_prompt,
+    EVENT_NOTICE,
     compress_tool_output,
     environment_block,
     estimate_tokens,
@@ -141,7 +148,7 @@ from opencode_tui.core.agent.prompt import (  # noqa: E402
     translate_message,
     truncate_for_model,
 )
-from opencode_tui.core.agent.provider import (  # noqa: E402
+from vsagent.core.agent.provider import (  # noqa: E402
     BUILTIN_MODELS,
     MODEL_ALIASES,
     DEFAULT_CONTEXT_WINDOW,
@@ -155,7 +162,8 @@ from opencode_tui.core.agent.provider import (  # noqa: E402
     lookup_model,
     model_names,
 )
-from opencode_tui.core.agent.tools import (  # noqa: E402
+from vsagent.core.agent.tools import (  # noqa: E402
+    BASH_OUTPUT_CHARS,
     BASH_TIMEOUT,
     BatchFailure,
     BatchOutcome,
@@ -173,13 +181,14 @@ from opencode_tui.core.agent.tools import (  # noqa: E402
     WriteTool,
     argument_error,
     change_counts,
+    clip_bash_output,
     decode_output,
     decode_text,
     number_lines,
     resolve_path,
 )
-from opencode_tui.core.agent.workspace import Workspace  # noqa: E402
-from opencode_tui.core.agent.ledger import (  # noqa: E402
+from vsagent.core.agent.workspace import Workspace  # noqa: E402
+from vsagent.core.agent.ledger import (  # noqa: E402
     DIGEST_LINE_CHARS,
     DIGEST_MAX_LINES,
     ArtifactHandle,
@@ -195,55 +204,57 @@ from opencode_tui.core.agent.ledger import (  # noqa: E402
     make_handle,
     parse_handle,
 )
-from opencode_tui.core.agent.domain import uniprot as uniprot_module  # noqa: E402
-from opencode_tui.core.agent.domain import pdbtext  # noqa: E402
-from opencode_tui.core.agent.domain import preprocess as preprocess_module  # noqa: E402
-from opencode_tui.core.agent.domain import structure as structure_module  # noqa: E402
-from opencode_tui.core.agent.domain import chembl as chembl_module  # noqa: E402
-from opencode_tui.core.agent.domain import chemistry as chemistry_module  # noqa: E402
-from opencode_tui.core.agent.domain import receptor as receptor_module  # noqa: E402
-from opencode_tui.core.agent.domain import ligand as ligand_module  # noqa: E402
-from opencode_tui.core.agent.domain import docking as docking_module  # noqa: E402
-from opencode_tui.core.agent.domain import affinity as affinity_module  # noqa: E402
-from opencode_tui.core.agent.domain import listing as listing_module  # noqa: E402
-from opencode_tui.core.agent.domain import export as export_module  # noqa: E402
-from opencode_tui.core.agent.domain import complexes as complexes_module  # noqa: E402
-from opencode_tui.core.agent.domain import prankweb as prankweb_module  # noqa: E402
-from opencode_tui.core.agent.domain import pockets as pockets_module  # noqa: E402
-from opencode_tui.core.agent.domain import align as align_module  # noqa: E402
-from opencode_tui.core.agent.domain import products as products_module  # noqa: E402
-from opencode_tui.core.agent.domain import analysis as analysis_module  # noqa: E402
-from opencode_tui.core.agent.domain import screen as screen_module  # noqa: E402
-from opencode_tui.core.agent.domain import admet as admet_module  # noqa: E402
-from opencode_tui.core.agent.domain import sar as sar_module  # noqa: E402
-from opencode_tui.core.agent.domain import pharmacophore as pharmacophore_module  # noqa: E402
-from opencode_tui.core.agent.domain.all_tools import catalog, families, tool_family  # noqa: E402
-from opencode_tui.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
-from opencode_tui.core.agent.toolset import (  # noqa: E402
+from vsagent.core.agent.domain import uniprot as uniprot_module  # noqa: E402
+from vsagent.core.agent.domain import pdbtext  # noqa: E402
+from vsagent.core.agent.domain import preprocess as preprocess_module  # noqa: E402
+from vsagent.core.agent.domain import structure as structure_module  # noqa: E402
+from vsagent.core.agent.domain import chembl as chembl_module  # noqa: E402
+from vsagent.core.agent.domain import chemistry as chemistry_module  # noqa: E402
+from vsagent.core.agent.domain import receptor as receptor_module  # noqa: E402
+from vsagent.core.agent.domain import ligand as ligand_module  # noqa: E402
+from vsagent.core.agent.domain import docking as docking_module  # noqa: E402
+from vsagent.core.agent.domain import affinity as affinity_module  # noqa: E402
+from vsagent.core.agent.domain import listing as listing_module  # noqa: E402
+from vsagent.core.agent.domain import export as export_module  # noqa: E402
+from vsagent.core.agent.domain import complexes as complexes_module  # noqa: E402
+from vsagent.core.agent.domain import prankweb as prankweb_module  # noqa: E402
+from vsagent.core.agent.domain import pockets as pockets_module  # noqa: E402
+from vsagent.core.agent.domain import align as align_module  # noqa: E402
+from vsagent.core.agent.domain import products as products_module  # noqa: E402
+from vsagent.core.agent.domain import analysis as analysis_module  # noqa: E402
+from vsagent.core.agent.domain import screen as screen_module  # noqa: E402
+from vsagent.core.agent.domain import admet as admet_module  # noqa: E402
+from vsagent.core.agent.domain import sar as sar_module  # noqa: E402
+from vsagent.core.agent.domain import pharmacophore as pharmacophore_module  # noqa: E402
+from vsagent.core.agent.domain.all_tools import catalog, families, tool_family  # noqa: E402
+from vsagent.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
+from vsagent.core.agent.toolset import (  # noqa: E402
     LoadToolsTool,
     catalog_text,
     family_of,
     hidden_names,
+    prune_families,
 )
-from opencode_tui.core.agent.trace import TraceWriter, log_directory_for  # noqa: E402
-from opencode_tui.core.event_bus import EventBus  # noqa: E402
-from opencode_tui.core.models import (  # noqa: E402
+from vsagent.core.agent.trace import TraceWriter, log_directory_for  # noqa: E402
+from vsagent.core.event_bus import EventBus  # noqa: E402
+from vsagent.core.models import (  # noqa: E402
     Event,
     Message,
     Part,
     PartType,
     Session,
+    Step,
     TaskState,
     ToolStatus,
 )
-from opencode_tui.screens.chat import ChatScreen  # noqa: E402
-from opencode_tui.screens.chat import SidePanel  # noqa: E402
-from opencode_tui.screens.connection_form import ConnectionFormScreen  # noqa: E402
-from opencode_tui.screens.home import HomeScreen  # noqa: E402
-from opencode_tui.screens.permission import PermissionDialog  # noqa: E402
-from opencode_tui.screens.session_picker import ConfirmDialog, SessionPickerScreen  # noqa: E402
-from opencode_tui.screens.spawn_agent import SpawnAgentScreen  # noqa: E402
-from opencode_tui.screens.subagent import StartBar, SubagentChatScreen  # noqa: E402
+from vsagent.screens.chat import ChatScreen  # noqa: E402
+from vsagent.screens.chat import SidePanel  # noqa: E402
+from vsagent.screens.connection_form import ConnectionFormScreen  # noqa: E402
+from vsagent.screens.home import HomeScreen  # noqa: E402
+from vsagent.screens.permission import PermissionDialog  # noqa: E402
+from vsagent.screens.session_picker import ConfirmDialog, SessionPickerScreen  # noqa: E402
+from vsagent.screens.spawn_agent import SpawnAgentScreen  # noqa: E402
+from vsagent.screens.subagent import StartBar, SubagentChatScreen  # noqa: E402
 
 from fake_model_server import (  # noqa: E402
     FakeModelServer,
@@ -282,7 +293,16 @@ DEMO_META_FIXTURE = ROOT / "tests" / "fixtures" / "demo-meta.json"
 
 # 压缩那几条断言用的上下文窗口。要明显大于系统提示的用量，否则量出来的超支
 # 来自系统提示本身（它是固定开销，压缩机制缩不动），而不是压缩没起作用。
-COMPACT_WINDOW = 16_000
+#
+# 16K 是 AGENTS.md 加「取证顺序」之前量的。那一段让前缀涨了约 700 token，
+# 16K 时事件块正好被挤出降级链（`degraded` 里出现 `event_layer`），
+# 「阶段块进了请求体」那条当场红。这里要验的是「溢出时封出的阶段能进请求体」，
+# 不是「差几百 token 时先丢谁」，所以窗口跟着前缀一起抬。
+#
+# 18K 是 2026-10-30 前缀压到 1838 token 之后重新量的：前缀省下 4800 token，
+# 事件块再也不会被挤掉，18K 就有了真正的余量（当时 18.0/18.4/18.8/19.3K 全绿）。
+# **它仍然是「固定开销 + 余量」而不是阈值**：前缀再涨回四千 token，这条又会假红。
+COMPACT_WINDOW = 18_000
 
 # 领域工具的名字，**从装配处算出来**而不是手抄一份：抄一份的话，加了工具而忘了
 # 更新这里，断言会一直通过，而它要挡的恰好就是「写了却没装」。
@@ -915,23 +935,18 @@ def check_rules() -> None:
     path.write_text("# 改过之后的规则\n", encoding="utf-8")
     check("改过之后的规则" in project_rules(RULES_FIXTURE), "每轮重新读，改动立刻生效")
 
+    # 超限不再截一半：截断处会被模型当成规则的结尾，后面的门禁它根本不知道有。
     lines = [f"第 {index} 行" + "字" * 40 for index in range(819)]
-    body = "\n".join(lines)
-    path.write_text(body, encoding="utf-8")
-    cut = project_rules(RULES_FIXTURE)
-    kept = cut.splitlines()
-    check("省略了" in kept[-1], f"超长规则文件末尾写明省略：{kept[-1]}")
-    check(
-        kept[:-1] == lines[: len(kept) - 1],
-        "截断之后留下的正好是开头的那些行",
-    )
-    check(len(kept) - 1 < len(lines), "确实截掉了后面的行")
-    kept_bytes = sum(len(line.encode("utf-8")) + 1 for line in kept[:-1])
-    check(kept_bytes <= RULES_LIMIT, f"留下的部分没有超过上限：{kept_bytes} 字节")
-    check(
-        kept_bytes + len(lines[len(kept) - 1].encode("utf-8")) + 1 > RULES_LIMIT,
-        "再多留一行就会超过上限",
-    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    over = project_rules(RULES_FIXTURE)
+    check("没有注入" in over, f"超限时明说本次没有注入：{over}")
+    check("AGENTS.md" in over, "并写明是哪个文件，模型才知道该去读谁")
+    check("第 0 行" not in over, "超限时不给半份规则")
+    check(len(over.encode("utf-8")) < 400, f"替代提示本身要短：{len(over)} 字节")
+
+    # 读不出来只让这一段缺席，不能让整轮挂掉：`stable_prefix` 在装配之前调，那里没有 try。
+    path.write_bytes(b"\xff\xfe\x00bad")
+    check(project_rules(RULES_FIXTURE) == "", "编码坏了返回空字符串，不抛异常")
 
     session = Session(id="ses_rules", title="规则")
     path.write_text("# 只许读，不许写\n", encoding="utf-8")
@@ -946,20 +961,61 @@ def check_rules() -> None:
     os.environ[RULES_DIR_ENV] = str(RULES_FIXTURE)
     try:
         check(rules_directory(WORKSPACE_FIXTURE) == RULES_FIXTURE, "VSA_RULES_DIR 能顶掉规则目录")
-        with_rules = build_system_prompt(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
+        with_rules = stable_prefix(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
         check("只许读，不许写" in with_rules, "系统提示里带上规则文件的内容")
-        check(
-            with_rules.index("只许读，不许写") < with_rules.index("工作目录："),
-            "规则排在工作目录之前",
-        )
-
-        os.environ[RULES_DIR_ENV] = str(RULES_FIXTURE / "empty")
-        without = build_system_prompt(Workspace("ses_rules_none", root=WORKSPACE_FIXTURE), session)
-        check("这个项目的规则" not in without, "规则文件不存在时系统提示里没有那一段")
     finally:
         os.environ.pop(RULES_DIR_ENV, None)
 
     path.unlink(missing_ok=True)
+
+
+def check_prefix() -> None:
+    """稳定前缀：规则排最后、平台是真的、日期与状态目录不进前缀、不点名看不见的工具。
+
+    预算、Plan 类别覆盖、越界参数表那三条在 `tools/check_prefix.py`：它们要装全部
+    工具、还要读真实的规则文件，跑一次比这一组贵，分开放着更容易查。
+    """
+    session = Session(id="ses_prefix", title="前缀")
+    RULES_FIXTURE.mkdir(parents=True, exist_ok=True)
+    rules_path = RULES_FIXTURE / "AGENTS.md"
+    rules_path.unlink(missing_ok=True)
+    os.environ[RULES_DIR_ENV] = str(RULES_FIXTURE)
+    try:
+        # 规则缺失时内置那一段就是全貌，用来看「纪律里点了哪些工具」。
+        bare = stable_prefix(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
+        check("这个项目的规则" not in bare, "没有规则文件时那一段不出现")
+
+        rules_path.write_text("# 前缀判据规则\n", encoding="utf-8")
+        with_rules = stable_prefix(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
+        check(with_rules.rstrip().endswith("# 前缀判据规则"), "规则排在前缀最后")
+    finally:
+        os.environ.pop(RULES_DIR_ENV, None)
+        rules_path.unlink(missing_ok=True)
+
+    # 平台那句必须是真的，日期与状态目录留在易变头里。
+    check(platform_note() in bare, "平台那句在稳定前缀里")
+    check("今天 " not in bare, "日期不进前缀（每天变一次会击穿缓存）")
+    check("状态目录" not in bare, "状态目录不进前缀")
+
+    # 内置纪律里不点任何领域工具名：它们首步看不见，点名等于教模型去撞墙。
+    # 核心工具可以点名（load_tools、recall_event 这些一直在清单里）；项目规则也
+    # 可以——门禁写在具体动作上，那里点出工具名是为了说清「这一步调用它之前先做什么」。
+    domain = {name for names in catalog().values() for name in names}
+    named = sorted(name for name in domain if re.search(rf"\b{re.escape(name)}\b", bare))
+    check(not named, f"内置纪律里不出现领域工具名：{named}")
+
+    # 点名了核心工具时，它们必须首步可见——看不见的工具写进前缀就是空话。
+    hidden = hidden_names(session)
+    core_named = [
+        name
+        for name in ("load_tools", "recall_event", "close_phase", "remember", "recall")
+        if name in bare
+    ]
+    check(
+        all(name not in hidden for name in core_named),
+        f"前缀点名的核心工具首步可见：{core_named}",
+    )
+    check("load_tools" in bare, "前缀说明工具按族加载，否则模型不知道怎么装")
 
 
 def build_permission_registry(disabled: frozenset[str] | None = None) -> ToolRegistry:
@@ -1099,7 +1155,7 @@ def check_permission() -> None:
 
     # ---- 计费配额：前 10 次放行，第 11 次起每次都问 ----
     # 两个联网工具用真的（配额是照着工具名判的，名字写错就等于没拦）。
-    from opencode_tui.core.agent.domain import websearch as websearch_module
+    from vsagent.core.agent.domain import websearch as websearch_module
 
     for tool in websearch_module.domain_tools():
         registry.register(tool)
@@ -1302,7 +1358,7 @@ def check_permission() -> None:
     check(
         not bounded.outside_paths(
             registry.get("bash"),
-            {"command": f"cat {Path.home() / '.opencode_tui' / 'state.toml'}"},
+            {"command": f"cat {Path.home() / '.vsagent' / 'state.toml'}"},
         ),
         "程序自己的数据目录仍然放行（`~` 展开之后要落回放行前缀）",
     )
@@ -1385,7 +1441,7 @@ def check_disabled_tools() -> None:
     开关关掉之后它不在数组里，模型连它存在都不知道。
     """
     root = ROOT / ".probe" / "tools_fixture"
-    config = root / ".opencode_tui"
+    config = root / ".vsagent"
     config.mkdir(parents=True, exist_ok=True)
     path = config / "tools.toml"
     path.unlink(missing_ok=True)
@@ -1530,7 +1586,7 @@ def check_disabled_tools() -> None:
     frozen, executable = getattr(sys, "frozen", None), sys.executable
     try:
         sys.frozen = True
-        sys.executable = str(exe_dir / "opencode-tui.exe")
+        sys.executable = str(exe_dir / "VSAgent.exe")
         check(
             project_config_directory(Path("/nowhere")) == exe_dir / CONFIG_DIRECTORY,
             "打包后配置目录取自可执行文件所在处，与启动目录无关",
@@ -2010,9 +2066,176 @@ def check_workspace() -> None:
     check("当前时间：" in text, "状态描述里有当前时间")
     check(workspace.ensure().exists(), "ensure() 建出工作目录")
     check(
-        ".opencode_tui" in str(Workspace("ses_x").root) and "workspaces" in str(Workspace("ses_x").root),
-        "默认根在 ~/.opencode_tui/workspaces 下",
+        ".vsagent" in str(Workspace("ses_x").root) and "workspaces" in str(Workspace("ses_x").root),
+        "默认根在 ~/.vsagent/workspaces 下",
     )
+
+
+def check_config_paths() -> None:
+    """用户目录改名之后旧数据还能找回来。
+
+    改名前那一份在 `~/.opencode_tui`，改名后代码只认 `~/.vsagent`。不搬的话
+    升级一次就是「会话全没了、接口还得重填」，而程序本身一切正常、不会报错。
+    """
+    from vsagent.core import paths
+
+    with tempfile.TemporaryDirectory() as raw:
+        home = Path(raw)
+        legacy = home / paths.LEGACY_CONFIG_DIRECTORY
+        legacy.mkdir()
+        (legacy / "state.toml").write_text("会话", encoding="utf-8")
+        moved = paths.migrate_legacy_config(home)
+        check(
+            moved is not None and moved.target == home / paths.CONFIG_DIRECTORY,
+            f"旧目录整体搬到新名字：{moved}",
+        )
+        check(moved is not None and moved.files == 1, f"迁移结果里报出搬了几个文件：{moved}")
+        check(
+            (home / paths.CONFIG_DIRECTORY / "state.toml").read_text(encoding="utf-8") == "会话",
+            "旧状态文件跟着搬过去，内容不变",
+        )
+        check(not legacy.exists(), "搬完之后旧目录不再留着")
+        # 两边都在：新的说了算，旧的留着不动（合并会覆盖用户已经在新目录里写的东西）。
+        legacy.mkdir()
+        (legacy / "stale.txt").write_text("旧", encoding="utf-8")
+        check(paths.migrate_legacy_config(home) is None, "新目录已经存在时不再搬")
+        check(
+            (home / paths.CONFIG_DIRECTORY / "state.toml").exists(),
+            "新目录没有被旧目录覆盖",
+        )
+        check((legacy / "stale.txt").exists(), "旧目录原样留着，不删用户的东西")
+    # 没有旧目录时什么都不做，也不创建空目录。
+    with tempfile.TemporaryDirectory() as raw:
+        home = Path(raw)
+        check(paths.migrate_legacy_config(home) is None, "没有旧目录时返回 None")
+        check(not (home / paths.CONFIG_DIRECTORY).exists(), "没有旧目录时不凭空建一个")
+    # 同一个函数也用来搬**项目侧**那一份（`<项目>/.opencode_tui` → `<项目>/.vsagent`）：
+    # 那里面是工具开关、判定规则与钩子，丢了模型会多出几个本该关掉的工具。
+    with tempfile.TemporaryDirectory() as raw:
+        project = Path(raw)
+        legacy = project / paths.LEGACY_CONFIG_DIRECTORY
+        legacy.mkdir()
+        (legacy / "tools.toml").write_text("[tools]\n", encoding="utf-8")
+        check(
+            paths.migrate_legacy_config(project) is not None
+            and (project / paths.CONFIG_DIRECTORY / "tools.toml").exists(),
+            "项目侧配置目录也按同一个规则搬过去",
+        )
+        check(
+            (project / paths.CONFIG_DIRECTORY / "tools.toml").exists(),
+            "工具开关跟着搬到项目侧新目录",
+        )
+
+
+def check_config_migrate() -> None:
+    """P0-2：项目侧配置也要跟着改名搬过去，而且搬的是 exe 旁边那一份。
+
+    四件必须成立的事：
+      · 只存在旧目录时迁移成功，内容逐字节相同，并报出搬了几个文件；
+      · 两个目录都在时不动新的，也不删旧的；
+      · 打包布局下搬的是**可执行文件旁边**那份，不是启动目录；
+      · 搬完之后 `load_tool_switches` 真的读到了被关掉的工具。
+
+    这条是 P0 而不是 P2：漏搬的不只是工具开关，`permissions.toml` 里的 deny
+    也一起失效——用户设的安全边界在打包版上等于不存在。
+    """
+    from vsagent.core import paths
+
+    content = (
+        "[tools]\n"
+        "search_pdb = false\n"
+        "search_literature = false\n"
+        "switch_receptor = false\n"
+    )
+
+    # ---- 一、只存在旧目录：整体搬过去，内容逐字节相同 ----
+    with tempfile.TemporaryDirectory() as raw:
+        project = Path(raw)
+        legacy = project / paths.LEGACY_CONFIG_DIRECTORY
+        (legacy / "nested").mkdir(parents=True)
+        (legacy / "tools.toml").write_text(content, encoding="utf-8")
+        (legacy / "permissions.toml").write_text(
+            '[bash]\ndeny = ["rm -rf*"]\n', encoding="utf-8"
+        )
+        (legacy / "nested" / "hooks.toml").write_text("[pre]\n", encoding="utf-8")
+
+        moved = paths.migrate_legacy_config(project)
+        check(moved is not None and moved.files == 3, f"报出搬过去的文件数（含子目录）：{moved}")
+        check(
+            (project / paths.CONFIG_DIRECTORY / "tools.toml").read_bytes()
+            == content.encode("utf-8"),
+            "工具开关逐字节搬过去",
+        )
+        check(
+            (project / paths.CONFIG_DIRECTORY / "permissions.toml").exists()
+            and (project / paths.CONFIG_DIRECTORY / "nested" / "hooks.toml").exists(),
+            "判定规则与子目录里的钩子一起搬过去",
+        )
+        check(not legacy.exists(), "搬完之后旧目录不在了")
+
+    # ---- 二、两个目录都在：新的说了算，旧的原样留着 ----
+    with tempfile.TemporaryDirectory() as raw:
+        project = Path(raw)
+        (project / paths.LEGACY_CONFIG_DIRECTORY).mkdir()
+        (project / paths.LEGACY_CONFIG_DIRECTORY / "tools.toml").write_text(
+            "[tools]\nsearch_pdb = false\n", encoding="utf-8"
+        )
+        (project / paths.CONFIG_DIRECTORY).mkdir()
+        (project / paths.CONFIG_DIRECTORY / "tools.toml").write_text(
+            "[tools]\nbash = false\n", encoding="utf-8"
+        )
+        check(paths.migrate_legacy_config(project) is None, "新目录已经存在时不再搬")
+        check(
+            "bash"
+            in (project / paths.CONFIG_DIRECTORY / "tools.toml").read_text(encoding="utf-8"),
+            "新目录里的开关没有被旧目录覆盖",
+        )
+        check(
+            (project / paths.LEGACY_CONFIG_DIRECTORY / "tools.toml").exists(),
+            "旧目录原样留着，不删用户的东西",
+        )
+
+    # ---- 三、打包布局：搬的是可执行文件旁边那份，不是启动目录 ----
+    # 从别的目录启动 exe 时 cwd ≠ exe 所在目录。搬 cwd 会搬到用户没在看的地方，
+    # 而 exe 旁边那份原封不动——正是这次实测到的形态（dist/.opencode_tui 还在）。
+    with tempfile.TemporaryDirectory() as raw:
+        exe_dir = Path(raw) / "dist"
+        exe_dir.mkdir()
+        legacy = exe_dir / paths.LEGACY_CONFIG_DIRECTORY
+        legacy.mkdir()
+        (legacy / "tools.toml").write_text(content, encoding="utf-8")
+
+        frozen, executable = getattr(sys, "frozen", None), sys.executable
+        try:
+            sys.frozen = True
+            sys.executable = str(exe_dir / "VSAgent.exe")
+            # 启动目录是另一个地方（模拟从桌面或别的项目目录启动）。
+            elsewhere = Path(raw) / "somewhere"
+            elsewhere.mkdir()
+            target = project_config_directory(elsewhere)
+            check(
+                target == exe_dir / paths.CONFIG_DIRECTORY,
+                f"打包后配置目录取自 exe 所在处，与启动目录无关：{target}",
+            )
+            check(
+                paths.migrate_legacy_config(target.parent) is not None,
+                "打包布局下迁移了 exe 旁边那份",
+            )
+            disabled, source = load_tool_switches(elsewhere)
+            check(
+                {"search_pdb", "search_literature", "switch_receptor"} <= set(disabled),
+                f"迁移后读到了被关掉的三个工具：{sorted(disabled)}",
+            )
+            check(
+                source.get("search_pdb") == exe_dir / paths.CONFIG_DIRECTORY / "tools.toml",
+                f"开关的来源指向 exe 旁边那份：{source.get('search_pdb')}",
+            )
+        finally:
+            if frozen is None:
+                del sys.frozen
+            else:
+                sys.frozen = frozen
+            sys.executable = executable
 
 
 def check_prompt() -> None:
@@ -2043,19 +2266,26 @@ def check_prompt() -> None:
     assistant.add_part(Part(type=PartType.STEP_FINISH, text="2 · 12 tok · 30 ms"))
     session.add_message(assistant)
 
-    system_prompt = build_system_prompt(workspace, session)
+    system_prompt = stable_prefix(workspace, session)
     prefix = stable_prefix(workspace, session)
     check(
-        "引用它们一律用 handle，不要写文件路径" in system_prompt,
+        "引用一律用 handle，不要写文件路径" in system_prompt,
         "系统提示里写着「收 handle 不收路径」那条纪律",
     )
     check(
-        "import_structure" in system_prompt,
-        "并点明全库只有 import_structure 一个动作收路径（规则要能指到具体名字上）",
+        "以各自工具的描述为准" in system_prompt,
+        "收路径的动作不枚举，改为指向各工具描述（枚举过三份写法，全都漂了）",
+    )
+    # handle 的出处改指「任务状态里的工作区索引」：那是每步都在的 TASK 层。
+    # 原先前缀写「从 list_workspace 里取」，而它属于 listing 族、首步不可见——
+    # 模型照着做会先撞一次墙。
+    check(
+        "工作区索引" in system_prompt,
+        "handle 从任务状态的工作区索引里取",
     )
     check(
-        "list_workspace" in system_prompt and "describe_entry" in system_prompt,
-        "handle 从哪儿取、详情在哪儿查，也写在同一段里",
+        "list_workspace" not in system_prompt and "describe_entry" not in system_prompt,
+        "前缀不点名首步看不见的工具（撞墙一次就是白花一步）",
     )
     # 复核癖：工具已经把结果写进返回，模型还要 ls → stat → md5sum 再核一遍。
     # 实测五次运行里复核占工具调用的 25–81%，钱不多（多 35 步只多 $0.014），
@@ -2065,8 +2295,8 @@ def check_prompt() -> None:
         "提示里写着：工具已经给出的事实不要再复核一遍",
     )
     check(
-        "md5sum" in system_prompt and "describe_entry" in system_prompt,
-        "点明了不该做的（ls/stat/md5sum 逐项）与该用的（describe_entry / read）",
+        "md5sum" in system_prompt and "read" in system_prompt,
+        "点明了不该做的（ls/stat/md5sum 逐项）与该用的（read 一次看完）",
     )
     # 现场来的三条：模型写 pwd、写 cp、把上一条命令的 cd 当基准。它只能从系统提示里知道
     # 「每次调用是一个新解释器」「这里是哪个平台」，否则只能靠一次次失败去猜。
@@ -2088,6 +2318,47 @@ def check_prompt() -> None:
         ("这套环境是 Windows" in system_prompt) == sys.platform.lower().startswith("win"),
         f"平台那句与真实平台一致（sys.platform={sys.platform}）",
     )
+    # 子 agent 在 37 步里一次都没被派过：前缀全文不含 spawn_agent，模型只在
+    # 工具清单的一行 description 里见过它——那句话只在「已经想到要用」时才有用。
+    check("该派子 agent" in system_prompt, "前缀里有父会话视角的派发规则")
+    check("spawn_agent" in system_prompt, "派发规则点到具体工具名")
+    check(
+        "子 agent 看不到你的推理" in system_prompt,
+        "写清了「什么时候不该派」：子任务依赖当前推理时不该派",
+    )
+    # 检索也是同一类问题：三个工具在注册表里、也能装，但项目规则原先只有「不要检索」
+    # 这一侧的限制，没有任何一句说「什么时候该查」。实测 α7 那次会话 0 次调用，
+    # 模型在 reasoning 里明确权衡过并选择了不查。取证顺序必须写进规则，
+    # 否则它只存在于工具描述里，而工具没装族时模型读不到。
+    check("search_corpus" in system_prompt, "规则里有取证顺序的第一站：本地语料")
+    check("命中就停" in system_prompt, "取证顺序写明命中即止，不是把三层都走一遍")
+    check(
+        "search_literature" in system_prompt and "search_web" in system_prompt,
+        "本地没有时给出去处：PubMed 与联网搜索都点到名字",
+    )
+    check(
+        "本地语料与 PubMed 都没有查到" in system_prompt,
+        "查不到时要说「没查到」，不是「没有这回事」",
+    )
+    # 规则里点名的检索工具必须真的能装。规则教模型去调一个装不进来的工具，
+    # 它撞墙之后会退回「自己做」——那正是 §1.3 要解决的那个问题。
+    # 名字从规则文件里现取，不手抄：改规则时不用回来同步这份名单。
+    import re as _re
+
+    named = set(_re.findall(r"`(search_[a-z_]+)`", project_rules(rules_directory(ROOT))))
+    installable = {name for names in catalog().values() for name in names}
+    installable -= set(load_disabled(ROOT)[0])
+    check(
+        named and named <= installable,
+        f"规则里点名的检索工具都能装：{sorted(named - installable)}",
+    )
+    child = Session(id="ses_child", title="子任务", depth=1)
+    child_prefix = stable_prefix(workspace, child)
+    check(
+        "该派子 agent" not in child_prefix,
+        "子 agent 的前缀里没有派发规则（它不能再派，写了只是白占额度）",
+    )
+    check("你是从父会话分出的子 agent" in child_prefix, "子 agent 有它自己的身份段")
     built = ContextAssembler(context_window=200_000).build(session, prefix)
     roles = [item["role"] for item in built.messages]
     check(roles == ["system", "user", "assistant", "tool", "assistant"], f"按角色翻译成消息序列：{roles}")
@@ -2189,9 +2460,17 @@ def check_prompt() -> None:
     kept_text = json.dumps([item["content"] for item in built.messages[2:]], ensure_ascii=False)
     check("第 39 条消息" in kept_text, "最后一条消息永远留着")
     check("第 0 条消息" not in kept_text, "丢掉的是开头那一段")
+    # 引用清单只列**最近** REFS_TURN_LIMIT 组，更早的写一行「再往前还有 N 组」。
+    # 原先断言 dropped_turns[0]（最早那组）在清单里，它隐含「移出不超过 20 组」；
+    # 而移出多少组取决于前缀长度——AGENTS.md 长一截就会破，破的还不是被测的那条契约。
     check(
-        f"- turn {built.dropped_turns[0]}：" in built.messages[1]["content"],
-        "被移出的交互组在引用清单里各占一行",
+        f"- turn {built.dropped_turns[-1]}：" in built.messages[1]["content"],
+        "最近被移出的交互组在引用清单里",
+    )
+    check(
+        built.dropped <= REFS_TURN_LIMIT
+        or "再往前还有" in built.messages[1]["content"],
+        f"移出超过 {REFS_TURN_LIMIT} 组时写明「再往前还有 N 组」，不装作列全了",
     )
     try:
         ContextAssembler(context_window=2_000).build(long_session, prefix)
@@ -2246,6 +2525,32 @@ def check_prompt() -> None:
             forced = True
     check(monotone, "记忆只让移出变多，不会变少")
     check(forced, "把记忆塞进小窗口会真的多移出几组（证明记忆计入预算）")
+
+
+def check_output_limit() -> None:
+    """截断文案要能让模型自己找到全文（P2-3）。
+
+    实测模型第一次自己写了 `[:300]`，只看到前半段，以为「输出被压缩了」，
+    于是同一个 `meta.json` 用 bash + python3 读了四次（11.4K / 6.4K / 2.9K / 1.4K
+    字符）。原来的文案只说「省略多少」，不说原文多长、不说怎么翻页——
+    模型能做的只有换个写法再读一遍。
+    """
+    # 三行、一万二千字符：行数太少，按内容挑不出东西，必然走按位置兜底那一档。
+    single = "甲" * 5000 + "\n" + "乙" * 5000 + "\n" + "丙" * 2000
+    check(len(single) > MODEL_OUTPUT_LIMIT, f"样本确实超限：{len(single)}")
+    cut = truncate_for_model(single)
+    check(f"原文 {len(single)} 字符" in cut, f"写明原文多长：{cut[2000:2300]}")
+    check("read <path> offset=0 limit=2000" in cut, "给出拿全文的具体写法")
+    check("grep" in cut, "也给了定位关键行的那条路")
+    check(
+        "重读同一个文件也一样" in cut,
+        "点明重读不会变长（那次连读四次的起因就是不知道这一点）",
+    )
+    check(
+        len(cut) <= MODEL_OUTPUT_LIMIT + 300,
+        f"说明文字本身不把额度吃回去：{len(cut)}",
+    )
+    check(truncate_for_model("短输出") == "短输出", "没超上限时一个字都不加")
 
 
 def delayed_command(seconds: float, marker: Path) -> str:
@@ -2322,6 +2627,32 @@ async def check_bash_tool() -> None:
             echoed.output == "中文测试",
             f"真命令输出的中文原样回来：{echoed.output!r}",
         )
+
+    # 长输出封顶：现场是模型用 `python -c` 把整份产物 JSON 打印出来（27.8 KB /
+    # 6,984 token），而那一步只要二十个口袋的摘要。封顶只砍中间，开头与结尾都在，
+    # 省略行里写明省了多少、完整输出多大、中间那段怎么取。
+    check(clip_bash_output("短输出") == "短输出", "没超限的输出原样返回")
+    at_limit = "x" * BASH_OUTPUT_CHARS
+    check(clip_bash_output(at_limit) == at_limit, "正好等于上限时不截断")
+    flood = await tool.run({"command": f'"{sys.executable}" -c "print(\'x\' * 40000)"'})
+    check(len(flood.output) < 40000, f"超长输出被压到预算内：{len(flood.output)} 字符")
+    check(flood.output.startswith("x" * 100), "开头那段留着——清单与表头在最前面")
+    check(flood.output.endswith("x" * 100), "结尾那段留着——构建与测试的结论在最后")
+    marker = next((line for line in flood.output.splitlines() if "中间省略" in line), "")
+    check(
+        "40,000" in marker,
+        f"省略行说清省了多少、原文多大：{marker}",
+    )
+    check(
+        "重跑" in marker and "grep" in marker,
+        "省略行告诉模型怎么只看中间那段，不是让它整段重打",
+    )
+    # 多行日志：省略行要给出省掉多少行，头尾也要正好切在整行之外。
+    lines = "\n".join(f"line {index:04d} " + "y" * 80 for index in range(400))
+    clipped = clip_bash_output(lines)
+    check(clipped.startswith("line 0000"), "多行输出的开头那一行留着")
+    check(clipped.rstrip().endswith("y" * 80) and "line 0399" in clipped, "最后一行留着")
+    check("约" in clipped and "行" in clipped, "多行输出要报出省略了多少行")
 
     raised = ""
     try:
@@ -2877,36 +3208,34 @@ async def check_loop(server: FakeModelServer) -> None:
     # 断言量的是「总量在可用额度以内」这个不变量，窗口多大不影响它的含义，
     # 但要大到扣完固定开销之后仍有余量——否则量出来的超支来自固定开销，与压缩无关。
     loop.context_window = COMPACT_WINDOW
-    server.script(
-        Reply(chunks=[*text_chunks("这一段收成摘要", size=3), usage_chunk(3, 3)]),
-        Reply(chunks=[*text_chunks("好", size=1), usage_chunk(2, 2)]),
-    )
+    server.script(Reply(chunks=[*text_chunks("好", size=1), usage_chunk(2, 2)]))
     message = await loop.stream_reply(compact_session, "")
     loop.context_window = 200_000
     assert message is not None
+    # 溢出不再请求摘要：那一段被就地封成一个阶段（流水 + 结论），零请求。
+    # 摘要机制本身已经退休（§4.7）：它的三段分别由 TASK、流水、阶段结论覆盖。
     compactions = [part for part in message.parts if part.type is PartType.COMPACTION]
-    check(len(compactions) == 1, "历史超过窗口时补一条 COMPACTION Part")
+    check(compactions == [], "溢出不再写摘要 Part（摘要已退休）")
+    check(bool(compact_session.events), "溢出时封出一个阶段")
+    check(compact_session.events[-1].kind == "auto", "自动封存的阶段标成 auto")
     check(
-        compactions[0].text == f"已把前 {compact_session.summary_upto} 条消息收成摘要",
-        f"压缩那一条写着收了多少条：{compactions[0].text}",
+        compact_session.summary == "" and compact_session.summary_upto == 0,
+        "摘要不再被写",
     )
-    check(compact_session.summary == "这一段收成摘要", f"摘要写进会话：{compact_session.summary}")
-    check(compact_session.summary_upto > 0, "摘要记下覆盖到第几条")
     request = server.requests[-1]["messages"]
     check(request[0]["role"] == "system", "第一条仍然是系统提示")
-    # 不判 startswith：那一头最前面现在是运行环境（日期/目录），摘要排在它后面。
-    check(
-        SUMMARY_NOTICE in str(request[1]["content"]),
-        f"摘要插在系统提示之后的那一条里：{str(request[1]['content'])[:40]}",
+    body = "\n".join(str(item["content"]) for item in request)
+    check(EVENT_NOTICE in body, "阶段块进了请求体")
+    covered = compact_session.events[-1].end
+    # 按**消息本身**数，不按子串数：阶段标题与结论里也会出现「第 N 条消息」，
+    # 用子串数会把流水里的引用算成「原文还在」。
+    present = sum(
+        1
+        for item in request
+        if str(item.get("content") or "").startswith("第 ")
+        and "条消息" in str(item.get("content"))
     )
-    check(
-        "这一段收成摘要" in str(request[1]["content"]),
-        f"摘要正文进了请求体：{str(request[1]['content'])[:160]}",
-    )
-
-    content = json.dumps([item["content"] for item in request], ensure_ascii=False)
-    present = sum(1 for index in range(40) if f"第 {index} 条消息" in content)
-    check(present == 40 - compact_session.summary_upto, f"摘要覆盖的那一段原文不再发出去：还剩 {present} 条")
+    check(present == 40 - covered, f"阶段覆盖的那一段原文不再发出去：还剩 {present} 条")
     total = sum(estimate_tokens(str(item["content"])) for item in request)
     check(
         total <= int(COMPACT_WINDOW * 0.8),
@@ -3051,7 +3380,7 @@ async def check_switch_model(server: FakeModelServer) -> None:
 
 
 async def check_compact(server: FakeModelServer) -> None:
-    """手动压缩：位置推前面，紧接着发问时把丢掉的那一段收成摘要。"""
+    """手动压缩：把当前这一段封成一个阶段，位置往前推，下一次发问只带最近几条。"""
     server.clear()
     bus = EventBus()
     registry = ToolRegistry()
@@ -3062,7 +3391,7 @@ async def check_compact(server: FakeModelServer) -> None:
     for index in range(12):
         ask(session, f"第 {index} 句")
     check(session.compact_upto == 0, "新会话的压缩位置是零")
-    check(session.summary == "" and session.summary_upto == 0, "新会话没有摘要")
+    check(session.events == [], "新会话没有阶段")
 
     server.script(Reply(chunks=[*text_chunks("收到了", size=2), usage_chunk(1, 1)]))
     message = await loop.stream_reply(session, "")
@@ -3072,44 +3401,38 @@ async def check_compact(server: FakeModelServer) -> None:
     check(full > KEEP_MESSAGES, f"没压缩时发出去的消息远多于保留条数：{full}")
 
     kept = loop.compact_session(session)
-    check(kept == KEEP_MESSAGES, "压完之后只留最近几条")
-    check(session.compact_upto == sent - KEEP_MESSAGES, "压缩位置记在会话上")
+    check(kept == 0, f"压完之后原文全部让位给流水：还剩 {kept} 条")
+    check(session.compact_upto == sent, "压缩位置推到这一段末端")
     check(len(session.messages) == sent, "压缩不动会话里的消息")
-    check(session.summary == "", "压缩这一步本身不生成摘要")
+    check(session.summary == "", "压缩这一步本身不写摘要")
+    check(bool(session.events), "压缩这一步把这一段封成一个阶段")
+    check(session.events[-1].kind == "local", "用户按出来的阶段标成 local")
+    check(session.events[-1].end == session.compact_upto, "阶段覆盖到压缩位置")
 
     server.clear()
-    server.script(
-        Reply(chunks=[*text_chunks("这一段收成摘要", size=3), usage_chunk(5, 5)]),
-        Reply(chunks=[*text_chunks("接着答", size=2), usage_chunk(1, 1)]),
-    )
+    server.script(Reply(chunks=[*text_chunks("接着答", size=2), usage_chunk(1, 1)]))
     message = await loop.stream_reply(session, "")
     assert message is not None
-    check(
-        session.summary == "这一段收成摘要",
-        f"下一次发问时把丢掉的那一段收成摘要：{session.summary}",
-    )
-    check(
-        session.summary_upto == session.compact_upto,
-        f"摘要覆盖到压缩位置：{session.summary_upto} 对 {session.compact_upto}",
-    )
+    check(session.summary == "" and session.summary_upto == 0, "下一次发问也不再写摘要")
     fed = server.requests[-1]["messages"]
     check(fed[0]["role"] == "system", "压缩之后最前面仍然是系统提示")
-    check(
-        SUMMARY_NOTICE in str(fed[1]["content"]),
-        f"摘要插在系统提示之后的那一条里：{str(fed[1]['content'])[:30]}",
+    body = "\n".join(str(item.get("content") or "") for item in fed)
+    check(EVENT_NOTICE in body, "阶段块进了请求体")
+    raw = sum(
+        1
+        for item in fed
+        if str(item.get("content") or "").startswith("第 ")
     )
-    check("这一段收成摘要" in str(fed[1]["content"]), "摘要正文进了请求体")
-    check(len(fed) == KEEP_MESSAGES + 2, f"压完之后只带最近几条：{len(fed)} 条")
+    check(raw == 0, f"原文全部让位给流水：还剩 {raw} 条")
     check(
-        [part.text for part in message.parts if part.type is PartType.COMPACTION]
-        == [f"已把前 {session.summary_upto} 条消息收成摘要"],
-        "压缩这一轮在界面上留一条记录",
+        [part.text for part in message.parts if part.type is PartType.COMPACTION] == [],
+        "这一轮没有摘要 Part",
     )
     check(
         [part.text for part in message.parts if part.type is PartType.TEXT] == ["接着答"],
-        "摘要之后这一步照常问模型",
+        "这一步照常问模型",
     )
-    check(session.total_tokens() > 0, "摘要那一次请求的用量也记进 tokens")
+    check(session.total_tokens() > 0, "用量记进 tokens")
 
     same = session.compact_upto
     server.clear()
@@ -3118,9 +3441,8 @@ async def check_compact(server: FakeModelServer) -> None:
     assert message is not None
     check(session.compact_upto >= same, "再压一次不会把位置往回退")
     check(
-        [part.text for part in message.parts if part.type is PartType.COMPACTION]
-        == [f"已丢弃 {session.summary_upto} 条更早的消息"],
-        "已经收进摘要的那一段不再收一次",
+        [part.text for part in message.parts if part.type is PartType.COMPACTION] == [],
+        "已经封存的那一段不再收一次，也不再重复提示（P3-1）",
     )
     check(len(server.requests) == 1, "不再收摘要时只发一次请求")
 
@@ -3129,17 +3451,60 @@ async def check_compact(server: FakeModelServer) -> None:
     check(loop.compact_session(fresh) == 1, "消息不够多时原样返回条数")
     check(fresh.compact_upto == 0, "消息不够多时不记压缩位置")
 
+    # 带工具的轮次在轮末已经自动封存过：这里没有新的一段可封（`_seal_phase`
+    # 返回 None），但 `/compact` 仍要把硬边界推到最后一个事件的末端。不推的话
+    # 最新一段的原文留在 RECENT 里，用户按下去什么也没腾出来，界面还回
+    # 「这一段已经压过了」。
+    sealed = Session(id="ses_compact_sealed", title="轮末已封存")
+    for index in range(6):
+        sealed.add_message(Message(role="user")).add_part(
+            Part(type=PartType.TEXT, text=f"第 {index} 句")
+        )
+        reply = sealed.add_message(Message(role="assistant"))
+        reply.add_part(Part(type=PartType.STEP_START))
+        reply.add_part(
+            Part(
+                type=PartType.TOOL,
+                tool_name="echo",
+                tool_status=ToolStatus.COMPLETED,
+                tool_input={},
+                tool_output="ok",
+            )
+        )
+        reply.add_part(Part(type=PartType.STEP_FINISH))
+        seal_phase(
+            sealed,
+            kind="auto",
+            upto=event_boundary(sealed, len(sealed.messages)),
+            title=f"阶段{index + 1}",
+        )
+    check(sealed.compact_upto == 0 and len(sealed.events) == 6, "轮末封存不推硬边界")
+    check(
+        loop.compact_session(sealed) == 0,
+        "已经封存过的会话按下去也要把原文压掉，返回 0 条要发",
+    )
+    check(
+        sealed.compact_upto == len(sealed.messages),
+        f"硬边界推到最后一个事件的末端：{sealed.compact_upto}",
+    )
+    check(len(sealed.events) == 6, "没有新的一段可封时不重复封")
+    check(loop.compact_session(sealed) == 0, "再按一次仍是 0 条，位置不往回退")
 
-async def check_summary_compaction(server: FakeModelServer) -> None:
-    """摘要真的进了请求体：用户给出的约束留住、原文不再发、Part 上的完整内容不动。"""
+
+async def check_overflow_phase(server: FakeModelServer) -> None:
+    """溢出时封存阶段而不是写摘要：原文让位、流水进场、Part 一字不改。"""
     server.clear()
     bus = EventBus()
     registry = ToolRegistry()
     registry.register(EchoTool())
-    loop = build_loop(server, bus, registry, context_window=20_000)
+    # 24K 而不是 20K：20K 时这一份会话正好卡在边界上——封出来的事件块只有 110 token，
+    # 而前缀涨了 180 token（阶段纪律 + close_phase 的说明）就把那 110 挤出去了，
+    # 降级链于是先丢掉事件层（它排在 RECENT 之前）。要验的是「封存之后流水进场」，
+    # 不是「正好差一个 token 时先丢谁」，所以把窗口放宽到能容下那 110 token。
+    loop = build_loop(server, bus, registry, context_window=24_000)
 
     constraint = "约束：所有报告用中文写，分子编号保留原始大小写。"
-    session = Session(id="ses_summary", title="摘要压缩")
+    session = Session(id="ses_phase", title="阶段压缩")
     ask(session, constraint)
     filler = "分子筛选过程的中间记录，" + "记" * 500
     for index in range(30):
@@ -3150,60 +3515,38 @@ async def check_summary_compaction(server: FakeModelServer) -> None:
     original = [part.text for message in session.messages for part in message.parts]
     check(len(session.messages) == 31, "这一段会话造出了 31 条消息")
 
-    summary_text = (
-        "一、用户的目标与意图\n筛选分子。\n"
-        "二、已经完成的改动与涉及的文件\n还没有改动。\n"
-        "三、待办的下一步\n继续筛选。\n"
-        f"四、用户明确给出的约束与要求\n{constraint}"
-    )
-    server.script(
-        Reply(chunks=[*text_chunks(summary_text, size=5), usage_chunk(7, 7)]),
-        Reply(chunks=[*text_chunks("接着做", size=2), usage_chunk(1, 1)]),
-    )
+    server.script(Reply(chunks=[*text_chunks("接着做", size=2), usage_chunk(1, 1)]))
     message = await loop.stream_reply(session, "")
     assert message is not None
-    check(session.summary_upto > 0, f"超窗之后生成了摘要，覆盖到第 {session.summary_upto} 条")
-
-    # 摘要那一次请求：指令四段齐全，用户给出的约束原样喂给模型
-    summary_request = server.requests[0]["messages"]
-    check(summary_request[0]["content"] == SUMMARY_INSTRUCTION, "摘要请求的第一条是摘要指令")
-    for section in (
-        "一、用户的目标与意图",
-        "二、已经完成的改动与涉及的文件",
-        "三、待办的下一步",
-        "四、用户明确给出的约束与要求",
-    ):
-        check(section in summary_request[0]["content"], f"摘要指令里有 {section}")
-    check(
-        constraint in summary_request[1]["content"],
-        "摘要请求把用户给出的约束一起交给模型",
-    )
-    check(constraint in session.summary, "摘要正文里带着用户给出的约束")
+    check(len(server.requests) == 1, f"溢出不再多花一次摘要请求：{len(server.requests)}")
+    check(session.summary_upto == 0, "摘要没被写（它已经退休）")
+    check(bool(session.events), "溢出封出了阶段")
+    covered = session.events[-1].end
+    check(covered > 0, f"阶段覆盖到第 {covered} 条")
 
     fed = server.requests[-1]["messages"]
     check(fed[0]["role"] == "system", "发出去的第一条是系统提示")
-    # 那一头最前面是运行环境，摘要排在它后面，所以只判「在这一条里」。
+    body = "\n".join(str(item.get("content") or "") for item in fed)
+    check(EVENT_NOTICE in body, "阶段块进了请求体")
+    check("结论：" in body, "阶段结论也进了请求体")
     check(
-        SUMMARY_NOTICE in str(fed[1]["content"]),
-        f"第二条里带着摘要那一段：{str(fed[1]['content'])[:30]}",
+        session.events[-1].steps == [],
+        "纯文本会话没有工具调用，阶段只有标题与结论",
     )
-    check(
-        str(fed[1]["content"]).split(SUMMARY_NOTICE, 1)[1].strip().startswith(session.summary),
-        "摘要那一条的正文以会话上的摘要开头",
+    raw = sum(
+        1
+        for item in fed
+        if str(item.get("content") or "").startswith("第 ")
     )
-    check(constraint in str(fed[1]["content"]), "摘要那一条的正文含用户给出的约束")
-
-    sent = json.dumps(fed, ensure_ascii=False)
-    check("第 0 条" not in sent, "被摘要覆盖的那一段原文不再发出去")
-    check("第 29 条" in sent, "保留的那几条原文照常发出去")
+    check(raw == 31 - covered, f"被阶段覆盖的原文不再发出去：还剩 {raw} 条")
 
     kept = [part.text for message in session.messages[:31] for part in message.parts]
     check(kept == original, "会话里的 Part 内容一条不少、一字不改")
     check(
         len(session.messages[1].parts[0].text) == len(f"第 0 条，{filler}"),
-        "被摘要覆盖的那一条在会话里仍是完整长度",
+        "被阶段覆盖的那一条在会话里仍是完整长度",
     )
-    check(session.total_tokens() > 0, "摘要那一次请求的用量也记进 tokens")
+    check(session.total_tokens() > 0, "这一轮的用量记进 tokens")
 
 
 async def check_effort(
@@ -3792,7 +4135,7 @@ def rendered_lines(widget: object) -> list[str]:
     ]
 
 
-async def wait_idle(app: OpenCodeApp, pilot: object, timeout: float = 10.0) -> None:
+async def wait_idle(app: VSAgentApp, pilot: object, timeout: float = 10.0) -> None:
     """等当前生成任务结束。"""
     waited = 0.0
     while waited < timeout:
@@ -3804,7 +4147,7 @@ async def wait_idle(app: OpenCodeApp, pilot: object, timeout: float = 10.0) -> N
     raise AssertionError("等待生成任务结束超时")
 
 
-def tool_parts_of(app: OpenCodeApp) -> list[Part]:
+def tool_parts_of(app: VSAgentApp) -> list[Part]:
     """当前会话里全部的 TOOL Part。"""
     return [
         part
@@ -3825,7 +4168,7 @@ async def check_home_new_session() -> None:
         Connection("https://api.example.com/v1", "k", "deepseek-flash"),
     )
 
-    app = OpenCodeApp(root=ROOT, state_path=state)
+    app = VSAgentApp(root=ROOT, state_path=state)
 
     async def fake_stream(session: object, prompt: str) -> None:
         """不发请求：这一组验的是会话选择，不是模型链路。"""
@@ -3880,7 +4223,7 @@ async def check_unconfigured_app() -> None:
     state.unlink(missing_ok=True)
     connection_path_for(state).unlink(missing_ok=True)
 
-    app = OpenCodeApp(root=ROOT, state_path=state)
+    app = VSAgentApp(root=ROOT, state_path=state)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         check(not app.is_configured, "没有连接配置时应用照常启动")
@@ -3930,7 +4273,7 @@ async def check_unconfigured_app() -> None:
 async def check_live_app(server: FakeModelServer) -> None:
     """从界面提交一句话到消息区出现完整回复。
 
-    **根目录要用隔离的那一个**（不是 `ROOT`）：`.opencode_tui/tools.toml` 是
+    **根目录要用隔离的那一个**（不是 `ROOT`）：`.vsagent/tools.toml` 是
     用户自己会改的本地配置，拿仓库根当 root 的话，本机把某个工具关掉之后
     这一组断言会当场响——那是配置生效，不是产品坏了。这里要验的是
     「没人配置时全装」，所以给一个空目录当 root。
@@ -3965,7 +4308,7 @@ async def check_live_app(server: FakeModelServer) -> None:
             ]
         )
     )
-    app = OpenCodeApp(root=bare_root, state_path=state)
+    app = VSAgentApp(root=bare_root, state_path=state)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         await pilot.press(*list("hello"))
@@ -4054,7 +4397,7 @@ async def check_live_app(server: FakeModelServer) -> None:
             ]
         )
     )
-    app = OpenCodeApp(root=ROOT, state_path=state, policy=PermissionPolicy(default_ask=frozenset()))
+    app = VSAgentApp(root=ROOT, state_path=state, policy=PermissionPolicy(default_ask=frozenset()))
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         app.event_bus.subscribe("turn.done", turns.append)
@@ -4224,6 +4567,30 @@ def check_ledger() -> None:
         f"内容变了判成 stale：{stale_entry.file_state}",
     )
 
+    # 一出生就 stale 是 P1-1 的病：登记时按**目录**算指纹，对账就不会立刻否掉它。
+    # 这条与上一条的区别在于「登记时用的函数」——上一条本来就用了 fingerprint_path，
+    # 而 `write_run` 曾经用的是 payload 的文本哈希，两边口径不同。
+    def _state(handle) -> str:
+        # `file_state` 是派生值，只有 reconcile() 会更新它；直接读字段永远是登记时的 ok。
+        ledger.reconcile()
+        return next(item.file_state for item in ledger.entries() if item.handle == handle)
+
+    fresh_dir = root / "fresh_run"
+    fresh_dir.mkdir()
+    (fresh_dir / "meta.json").write_text("{}", encoding="utf-8")
+    fresh_entry = ledger.add(
+        "artifact",
+        path=fresh_dir,
+        fingerprint=fingerprint_path(fresh_dir),
+        summary="刚写完的运行目录",
+    )
+    check(_state(fresh_entry.handle) == "ok", "按目录算的指纹对账之后仍是 ok")
+    (fresh_dir / "meta.json").write_text('{"改过": true}', encoding="utf-8")
+    check(
+        _state(fresh_entry.handle) == "stale",
+        "改动目录里任一文件后变 stale",
+    )
+
     # 目录指纹：文件名与内容都进哈希，空子目录也算一条。
     group = root / "prepared"
     group.mkdir()
@@ -4361,6 +4728,27 @@ def check_ledger_digest() -> None:
         "索引算进 TASK 层的用量（否则它是一段看不见的开销）",
     )
 
+    # 进度提示：本阶段够长才出现，而且**只能出现在尾部**。
+    # 进 header 的话它每步都变（「已 3 步」→「已 4 步」），第 1 条消息每步都不同，
+    # 整条前缀缓存作废——那正是长会话命中率掉下来的原因（§4.13 量过）。
+    tick = Session(title="进度")
+    tick.add_message(Message(role="user", parts=[Part(type=PartType.TEXT, text="开始")]))
+    for count in (1, 2):
+        tick.pending_steps.append(Step(seq=count, intent="bash", tools=["bash"]))
+    short = ContextAssembler(200_000).build(tick, prefix)
+    check("本阶段已" not in short.messages[-1]["content"], "两步以内不提示收口")
+    tick.pending_steps.append(Step(seq=3, intent="bash", tools=["bash"]))
+    long_run = ContextAssembler(200_000).build(tick, prefix)
+    check("本阶段已 3 步" in long_run.messages[-1]["content"], "第 3 步起在尾部提示收口")
+    check(
+        long_run.messages[1]["content"] == short.messages[1]["content"],
+        "提示不进 user 头：前缀一个字节都没动",
+    )
+    check(
+        long_run.usage[Layer.TASK] > short.usage[Layer.TASK],
+        "提示算进 TASK 用量（否则它是一段看不见的开销）",
+    )
+
     # 接线：循环层从登记表现取；没装配登记表时给空串，不炸。
     config = ProviderConfig(base_url="http://127.0.0.1:1", api_key="x", model="fake")
     loop = AgentLoop(
@@ -4401,11 +4789,9 @@ async def check_env_block() -> None:
     )
 
     # 日期与状态目录只在易变头里；平台在前缀里（它是常量，进前缀不伤缓存）。
+    # 那三条在 `prefix` 组里断言，这里只验环境块自己的形状。
     session = Session(title="运行环境")
     prefix = stable_prefix(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
-    check(platform_note() in prefix, "平台那句在稳定前缀里")
-    check("今天 " not in prefix, "日期不进前缀（每天变一次会击穿缓存）")
-    check("状态目录" not in prefix, "状态目录不进前缀")
 
     # 固定一个 23:59 的时刻：只到天，就不该出现时分。
     fixed = time.mktime((2026, 10, 26, 23, 59, 0, 0, 0, -1))
@@ -4457,7 +4843,7 @@ async def check_env_block() -> None:
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     state = root / "state.toml"
-    app = OpenCodeApp(root=ROOT, state_path=state)
+    app = VSAgentApp(root=ROOT, state_path=state)
     wired = app.host.loop_for(app.session_manager.current.id)
     check(
         wired.state_dir == app.session_manager.state_path.parent,
@@ -5545,9 +5931,267 @@ async def check_docking() -> None:
         ):
             check(flag in argv, f"命令里有 {flag}")
         source = (
-            ROOT / "opencode_tui" / "core" / "agent" / "domain" / "docking.py"
+            ROOT / "vsagent" / "core" / "agent" / "domain" / "docking.py"
         ).read_text(encoding="utf-8")
         check("create_subprocess_shell" not in source, "对接不拼 shell")
+
+        # ---- 七之二、力场：vina / vinardo / ad4 ----
+        check(
+            (tool.spec.parameters.get("properties") or {}).get("scoring", {}).get("enum")
+            == ["vina", "vinardo", "ad4"],
+            "scoring 是参数、枚举写进 schema（写错在参数校验那一层就被挡，不必等到跑引擎）",
+        )
+        vinardo = docking_module.build_command(
+            "/fake/vina",
+            Path("r.pdbqt"),
+            Path("l.pdbqt"),
+            Path("o.pdbqt"),
+            box,
+            docking_module.DockParams(scoring="vinardo"),
+        )
+        check(
+            vinardo[vinardo.index("--scoring") + 1] == "vinardo",
+            f"vinardo 只多一个 --scoring：{vinardo[:6]}",
+        )
+        check("--receptor" in vinardo, "vinardo 仍要受体（它不需要图）")
+
+        ad4 = docking_module.build_command(
+            "/fake/vina",
+            Path("r.pdbqt"),
+            Path("l.pdbqt"),
+            Path("o.pdbqt"),
+            box,
+            docking_module.DockParams(scoring="ad4"),
+            maps="/grids/x/receptor",
+        )
+        check(
+            ad4[ad4.index("--maps") + 1] == "/grids/x/receptor",
+            f"ad4 走 --maps：{ad4[:8]}",
+        )
+        check(
+            "--receptor" not in ad4 and "--center_x" not in ad4 and "--size_x" not in ad4,
+            "ad4 不能给受体或盒子：盒子已经烘进图里，再给一遍会被当成参数冲突",
+        )
+        check(ad4[ad4.index("--scoring") + 1] == "ad4", "力场显式传给引擎")
+
+        try:
+            docking_module._scoring_argument({"scoring": "vina2"})
+            check(False, "未知力场应当拒绝")
+        except ToolError as error:
+            check(
+                "vinardo" in str(error) and "不能互相比较" in str(error),
+                f"写错时列全三个、并说清分数不可比：{error}",
+            )
+
+        # PDBQT 的类型列决定 autogrid 要算哪几张图：少一张图 autogrid 会直接报错
+        typed = work / "typed.pdbqt"
+        typed.write_text(
+            "ATOM      1  C   LIG     1       0.000   0.000   0.000  1.00  0.00    +0.100 C \n"
+            "ATOM      2  OA  LIG     1       1.000   0.000   0.000  1.00  0.00    -0.300 OA\n"
+            "ATOM      3  C   LIG     1       2.000   0.000   0.000  1.00  0.00    +0.050 C \n",
+            encoding="utf-8",
+        )
+        check(
+            docking_module.pdbqt_types(typed) == ["C", "OA"],
+            f"类型列读得出来、去重且保序：{docking_module.pdbqt_types(typed)}",
+        )
+
+        # ---- 七之三、ad4：图的类型集合、盒子上限、缺 autogrid4 ----
+        grid_calls: list[dict[str, Any]] = []
+        original_autogrid = docking_module.resolve_autogrid
+        original_grids = docking_module.prepare_grids
+        original_capture = docking_module.run_vina
+        captured_argv: list[list[str]] = []
+
+        async def capture_run(argv, *, cwd, timeout, log_path):  # type: ignore[no-untyped-def]
+            captured_argv.append(list(argv))
+            return await original_capture(argv, cwd=cwd, timeout=timeout, log_path=log_path)
+
+        async def fake_prepare_grids(**kwargs):  # type: ignore[no-untyped-def]
+            grid_calls.append(kwargs)
+            return work / "grids" / "hash" / "receptor", False
+
+        try:
+            docking_module.resolve_autogrid = lambda: "/fake/autogrid4"
+            docking_module.prepare_grids = fake_prepare_grids
+            docking_module.run_vina = capture_run
+            # 配体的 PDBQT 要有类型列，否则算不出 ligand_types
+            (ligand_dir / "ligands" / "A.pdbqt").write_text(
+                "ATOM      1  C   LIG     1       0.000   0.000   0.000  1.00  0.00    +0.100 C \n"
+                "ATOM      2  OA  LIG     1       1.000   0.000   0.000  1.00  0.00    -0.300 OA\n",
+                encoding="utf-8",
+            )
+            ad4_result = await tool.execute(
+                {
+                    "receptor": str(receptor.handle),
+                    "ligands": str(ligand_set.handle),
+                    "scoring": "ad4",
+                    "limit": 1,
+                },
+                context=ledger,
+            )
+            check(not ad4_result.failed, f"ad4 能跑通（图打桩）：{ad4_result.output}")
+            check(
+                ad4_result.meta.get("scoring") == "ad4",
+                f"meta 里带力场：{ad4_result.meta}",
+            )
+            check(
+                grid_calls and grid_calls[0]["ligand_types"] == ["C", "OA"],
+                f"ligand_types 取自这一批配体的类型列：{grid_calls[:1]}",
+            )
+            check(
+                "AutoDock4 力场" in ad4_result.output,
+                f"返回里说清是哪一种力场（ad4 不是另一个引擎）：{ad4_result.output[:80]}",
+            )
+            check(
+                "不能" in ad4_result.output and "比较" in ad4_result.output,
+                "返回里要写明三种力场的分数不能互相比较",
+            )
+
+            ad4_manifest = json.loads(
+                (Path(ad4_result.output.split("产物目录：")[1].splitlines()[0]) / "manifest.json")
+                .read_text(encoding="utf-8")
+            )
+            check(
+                ad4_manifest["engine"].get("scoring") == "ad4"
+                and ad4_manifest["engine"].get("maps"),
+                f"manifest 的 engine 记了力场与图目录：{ad4_manifest['engine']}",
+            )
+            check(
+                any(
+                    "--maps" in argv and "--receptor" not in argv for argv in captured_argv
+                ),
+                f"真跑时的命令走 --maps：{captured_argv[:1]}",
+            )
+
+            # 盒子超 40 Å 直接拒绝：图的代价是三次方
+            (receptor_dir / "big-box.txt").write_text(
+                "center_x = 0\ncenter_y = 0\ncenter_z = 0\n"
+                "size_x = 50.0\nsize_y = 20.0\nsize_z = 20.0\n",
+                encoding="utf-8",
+            )
+            big = ledger.add(
+                "receptor",
+                path=receptor_dir,
+                summary="大盒子受体",
+                fingerprint=fingerprint_path(receptor_dir),
+                meta={"stage": "prepared", "pdbqt_file": "receptor.pdbqt", "box_file": "big-box.txt"},
+            )
+            oversized = await tool.execute(
+                {"receptor": str(big.handle), "ligands": str(ligand_set.handle), "scoring": "ad4"},
+                context=ledger,
+            )
+            check(
+                oversized.failed and "40" in oversized.output and "三次方" in oversized.output,
+                f"ad4 的盒子超限要拒绝并说清代价：{oversized.output}",
+            )
+
+            # 缺 autogrid4：只影响 ad4，vina / vinardo 照常
+            docking_module.resolve_autogrid = lambda: (_ for _ in ()).throw(
+                ToolError(docking_module.AUTOGRID_INSTALL_HINT)
+            )
+            missing_grid = await tool.execute(
+                {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle), "scoring": "ad4"},
+                context=ledger,
+            )
+            check(
+                missing_grid.failed
+                and "autogrid4" in missing_grid.output
+                and "vina" in missing_grid.output,
+                f"缺 autogrid4 时给安装指引，并指出还能用哪两种力场：{missing_grid.output}",
+            )
+        finally:
+            docking_module.resolve_autogrid = original_autogrid
+            docking_module.prepare_grids = original_grids
+            docking_module.run_vina = original_capture
+
+        # ---- 七之四、prepare_grids 里的 GPF 是真的生成的（只有 autogrid4 打桩）----
+        # meeko 的 `gridbox.get_gpf_string` 换签名的话，这一段会当场红；不测就只能等
+        # 真装机器的用户撞上。
+        original_autogrid_run = docking_module.run_autogrid
+        original_grid_root = docking_module.grids_dir
+
+        async def fake_autogrid(argv, *, cwd, timeout, log_path):  # type: ignore[no-untyped-def]
+            for name in ("A", "C", "OA"):
+                (Path(cwd) / f"receptor.{name}.map").write_text("", encoding="utf-8")
+            (Path(cwd) / docking_module.GRID_MARKER).write_text("", encoding="utf-8")
+            log_path.write_text("autogrid done", encoding="utf-8")
+            return docking_module.VinaRun(
+                argv=tuple(argv),
+                returncode=0,
+                output="",
+                timed_out=False,
+                log_path=log_path,
+            )
+
+        try:
+            docking_module.grids_dir = lambda: work / "real-grids"
+            docking_module.run_autogrid = fake_autogrid
+            grid_key = {"receptor": "fp", "box": [1, 2, 3, 20, 21, 22]}
+            prefix, grid_reused = await docking_module.prepare_grids(
+                autogrid="/fake/autogrid4",
+                receptor_pdbqt=receptor_dir / "receptor.pdbqt",
+                box=box,
+                ligand_types=["A", "C", "OA"],
+                cache_key=grid_key,
+            )
+            gpf_text = (prefix.parent / "receptor.gpf").read_text(encoding="utf-8")
+            check(
+                "ligand_types A C OA" in gpf_text,
+                f"GPF 的 ligand_types 就是 autogrid 要算的那几张图：{gpf_text.splitlines()[:6]}",
+            )
+            check(
+                "gridcenter 1.000 2.000 3.000" in gpf_text,
+                "盒子中心写进 GPF",
+            )
+            check(
+                "receptor receptor.pdbqt" in gpf_text,
+                "GPF 里是受体文件名（autogrid 在 cwd 里找它）",
+            )
+            check(
+                (prefix.parent / docking_module.GRID_PARAM_FILE).is_file(),
+                "B/Si 参数文件与 GPF 同目录（否则 autogrid 找不到参数文件）",
+            )
+            check(not grid_reused, "第一次是新算的")
+            check(
+                (prefix.parent / "receptor.pdbqt").is_file(),
+                "受体 PDBQT 被复制进了图目录",
+            )
+
+            _, second_reused = await docking_module.prepare_grids(
+                autogrid="/fake/autogrid4",
+                receptor_pdbqt=receptor_dir / "receptor.pdbqt",
+                box=box,
+                ligand_types=["A", "C", "OA"],
+                cache_key=grid_key,
+            )
+            check(second_reused, "同一套参数直接复用，不再跑一次 autogrid")
+
+            # 缺一张图要报出来（少一张图那一类原子就没有势场，分数是错的）
+            async def one_map_missing(argv, *, cwd, timeout, log_path):  # type: ignore[no-untyped-def]
+                for name in ("A", "C"):
+                    (Path(cwd) / f"receptor.{name}.map").write_text("", encoding="utf-8")
+                (Path(cwd) / docking_module.GRID_MARKER).write_text("", encoding="utf-8")
+                log_path.write_text("autogrid done", encoding="utf-8")
+                return docking_module.VinaRun(
+                    argv=tuple(argv), returncode=0, output="", timed_out=False, log_path=log_path
+                )
+
+            docking_module.run_autogrid = one_map_missing
+            try:
+                await docking_module.prepare_grids(
+                    autogrid="/fake/autogrid4",
+                    receptor_pdbqt=receptor_dir / "receptor.pdbqt",
+                    box=box,
+                    ligand_types=["A", "C", "OA"],
+                    cache_key={"receptor": "fp2"},
+                )
+                check(False, "缺图应当失败")
+            except ToolError as error:
+                check("OA" in str(error), f"缺哪张图就点哪张：{error}")
+        finally:
+            docking_module.grids_dir = original_grid_root
+            docking_module.run_autogrid = original_autogrid_run
 
         modes = docking_module.parse_vina_results(
             "REMARK VINA RESULT: -8.0 0.1 0.2\nREMARK VINA RESULT: -7.0 0.3 0.4\n"
@@ -6027,13 +6671,13 @@ async def check_affinity() -> None:
                 f"{name} 越界时给出范围：{bad.output}",
             )
 
-        from opencode_tui.core.agent.permission import DEFAULT_ASK, PLAN_DENY
+        from vsagent.core.agent.permission import DEFAULT_ASK, PLAN_DENY
 
         check("score_affinity" in DEFAULT_ASK, "默认策略下要问一次（它会跑外部进程）")
         check("score_affinity" in PLAN_DENY, "Plan 方式下一律拒绝")
 
         source = (
-            ROOT / "opencode_tui" / "core" / "agent" / "domain" / "affinity.py"
+            ROOT / "vsagent" / "core" / "agent" / "domain" / "affinity.py"
         ).read_text(encoding="utf-8")
         check("create_subprocess_shell" not in source, "打分不拼 shell")
         check("import torch" not in source, "主仓不 import torch（否则启动就炸）")
@@ -6963,8 +7607,8 @@ def check_complexes() -> None:
     check(bad is not None and "UniProt" in bad, f"空编号直接报错：{bad}")
 
     # ---- 缓存只有一套：这一条是合并的判据，不是风格 ----
-    from opencode_tui.core.agent.domain import http as http_module
-    from opencode_tui.core.agent.domain import rsearch as rsearch_module
+    from vsagent.core.agent.domain import http as http_module
+    from vsagent.core.agent.domain import rsearch as rsearch_module
 
     for gone in ("search_cache_dir", "_cache_path", "_read_cache", "_write_cache"):
         check(
@@ -7609,6 +8253,16 @@ async def check_pocket_tools() -> None:
             context=ledger,
         )
         check(not done.failed, f"口袋盒子能准备受体：{done.output}")
+        # 补氢那一行报的是**全部**残基（输入已去氢，全由模板补），
+        # 不是「补后仍有缺失」的异常数——后者实测只有 20，而总数是 1970（P3-2）。
+        check(
+            "补氢：" in done.output and "输入已去氢" in done.output,
+            f"补氢总数报全部残基：{done.output[:300]}",
+        )
+        check(
+            "补后仍有缺失" in done.output,
+            f"异常数单独说一句：{done.output[:300]}",
+        )
         prepared = ledger.get(done.meta["handle"])
         box_text = (prepared.path / "box.txt").read_text(encoding="utf-8")
         check(
@@ -7856,8 +8510,515 @@ async def check_rank_candidates() -> None:
             "单路分位数" in single.output,
             f"只有一路时要写明不是共识：{single.output}",
         )
+        check(
+            "dock·vina:vina" in single.output,
+            f"来源里带引擎:力场（换力场就是另一套数，不能只看 dock 这两个字）：{single.output}",
+        )
     finally:
         analysis_module.candidates_dir = original_dir
+
+
+async def check_contact_map() -> None:
+    """接触频次表：分母只算得出位姿的分子、按出现次数排、截断写清还剩多少。
+
+    坐标照旧手写，每一处距离都能口算：THR 在原点，PHE 在 20 Å 外，
+    三个位姿分别贴 THR 1.0 Å、THR 3.0 Å、PHE 1.0 Å。
+    """
+
+    def line(kind: str, serial: int, name: str, resname: str, number: int,
+             x: float, y: float, z: float, element: str) -> str:
+        return (
+            f"{kind:<6}{serial:>5} {name:<4} {resname:>3} A{number:>4}    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{1.00:>6.2f}{20.00:>6.2f}          "
+            f"{element:>2}"
+        )
+
+    work = PROBE / "contact_map"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    receptor_path = work / "receptor.pdb"
+    receptor_path.write_text(
+        "\n".join(
+            [
+                line("ATOM", 1, "OG1", "THR", 315, 0.0, 0.0, 0.0, "O"),
+                line("ATOM", 2, "CE1", "PHE", 331, 20.0, 0.0, 0.0, "C"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    poses = work / "poses"
+    poses.mkdir(parents=True, exist_ok=True)
+    for name, x in (("near", 0.0), ("far", 0.0), ("phe", 20.0)):
+        y = 1.0 if name != "far" else 3.0
+        (poses / f"{name}.pdb").write_text(
+            line("HETATM", 1, "C1", "LIG", 1, x, y, 0.0, "C") + "\n",
+            encoding="utf-8",
+        )
+
+    ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+    receptor = ledger.add(
+        "receptor",
+        path=receptor_path,
+        summary="合成受体",
+        fingerprint=fingerprint_text(receptor_path.read_text(encoding="utf-8")),
+        meta={"stage": "raw"},
+    )
+    docking_entry = ledger.add(
+        "artifact",
+        path=work,
+        summary="对接产物",
+        fingerprint="fp-map",
+        meta={"kind": "docking", "stage": "docking"},
+    )
+    products_module.write_json_atomic(
+        work / analysis_module.docking.MANIFEST_FILE,
+        {
+            "kind": "docking",
+            "stage": "docking",
+            "receptor": {"handle": str(receptor.handle)},
+            "engine": {"name": "vina", "scoring": "vina"},
+            "results": [
+                {"id": "near", "name": "near", "score": -9.0, "pose_pdb": "poses/near.pdb"},
+                {"id": "far", "name": "far", "score": -8.0, "pose_pdb": "poses/far.pdb"},
+                {"id": "phe", "name": "phe", "score": -7.0, "pose_pdb": "poses/phe.pdb"},
+                {"id": "nopose", "name": "np", "score": -6.0, "pose_pdb": ""},
+            ],
+        },
+    )
+
+    contact_map = analysis_module.ContactMapTool()
+    result = await contact_map.execute(
+        {"docking": str(docking_entry.handle)}, context=ledger
+    )
+    check(not result.failed, f"频次表算得出来：{result.output}")
+    check(result.meta.get("poses") == 3, f"分母是算得出位姿的三个：{result.meta}")
+    check(result.meta.get("skipped") == 1, f"缺位姿的单独计数：{result.meta}")
+    check(result.meta.get("residues") == 2, f"两个残基接触过：{result.meta}")
+    check("A:315:THR" in result.output and "A:331:PHE" in result.output, result.output)
+    check(
+        result.output.index("A:315:THR") < result.output.index("A:331:PHE"),
+        f"出现次数多的排前面：{result.output}",
+    )
+    check("2/3" in result.output, f"THR 在 2 个位姿里出现：{result.output}")
+    check("跳过 1 条" in result.output, f"跳过的要写明：{result.output}")
+
+    tight = await contact_map.execute(
+        {"docking": str(docking_entry.handle), "cutoff": 2.5}, context=ledger
+    )
+    check(
+        "1/3" in tight.output and "2/3" not in tight.output,
+        f"收紧到 2.5 Å 之后 3.0 Å 那条不算：{tight.output}",
+    )
+
+    truncated = await contact_map.execute(
+        {"docking": str(docking_entry.handle), "top": 1}, context=ledger
+    )
+    check(
+        "另有 1 个残基未显示" in truncated.output,
+        f"截断要说清还剩多少：{truncated.output}",
+    )
+
+    wrong_kind = await contact_map.execute(
+        {"docking": str(receptor.handle)}, context=ledger
+    )
+    check(wrong_kind.failed, f"受体不是对接产物：{wrong_kind.output}")
+
+    no_ledger = await contact_map.execute({"docking": str(docking_entry.handle)})
+    check(
+        no_ledger.failed and "内核装配问题" in no_ledger.output,
+        f"没注入登记表是装配问题：{no_ledger.output}",
+    )
+
+    # 一个都碰不到时不能说「没有残基接触」就完事，要指向口袋或坐标。
+    empty = work / "empty"
+    empty.mkdir(exist_ok=True)
+    far_entry = ledger.add(
+        "artifact",
+        path=empty,
+        summary="远距离产物",
+        fingerprint="fp-far",
+        meta={"kind": "docking", "stage": "docking"},
+    )
+    products_module.write_json_atomic(
+        empty / analysis_module.docking.MANIFEST_FILE,
+        {
+            "kind": "docking",
+            "stage": "docking",
+            "receptor": {"handle": str(receptor.handle)},
+            "results": [{"id": "x", "score": -1.0, "pose_pdb": ""}],
+        },
+    )
+    nothing = await contact_map.execute(
+        {"docking": str(far_entry.handle)}, context=ledger
+    )
+    check(
+        nothing.failed and "没有一个能算出接触的位姿" in nothing.output,
+        f"全是空位姿时要说明白：{nothing.output}",
+    )
+
+
+async def check_hydrophobic() -> None:
+    """疏水分账：HP 对数、HM 匹配率、脱水账、没有疏水原子的边界。
+
+    坐标是手写的小体系，每一处距离都能口算：三个碳围着一个配体氧（埋深 3、最近极性
+    受体 6.62 Å），三个碳衬着一个配体碳（2.5–2.9 Å，全疏水 → HM 100%）。
+    """
+
+    def line(serial: int, name: str, resname: str, number: int,
+             x: float, y: float, z: float, element: str) -> str:
+        return (
+            f"ATOM  {serial:>5} {name:<4} {resname:>3} A{number:>4}    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{1.00:>6.2f}{20.00:>6.2f}          "
+            f"{element:>2}"
+        )
+
+    def pose_line(serial: int, name: str, x: float, y: float, z: float, element: str) -> str:
+        return (
+            f"HETATM{serial:>5} {name:<4} LIG     1    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{1.00:>6.2f}{20.00:>6.2f}          "
+            f"{element:>2}"
+        )
+
+    work = PROBE / "hydrophobic"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    poses = work / "poses"
+    poses.mkdir(parents=True, exist_ok=True)
+
+    receptor_path = work / "receptor.pdb"
+    receptor_path.write_text(
+        "\n".join(
+            [
+                line(1, "CD1", "LEU", 694, 0.0, 0.0, 0.0, "C"),
+                line(2, "CG", "LEU", 694, 1.6, 0.0, 0.0, "C"),
+                line(3, "CG1", "VAL", 702, -1.6, 0.0, 0.0, "C"),
+                line(4, "CD1", "ILE", 700, 0.0, 4.0, 2.0, "C"),
+                line(5, "CG1", "ILE", 700, 1.6, 4.0, 2.0, "C"),
+                line(6, "CG2", "ILE", 700, -1.6, 4.0, 2.0, "C"),
+                line(7, "OG", "SER", 730, 0.0, 6.0, 0.0, "O"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (poses / "mol-greasy.pdb").write_text(
+        "\n".join(
+            [
+                pose_line(1, "C1", 0.0, 4.0, 4.5, "C"),
+                pose_line(2, "O1", 0.0, 0.0, 2.8, "O"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # 全是极性原子：HP / HM 应当明说「不适用」，而不是除零
+    (poses / "mol-polar.pdb").write_text(
+        "\n".join([pose_line(1, "O1", 0.0, 0.0, 2.8, "O"), pose_line(2, "O2", 2.0, 0.0, 2.8, "O")])
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+    receptor = ledger.add(
+        "receptor",
+        path=receptor_path,
+        summary="合成受体",
+        fingerprint=fingerprint_text(receptor_path.read_text(encoding="utf-8")),
+        meta={"stage": "raw"},
+    )
+    docking_entry = ledger.add(
+        "artifact",
+        path=work,
+        summary="对接产物",
+        fingerprint="fp-hydrophobic",
+        meta={"kind": "docking", "stage": "docking"},
+    )
+    products_module.write_json_atomic(
+        work / analysis_module.docking.MANIFEST_FILE,
+        {
+            "kind": "docking",
+            "stage": "docking",
+            "engine": {"name": "vina", "version": "1.2.5", "scoring": "vinardo"},
+            "receptor": {"handle": str(receptor.handle)},
+            "results": [
+                {"id": "mol-greasy", "name": "", "score": -9.0, "pose_pdb": "poses/mol-greasy.pdb"},
+                {"id": "mol-polar", "name": "", "score": -8.0, "pose_pdb": "poses/mol-polar.pdb"},
+            ],
+        },
+    )
+
+    tool = analysis_module.AnalyzeHydrophobicTool()
+    result = await tool.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-greasy"}, context=ledger
+    )
+    check(not result.failed, f"疏水分账跑通：{result.output}")
+    check(
+        result.meta.get("hp_pairs") == 3,
+        f"三个碳都在 4 Å 内，HP = 3：{result.meta}",
+    )
+    check(
+        result.meta.get("hm_total") == 1 and result.meta.get("hm_matched") == 1,
+        f"唯一的疏水原子周围全是碳，HM 匹配 1/1：{result.meta}",
+    )
+    check(
+        result.meta.get("buried_polar") == 1 and result.meta.get("hbonded_polar") == 0,
+        f"那个氧被埋了但没成氢键：{result.meta}",
+    )
+    check(
+        "O1" in result.output and "埋深 3 个受体原子" in result.output,
+        f"脱水账里指名道姓：{result.output}",
+    )
+    check(
+        "A:730:SER OG 6.62" in result.output,
+        f"给出最近的受体极性原子（6.62 Å 太远，所以成不了氢键）：{result.output}",
+    )
+    check(
+        "这不是 HYDE" in result.output and "kcal" in result.output,
+        "口径里必须写明这不是 HYDE、不给 kcal",
+    )
+    check(
+        result.meta.get("engine") == "vina:vinardo",
+        f"meta 里带引擎:力场（换力场就是另一套数）：{result.meta}",
+    )
+
+    polar = await tool.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-polar"}, context=ledger
+    )
+    check(
+        not polar.failed and polar.meta.get("hm_total") == 0,
+        f"没有疏水原子时不除零：{polar.meta}",
+    )
+    check(
+        "不适用" in polar.output,
+        f"没有疏水原子要说「不适用」，不是「0%」：{polar.output.splitlines()[0]}",
+    )
+
+    bad_radius = await tool.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-greasy", "radius": 9.0},
+        context=ledger,
+    )
+    check(bad_radius.failed, f"radius 越界要拒绝：{bad_radius.output}")
+
+    # 「够近但没算成氢键」与「白埋」必须分开说：3.19 Å 的极性对说成白埋是错的，
+    # 它只是角度没过口径（PDB 里氢可能缺、质子化状态也可能不同）。实测那个
+    # 伊马替尼位姿就有这种情况，所以这一条不是假想。
+    fake_pose = analysis_module._Pose(
+        molecule="x",
+        name="",
+        pose=Path("x.pdb"),
+        record={},
+        entry=None,
+        receptor=None,
+        receptor_text="",
+        pose_text="",
+        receptor_atoms=(),
+        ligand_atoms=(),
+        engine="vina:vina",
+    )
+    facing = analysis_module._render_hydrophobic(
+        pose=fake_pose,
+        profile=analysis_module._HydrophobicProfile(
+            pairs=2,
+            closest=3.4,
+            total=2,
+            matched=2,
+            unmatched=(),
+            buried=(("N6", 4, "A:766:THR OG1", 3.19),),
+            satisfied=(),
+        ),
+        radius=4.0,
+    )
+    check(
+        "只差 3.19 Å" in facing and "白埋" not in facing.splitlines()[-1],
+        f"够近却没成键不能说成「白埋」：{facing.splitlines()[-1]}",
+    )
+    check(
+        "0 个极性原子白埋" in facing.splitlines()[0],
+        f"首行把这一类算作 0 个白埋、另计「够近没成键」：{facing.splitlines()[0]}",
+    )
+
+    other = ledger.add("artifact", summary="不是对接产物", fingerprint="fp-other", meta={"kind": "affinity"})
+    wrong_kind = await tool.execute(
+        {"docking": str(other.handle), "molecule": "mol-greasy"}, context=ledger
+    )
+    check(
+        wrong_kind.failed and "analyze_hydrophobic" in wrong_kind.output,
+        f"非对接产物时点的是自己的名字：{wrong_kind.output}",
+    )
+
+
+async def check_efficiency() -> None:
+    """效率体检：LE / LELP 的算术、排序、缺 logP 的降级、LLE 的联接与三种失败。"""
+    work = PROBE / "efficiency"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    products_module.write_json_atomic(
+        work / analysis_module.docking.MANIFEST_FILE,
+        {
+            "kind": "docking",
+            "stage": "docking",
+            "engine": {"name": "vina", "version": "1.2.5", "scoring": "vina"},
+            "results": [
+                # 十二烷：又大又油，原始分不差，但每颗重原子换来的分很少
+                {"id": "big", "name": "dodecane", "smiles": "CCCCCCCCCCCC",
+                 "heavy_atoms": 12, "score": -6.0},
+                {"id": "mid", "name": "benzene", "smiles": "c1ccccc1",
+                 "heavy_atoms": 6, "score": -5.0},
+                {"id": "small", "name": "ethanol", "smiles": "CCO",
+                 "heavy_atoms": 3, "score": -3.0},
+                # 没有 SMILES：logP 与 LELP 都算不出来，只能排在最后
+                {"id": "nolp", "name": "no smiles", "smiles": "",
+                 "heavy_atoms": 8, "score": -4.0},
+            ],
+        },
+    )
+    ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+    docking_entry = ledger.add(
+        "artifact",
+        path=work,
+        summary="对接产物",
+        fingerprint="fp-eff",
+        meta={"kind": "docking", "stage": "docking"},
+    )
+
+    actives_dir = work / "actives"
+    actives_dir.mkdir(parents=True, exist_ok=True)
+    products_module.write_json_atomic(
+        actives_dir / "manifest.json",
+        {
+            "kind": "ligandset",
+            "stage": "raw",
+            "records": [
+                # 规范 SMILES 与位姿那条对不上大小写/写法也要能联上
+                {"id": "CHEMBL1", "smiles": "c1ccccc1", "pchembl_value": 6.5},
+                {"id": "CHEMBL2", "smiles": "CCO", "pchembl_value": None},
+            ],
+        },
+    )
+    actives = ledger.add(
+        "ligandset",
+        path=actives_dir,
+        summary="已知活性",
+        fingerprint="fp-actives",
+        meta={"stage": "raw"},
+    )
+    empty_actives_dir = work / "actives-empty"
+    empty_actives_dir.mkdir(parents=True, exist_ok=True)
+    products_module.write_json_atomic(
+        empty_actives_dir / "manifest.json",
+        {"kind": "ligandset", "stage": "raw", "records": [{"id": "X", "smiles": "CCO"}]},
+    )
+    empty_actives = ledger.add(
+        "ligandset",
+        path=empty_actives_dir,
+        summary="没有活性值",
+        fingerprint="fp-actives-empty",
+        meta={"stage": "raw"},
+    )
+
+    try:
+        from rdkit import Chem as _Chem
+        from rdkit.Chem import Descriptors as _Descriptors
+    except Exception:
+        _Chem = None
+        _Descriptors = None
+
+    tool = analysis_module.EfficiencyProfileTool()
+    result = await tool.execute({"docking": str(docking_entry.handle)}, context=ledger)
+    check(not result.failed, f"效率体检跑通：{result.output}")
+
+    if _Chem is None:
+        # 没有化学栈时整列都算不出来——这条路径也要说人话，而不是列一堆 —
+        check(
+            "算不出 logP" in result.output and result.meta.get("without_logp") == 4,
+            f"缺 rdkit 时明说这一列没有：{result.output[:120]}",
+        )
+        return
+
+    logp_benzene = float(_Descriptors.MolLogP(_Chem.MolFromSmiles("c1ccccc1")))
+    le_benzene = 5.0 / 6
+    check(
+        result.meta.get("total") == 4,
+        f"四条都进了表：{result.meta}",
+    )
+    check(
+        result.meta.get("without_logp") == 1,
+        f"只有没 SMILES 那一条算不出 logP：{result.meta}",
+    )
+    check(
+        result.meta.get("fat") == 1,
+        f"只有十二烷算「大而油」（logP ≥ 4 且 LELP ≥ 6）：{result.meta}",
+    )
+    check(
+        result.meta.get("top", [])[0] == "small",
+        f"默认按 LELP 升序，乙醇最靠前：{result.meta.get('top')}",
+    )
+    check(
+        result.meta.get("top", [])[-1] == "nolp",
+        f"算不出 LELP 的排最后（None 不是 0）：{result.meta.get('top')}",
+    )
+    check(
+        f"{logp_benzene:>8.2f}" in result.output
+        and f"{le_benzene:>8.2f}" in result.output
+        and f"{logp_benzene / le_benzene:>8.1f}" in result.output,
+        f"苯环那一行的 logP / LE / LELP 与 RDKit 算的一致：{result.output}",
+    )
+    check("← 大而油" in result.output, "「大而油」要标在行上，不是只给个计数")
+    check(
+        "不等于从 ΔG 算的 LE" in result.output,
+        "口径必须写明「对接分数的 LE ≠ ΔG 的 LE」",
+    )
+
+    by_le = await tool.execute(
+        {"docking": str(docking_entry.handle), "sort": "le"}, context=ledger
+    )
+    check(
+        by_le.meta.get("top", [])[0] == "small",
+        f"按 LE 降序，乙醇（1.00）仍然第一：{by_le.meta.get('top')}",
+    )
+    check(
+        by_le.meta.get("top", [])[1] == "mid",
+        f"第二位是苯环（0.83）：{by_le.meta.get('top')}",
+    )
+    check(
+        by_le.meta.get("top", [])[-1] == "nolp",
+        f"按 LE 降序时缺值的仍然排最后（降序不能把 None 翻到前面）：{by_le.meta.get('top')}",
+    )
+
+    with_potency = await tool.execute(
+        {"docking": str(docking_entry.handle), "actives": str(actives.handle)}, context=ledger
+    )
+    check(not with_potency.failed, f"给了活性集就能算 LLE：{with_potency.output}")
+    check(
+        with_potency.meta.get("has_potency") is True,
+        f"meta 说明这次带了活性：{with_potency.meta}",
+    )
+    check(
+        "pChEMBL" in with_potency.output and "LLE" in with_potency.output,
+        f"表头多出 pChEMBL 与 LLE 两列：{with_potency.output.splitlines()[-4:]}",
+    )
+    check(
+        f"{6.5 - logp_benzene:>7.1f}" in with_potency.output,
+        f"苯环的 LLE = 6.5 − logP：{with_potency.output}",
+    )
+
+    no_values = await tool.execute(
+        {"docking": str(docking_entry.handle), "actives": str(empty_actives.handle)},
+        context=ledger,
+    )
+    check(
+        no_values.failed and "pchembl_value" in no_values.output,
+        f"活性集里没有 pChEMBL 时明说算不了：{no_values.output}",
+    )
+
+    bad_sort = await tool.execute(
+        {"docking": str(docking_entry.handle), "sort": "lelp2"}, context=ledger
+    )
+    check(bad_sort.failed, f"未知排序要拒绝：{bad_sort.output}")
 
 
 async def check_analyze_pose() -> None:
@@ -8051,6 +9212,242 @@ async def check_analyze_pose() -> None:
     )
     check(wrong_kind.failed, f"受体不是对接产物：{wrong_kind.output}")
 
+    # ---- PLIP 交互指纹 ----
+    # 合并、抽取、渲染三段都是纯函数，用假记录就能验，不需要装 PLIP；
+    # 真跑 PLIP 的那一条在最后，装没装都过。
+    pose_text = (poses / "mol-ok.pdb").read_text(encoding="utf-8")
+    receptor_text = receptor_path.read_text(encoding="utf-8")
+
+    # 受体末尾的 END 是真实文件里就有的（Vina 转出来的位姿也带一个）。直接拼接的话
+    # openbabel 读到那一行就停，配体一个原子都读不进去，PLIP 于是报「没有配体」。
+    merged, resname = analysis_module._plip_complex_text(
+        receptor_text + "MASTER      1    0    0    0    0    0    0    6    1    0    0\nEND\n",
+        pose_text + "CONECT    1    2\nEND\n",
+    )
+    check(
+        merged.splitlines()[-1] == "END" and merged.count("END") == 1,
+        f"END 只在最末尾出现一次（受体末尾那个必须丢掉）：{merged.splitlines()[-3:]}",
+    )
+    check("MASTER" not in merged and "CONECT" not in merged, "MASTER / CONECT 一并丢掉")
+    check(
+        "OG1" in merged and "O1" in merged,
+        "受体与位姿的原子都在同一份文件里（拼上了，不是只读了一份）",
+    )
+    check(resname == "LIG", f"位姿残基名取候选里第一个没被占用的：{resname}")
+
+    # 受体里已经有 LIG（保留下来的共晶配体）时必须换名字：否则 PLIP 会把晶体那个
+    # 也当配体，我们可能拿晶体的相互作用去解释对接位姿，而输出看着完全正常。
+    collided, collided_name = analysis_module._plip_complex_text(
+        line("HETATM", 9, "C1", "LIG", 5, 9.0, 9.0, 9.0, "C") + "\n", pose_text
+    )
+    check(
+        collided_name == "UNL" and collided.count("UNL") == 2,
+        f"受体里已有 LIG 时换用 UNL：{collided_name} / {collided.count('UNL')}",
+    )
+
+    def plip_row(**kwargs: Any) -> Any:
+        base = {"restype": "LYS", "resnr": 721, "reschain": "A"}
+        base.update(kwargs)
+        return types.SimpleNamespace(**base)
+
+    fake_site = types.SimpleNamespace(
+        saltbridge_lneg=[],
+        # 同一个 Asp 的两条盐桥：指纹按残基合并，留最近的那个距离
+        saltbridge_pneg=[
+            plip_row(restype="ASP", resnr=831, distance=5.11),
+            plip_row(restype="ASP", resnr=831, distance=4.90),
+        ],
+        hbonds_ldon=[],
+        hbonds_pdon=[plip_row(distance_ad=3.37)],
+        pistacking=[plip_row(restype="PHE", resnr=699, distance=3.71, type="P")],
+        pication_laro=[],
+        pication_paro=[],
+        hydrophobic_contacts=[plip_row(restype="LEU", resnr=694, distance=3.46)],
+        halogen_bonds=[],
+        water_bridges=[],
+        metal_complexes=[],
+    )
+    hits = analysis_module._plip_hits(fake_site)
+    check(
+        set(hits) == {"saltbridge", "hbond", "pistacking", "hydrophobic"},
+        f"只报有记录的那几类（空的不占行）：{sorted(hits)}",
+    )
+    check(
+        len(hits["saltbridge"]) == 1 and hits["saltbridge"][0].count == 2,
+        f"同一残基的两条盐桥合成一条、记住条数：{hits.get('saltbridge')}",
+    )
+    check(
+        hits["saltbridge"][0].distance == 4.90,
+        f"合并时留最近的那个距离：{hits['saltbridge'][0].distance}",
+    )
+    check(
+        hits["saltbridge"][0].detail == "配体正电",
+        f"盐桥方向按属性名认（pneg = 蛋白带负电）：{hits['saltbridge'][0].detail}",
+    )
+    check(
+        hits["hbond"][0].detail == "蛋白供体",
+        f"氢键方向按属性名认（pdon = 蛋白是供体）：{hits['hbond'][0].detail}",
+    )
+    check(
+        hits["pistacking"][0].detail == "平行",
+        f"P 型 π 堆积译成「平行」（T 型另有其名）：{hits['pistacking'][0].detail}",
+    )
+    check(
+        hits["hbond"][0].distance == 3.37,
+        f"氢键的距离字段叫 distance_ad（不是 distance）：{hits['hbond'][0].distance}",
+    )
+
+    rendered = analysis_module._render_fingerprint(hits)
+    check(
+        rendered[0].startswith("  盐桥 1 个残基：A:831:ASP 4.90 Å（×2） 配体正电"),
+        f"盐桥那行的格式：{rendered[0]!r}",
+    )
+    check(
+        len(rendered) == 4 and rendered[3].startswith("  疏水 1 个残基：A:694:LEU"),
+        f"一类一行、顺序固定：{rendered}",
+    )
+    check(
+        analysis_module._render_fingerprint({})[0].startswith("  一类都没找到"),
+        "一条都没有时说清是「没找到」而不是「没算」",
+    )
+
+    # 缺依赖的两种形态说法不同：没装 plip 与「plip 在、它的依赖不在」。
+    # 后者说成「本机没装 PLIP」会让用户去重装已经装好的东西。
+    check(
+        "本机没装 PLIP" in analysis_module._plip_missing_message("plip"),
+        f"缺 plip 本身：{analysis_module._plip_missing_message('plip')}",
+    )
+    partial = analysis_module._plip_missing_message("openbabel")
+    check(
+        "本机没装 PLIP" not in partial and "openbabel" in partial and "plip 本身在" in partial,
+        f"plip 在、缺的是它的依赖时要照实说：{partial}",
+    )
+    check(
+        analysis_module.PLIP_INSTALL_HINT in partial,
+        "两种形态都给同一条安装指令（装那个文件两样都会补上）",
+    )
+
+    # 版本漂移：字段改名时 getattr 不会报错，只会永远返回空——必须先核对再算。
+    check(
+        analysis_module._plip_missing_attrs(fake_site) == [],
+        "字段齐全时不报缺",
+    )
+    trimmed = types.SimpleNamespace(
+        **{k: v for k, v in vars(fake_site).items() if k != "hbonds_pdon"}
+    )
+    check(
+        analysis_module._plip_missing_attrs(trimmed) == ["hbonds_pdon"],
+        f"少一个字段要指名道姓：{analysis_module._plip_missing_attrs(trimmed)}",
+    )
+
+    # PLIP 在场但一用就炸（openbabel 初始化失败、临时目录不可写、内部断言）：
+    # 整段都在 try 里，所以这里拿到的是原因，不是异常。漏出去的话整次调用都会失败，
+    # 而接触与氢键早就算完了。
+    class _ExplodingPlip:
+        def __init__(self) -> None:
+            raise RuntimeError("openbabel 初始化失败")
+
+    original_loader = analysis_module._plip_loader
+    try:
+        analysis_module._plip_loader = lambda: (_ExplodingPlip, "")
+        broken_hits, broken_note = analysis_module.plip_fingerprint(receptor_text, pose_text)
+    finally:
+        analysis_module._plip_loader = original_loader
+    check(
+        broken_hits == {} and "算不了" in broken_note and "RuntimeError" in broken_note,
+        f"PLIP 内部炸掉要降级成一句原因，不能把整次调用带下去：{broken_note}",
+    )
+
+    # 开关本身：默认不跑（那 0.3 秒不该白花），打开才追加那一节。
+    check("PLIP" not in result.output, "默认不跑 PLIP，输出里不该出现它")
+
+    original_plip = analysis_module.plip_fingerprint
+    try:
+        analysis_module.plip_fingerprint = lambda *a, **k: (hits, "")
+        with_fp = await analyze.execute(
+            {"docking": str(docking_entry.handle), "molecule": "mol-ok", "interactions": True},
+            context=ledger,
+        )
+        analysis_module.plip_fingerprint = lambda *a, **k: (
+            {},
+            analysis_module._plip_missing_message("plip"),
+        )
+        degraded_fp = await analyze.execute(
+            {"docking": str(docking_entry.handle), "molecule": "mol-ok", "interactions": True},
+            context=ledger,
+        )
+    finally:
+        analysis_module.plip_fingerprint = original_plip
+
+    check(not with_fp.failed, f"打开 interactions 不影响主结果：{with_fp.output}")
+    check(
+        "PLIP 交互指纹" in with_fp.output and "A:831:ASP" in with_fp.output,
+        f"指纹那一节进了输出：{with_fp.output}",
+    )
+    check(
+        "PLIP：1 盐桥 / 1 氢键 / 1 π 堆积 / 1 疏水。" in with_fp.output,
+        f"结论那行带上各类总数（模型只读第一行）：{with_fp.output.splitlines()[0]}",
+    )
+    check(
+        with_fp.meta.get("interactions") == {
+            "saltbridge": 1, "hbond": 1, "pistacking": 1, "hydrophobic": 1
+        },
+        f"meta 里带机器可读的计数：{with_fp.meta.get('interactions')}",
+    )
+    check(
+        not degraded_fp.failed and degraded_fp.meta.get("contacts") == 2,
+        "PLIP 缺席时接触照算（可选依赖不能拖垮整条结果）",
+    )
+    check(
+        "本机没装 PLIP" in degraded_fp.output
+        and "interactions_error" in degraded_fp.meta,
+        f"缺席的原因照实写出来，并进 meta：{degraded_fp.output.splitlines()[-1]}",
+    )
+    check(
+        "interactions" not in degraded_fp.meta,
+        "没算成时不写 interactions（空字典与「算了但没有」长得一样，结论却相反）",
+    )
+    check(
+        "PLIP 没算成（原因见末尾）" in degraded_fp.output.splitlines()[0],
+        f"第一行就要说没算成——否则「没有盐桥那几行」会被读成「没有盐桥」："
+        f"{degraded_fp.output.splitlines()[0]}",
+    )
+
+    bad_plip = await analyze.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-ok", "interactions": "yes"},
+        context=ledger,
+    )
+    check(bad_plip.failed and "interactions" in bad_plip.output, f"类型不对要拒绝：{bad_plip.output}")
+
+    # 真跑一次 PLIP：验证「拼文件 → 读进去 → 抽出指纹」这条链真的通。
+    # 用一对平行的苯环（PHE 331 与配体），疏水接触是必然的；不依赖芳香性识别，
+    # 所以换 openbabel 版本也不会红。没装 PLIP 时只验那句安装指引。
+    loader, reason = analysis_module._plip_loader()
+    if loader is None:
+        check("requirements-chem.txt" in reason, f"没装 PLIP 时给的是安装入口：{reason}")
+    else:
+        real_hits, real_note = analysis_module.plip_fingerprint(
+            "\n".join(
+                line("ATOM", index + 1, name, "PHE", 331,
+                     1.39 * math.cos(math.radians(60 * index)),
+                     1.39 * math.sin(math.radians(60 * index)), 0.0, "C")
+                for index, name in enumerate(["CG", "CD1", "CE1", "CZ", "CE2", "CD2"])
+            )
+            + "\n",
+            "\n".join(
+                line("HETATM", index + 1, f"C{index + 1}", "UNL", 1,
+                     1.39 * math.cos(math.radians(60 * index)),
+                     1.39 * math.sin(math.radians(60 * index)), 3.7, "C")
+                for index in range(6)
+            )
+            + "\n",
+        )
+        check(real_note == "", f"真跑 PLIP 不报错：{real_note}")
+        check(
+            real_hits.get("hydrophobic") and real_hits["hydrophobic"][0].residue == "A:331:PHE",
+            f"3.7 Å 的平行苯环要认出疏水接触：{real_hits}",
+        )
+
     no_ledger = await analyze.execute(
         {"docking": str(docking_entry.handle), "molecule": "mol-ok"}
     )
@@ -8175,6 +9572,13 @@ async def check_curate_ligands() -> None:
         check(
             any("PAINS" in row["flags"] for row in flagged),
             "标记里写明命中的是哪一类规则",
+        )
+        # flag 模式下「保留 / 淘汰」不互斥：9 条全在库里，5 条带标记。
+        # 原先照 drop 的口径写「保留 4 条，淘汰 5 条」，4 + 5 = 9 看着像算错了（P3-3）。
+        check("淘汰" not in flag.output, f"flag 模式不说「淘汰」：{flag.output}")
+        check(
+            "其中 5 条带标记" in flag.output and "仍在库里" in flag.output,
+            f"flag 模式说清「标了几条、还在库里」：{flag.output}",
         )
 
         # ---- 五、全灭要报失败并说清 ----
@@ -8847,7 +10251,7 @@ async def check_batch_offset() -> None:
     work.mkdir(parents=True, exist_ok=True)
 
     # ---- 一、先验纯函数：切片不重叠、不漏 ---
-    from opencode_tui.core.agent.domain.ligand import PrepItem, Cleaned
+    from vsagent.core.agent.domain.ligand import PrepItem, Cleaned
 
     items = [
         PrepItem(
@@ -9533,7 +10937,7 @@ async def check_sar() -> None:
         )
         assay_tool = sar_module.RecordAssayTool()
         recorded = await assay_tool.execute(
-            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger
+            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger, task_state=TaskState()
         )
         check(not recorded.failed, f"实验回填成功：{recorded.output.splitlines()[0]}")
         check(recorded.meta.get("received") == 2, f"只收可解析的两条：{recorded.meta}")
@@ -9550,7 +10954,7 @@ async def check_sar() -> None:
         # 同一个分子再报一次：保留最新，旧值进历史
         assay_csv.write_text("molecule,value\nc2,15\n", encoding="utf-8")
         again = await assay_tool.execute(
-            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger
+            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger, task_state=TaskState()
         )
         check(again.meta.get("superseded") == 1, f"覆盖了一条旧值：{again.meta}")
         with assay_path.open(encoding="utf-8") as handle:
@@ -9566,12 +10970,12 @@ async def check_sar() -> None:
         other.write_text("molecule,value\nz1,1\n", encoding="utf-8")
         before = other.read_text(encoding="utf-8")
         await assay_tool.execute(
-            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger
+            {"file": str(assay_csv), "campaign": "egfr", "assay": "IC50"}, context=ledger, task_state=TaskState()
         )
         check(other.read_text(encoding="utf-8") == before, "别的 campaign 一个字节都不动")
 
         bad_campaign = await assay_tool.execute(
-            {"file": str(assay_csv), "campaign": "../etc", "assay": "IC50"}, context=ledger
+            {"file": str(assay_csv), "campaign": "../etc", "assay": "IC50"}, context=ledger, task_state=TaskState()
         )
         check(
             bad_campaign.failed,
@@ -9580,7 +10984,7 @@ async def check_sar() -> None:
         bad_columns = work / "bad.csv"
         bad_columns.write_text("foo,bar\n1,2\n", encoding="utf-8")
         missing = await assay_tool.execute(
-            {"file": str(bad_columns), "campaign": "egfr", "assay": "IC50"}, context=ledger
+            {"file": str(bad_columns), "campaign": "egfr", "assay": "IC50"}, context=ledger, task_state=TaskState()
         )
         check(
             missing.failed and "表头" in missing.output,
@@ -9590,6 +10994,229 @@ async def check_sar() -> None:
         sar_module.sar_dir = original_sar
         ligand_module.ligands_dir = original_ligands
         export_module.runs_dir = original_runs
+
+
+async def check_hypothesis() -> None:
+    """假设：六要素硬门槛、只渲染未结的、实验回填结案、对照挑选、导出。"""
+    work = PROBE / "hypothesis"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    state = TaskState()
+    tool = HypothesisTool()
+
+    async def call(payload: dict[str, Any]) -> ToolResult:
+        """内核那一侧会把 `ToolError` 转成一条失败结果；这里照做，好断言文本。"""
+        try:
+            return await tool.execute(payload, task_state=state)
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+
+    # ---- 一、六要素是硬门槛 ----
+    no_test = await call(
+        {"action": "propose", "kind": "mechanism", "claim": "S1 口袋的极性亚位点决定活性",
+         "expected": "IC50 < 100 nM"}
+    )
+    check(no_test.failed and "test" in no_test.output, f"缺 test 直接拒绝：{no_test.output}")
+    vague = await call(
+        {"action": "propose", "kind": "mechanism", "claim": "S1 口袋的极性亚位点决定活性",
+         "test": "挑 10 个测一下", "expected": "活性会更好"}
+    )
+    check(
+        vague.failed and "含糊" in vague.output,
+        f"预期没有数/阈值/对照时拒绝：{vague.output}",
+    )
+    no_mode = await call(
+        {"action": "propose", "kind": "strategy", "claim": "先做多样性库再收窄",
+         "test": "看前 20 名落在几个骨架", "expected": "至少 5 个骨架"}
+    )
+    check(
+        no_mode.failed and "mode" in no_mode.output,
+        f"策略假设没有方向时拒绝：{no_mode.output}",
+    )
+    check(not state.hypotheses, "三次被拒都没有留下半条假设")
+
+    # ---- 二、提出、去重、渲染 ----
+    created = await call(
+        {"action": "propose", "kind": "strategy", "mode": "narrow",
+         "claim": "在氨基吡啶骨架上做取代基优化能提高活性",
+         "mechanism": "取代基填满疏水口袋",
+         "test": "同一骨架合成 6 个类似物测 IC50", "expected": "IC50 < 100 nM"}
+    )
+    check(created.meta.get("id") == "hyp#1", f"第一条编号是 hyp#1：{created.meta}")
+    duplicate = await call(
+        {"action": "propose", "kind": "strategy", "mode": "narrow",
+         "claim": "在氨基吡啶骨架上做取代基优化能提高活性",
+         "test": "再测一遍", "expected": "< 50 nM"}
+    )
+    check(
+        "已经有了" in duplicate.output and len(state.hypotheses) == 1,
+        f"同一主张不重复建号（否则旧编号的引用会断）：{duplicate.output}",
+    )
+    rendered = state.render()
+    check("hyp#1" in rendered and "检验：" in rendered and "预期：" in rendered,
+          f"未结假设进 TASK 层：{rendered}")
+
+    for index in range(3):
+        await call(
+            {"action": "propose", "kind": "mechanism",
+             "claim": f"机制假设 {index}", "test": "做一次突变", "expected": "活性下降 10 倍"}
+        )
+    rendered = state.render()
+    check(rendered.count("- hyp#") == 3, f"只渲染前 3 条未结的：{rendered}")
+    check("另有 1 条未列出" in rendered, f"超出的要说明还有几条：{rendered}")
+    listed = await call({"action": "list"})
+    check("共 4 条假设" in listed.output, f"list 能看到全部：{listed.output}")
+
+    # ---- 三、update / close 的边界 ----
+    updated = await call({"action": "update", "id": "hyp#2", "expected": "IC50 > 500 nM"})
+    check("expected" in updated.output, f"能改预期：{updated.output}")
+    bad_update = await call({"action": "update", "id": "hyp#2", "expected": "会变好"})
+    check(bad_update.failed, "改预期也过同一道校验")
+    unknown_id = await call({"action": "close", "id": "hyp#99", "status": "refuted"})
+    check(unknown_id.failed and "hyp#1" in unknown_id.output,
+          f"编号不存在时列出已有的：{unknown_id.output}")
+    closed = await call(
+        {"action": "close", "id": "hyp#2", "status": "refuted", "result": "突变体仍活跃"}
+    )
+    check(state.find_hypothesis("hyp#2").status == "refuted", f"close 改了状态：{closed.output}")
+    frozen = await call({"action": "update", "id": "hyp#2", "claim": "改个说法"})
+    check(frozen.failed and "已经结案" in frozen.output,
+          f"结案之后不再改内容：{frozen.output}")
+
+    # ---- 四、实验回填结案：supported / refuted / inconclusive ----
+    runs = work / "runs"
+    original_runs = export_module.runs_dir
+    export_module.runs_dir = lambda: runs
+    ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+    assay_tool = sar_module.RecordAssayTool()
+
+    async def feed(text: str, hypothesis: str = "hyp#1") -> Any:
+        path = work / "in.csv"
+        path.write_text(text, encoding="utf-8")
+        return await assay_tool.execute(
+            {"file": str(path), "campaign": "egfr", "assay": "IC50", "hypothesis": hypothesis},
+            context=ledger,
+            task_state=state,
+        )
+
+    try:
+        supported = await feed("molecule,value\nc1,40\nc2,80\n")
+        check(
+            state.find_hypothesis("hyp#1").status == "supported",
+            f"全部达标时结案 supported：{supported.output}",
+        )
+        check("达标 2 条" in supported.output, f"报告逐条对照：{supported.output}")
+        check(
+            state.find_hypothesis("hyp#1").result_ref.startswith("artifact#"),
+            "结案时记下证据出处",
+        )
+
+        refuted = await feed("molecule,value\nc1,400\nc2,900\n")
+        check(
+            state.find_hypothesis("hyp#1").status == "refuted",
+            f"全部不达标时结案 refuted：{refuted.output}",
+        )
+
+        # 实测只给了下界（`>1`），而预期是「< 100」：真值可能 5 也可能 500，
+        # 这一条判不了——不能当达标，也不能当不达标。
+        unclear = await feed("molecule,value\nc1,>1\n")
+        check(
+            state.find_hypothesis("hyp#1").status == "inconclusive",
+            f"限定符只给出一侧边界时不下结论：{unclear.output}",
+        )
+        check("判不了 1 条" in unclear.output, f"要说明为什么判不了：{unclear.output}")
+
+        # 反过来 `>10000` 是稳的 fail：真值只会更大，更不可能落在「< 100」这一侧。
+        certain = await feed("molecule,value\nc1,>10000\n")
+        check(
+            state.find_hypothesis("hyp#1").status == "refuted",
+            f"单侧边界也能判死的要判死：{certain.output}",
+        )
+
+        unknown_hyp = await feed("molecule,value\nc1,10\n", hypothesis="hyp#99")
+        check(
+            unknown_hyp.failed and "没有写入" in unknown_hyp.output,
+            f"假设编号写错时不写盘：{unknown_hyp.output}",
+        )
+    finally:
+        export_module.runs_dir = original_runs
+
+    # ---- 五、对照分子 ----
+    cand_dir = work / "candidates"
+    products_module.write_json_atomic(
+        cand_dir / "candidates.json",
+        {
+            "kind": "candidates",
+            "rows": [
+                {"id": "m1", "name": "a", "smiles": "CCO", "scores": {"dock": -10.0},
+                 "consensus_rank": 1.0, "tier": "high", "gates": {}},
+                {"id": "m2", "name": "b", "smiles": "CCN", "scores": {"dock": -9.0},
+                 "consensus_rank": 2.0, "tier": "high", "gates": {"pains": True}},
+                {"id": "m3", "name": "c", "smiles": "CCC", "scores": {"dock": -5.0},
+                 "consensus_rank": 3.0, "tier": "low", "gates": {}},
+                {"id": "m4", "name": "d", "smiles": "CCCl", "scores": {"dock": -4.0},
+                 "consensus_rank": 4.0, "tier": "below_cutoff", "gates": {}},
+            ],
+        },
+    )
+    entry = ledger.add(
+        "artifact", path=cand_dir, summary="候选表", meta={"kind": "candidates"}
+    )
+    controls = await analysis_module.PickControlsTool().execute(
+        {"source": str(entry.handle), "hypothesis": "hyp#1"},
+        context=ledger,
+        task_state=state,
+    )
+    check(not controls.failed, f"对照挑选成功：{controls.output}")
+    check(
+        controls.meta["controls"]["正向对照"] == ["m1"],
+        f"正向对照是排名最高且门禁全过的：{controls.meta}",
+    )
+    check(
+        controls.meta["controls"]["阴性对照"] == ["m4"],
+        f"阴性对照是排名最低且门禁全过的：{controls.meta}",
+    )
+    check(
+        controls.meta["controls"]["背离对照"] == ["m2"],
+        f"背离对照是门禁没过却排在前半的：{controls.meta}",
+    )
+    check("用来检验 hyp#1" in controls.output, "说明这批对照为哪条假设服务")
+    not_candidates = await analysis_module.PickControlsTool().execute(
+        {"source": "receptor#1"}, context=ledger, task_state=state
+    )
+    check(not_candidates.failed, "不存在的 handle 要报错而不是静默")
+
+    # ---- 六、导出：假设挂在 provenance 下，不新增顶层键 ----
+    from types import SimpleNamespace
+
+    bundle = SimpleNamespace(
+        pockets=[], origin="ligand", note="", total=0, used=0, excluded={}, sources=[]
+    )
+    meta = export_module._build_meta(
+        run_id="r1", name="n", pdb_id="1M17", uniprot="P00533", chains=["A"],
+        reference="", bundle=bundle, ligands=[], hypotheses=tuple(state.hypotheses),
+    )
+    check("hypotheses" not in meta, "不新增顶层键（判据按与演示数据同键核对）")
+    check(
+        len(meta["provenance"]["hypotheses"]) == len(state.hypotheses),
+        "假设整份进 provenance，含已结的",
+    )
+    check(
+        meta["provenance"]["hypotheses"][1]["status"] == "refuted",
+        "已结的状态一起导出",
+    )
+
+    # 状态要能落盘再读回来：不然重开会话假设就没了。
+    restored = TaskState.from_dict(state.to_dict())
+    check(
+        [item.id for item in restored.hypotheses] == [item.id for item in state.hypotheses],
+        "假设随任务状态一起序列化",
+    )
+    check(
+        restored.find_hypothesis("hyp#2").status == "refuted",
+        "状态与依据都还原",
+    )
 
 
 async def check_pharmacophore() -> None:
@@ -9799,6 +11426,97 @@ async def check_pharmacophore() -> None:
         screen_module.candidates_dir = original_candidates
 
 
+def check_identity_floor() -> None:
+    """同一性口径：截短构建体不能误杀，一小段不能混进来（P0-1）。
+
+    三件必须成立的事：
+      · 208 aa 的构建体对 394 aa 的全长链、208 个残基一个不差 → 同一性 1.00、
+        覆盖 0.53，判同一个蛋白（旧口径算成 0.528，把这条正确结论判成了「另一个蛋白」）；
+      · 同一性 1.00 但只覆盖 15% → 剔除，原因说的是「只覆盖多少」，不是「另一个蛋白」；
+      · 等长序列的结果与旧实现（分母取 max）逐位相同——换口径不动已验证的样本。
+    """
+    abl_text = IEP_FIXTURE.read_text(encoding="utf-8")
+    seqs = align_module.sequences(abl_text)
+    chain = seqs["A"]
+
+    # ---- 一、事故的精确复现：394 的全长受体对 208 的构建体 ----
+    # 后 186 个残基填 X（未知残基）：它不与任何残基匹配，所以前 208 个的对齐不变。
+    full_length = chain[:208] + "X" * 186
+    same, cover = align_module.identity(full_length, chain[:208])
+    check(
+        same == 1.0 and round(cover, 3) == 0.528,
+        f"208/394 的构建体：同一性 {same:.3f}、覆盖度 {cover:.3f}",
+    )
+    check(
+        align_module.same_protein(same, cover),
+        "208/394 的构建体判同一个蛋白（旧口径 0.528 会误杀）",
+    )
+    check(
+        not align_module.same_protein(0.356, 1.0),
+        "同家族的另一条链（同一性 0.356）仍然被剔除",
+    )
+    check(
+        not align_module.same_protein(1.0, 0.15),
+        "只覆盖 15% 的片段被剔除——覆盖度那道闸门真的在起作用",
+    )
+
+    # ---- 二、端到端：align_candidate 两道闸门都用上了 ----
+    # 1IEP 的链 A 是 274 个残基（残基号 225–498），只留这一条链再截短。
+    def sliced(last_residue: int) -> str:
+        kept = []
+        for line in abl_text.splitlines():
+            if line.startswith(("ATOM", "HETATM", "ANISOU")):
+                if line[21] != "A" or int(line[22:26]) > last_residue:
+                    continue
+            kept.append(line)
+        return "\n".join(kept) + "\n"
+
+    # 截到 208 个残基：覆盖 0.76，是「同一个蛋白的一段」，通过，且报出覆盖数。
+    partial, partial_transform = align_module.align_candidate(
+        abl_text, sliced(432), "T208"
+    )
+    check(
+        partial.ok and partial_transform is not None,
+        f"208/274 的构建体通过核对：{partial.state} {partial.reason}",
+    )
+    check("208/274" in partial.reason, f"结论里写明覆盖了多少个残基：{partial.reason}")
+
+    # 截到 40 个残基：同一性仍是 1.000，但覆盖只有 0.15，剔除。
+    # 这里必须说「只覆盖一小段」——说成「另一个蛋白」会把模型引去换编号。
+    fragment, fragment_transform = align_module.align_candidate(
+        abl_text, sliced(264), "T40"
+    )
+    check(
+        fragment.state == "mismatch" and fragment_transform is None,
+        f"40/274 的片段被剔除、且拿不到变换：{fragment.state}",
+    )
+    check("40/274" in fragment.reason, f"剔除原因写明覆盖数：{fragment.reason}")
+    check(
+        "另一个蛋白" not in fragment.reason,
+        f"同一性够、只是覆盖不足时不能说成「另一个蛋白」：{fragment.reason}",
+    )
+
+    # ---- 三、等长序列不回归：新旧分母是同一个数 ----
+    def legacy(left: str, right: str) -> float:
+        result = align_module._gemmi().align_string_sequences(
+            list(left), list(right), []
+        )
+        matches = sum(1 for char in result.match_string if char == "|")
+        return matches / max(len(left), len(right))
+
+    for label, other in (("自己", chain), ("同蛋白的另一条链", seqs["B"]), ("反向序列", chain[::-1])):
+        now, _ = align_module.identity(chain, other)
+        check(
+            now == legacy(chain, other),
+            f"{label}：新口径 {now:.3f} 与旧实现 {legacy(chain, other):.3f} 逐位相同",
+        )
+    # 不等长的样本上两个口径必须分得开——否则说明改动根本没生效。
+    check(
+        legacy(full_length, chain[:208]) != same,
+        f"不等长的样本上新旧口径确实不同：旧 {legacy(full_length, chain[:208]):.3f} / 新 {same:.3f}",
+    )
+
+
 def check_align_and_prior() -> None:
     """`align` + `pockets.prior_pockets`：序列核对、叠合、按先验清单算口袋。
 
@@ -9814,9 +11532,10 @@ def check_align_and_prior() -> None:
     seqs = align_module.sequences(abl_text)
     check(set(seqs) == {"A", "B"}, f"读出两条聚合物链：{sorted(seqs)}")
     check(len(seqs["A"]) == 274, f"链 A 的序列长度：{len(seqs['A'])}")
-    check(align_module.identity(seqs["A"], seqs["A"]) == 1.0, "同一条序列的同一性为 1")
+    same, cover = align_module.identity(seqs["A"], seqs["A"])
+    check(same == 1.0 and cover == 1.0, f"同一条序列的同一性与覆盖度都是 1：{same:.3f}/{cover:.3f}")
     reversed_seq = seqs["A"][::-1]
-    low = align_module.identity(seqs["A"], reversed_seq)
+    low, _low_cover = align_module.identity(seqs["A"], reversed_seq)
     check(low < align_module.IDENTITY_FLOOR, f"与无关序列的同一性低于门槛：{low:.3f}")
 
     pair = align_module.best_pair(seqs, {"X": seqs["B"]})
@@ -9940,7 +11659,7 @@ async def check_write_run() -> None:
     import tempfile
     from pathlib import Path as _Path
 
-    from opencode_tui.core.agent.ledger import SessionLedger
+    from vsagent.core.agent.ledger import SessionLedger
 
     real_1iep = IEP_FIXTURE
     text = real_1iep.read_text(encoding="utf-8")
@@ -9966,7 +11685,7 @@ async def check_write_run_docking() -> None:
     import tempfile
     from pathlib import Path as _Path
 
-    from opencode_tui.core.agent.ledger import SessionLedger
+    from vsagent.core.agent.ledger import SessionLedger
 
     runs_root = _Path(tempfile.mkdtemp(prefix="vsa-run-dock-"))
     original_runs_dir = export_module.runs_dir
@@ -10081,6 +11800,7 @@ async def check_write_run_docking() -> None:
                 "name": "docked",
             },
             context=ledger,
+            task_state=TaskState(),
         )
         check(not result.failed, f"write_run(docking=...) 跑通：{result.output[:300]}")
         run_dir = runs_root / "dock-run"
@@ -10127,6 +11847,10 @@ async def check_write_run_docking() -> None:
             f"provenance.poses 说清方向与来源：{poses}",
         )
         check(
+            poses["source"] == "vina:vina" and poses["scoring"] == "vina",
+            f"来源写成「引擎:力场」（三种力场的分数不可比）：{poses['source']}",
+        )
+        check(
             poses["counts"]["written"] == 2
             and poses["counts"]["skipped"] == 1
             and poses["counts"]["docked"] == 2,
@@ -10151,6 +11875,7 @@ async def check_write_run_docking() -> None:
                 "run_id": "dock-run",
             },
             context=ledger,
+            task_state=TaskState(),
         )
         check(not again.failed, f"同 run_id 重写成功：{again.output[:200]}")
         meta2 = _json.loads(
@@ -10181,6 +11906,7 @@ async def check_write_run_docking() -> None:
                 "run_id": "dock-run",
             },
             context=ledger,
+            task_state=TaskState(),
         )
         check(
             bad_result.failed and "不存在或越界" in bad_result.output,
@@ -10204,6 +11930,7 @@ async def check_write_run_docking() -> None:
                 "run_id": "dock-run",
             },
             context=ledger,
+            task_state=TaskState(),
         )
         check(
             wrong_result.failed and "另一份受体" in wrong_result.output,
@@ -10232,6 +11959,7 @@ async def check_write_run_docking() -> None:
                 "run_id": "dock-run",
             },
             context=ledger,
+            task_state=TaskState(),
         )
         check(
             both.failed and "二选一" in both.output,
@@ -10242,6 +11970,7 @@ async def check_write_run_docking() -> None:
         plain = await tool.execute(
             {"receptor": str(receptor.handle), "run_id": "plain-run"},
             context=ledger,
+            task_state=TaskState(),
         )
         check(not plain.failed, f"无对接的旧路径仍能跑：{plain.output[:200]}")
         plain_meta = _json.loads(
@@ -10259,6 +11988,7 @@ async def check_write_run_docking() -> None:
         cleared = await tool.execute(
             {"receptor": str(receptor.handle), "run_id": "dock-run"},
             context=ledger,
+            task_state=TaskState(),
         )
         check(not cleared.failed, f"同一 run_id 改写成无对接成功：{cleared.output[:200]}")
         cleared_meta = _json.loads(
@@ -10291,7 +12021,11 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
     ledger_ref: list = [None]
 
     async def _run_tool(tool, arguments, viewer=None):
-        return await tool.execute(arguments, context=ledger_ref[0], viewer=viewer)
+        # 任务状态一并给：`write_run` 把假设导出到 `provenance.hypotheses`，
+        # 没给就是内核装配问题（与 `task` / `record_assay` 同一种注入）。
+        return await tool.execute(
+            arguments, context=ledger_ref[0], task_state=TaskState(), viewer=viewer
+        )
 
     # ---- 早退：P0 有货时必须不去查预测（本步最要紧的一条）----
     calls: list[str] = []
@@ -10332,6 +12066,16 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
             {"receptor": str(entry.handle), "run_id": "p0-check", "uniprot": "P00519"},
         )
         check(not result.failed, f"write_run 跑通：{result.output[:200]}")
+        # 两处「杂原子组」分属两个对象：受体 PDB 里的、与候选复合物配体集里的。
+        # 都叫「杂原子组」而不标对象时，10 与 45 并排读着像矛盾（P3-4）。
+        check(
+            "受体预处理：" in result.output,
+            f"预处理那一段标明是受体：{result.output[:400]}",
+        )
+        check(
+            "  筛掉的杂原子组" not in result.output,
+            "旧的那句「筛掉的杂原子组」不再出现（它没说对象）",
+        )
         check(not calls, "P0 有货时**一次都没调用预测**（优先级真的生效）")
         # 「里面有哪些文件」是 write_run 之后最常被问的一句；返回里不列的话，
         # 模型只能再跑一次 ls —— 四问探针里 artifact 那一问就卡在这里。
@@ -10348,7 +12092,7 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
         )
         # 再走一遍证据层：干净行要真能落进证据的正文里，光「is_key_line 为真」
         # 还不够——`add_from_part` 还要选它。
-        from opencode_tui.core.agent.context import EvidenceStore as _Store
+        from vsagent.core.agent.context import EvidenceStore as _Store
 
         probe_part = Part(
             type=PartType.TOOL,
@@ -10370,9 +12114,38 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
         check(result.meta.get("origin") == "complex", f"返回 origin=complex：{result.meta.get('origin')}")
 
         run_dir = runs_root / "p0-check"
-        meta = _json.loads((run_dir / export_module.RUN_META).read_text(encoding="utf-8"))
+        meta_text = (run_dir / export_module.RUN_META).read_text(encoding="utf-8")
+        meta = _json.loads(meta_text)
         check((run_dir / "receptor.pdb").is_file(), "写出了 receptor.pdb")
         check((run_dir / "ligands").is_dir(), "写出了 ligands/ 目录")
+
+        # 登记时按**目录**算指纹，handle 一出生就该是 ok；改了目录里的文件才 stale。
+        # 以前这里记的是 `json.dumps(payload)` 的哈希，对账走 `fingerprint_path`，
+        # 两个永不相等——artifact 从登记那一刻起就恒为 stale（P1-1），
+        # 而 `file_state` 是模型用来判断「这个 handle 还作数吗」的唯一信号。
+        def artifact_state() -> str:
+            # `file_state` 是派生值，只有 reconcile() 会更新它。
+            ledger.reconcile()
+            return next(
+                item.file_state
+                for item in ledger.entries()
+                if str(item.handle) == result.meta.get("handle")
+            )
+
+        check(
+            artifact_state() == "ok",
+            f"刚写完的 artifact 是 ok，不是一出生就 stale：{artifact_state()}",
+        )
+        (run_dir / export_module.RUN_META).write_text(meta_text + " ", encoding="utf-8")
+        check(
+            artifact_state() == "stale",
+            f"改了目录里的文件之后变 stale：{artifact_state()}",
+        )
+        (run_dir / export_module.RUN_META).write_text(meta_text, encoding="utf-8")
+        check(
+            artifact_state() == "ok",
+            f"改回去之后又变回 ok（指纹按内容算，不是按时间）：{artifact_state()}",
+        )
 
         # meta.json 键集合与演示数据一致。**`contacts` 是刻意的例外**：
         # 本轮没有真实位姿，接触距离不可信，字段本身不出（方案稿 §2.1 第 78 行）。
@@ -10481,7 +12254,7 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
             "保留的是 STI 的坐标行，不只是说明行",
         )
         check(
-            "结构预处理" in structure_result.output,
+            "受体预处理" in structure_result.output,
             f"返回里报预处理做了什么：{structure_result.output[:200]}",
         )
 
@@ -10772,8 +12545,8 @@ async def check_rsearch() -> None:
     import tempfile
     from pathlib import Path as _Path
 
-    from opencode_tui.core.agent.domain import http as http_module
-    from opencode_tui.core.agent.domain import rsearch as rsearch_module
+    from vsagent.core.agent.domain import http as http_module
+    from vsagent.core.agent.domain import rsearch as rsearch_module
 
     # 缓存目录指到临时处：别读也别写家目录，否则上一次的结果会让这一次「命中」。
     tmp = _Path(tempfile.mkdtemp(prefix="vsa-search-"))
@@ -10923,9 +12696,9 @@ async def check_literature() -> None:
     import tempfile
     from pathlib import Path as _Path
 
-    from opencode_tui.core.agent.domain import http as http_module
-    from opencode_tui.core.agent.domain import literature as literature_module
-    from opencode_tui.core.agent.domain import rsearch as rsearch_module
+    from vsagent.core.agent.domain import http as http_module
+    from vsagent.core.agent.domain import literature as literature_module
+    from vsagent.core.agent.domain import rsearch as rsearch_module
 
     tmp = _Path(tempfile.mkdtemp(prefix="vsa-lit-"))
     # 缓存的路径拼法在 `rsearch.cache_path` 里，它调的是 **rsearch 的** `search_dir`，
@@ -11044,23 +12817,1084 @@ def _pubmed_xml(ids=None) -> str:
     return "<PubmedArticleSet>" + "".join(article(pid) for pid in wanted) + "</PubmedArticleSet>"
 
 
+def _jats_fixture() -> str:
+    """一份最小 JATS 全文：摘要 + 三节正文（Results 里还有一节子章节）。
+
+    字段名与 Europe PMC `fullTextXML` 一致：`sec` 直接挂在 `body` 下、小节再嵌一层，
+    摘要与许可在 `front/article-meta` 里。
+    """
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<article article-type="research-article">
+  <front>
+    <journal-meta><journal-title-group><journal-title>Journal of Stub</journal-title></journal-title-group></journal-meta>
+    <article-meta>
+      <title-group><article-title>EGFR T790M resistance in a stub</article-title></title-group>
+      <pub-date><year>2024</year></pub-date>
+      <abstract><title>Abstract</title><p>Background: stub abstract with <b>bold</b> text.</p></abstract>
+      <permissions><license license-type="cc by"><license-p>This is a long licence paragraph that must not be printed in full.</license-p></license></permissions>
+    </article-meta>
+  </front>
+  <body>
+    <sec><title>1 Introduction</title><p>Intro paragraph.</p></sec>
+    <sec><title>2 Methods</title><p>Methods paragraph one.</p><p>Methods paragraph two.</p></sec>
+    <sec><title>3 Results</title><p>Results paragraph with IC50 = 12 nM.</p>
+      <p>IC50 was 12 nM in the base case and 14 nM in the sensitivity analysis, with a confidence interval wide enough to make this paragraph long, so the truncation path can be exercised without inventing new fields or a second fixture.</p>
+      <sec><title>3.1 Sensitivity</title><p>Subsection paragraph.</p></sec>
+    </sec>
+  </body>
+</article>
+"""
+
+
+async def check_europepmc() -> None:
+    """Europe PMC：一步检索（含预印本）+ 开放全文的某一节；三条失败路径要能分清。
+
+    全程打桩：`http.get_json` / `http.get_text` 都换掉，缓存目录指到临时目录。
+    """
+    import tempfile
+    from pathlib import Path as _Path
+
+    from vsagent.core.agent.domain import http as http_module
+    from vsagent.core.agent.domain import literature as literature_module
+    from vsagent.core.agent.domain import rsearch as rsearch_module
+
+    tmp = _Path(tempfile.mkdtemp(prefix="vsa-epmc-"))
+    original_dir = rsearch_module.search_dir
+    rsearch_module.search_dir = lambda: tmp
+    original_json = http_module.get_json
+    original_text = http_module.get_text
+
+    searches: list[dict[str, object]] = []
+    downloads: list[str] = []
+    fail_download = {"value": False}
+
+    def get_json(url, params=None, **kwargs):
+        params = params or {}
+        searches.append(dict(params))
+        if params.get("resultType") == "lite":
+            query = str(params.get("query") or "")
+            if "PMC99999999" in query:
+                return {"hitCount": 0, "resultList": {"result": []}}
+            if "PMC5884736" in query:
+                return {
+                    "hitCount": 1,
+                    "resultList": {
+                        "result": [
+                            {
+                                "id": "29551287",
+                                "source": "MED",
+                                "pmid": "29551287",
+                                "pmcid": "PMC5884736",
+                                "title": "Closed access stub",
+                                "isOpenAccess": "N",
+                                "inEPMC": "Y",
+                            }
+                        ]
+                    },
+                }
+            if "PPR1350376" in query:
+                return {
+                    "hitCount": 1,
+                    "resultList": {
+                        "result": [
+                            {
+                                "id": "PPR1350376",
+                                "source": "PPR",
+                                "title": "Preprint stub",
+                                "isOpenAccess": "N",
+                            }
+                        ]
+                    },
+                }
+            return {
+                "hitCount": 1,
+                "resultList": {
+                    "result": [
+                        {
+                            "id": "41142240",
+                            "source": "MED",
+                            "pmid": "41142240",
+                            "pmcid": "PMC12545111",
+                            "doi": "10.1/x",
+                            "title": "Stub paper",
+                            "isOpenAccess": "Y",
+                            "inEPMC": "Y",
+                        }
+                    ]
+                },
+            }
+        return {
+            "hitCount": 42,
+            "resultList": {
+                "result": [
+                    {
+                        "id": "41142240",
+                        "source": "MED",
+                        "pmid": "41142240",
+                        "pmcid": "PMC12545111",
+                        "doi": "10.1/x",
+                        "title": "Stub <i>EGFR</i> paper",
+                        "authorString": "Li X, Lu Y, Zhou M, Dai Z.",
+                        "pubYear": "2024",
+                        "citedByCount": 7,
+                        "isOpenAccess": "Y",
+                        "abstractText": "<h4>Background</h4>Stub abstract &amp; a second-<i>line</i> note.",
+                        "journalInfo": {"journal": {"title": "Journal of Stub"}},
+                        "pubTypeList": {"pubType": ["Journal Article"]},
+                    },
+                    {
+                        "id": "PPR1350376",
+                        "source": "PPR",
+                        "title": "Preprint on EGFR",
+                        "pubYear": "2026",
+                        "authorString": "Doe J",
+                        "isOpenAccess": "N",
+                        "bookOrReportDetails": {"publisher": "bioRxiv"},
+                        "abstractText": "Preprint abstract.",
+                    },
+                ]
+            },
+        }
+
+    def get_text(url, params=None, **kwargs):
+        downloads.append(url)
+        if fail_download["value"]:
+            raise http_module.RetryableToolError("模拟 HTTP 500")
+        if "fullTextXML" not in url:
+            raise AssertionError(f"没预料到的 GET：{url}")
+        return _jats_fixture()
+
+    try:
+        http_module.get_json = get_json
+        http_module.get_text = get_text
+
+        # ---- 1. 检索：字段、预印本、全文入口、标签剥离 ----
+        search = literature_module.SearchEuropePmcTool()
+        result = await search.run({"query": "EGFR T790M", "limit": 5})
+        check(not result.failed, f"Europe PMC 检索跑通：{result.output[:160]}")
+        check("命中 42 篇，列出 2 篇" in result.output, "命中总数与列出条数分开报")
+        check("PMID 41142240 · PMC12545111 · 2024 · Journal of Stub · 被引 7" in result.output,
+              "命中行带 PMID / PMCID / 年份 / 期刊 / 被引")
+        check("Stub EGFR paper" in result.output, "标题里的 <i> 被剥掉")
+        check("Stub abstract & a second-line note." in result.output,
+              "块标签换空格、行内标签不留空格（second-<i>line</i> 不该变成 second- line）")
+        check("预印本" in result.output and "bioRxiv" in result.output, "预印本标出来源")
+        check(
+            "可读全文：read_fulltext article=PMC12545111" in result.output,
+            "OA 条目给出全文入口",
+        )
+        check("被引 0" not in result.output and "预印本 · 被引" not in result.output,
+              "没有引用数时不印一个假 0")
+        check(result.meta["total"] == 42 and result.meta["pmcids"] == ["PMC12545111"],
+              f"meta 里的总数与 PMCID：{result.meta.get('total')} / {result.meta.get('pmcids')}")
+
+        # ---- 2. 缓存：同一条查询第二次不联网（键里带 source / sort）----
+        before = len(searches)
+        await search.run({"query": "EGFR T790M", "limit": 5})
+        check(len(searches) == before, f"同一条查询走缓存：新增 {len(searches) - before} 次请求")
+
+        # ---- 3. 排序：透传成接口表达式，不认的值当场拒绝 ----
+        await search.run({"query": "EGFR T790M", "limit": 5, "sort": "cited"})
+        check(searches[-1].get("sort") == "CITED desc", f"被引排序转成表达式：{searches[-1].get('sort')}")
+        bad_sort = await search.run({"query": "EGFR T790M", "sort": "hot"})
+        check(bad_sort.failed and "sort" in bad_sort.output, f"不认识的排序拒绝：{bad_sort.output[:80]}")
+
+        # ---- 4. 全文：默认摘要 + 章节清单，不抓正文 ----
+        reader = literature_module.ReadFulltextTool()
+        listing = await reader.run({"article": "PMC12545111"})
+        check(not listing.failed, f"读全文清单成功：{listing.output[:120]}")
+        check("Journal of Stub · 2024 · cc by" in listing.output, "首行给期刊、年份与许可")
+        check("3 Results" in listing.output and "2 Methods" in listing.output, "章节清单列出了正文各节")
+        check('取某一节：read_fulltext article="PMC12545111" section="results"' in listing.output,
+              "清单后面给下一步怎么取")
+
+        # ---- 5. 取一节：子章节的段落也要在 ----
+        results = await reader.run({"article": "PMC12545111", "section": "Results"})
+        check(not results.failed, f"取 Results 成功：{results.output[:120]}")
+        check("IC50 = 12 nM" in results.output, "本节正文在")
+        check("[3.1 Sensitivity]" in results.output and "Subsection paragraph." in results.output,
+              "子章节标题与段落一起给出来")
+        check("章节：3 Results" in results.output, "报出匹配到的标题")
+
+        # ---- 6. 截断：说清原文多长、给了多少 ----
+        clipped = await reader.run({"article": "PMC12545111", "section": "results", "max_chars": 200})
+        check(not clipped.failed, "小预算也能取")
+        check("已截断：本节共" in clipped.output and "这里给前" in clipped.output,
+              f"截断要说明白：{clipped.output[-120:]}")
+        check(clipped.meta["truncated"] is True, "meta 里也标了截断")
+
+        # ---- 7. 摘要单独取（不在 body 的 sec 里）----
+        abstract = await reader.run({"article": "PMC12545111", "section": "abstract"})
+        check(not abstract.failed, "摘要能单独取")
+        check("章节：Abstract" in abstract.output and "stub abstract" in abstract.output,
+              f"摘要内容在：{abstract.output[:160]}")
+
+        # ---- 8. 没有这一节：不假装成功，把可读的列出来 ----
+        missing = await reader.run({"article": "PMC12545111", "section": "discussion"})
+        check(missing.failed and "没有标题含" in missing.output, f"缺节要照实说：{missing.output[:160]}")
+        check("1 Introduction" in missing.output, "缺节时把可读章节列出来")
+
+        # ---- 9. 非 OA：**在下载之前**就拒绝 ----
+        before = len(downloads)
+        closed = await reader.run({"article": "PMC5884736"})
+        check(closed.failed and "不是开放获取" in closed.output, f"非 OA 明确拒绝：{closed.output[:120]}")
+        check(len(downloads) == before, "非 OA 不该去请求全文接口（那个端点会回 500，分不清病因）")
+
+        # ---- 10. 预印本没有 PMCID ----
+        preprint = await reader.run({"article": "PPR1350376"})
+        check(preprint.failed and "没有 PMC 全文编号" in preprint.output,
+              f"预印本说明白：{preprint.output[:140]}")
+
+        # ---- 11. 认不出的编号 / 查不到记录 ----
+        unknown = await reader.run({"article": "my-paper"})
+        check(unknown.failed and "认不出来" in unknown.output, f"认不出的编号要指路：{unknown.output[:140]}")
+        absent = await reader.run({"article": "PMC99999999"})
+        check(absent.failed and "没有 PMC99999999" in absent.output, f"查不到记录：{absent.output[:120]}")
+
+        # ---- 12. PMID / DOI 也能喂（先换 PMCID）----
+        searches.clear()
+        await reader.run({"article": "41142240"})
+        check(any("EXT_ID:41142240" in str(item.get("query")) for item in searches),
+              f"PMID 换成 EXT_ID 查询：{[item.get('query') for item in searches]}")
+        searches.clear()
+        await reader.run({"article": "10.1/x"})
+        check(any('DOI:"10.1/x"' in str(item.get("query")) for item in searches),
+              f"DOI 换成 DOI 查询：{[item.get('query') for item in searches]}")
+
+        # ---- 13. 全文接口真的挂了：说「可能暂时，也可能没有全文」 ----
+        fail_download["value"] = True
+        broken = await reader.run({"article": "PMC12545111"})
+        check(broken.failed and "5xx" in broken.output, f"5xx 要说清两种可能：{broken.output[:200]}")
+    finally:
+        http_module.get_json = original_json
+        http_module.get_text = original_text
+        rsearch_module.search_dir = original_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _pubchem_row(
+    cid: int, title: str = "", *, formula: str = "C9H8O4",
+    inchikey: str = "BSYNRYMUTXBXSQ-UHFFFAOYSA-N",
+) -> dict[str, object]:
+    """一条 PUG 属性表的行。键名照真实返回写（`SMILES` 而不是 `CanonicalSMILES`）。"""
+    return {
+        "CID": cid,
+        "Title": title,
+        "MolecularFormula": formula,
+        "MolecularWeight": "180.16",
+        "SMILES": "CC(=O)OC1=CC=CC=C1C(=O)O",
+        "ConnectivitySMILES": "CC(=O)OC1=CC=CC=C1C(=O)O",
+        "InChIKey": inchikey,
+        "IUPACName": "2-acetyloxybenzoic acid",
+        "Charge": 0,
+        "XLogP": 1.2,
+        "TPSA": 63.6,
+        "HBondDonorCount": 1,
+        "HBondAcceptorCount": 4,
+        "RotatableBondCount": 3,
+    }
+
+
+async def check_pubchem() -> None:
+    """PubChem：标识识别、名称→SMILES 回退、相似检索的截断与无命中。
+
+    全程打桩；断言里带 URL 的命名空间，因为「拿它当名字还是当结构查」正是这层
+    最容易错的地方——错的时候接口会回 404，而 404 读起来像「这个化合物不存在」。
+
+    **合并入口那几条单独打 ChEMBL 的桩**（`chembl._request_json`），不打 `get_json`：
+    两条库的请求走同一个 `http`，但只按 URL 认的话，PubChem 那半的断言会被 ChEMBL
+    的 URL 串进来搅乱（`calls` 记的是全部 GET）。
+    """
+    from vsagent.core.agent.domain import chembl as chembl_module
+    from vsagent.core.agent.domain import http as http_module
+    from vsagent.core.agent.domain import pubchem as pubchem_module
+
+    original_json = http_module.get_json
+    original_chembl_json = chembl_module._request_json
+    chembl_calls: list[tuple[str, dict[str, object]]] = []
+    calls: list[tuple[str, dict[str, object], dict[str, object]]] = []
+
+    def chembl_json(url, params=None, **kwargs):
+        chembl_calls.append((url, dict(params or {})))
+        if "molecule_structures__standard_inchi_key__iexact" in (params or {}):
+            # 只有阿司匹林那把钥匙在 ChEMBL 里有记录；其余一律「没收录」，
+            # 用来验证「查不到不是失败，也不许说成接口故障」。
+            if (params or {})["molecule_structures__standard_inchi_key__iexact"] == (
+                "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"
+            ):
+                return {"molecules": [{"molecule_chembl_id": "CHEMBL25"}]}
+            return {"molecules": []}
+        if url.endswith(".json"):
+            return {
+                "molecule_chembl_id": "CHEMBL25",
+                "pref_name": "ASPIRIN",
+                "molecule_type": "Small molecule",
+                "structure_type": "MET",
+                "max_phase": 4.0,
+                "first_approval": 1950,
+                "molecule_structures": {
+                    "canonical_smiles": "CC(=O)Oc1ccccc1C(=O)O",
+                    "standard_inchi_key": "BSYNRYMUTXBXSQ-UHFFFAOYSA-N",
+                },
+                "molecule_properties": {},
+                "molecule_hierarchy": {"parent_chembl_id": "CHEMBL25"},
+                "molecule_synonyms": [{"molecule_synonym": "Aspirin"}],
+                "atc_classifications": ["N02BA01"],
+            }
+        if "mechanism" in url:
+            return {"mechanisms": []}
+        return {"drug_indications": [], "page_meta": {"total_count": 0}}
+
+    def get_json(url, params=None, **kwargs):
+        calls.append((url, dict(params or {}), dict(kwargs)))
+        if "fastsimilarity_2d" in url:
+            if "nosuch" in url:
+                raise http_module.NotFound("资源不存在（HTTP 404）")
+            # 30 条：用来验证 limit 的夹取（上限 20）与「只列前几条」。
+            return {
+                "IdentifierList": {
+                    "CID": [2244, 135269, 71586929] + [1000 + index for index in range(27)]
+                }
+            }
+        if "/synonyms/" in url:
+            return {
+                "InformationList": {
+                    "Information": [{"CID": 2244, "Synonym": ["aspirin", "ASA", "50-78-2"]}]
+                }
+            }
+        if "/cid/" in url and "," in url.split("/cid/")[1]:
+            ids = [int(item) for item in url.split("/cid/")[1].split("/")[0].split(",")]
+            return {"PropertyTable": {"Properties": [_pubchem_row(cid, f"Mol {cid}") for cid in ids]}}
+        if "/name/multi/" in url:
+            return {
+                "PropertyTable": {
+                    "Properties": [_pubchem_row(1, "First"), _pubchem_row(2, "Second", formula="C2H6O")]
+                }
+            }
+        if "/name/zzz/" in url:
+            raise http_module.NotFound("资源不存在（HTTP 404）")
+        if "/name/CCO/" in url:
+            raise http_module.NotFound("资源不存在（HTTP 404）")
+        if "/smiles/CCO/" in url:
+            return {"PropertyTable": {"Properties": [
+                _pubchem_row(702, "Ethanol", formula="C2H6O",
+                             inchikey="LFQSCWFLJHTTHZ-UHFFFAOYSA-N")
+            ]}}
+        if "/smiles/zzz/" in url:
+            raise http_module.NotFound("资源不存在（HTTP 404）")
+        if "/cid/2244/" in url:
+            return {"PropertyTable": {"Properties": [_pubchem_row(2244, "Aspirin")]}}
+        if "/inchikey/" in url:
+            return {"PropertyTable": {"Properties": [_pubchem_row(2244, "Aspirin")]}}
+        if "/name/aspirin/" in url or "/smiles/" in url:
+            return {"PropertyTable": {"Properties": [_pubchem_row(2244, "Aspirin")]}}
+        raise AssertionError(f"没预料到的 GET：{url}")
+
+    try:
+        http_module.get_json = get_json
+        chembl_module._request_json = chembl_json
+        lookup = pubchem_module.LookupCompoundTool()
+        similar = pubchem_module.FindSimilarCompoundsTool()
+
+        # ---- 1. 名称 ----
+        result = await lookup.run({"compound": "aspirin"})
+        check(not result.failed, f"按名称查成功：{result.output[:120]}")
+        check("/compound/name/aspirin/property/" in calls[-1][0], "名称走 name 命名空间")
+        check("CID 2244 · Aspirin" in result.output, "首行给 CID 与名称")
+        check("分子式 C9H8O4 · MW 180.16 · 电荷 0" in result.output, "身份行给分子式/分子量/电荷")
+        check("SMILES：CC(=O)OC1=CC=CC=C1C(=O)O" in result.output, "规范 SMILES 在")
+        check(
+            "计算值（PubChem 按规则算的，不是实验数据）：XLogP 1.2 · TPSA 63.6 · "
+            "氢键供体 1 / 受体 4 · 可旋转键 3" in result.output,
+            "计算性质单独一行，并写明是算出来的",
+        )
+        check(result.meta["cids"] == [2244], f"meta 里带 CID：{result.meta.get('cids')}")
+
+        # ---- 2. CID 与 InChIKey 各走自己的命名空间 ----
+        await lookup.run({"compound": "CID 2244"})
+        check("/compound/cid/2244/property/" in calls[-1][0], "CID 前缀能剥掉")
+        await lookup.run({"compound": "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"})
+        check("/compound/inchikey/" in calls[-1][0], "InChIKey 走 inchikey")
+
+        # ---- 3. SMILES：括号要编码；结构串的 500 要按「解析失败」报 ----
+        await lookup.run({"compound": "CC(=O)OC1=CC=CC=C1C(=O)O"})
+        smiles_url = calls[-1][0]
+        check("/compound/smiles/" in smiles_url and "%28" in smiles_url,
+              f"SMILES 走 smiles 且做了 URL 编码：{smiles_url}")
+
+        # ---- 4. 名称查不到 → 退回当 SMILES 查（CCO 这种没有提示字符的串）----
+        before = len(calls)
+        fallback = await lookup.run({"compound": "CCO"})
+        check(not fallback.failed, f"CCO 退回结构查询成功：{fallback.output[:100]}")
+        check(len(calls) == before + 2, f"先 name 再 smiles，共两次请求：{len(calls) - before}")
+        check("/name/CCO/" in calls[before][0] and "/smiles/CCO/" in calls[before + 1][0],
+              "回退顺序是 name → smiles")
+        check("CID 702" in fallback.output, "拿到乙醇那条")
+
+        # ---- 5. 两种都查不到：说清试过什么 ----
+        missing = await lookup.run({"compound": "zzz"})
+        check(missing.failed and "PubChem 里没有" in missing.output, f"查不到照实说：{missing.output[:160]}")
+        check("name=zzz" in missing.output, "把试过的命名空间列出来")
+
+        # ---- 5.1 PUG 的两种 500：结构错要翻成人话，真的故障要留给内核重试 ----
+        def bad_structure(url, params=None, **kwargs):
+            raise http_module.RetryableToolError(
+                '接口暂时不可用（HTTP 500）：{"Fault": {"Code": "PUGREST.ServerError", '
+                '"Message": "Search status indicates failure"}}'
+            )
+
+        http_module.get_json = bad_structure
+        broken = await lookup.run({"compound": "CC(=O)O"})
+        check(broken.failed and "没能解析" in broken.output,
+              f"结构解析失败要翻成人话：{broken.output[:140]}")
+
+        def busy(url, params=None, **kwargs):
+            raise http_module.RetryableToolError("接口暂时不可用（HTTP 503）：PUGREST.ServerBusy")
+
+        http_module.get_json = busy
+        try:
+            await lookup.run({"compound": "aspirin"})
+            check(False, "瞬时故障应当抛给内核重试")
+        except http_module.RetryableToolError:
+            check(True, "瞬时故障原样抛给内核（不伪装成参数错）")
+        http_module.get_json = get_json
+
+        # ---- 6. 别名：多一次请求，拿不到不算失败 ----
+        named = await lookup.run({"compound": "aspirin", "synonyms": True})
+        check("别名：aspirin、ASA、50-78-2" in named.output, "别名列出来了")
+        check(any("/synonyms/" in item[0] for item in calls), "确实查了同义词接口")
+
+        def no_synonyms(url, params=None, **kwargs):
+            if "/synonyms/" in url:
+                raise http_module.ToolError("模拟 503")
+            return get_json(url, params, **kwargs)
+
+        http_module.get_json = no_synonyms
+        degraded = await lookup.run({"compound": "aspirin", "synonyms": True})
+        # 判据只能看 PubChem 那份别名里的具体条目：ChEMBL 那半自己也印「别名 N 个」，
+        # 用「输出里有没有『别名』两个字」判会把两半混为一谈。
+        check(not degraded.failed and "ASA" not in degraded.output, "别名取不到时不影响主查询")
+        http_module.get_json = get_json
+
+        # ---- 7. 同名多义：列全并提醒确认 ----
+        multi = await lookup.run({"compound": "multi"})
+        check(not multi.failed and "命中 2 条" in multi.output, f"多条命中要说清：{multi.output[:80]}")
+        check("同名多义" in multi.output, "提醒同名多义")
+        check(multi.meta["cids"] == [1, 2], f"meta 列出全部 CID：{multi.meta.get('cids')}")
+
+        # ---- 8. 相似检索：批量取属性、保持顺序、报总数 ----
+        found = await similar.run({"smiles": "CC(=O)OC1=CC=CC=C1C(=O)O", "threshold": 98, "limit": 2})
+        check(not found.failed, f"相似检索跑通：{found.output[:120]}")
+        check("命中 30 条，列出前 2 条" in found.output, "总数与列出条数分开")
+        check(calls[-1][0].endswith("/property/" + pubchem_module.PROPERTIES + "/JSON")
+              and "/cid/2244,135269/" in calls[-1][0],
+              f"一次批量请求取前几条的属性：{calls[-1][0]}")
+        check(found.meta["cids"] == [2244, 135269], f"顺序照接口给的：{found.meta.get('cids')}")
+        check("阈值内共 30 条" in found.output, "截断时说明还剩多少")
+        check("接口不给分数" in found.output, "不编相似度分数")
+
+        # ---- 9. 无命中：不是失败 ----
+        empty = await similar.run({"smiles": "nosuch"})
+        check(not empty.failed and "没有与这段结构相似度" in empty.output,
+              f"阈值内没有命中不算失败：{empty.output[:120]}")
+        check(empty.meta["total"] == 0, "meta 里总数是 0")
+
+        # ---- 9.1 相似检索里结构串解析失败：同样翻成人话 ----
+        def bad_similarity(url, params=None, **kwargs):
+            raise http_module.RetryableToolError(
+                '接口暂时不可用（HTTP 500）：{"Fault": {"Code": "PUGREST.ServerError"}}'
+            )
+
+        http_module.get_json = bad_similarity
+        bad_smiles = await similar.run({"smiles": "CC(("})
+        check(bad_smiles.failed and "没能解析" in bad_smiles.output,
+              f"相似检索的结构错也要说清：{bad_smiles.output[:140]}")
+        http_module.get_json = get_json
+
+        # ---- 10. 参数边界 ----
+        low = await similar.run({"smiles": "CCO", "threshold": 10})
+        check(low.failed and "50–100" in low.output, f"阈值下限拦住：{low.output[:80]}")
+        clipped = await similar.run({"smiles": "CCO", "limit": 99})
+        check(not clipped.failed, "limit 超上限不报错，夹住")
+        batch = calls[-1][0].split("/cid/")[1].split("/")[0]
+        check(len(batch.split(",")) == pubchem_module.MAX_LIMIT,
+              f"limit 夹到 {pubchem_module.MAX_LIMIT}：实际取了 {len(batch.split(','))} 个")
+        check(clipped.meta["count"] == pubchem_module.MAX_LIMIT,
+              f"只列上限那么多：{clipped.meta.get('count')}")
+
+        # ---- 11. 合并入口：两半靠 InChIKey 对上 ----
+        # 名称进来：PubChem 先答，再按 InChIKey 补 ChEMBL 那半。
+        chembl_calls.clear()
+        merged = await lookup.run({"compound": "aspirin"})
+        check(not merged.failed, f"合并入口跑通：{merged.output[:80]}")
+        check(
+            "（下半来自 ChEMBL，按 InChIKey BSYNRYMUTXBXSQ-UHFFFAOYSA-N 对上同一个结构）"
+            in merged.output,
+            "两半之间说明是怎么对上的",
+        )
+        check("ChEMBL 分子 CHEMBL25 · ASPIRIN" in merged.output, "ChEMBL 那半在")
+        check("已上市药物" in merged.output, "max_phase 4 翻成已上市")
+        check(
+            merged.meta["chembl_id"] == "CHEMBL25",
+            f"meta 带 ChEMBL 编号：{merged.meta.get('chembl_id')}",
+        )
+        check(merged.meta["max_phase"] == 4.0, f"meta 带 max_phase：{merged.meta.get('max_phase')}")
+        check(
+            any(
+                any("standard_inchi_key" in key for key in params)
+                for _url, params in chembl_calls
+            ),
+            f"是拿 InChIKey 去反查的：{chembl_calls}",
+        )
+
+        # 编号进来：方向反过来，先 ChEMBL 后按 InChIKey 反查 PubChem。
+        calls.clear()
+        chembl_calls.clear()
+        by_code = await lookup.run({"compound": "chembl25"})
+        check(not by_code.failed, f"按编号查也跑通：{by_code.output[:80]}")
+        check("CID 2244 · Aspirin" in by_code.output, "PubChem 那半照样有")
+        check("ChEMBL 分子 CHEMBL25" in by_code.output, "ChEMBL 那半也有")
+        check(
+            by_code.output.index("CID 2244") < by_code.output.index("ChEMBL 分子"),
+            "输出顺序统一：PubChem 在前、ChEMBL 在后（进来的方向不影响排版）",
+        )
+        check(
+            any("/inchikey/" in url for url, _params, _kwargs in calls),
+            f"按编号进来时用 InChIKey 去 PubChem 反查：{calls}",
+        )
+
+        # 同名多义：不知道该补哪一个，就不补——但要说清下一步怎么补。
+        chembl_calls.clear()
+        ambiguous = await lookup.run({"compound": "multi"})
+        check(chembl_calls == [], f"同名多义时不查 ChEMBL：{chembl_calls}")
+        check("拿 CID 再查一次会顺带取 ChEMBL 画像" in ambiguous.output, "指路：用 CID 再查")
+
+        # ChEMBL 里没收录：一句说明，不是失败，也不许说成接口故障。
+        chembl_module._request_json = lambda url, params=None, **kwargs: (
+            {"molecules": []}
+            if any("standard_inchi_key" in key for key in (params or {}))
+            else chembl_json(url, params, **kwargs)
+        )
+        absent = await lookup.run({"compound": "aspirin"})
+        check(not absent.failed, "ChEMBL 没收录不算失败")
+        check("ChEMBL 里没有这个结构" in absent.output, f"说清是没收录：{absent.output[-200:]}")
+        check("不代表没有活性" in absent.output, "别让「没收录」被读成「没活性」")
+        check(absent.meta["chembl_id"] == "", "meta 里 ChEMBL 编号是空的")
+
+        # 确定性错误：降级成一句说明（主答案已经拿到），不整次失败。
+        def chembl_down(url, params=None, **kwargs):
+            raise http_module.ToolError("模拟 400")
+
+        chembl_module._request_json = chembl_down
+        degraded_half = await lookup.run({"compound": "aspirin"})
+        check(not degraded_half.failed, "ChEMBL 挂了不影响 PubChem 那半")
+        check(
+            "ChEMBL 那半没取到" in degraded_half.output,
+            f"降级要说清：{degraded_half.output[-160:]}",
+        )
+        check("CID 2244" in degraded_half.output, "身份照旧给出来")
+
+        # 瞬时故障：照旧抛给内核重试——吞掉它会让模型以为「这个分子不在 ChEMBL 里」。
+        def chembl_busy(url, params=None, **kwargs):
+            raise http_module.RetryableToolError("接口暂时不可用（HTTP 503）")
+
+        chembl_module._request_json = chembl_busy
+        try:
+            await lookup.run({"compound": "aspirin"})
+            check(False, "ChEMBL 的瞬时故障应当抛给内核重试")
+        except http_module.RetryableToolError:
+            check(True, "ChEMBL 的瞬时故障原样抛给内核")
+
+        # 生物药：ChEMBL 记录里没有结构式，PubChem 那半无从查起——说清楚，不是「查不到」。
+        def biological(url, params=None, **kwargs):
+            if url.endswith(".json"):
+                return {
+                    "molecule_chembl_id": "CHEMBL1201583",
+                    "pref_name": "BEVACIZUMAB",
+                    "molecule_type": "Antibody",
+                    "structure_type": "SEQ",
+                    "max_phase": 4.0,
+                    "molecule_structures": {"canonical_smiles": None, "standard_inchi_key": None},
+                    "molecule_properties": {},
+                    "molecule_hierarchy": {"parent_chembl_id": "CHEMBL1201583"},
+                }
+            return chembl_json(url, params, **kwargs)
+
+        chembl_module._request_json = biological
+        calls.clear()
+        biologic = await lookup.run({"compound": "CHEMBL1201583"})
+        check(not biologic.failed, "生物药也能出画像")
+        check(
+            "PubChem 那半跳过" in biologic.output,
+            f"说清为什么没有 PubChem 那半：{biologic.output[:200]}",
+        )
+        check(calls == [], f"没有结构式就不该去 PubChem 白跑一趟：{calls}")
+    finally:
+        http_module.get_json = original_json
+        chembl_module._request_json = original_chembl_json
+
+
+def _ot_target(**overrides: object) -> dict[str, object]:
+    """一份 GraphQL 的 `data` 块，里面是一个靶点。键名照真实返回写。"""
+    target: dict[str, object] = {
+        "id": "ENSG00000146648",
+        "approvedSymbol": "EGFR",
+        "approvedName": "epidermal growth factor receptor",
+        "biotype": "protein_coding",
+        "functionDescriptions": [
+            "Receptor tyrosine kinase (PubMed:12345) that binds EGF. "
+            "{ECO:0000269|PubMed:12345}"
+        ],
+        "genomicLocation": {"chromosome": "7", "start": 55018820, "end": 55211628},
+        "tractability": [
+            {"label": "Approved Drug", "modality": "SM", "value": True},
+            {"label": "High-Quality Pocket", "modality": "SM", "value": True},
+            {"label": "Med-Quality Pocket", "modality": "SM", "value": False},
+            {"label": "Approved Drug", "modality": "AB", "value": False},
+            {"label": "Literature", "modality": "PR", "value": True},
+        ],
+        # 7 条：用来验证「高质量优先 → 评分从高到低」的排序与「列 5 条 + 还有 2 个」。
+        # 顺序故意打乱，而且低质量那条的评分比几条高质量的都高——排序必须先看质量。
+        "chemicalProbes": [
+            {"id": "LOWQ", "drugId": "CHEMBL1", "isHighQuality": False,
+             "mechanismOfAction": ["inverse agonist"], "control": None,
+             "scoreInCells": 10, "scoreInOrganisms": 0, "probesDrugsScore": 90},
+            # 探针名故意不用 AFATINIB：药物那一段也用它，两处同名会让「盐型只占一条」
+            # 与「按阶段排序」那几条断言分不清是哪一段在说话。
+            {"id": "GEFITINIB", "drugId": "CHEMBL939", "isHighQuality": True,
+             "mechanismOfAction": ["inhibitor"], "control": None,
+             "scoreInCells": 67.5, "scoreInOrganisms": 82.5, "probesDrugsScore": 80.4},
+            {"id": "DDC-01-163", "drugId": "CHEMBL4468472", "isHighQuality": True,
+             "mechanismOfAction": [], "control": None,
+             "scoreInCells": None, "scoreInOrganisms": None, "probesDrugsScore": 40},
+            {"id": "ACBI3", "drugId": "CHEMBL6195033", "isHighQuality": True,
+             "mechanismOfAction": ["degrader"], "control": "Cis-ACBI3",
+             "scoreInCells": 82.5, "scoreInOrganisms": 75, "probesDrugsScore": 70},
+            {"id": "P4B", "drugId": None, "isHighQuality": True,
+             "mechanismOfAction": ["degrader"], "control": None,
+             "scoreInCells": None, "scoreInOrganisms": None, "probesDrugsScore": 100},
+            {"id": "ARS-1620", "drugId": "CHEMBL4214264", "isHighQuality": False,
+             "mechanismOfAction": ["inhibitor"], "control": None,
+             "scoreInCells": 50, "scoreInOrganisms": 50, "probesDrugsScore": 67.2},
+            {"id": "NOSCORE", "drugId": None, "isHighQuality": False,
+             "mechanismOfAction": [], "control": None,
+             "scoreInCells": None, "scoreInOrganisms": None, "probesDrugsScore": None},
+        ],
+        # 7 条：用来验证「列 6 条 + 还有 1 条」；最后一条没有来源也没有方向。
+        "safetyLiabilities": [
+            {"event": f"event {index}", "datasource": "Brennan et al. (2024)",
+             "effects": [{"direction": "Inhibition/Decrease/Downregulation"}]}
+            for index in range(6)
+        ] + [{"event": "bare event", "datasource": None, "effects": []}],
+        "associatedDiseases": {
+            "count": 123,
+            "rows": [
+                # 故意乱序：渲染前要按分数重排。
+                {"score": 0.4, "disease": {"id": "MONDO_0004992", "name": "cancer"},
+                 "datatypeScores": [
+                     {"id": name, "score": score}
+                     for name, score in (
+                         ("clinical", 0.9), ("literature", 0.8), ("genetic_association", 0.7),
+                         ("affected_pathway", 0.6), ("somatic_mutation", 0.5),
+                     )
+                 ]},
+                {"score": 0.85,
+                 "disease": {"id": "MONDO_0005233", "name": "non-small cell lung carcinoma"},
+                 "datatypeScores": [{"id": "clinical", "score": 0.99}]},
+                {"score": 0.7, "disease": {"id": "MONDO_0005061", "name": "lung adenocarcinoma"},
+                 "datatypeScores": [{"id": "literature", "score": 0.95}]},
+            ],
+        },
+        "drugAndClinicalCandidates": {
+            "count": 4,
+            "rows": [
+                {"maxClinicalStage": "PRECLINICAL",
+                 "drug": {"id": "CHEMBL9", "name": "ZETA", "drugType": "Small molecule",
+                          "parentMolecule": None}},
+                # 盐型：要并到母体上，且母体自己还有一条（PHASE_4），归并后只留阶段高的那条。
+                {"maxClinicalStage": "APPROVAL",
+                 "drug": {"id": "CHEMBL2105712", "name": "AFATINIB DIMALEATE",
+                          "drugType": "Small molecule",
+                          "parentMolecule": {"id": "CHEMBL1173655", "name": "AFATINIB"}}},
+                {"maxClinicalStage": "PHASE_3",
+                 "drug": {"id": "CHEMBL3678958", "name": "RUSERONTINIB",
+                          "drugType": "Small molecule", "parentMolecule": None}},
+                {"maxClinicalStage": "PHASE_4",
+                 "drug": {"id": "CHEMBL1173655", "name": "AFATINIB",
+                          "drugType": "Small molecule", "parentMolecule": None}},
+            ],
+        },
+    }
+    target.update(overrides)
+    return {"data": {"target": target}}
+
+
+def _ot_search(*hits: tuple[str, str]) -> dict[str, object]:
+    """`search` 的返回。`hits` 是 `(编号, 名字)`。"""
+    return {
+        "data": {
+            "search": {
+                "total": len(hits),
+                "hits": [
+                    {"id": identifier, "name": name, "entity": "target", "description": ""}
+                    for identifier, name in hits
+                ],
+            }
+        }
+    }
+
+
+def _ot_disease(*rows: tuple[float, str, str], count: int = 0) -> dict[str, object]:
+    """`disease` 的返回。`rows` 是 `(分数, 符号, 编号)`。"""
+    return {
+        "data": {
+            "disease": {
+                "id": "MONDO_0005061",
+                "name": "lung adenocarcinoma",
+                "associatedTargets": {
+                    "count": count or len(rows),
+                    "rows": [
+                        {"score": score,
+                         "target": {"id": identifier, "approvedSymbol": symbol,
+                                    "approvedName": f"{symbol} full name"},
+                         "datatypeScores": [{"id": "literature", "score": score}]}
+                        for score, symbol, identifier in rows
+                    ],
+                },
+            }
+        }
+    }
+
+
+async def check_opentargets() -> None:
+    """Open Targets：名字→编号、可成药性分模态、安全性/药物/疾病的截断与排序、两个方向的工具。
+
+    全程打桩。断言盯三件最容易错的事：**把基因名当 Ensembl 编号发出去**（接口回 null
+    而不是报错，沉默失败）、**把未成立的证据也列出来**（25 项全列没人看）、
+    **把接口给的任意顺序当排序**（「前 5 个」就成了随便 5 个）。
+    """
+    from vsagent.core.agent.domain import http as http_module
+    from vsagent.core.agent.domain import opentargets as ot_module
+    from vsagent.core.agent.domain import rsearch as rsearch_module
+    import copy
+
+    original_post = http_module.post_json
+    original_dir = rsearch_module.search_dir
+    tmp = ROOT / ".probe" / "opentargets-cache"
+    shutil.rmtree(tmp, ignore_errors=True)
+    # 缓存的路径拼法在 `rsearch.cache_path` 里，它调的是 **rsearch 的** `search_dir`。
+    rsearch_module.search_dir = lambda: tmp
+    calls: list[tuple[str, dict[str, object], dict[str, object]]] = []
+    replies: dict[str, object] = {}
+
+    def clear_cache() -> None:
+        """清掉这一轮写下的缓存。**每一节都要从「没查过」开始**，否则第二节起就是读缓存，
+        断言里的请求次数会莫名其妙变成 0。"""
+        for path in tmp.glob("*.json"):
+            path.unlink()
+
+    def post_json(url, payload, **kwargs):
+        calls.append((url, dict(payload), dict(kwargs)))
+        query = str(payload.get("query") or "")
+        for marker, reply in replies.items():
+            if f"query {marker}" in query:
+                if isinstance(reply, BaseException):
+                    raise reply
+                # 接口真的会按 page.size 分页，夹具也要照做——不然「截断」那条断言
+                # 测的是夹具自己没截断，而不是工具截没截。
+                body = copy.deepcopy(reply)
+                size = payload["variables"].get("size") or payload["variables"].get("diseases")
+                data = body.get("data") if isinstance(body, dict) else None
+                if size and isinstance(data, dict):
+                    block = None
+                    if marker == "Disease":
+                        block = (data.get("disease") or {}).get("associatedTargets")
+                    elif marker == "Profile":
+                        block = (data.get("target") or {}).get("associatedDiseases")
+                    if isinstance(block, dict):
+                        # 接口默认按关联分排序再分页（`orderByScore` 的默认值），夹具照做。
+                        block["rows"] = sorted(
+                            block["rows"], key=lambda row: row["score"], reverse=True
+                        )[: int(size)]
+                return body
+        raise AssertionError(f"没预料到的 GraphQL 查询：{query[:80]}")
+
+    async def fresh(tool, arguments: dict[str, object]):
+        """清缓存再跑——除了缓存那一节，其余各节验的都是「这一次请求拿到了什么」。"""
+        clear_cache()
+        return await tool.run(arguments)
+
+    try:
+        http_module.post_json = post_json
+        druggable = ot_module.CheckDruggabilityTool()
+        diseases = ot_module.DiseaseTargetsTool()
+
+        # ---- 1. 基因名先解析成编号，再查档案 ----
+        replies.update({"Search": _ot_search(("ENSG00000146648", "EGFR")),
+                        "Profile": _ot_target()})
+        result = await fresh(druggable, {"target": "EGFR"})
+        check(not result.failed, f"按基因名查成功：{result.output[:160]}")
+        check(len(calls) == 2, f"先搜再查，共两次请求：{len(calls)}")
+        check("query Search" in str(calls[0][1]["query"]), "第一次是检索")
+        check(calls[0][1]["variables"] == {"q": "EGFR", "entities": ["target"], "size": 5},
+              f"检索参数：{calls[0][1]['variables']}")
+        check(calls[1][1]["variables"]["id"] == "ENSG00000146648",
+              f"第二次用解析出来的编号：{calls[1][1]['variables']}")
+        check(calls[1][1]["variables"]["diseases"] == ot_module.DEFAULT_DISEASE_LIMIT,
+              f"疾病条数用默认值：{calls[1][1]['variables']}")
+
+        # ---- 2. 输出：解析行、身份行、功能（剥掉文献与证据编号）----
+        check("EGFR → ENSG00000146648" in result.output, "解析结果单独一行，便于复用")
+        check("EGFR（ENSG00000146648） · epidermal growth factor receptor" in result.output,
+              "身份行给符号、编号与全名")
+        check("位置 7 号染色体 55,018,820–55,211,628" in result.output, "位置带千分位")
+        check("PubMed:12345" not in result.output and "ECO:" not in result.output,
+              f"功能注释里的文献/证据编号剥掉了：{result.output[:200]}")
+        check("Receptor tyrosine kinase that binds EGF." in result.output,
+              "功能正文保留（剥编号时不能把整句吃掉）")
+
+        # ---- 3. 可成药性：只列成立的，没成立过的模态整行不出现 ----
+        check("小分子（SM）：已批准药物、高质量口袋" in result.output,
+              f"只列成立的证据：{result.output[:400]}")
+        check("中等质量口袋" not in result.output, "value=False 的条目不出现")
+        check("抗体（AB）" not in result.output, "一条都没成立的模态不占一行")
+        check("PROTAC/降解剂（PR）：文献支持" in result.output, "PR 模态也按代码翻成中文")
+
+        # ---- 3.1 化学探针：高质量优先，再按评分；截断要说还剩几个 ----
+        check(
+            "化学探针（经选择性验证的阳性对照，共 7 个，高质量优先，列出前 5 个）："
+            in result.output,
+            f"探针段要说清总数与排序口径：{result.output[400:900]}",
+        )
+        probe_part = result.output[result.output.index("化学探针"):result.output.index("安全性")]
+        check(
+            probe_part.index("P4B") < probe_part.index("GEFITINIB") < probe_part.index("ACBI3")
+            < probe_part.index("DDC-01-163") < probe_part.index("LOWQ"),
+            f"高质量在前、评分从高到低：{probe_part}",
+        )
+        check(
+            "ARS-1620" not in probe_part,
+            "超过上限的低质量探针不列（低质量评分再高也排在后面）",
+        )
+        check("（还有 2 个）" in probe_part, "截断时说明还剩几个")
+        check("CHEMBL939" in probe_part, "探针带 ChEMBL 编号，可接着查它是什么药")
+        check("抑制剂" in probe_part and "降解剂" in probe_part, "作用方式翻成中文")
+        check(
+            "inverse agonist" in probe_part,
+            "查不到译名的原样印英文（猜一个中文更容易误导）",
+        )
+        check("对照化合物：Cis-ACBI3" in probe_part, "有对照化合物就单独一行")
+        check(
+            "复现不出来" in probe_part and "没有基准可校" in probe_part,
+            "说清它为什么值得先对接一遍",
+        )
+        check(result.meta.get("probe_count") == 7, f"meta 里探针总数：{result.meta.get('probe_count')}")
+        check(
+            [item["name"] for item in result.meta.get("probes") or []][:2] == ["P4B", "GEFITINIB"],
+            f"meta 里的探针也按同一顺序：{result.meta.get('probes')}",
+        )
+
+        # 没有探针的靶点：说清后果（对接结果没有基准），不是一句「无数据」。
+        replies["Profile"] = _ot_target(chemicalProbes=[])
+        bare = await fresh(druggable, {"target": "EGFR", "disease_limit": 2, "drug_limit": 2})
+        check(
+            "化学探针：没有收录" in bare.output and "没有基准可校" in bare.output,
+            f"空探针要说出后果：{bare.output[400:800]}",
+        )
+        check(bare.meta.get("probe_count") == 0, "meta 里探针数是 0")
+        replies["Profile"] = _ot_target()
+
+        # ---- 4. 安全性：列 6 条 + 还有几条 ----
+        check("安全性（7 条记录，列出前 6 条）" in result.output, "安全性说清总数与列了几条")
+        check("（还有 1 条）" in result.output, "剩下的条数要写出来")
+        check("- bare event" not in result.output, "被截断的那条不出现")
+        check("（Brennan et al. (2024)，抑制/下调）" in result.output, "方向翻成中文")
+
+        # ---- 5. 药物：按阶段排序、盐型并入母体 ----
+        check("已知药物与临床候选（共 3 个，接口原始 4 条（盐型已并入母体）" in result.output,
+              f"盐型归并后的个数与原始条数都要说：{result.output[-900:]}")
+        check(result.output.count("AFATINIB") == 1, "AFATINIB 的盐型没有单独占一条")
+        check("AFATINIB DIMALEATE" not in result.output, "盐型名不出现")
+        ordered = [result.output.index(name) for name in ("AFATINIB", "RUSERONTINIB", "ZETA")]
+        check(ordered == sorted(ordered), f"按最高临床阶段排序：{ordered}")
+        check("AFATINIB · Small molecule · 已批准 · CHEMBL1173655" in result.output,
+              "母体的编号与阶段都取归并后那条")
+
+        # ---- 6. 疾病：重排、证据分解只列前四路 ----
+        check("疾病关联（共 123 条，按关联分排序，列出前 3 条）" in result.output,
+              "疾病总数与列出的条数分开写")
+        first = result.output.index("non-small cell lung carcinoma")
+        second = result.output.index("lung adenocarcinoma")
+        third = result.output.index("MONDO_0004992")
+        check(first < second < third, "按分数从高到低重排，不照接口顺序")
+        check("0.85 non-small cell lung carcinoma（MONDO_0005233）" in result.output,
+              "分数保留两位")
+        check("另有 1 路" in result.output, "证据多于四路时写明还剩几路")
+        check("不是概率，也不跨靶点比较大小" in result.output, "分数的口径要写清")
+
+        # ---- 7. meta ----
+        check(result.meta["ensembl_id"] == "ENSG00000146648", "meta 带编号")
+        check(result.meta["symbol"] == "EGFR", "meta 带符号")
+        check(result.meta["disease_count"] == 123 and result.meta["drug_count"] == 3,
+              f"meta 里的计数：{result.meta.get('disease_count')} / {result.meta.get('drug_count')}")
+        check(result.meta["source"] == "opentargets", "meta 标来源")
+
+        # ---- 8. 已经是编号就不再搜 ----
+        calls.clear()
+        await fresh(druggable, {"target": "ensg00000146648"})
+        check(len(calls) == 1 and "query Profile" in str(calls[0][1]["query"]),
+              f"编号直通，只发一次查询：{[str(c[1]['query'])[:20] for c in calls]}")
+        check(calls[0][1]["variables"]["id"] == "ENSG00000146648", "小写编号按大写发出去")
+
+        # ---- 9. 搜不到 / 编号不存在 ----
+        replies["Search"] = _ot_search()
+        missing = await fresh(druggable, {"target": "FOOBAR1"})
+        check(missing.failed and "搜不到" in missing.output, f"搜不到照实说：{missing.output[:120]}")
+
+        replies["Profile"] = {"data": {"target": None}}
+        absent = await fresh(druggable, {"target": "ENSG00000000000"})
+        check(absent.failed and "没有" in absent.output and "ENSG00000000000" in absent.output,
+              f"编号不存在要说清是编号的问题：{absent.output[:160]}")
+
+        # ---- 10. GraphQL 层的两类错误 ----
+        replies["Profile"] = {"errors": [{"message": "Cannot query field 'nope' on type 'Target'."}]}
+        rejected = await fresh(druggable, {"target": "ENSG00000146648"})
+        check(rejected.failed and "Cannot query field" in rejected.output,
+              f"200 里的 errors 也要接住：{rejected.output[:160]}")
+
+        replies["Profile"] = http_module.ResponseError(
+            "接口拒绝了请求（HTTP 400）：bad request", status_code=400
+        )
+        refused = await fresh(druggable, {"target": "ENSG00000146648"})
+        check(refused.failed and "Open Targets 查询失败" in refused.output,
+              f"4xx 翻成工具失败：{refused.output[:160]}")
+
+        replies["Profile"] = http_module.RetryableToolError("接口暂时不可用（HTTP 503）")
+        retried = None
+        try:
+            await fresh(druggable, {"target": "ENSG00000146648"})
+        except http_module.RetryableToolError as error:
+            retried = str(error)
+        check(retried is not None, "瞬时故障原样抛给内核（不伪装成参数错）")
+
+        # ---- 11. 参数边界 ----
+        replies["Profile"] = _ot_target()
+        await fresh(druggable, {"target": "ENSG00000146648", "disease_limit": 99, "drug_limit": 99})
+        check(calls[-1][1]["variables"]["diseases"] == ot_module.MAX_DISEASE_LIMIT,
+              f"疾病条数夹到上限：{calls[-1][1]['variables']}")
+        bad_limit = await fresh(druggable, {"target": "EGFR", "disease_limit": "x"})
+        check(bad_limit.failed and "整数" in bad_limit.output, f"非整数拦住：{bad_limit.output[:80]}")
+        empty = await fresh(druggable, {"target": "  "})
+        check(empty.failed, "空参数直接失败")
+
+        # ---- 12. 反方向：疾病 → 靶点 ----
+        calls.clear()
+        replies["Search"] = {
+            "data": {"search": {"total": 1, "hits": [
+                {"id": "MONDO_0005061", "name": "lung adenocarcinoma", "entity": "disease"}
+            ]}}
+        }
+        replies["Disease"] = _ot_disease(
+            (0.5, "TP53", "ENSG00000141510"),
+            (0.82, "EGFR", "ENSG00000146648"),
+            (0.7, "KRAS", "ENSG00000133703"),
+            count=10770,
+        )
+        found = await fresh(diseases, {"disease": "lung adenocarcinoma", "limit": 2})
+        check(not found.failed, f"疾病→靶点跑通：{found.output[:160]}")
+        check(calls[0][1]["variables"] == {"q": "lung adenocarcinoma",
+                                           "entities": ["disease"], "size": 5},
+              f"疾病检索参数：{calls[0][1]['variables']}")
+        check("lung adenocarcinoma（MONDO_0005061）：关联靶点共 10770 个" in found.output,
+              "首行给疾病名、编号与总数")
+        check(found.output.index("EGFR") < found.output.index("KRAS"),
+              "按分数排序（EGFR 0.82 在 KRAS 0.70 前）")
+        check("（还有 10768 个；调大 limit 再看）" in found.output,
+              f"截断要说清还剩多少：{found.output[-200:]}")
+        check(found.meta["disease_id"] == "MONDO_0005061", "meta 带疾病编号")
+        check(found.meta["total"] == 10770, "meta 带总数")
+
+        # ---- 13. 疾病侧的空结果与参数 ----
+        replies["Disease"] = _ot_disease(count=0)
+        nothing = await fresh(diseases, {"disease": "MONDO_0005061"})
+        check(not nothing.failed and "共 0 个" in nothing.output,
+              f"零命中不算失败：{nothing.output[:120]}")
+        clipped = await fresh(diseases, {"disease": "MONDO_0005061", "limit": 999})
+        check(not clipped.failed and calls[-1][1]["variables"]["size"] == ot_module.MAX_ASSOC_LIMIT,
+              f"limit 夹到上限：{calls[-1][1]['variables']}")
+        replies["Search"] = _ot_search()
+        unknown = await fresh(diseases, {"disease": "nosuch disease"})
+        check(unknown.failed and "搜不到" in unknown.output, f"疾病名搜不到照实说：{unknown.output[:120]}")
+
+        # ---- 14. 缓存：键是「查询 + 变量」，失败不落缓存 ----
+        replies.update({"Search": _ot_search(("ENSG00000146648", "EGFR")),
+                        "Profile": _ot_target()})
+        clear_cache()
+        calls.clear()
+        first = await druggable.run({"target": "EGFR"})
+        check(len(calls) == 2, f"第一次联网两次：{len(calls)}")
+        cached_files = sorted(path.name for path in tmp.glob("*.json"))
+        check(len(cached_files) == 2, f"两次查询各落一份缓存：{cached_files}")
+        check(all(name.startswith("opentargets-") for name in cached_files),
+              f"缓存文件名带来源前缀，与检索的缓存分得开：{cached_files}")
+
+        again = await druggable.run({"target": "EGFR"})
+        check(len(calls) == 2, f"第二次不再联网：{len(calls)}")
+        check(again.output == first.output, "缓存命中时输出与第一次一致")
+
+        # 换了疾病条数就是另一次查询——只按编号做键的话这里会拿到 5 条那份。
+        await druggable.run({"target": "EGFR", "disease_limit": 2})
+        check(len(calls) == 3, f"参数不同不共用缓存：{len(calls)}")
+        check(calls[-1][1]["variables"]["diseases"] == 2, "确实按新的条数查了一次")
+
+        # 缓存坏掉不能变成假结果：`read_cache` 认不出就当没有，重新联网。
+        for path in tmp.glob("*.json"):
+            path.write_text("{ 这不是 JSON", encoding="utf-8")
+        calls.clear()
+        recovered = await druggable.run({"target": "ENSG00000146648"})
+        check(not recovered.failed and len(calls) == 1,
+              f"缓存损坏时重新联网：{len(calls)} 次请求，失败={recovered.failed}")
+
+        # 失败的应答不落缓存：先 4xx，再正常——第二次必须真的发请求。
+        clear_cache()
+        replies["Profile"] = http_module.ResponseError("拒绝了（HTTP 400）", status_code=400)
+        calls.clear()
+        broken = await druggable.run({"target": "ENSG00000146648"})
+        check(broken.failed, "先制造一次失败")
+        check(len(list(tmp.glob("*.json"))) == 0, "失败的应答不写缓存")
+        replies["Profile"] = _ot_target()
+        calls.clear()
+        healed = await druggable.run({"target": "ENSG00000146648"})
+        check(not healed.failed and len(calls) == 1, f"失败之后重查要真的联网：{len(calls)}")
+
+        # 库层的开关：`use_cache=False` 绕过缓存（工具本身不暴露这个参数）。
+        calls.clear()
+        ot_module.target_profile("ENSG00000146648", use_cache=False)
+        check(len(calls) == 1, f"use_cache=False 时直接联网：{len(calls)}")
+    finally:
+        http_module.post_json = original_post
+        rsearch_module.search_dir = original_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def check_websearch() -> None:
     """联网搜索：凭据三档、查询归档不过期、摘要落库、抓取升全文、空结果不是失败。
 
     全程离线：`http.post_json` 打桩，语料根与归档目录都指到临时目录。**不碰
-    `~/.opencode_tui/search/`** —— 打桩能挡住网络，却挡不住上一次真实运行留下的
+    `~/.vsagent/search/`** —— 打桩能挡住网络，却挡不住上一次真实运行留下的
     归档命中，那会让「第二次没联网」这条断言在别人的机器上假绿。
     """
     import re
     import tempfile
     from pathlib import Path as _Path
 
-    from opencode_tui.core import corpus as corpus_module
-    from opencode_tui.core import corpus_config as corpus_config_module
-    from opencode_tui.core import search_config as search_config_module
-    from opencode_tui.core.agent.domain import http as http_module
-    from opencode_tui.core.agent.domain import rsearch as rsearch_module
-    from opencode_tui.core.agent.domain import websearch as websearch_module
+    from vsagent.core import corpus as corpus_module
+    from vsagent.core import corpus_config as corpus_config_module
+    from vsagent.core import search_config as search_config_module
+    from vsagent.core.agent.domain import corpus as corpus_tools
+    from vsagent.core.agent.domain import http as http_module
+    from vsagent.core.agent.domain import rsearch as rsearch_module
+    from vsagent.core.agent.domain import websearch as websearch_module
 
     root = _Path(tempfile.mkdtemp(prefix="vsa-web-"))
     archive = root / "search"
@@ -11188,7 +14022,7 @@ async def check_websearch() -> None:
 
         # 落盘之后必须**当场可检索**：工具说明写的是「之后免费可查」，而 S0/S1 里
         # 这一步是漏的——要等下一次 reindex 才看得见，模型会以为刚搜到的东西丢了。
-        from opencode_tui.core import index as index_module
+        from vsagent.core import index as index_module
 
         conn = index_module.connect()
         try:
@@ -11198,6 +14032,16 @@ async def check_websearch() -> None:
             conn.close()
         check(indexed == 3, f"三条搜索结果当场进索引：{indexed}")
         check(chunks >= 3, f"索引里有块：{chunks}")
+
+        # 入库不等于能查：RAG 的契约是「搜到的网页当场能被 search_corpus 检索到」。
+        # 上面那两条只验了 sources / chunks 表里有行——表里有行而检索查不到，
+        # 症状与「没入库」一样（模型以为刚搜到的东西丢了），但修的地方完全不同。
+        found = await corpus_tools.SearchCorpusTool().run({"query": "EGFR T790M"})
+        refs = found.meta.get("refs") or []
+        check(
+            not found.failed and any(ref.startswith("web#") for ref in refs),
+            f"刚搜到的网页当场能被本地检索命中：{refs}",
+        )
 
         # ---- 四、归档永久有效：同一 query 再搜不联网、不计费 ----
         again = await search.run({"query": "EGFR T790M"})
@@ -11382,11 +14226,11 @@ async def check_corpus() -> None:
     import tempfile
     from pathlib import Path as _Path
 
-    from opencode_tui.core import chunker as chunker_module
-    from opencode_tui.core import corpus as corpus_module
-    from opencode_tui.core import index as index_module
-    from opencode_tui.core import parse as parse_module
-    from opencode_tui.core.agent.domain import corpus as corpus_tools
+    from vsagent.core import chunker as chunker_module
+    from vsagent.core import corpus as corpus_module
+    from vsagent.core import index as index_module
+    from vsagent.core import parse as parse_module
+    from vsagent.core.agent.domain import corpus as corpus_tools
 
     root = _Path(tempfile.mkdtemp(prefix="vsa-corpus-"))
     store = root / "corpus"
@@ -11656,6 +14500,176 @@ async def check_corpus() -> None:
     finally:
         corpus_module.corpus_root = original_root
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _af_model_pdb(*, low: int = 12, high: int = 8) -> str:
+    """一份 AlphaFold 形状的 PDB：HEADER 有日期、没有 EXPDTA，B 因子是 pLDDT。
+
+    前 `low` 个残基给 40（低置信），其余给 95（很高）——这样「低置信区段」那条
+    断言有一个确定的期望值，而不是靠真实模型碰运气。
+    """
+    lines = [f"{'HEADER':<6}{'':4}{'':40}{'01-AUG-25':<9}{'':10}"]
+    total = low + high
+    for index in range(1, total + 1):
+        score = 40.0 if index <= low else 95.0
+        lines.append(
+            "ATOM  "
+            + f"{index:5d}"
+            + "  CA "
+            + " "
+            + f"{'ALA':>3s}"
+            + " "
+            + "A"
+            + f"{index:4d}"
+            + " "
+            + "   "
+            + f"{float(index):8.3f}"
+            + f"{0.0:8.3f}"
+            + f"{0.0:8.3f}"
+            + f"{1.0:6.2f}"
+            + f"{score:6.2f}"
+            + "          "
+            + " C"
+        )
+    return "\n".join(lines) + "\nEND\n"
+
+
+def _af_payload(**overrides: object) -> list[dict[str, object]]:
+    entry: dict[str, object] = {
+        "entryId": "AF-P00533-F1",
+        "latestVersion": 6,
+        "pdbUrl": "https://af.example/AF-P00533-F1-model_v6.pdb",
+        "cifUrl": "https://af.example/AF-P00533-F1-model_v6.cif",
+        "uniprotStart": 1,
+        "uniprotEnd": 20,
+        "gene": "EGFR",
+        "organismScientificName": "Homo sapiens",
+        "modelCreatedDate": "2025-08-01T00:00:00Z",
+    }
+    entry.update(overrides)
+    return [entry]
+
+
+async def check_alphafold() -> None:
+    """AlphaFold 预测模型：编号校验、pLDDT 汇总、坐标缓存、两档失败。"""
+    work = PROBE / "alphafold"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    store = work / "structures"
+
+    json_calls: list[str] = []
+    text_calls: list[str] = []
+    payload = _af_payload()
+    pdb_text = _af_model_pdb()
+
+    def get_json(url, params=None, *, timeout=45.0, headers=None, server_5xx_as_error=""):
+        json_calls.append(url)
+        return payload
+
+    def get_text_or_none(url, params=None, *, timeout=45.0, headers=None):
+        text_calls.append(url)
+        # cif 也回同一份文本：这一组只关心「没有 pdbUrl 时会不会走转换那条路」，
+        # 真正的 mmCIF→PDB 解析由 check_mmcif 负责。
+        if url.endswith(".pdb") or url.endswith(".cif"):
+            return pdb_text
+        return None
+
+    original_json = structure_module.http.get_json
+    original_text = structure_module.http.get_text_or_none
+    original_dir = structure_module.structure_dir
+    original_cif = structure_module._cif_to_pdb
+    structure_module.http.get_json = get_json
+    structure_module.http.get_text_or_none = get_text_or_none
+    structure_module.structure_dir = lambda: store
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+        tool = structure_module.FetchAlphafoldTool()
+
+        # 1. 基因名不是编号：在联网之前就该拦住
+        bad = await tool.execute({"uniprot_id": "EGFR"}, context=ledger)
+        check(bad.failed and "不是 UniProt 编号" in bad.output, f"基因名被拦下：{bad.output}")
+        check(not json_calls, f"格式错不该发请求：{json_calls}")
+
+        # 2. 模型编号与 UniProt 编号都收
+        result = await tool.execute({"uniprot_id": "AF-P00533-F1"}, context=ledger)
+        check(not result.failed, f"按模型编号取模型成功：{result.output.splitlines()[0]}")
+        check(
+            "AlphaFold AF-P00533-F1 · AlphaFold 预测模型 v6" in result.output,
+            f"首行说清是哪个模型、哪一版：{result.output.splitlines()[0]}",
+        )
+        check("沉积于" not in result.output, "预测模型不冒充「沉积日期」")
+        check(
+            "pLDDT（按 CA 逐残基，20 个）：均值 62.0" in result.output,
+            "pLDDT 均值按残基算："
+            + next(line for line in result.output.splitlines() if "pLDDT" in line),
+        )
+        check(
+            "<50 60% · 50–70 0% · 70–90 0% · ≥90 40%" in result.output,
+            "四档占比与夹具一致",
+        )
+        check(
+            "链 A 1–12（12 aa，均值 40）" in result.output,
+            "低置信区段报出起止与均值",
+        )
+        check("没有共晶配体可借" in result.output, "下游影响写出来了")
+
+        entry = ledger.entries()[0]
+        check(isinstance(entry.handle, ReceptorHandle), f"登记成 receptor：{entry.handle}")
+        check(entry.meta.get("source") == "alphafold", f"来源标成 alphafold：{entry.meta.get('source')}")
+        check(entry.meta.get("stage") == "raw", f"状态是原始结构：{entry.meta.get('stage')}")
+        check(entry.meta.get("alphafold_id") == "AF-P00533-F1", "meta 里带模型编号")
+        check(entry.meta.get("alphafold_version") == 6, "meta 里带版本")
+        check(entry.meta.get("coverage") == [1, 20], f"meta 里带覆盖范围：{entry.meta.get('coverage')}")
+        check(entry.meta.get("plddt_mean") == 62.0, f"meta 里带均值：{entry.meta.get('plddt_mean')}")
+        check(
+            entry.meta.get("source_url") == "https://alphafold.ebi.ac.uk/entry/AF-P00533-F1",
+            f"来源页是条目页：{entry.meta.get('source_url')}",
+        )
+        check("AlphaFold 模型 AF-P00533-F1" in entry.summary, f"摘要点明是预测：{entry.summary}")
+
+        # 3. 第二次：坐标不再下载，元数据仍问一次（版本可能变）
+        downloads = len(text_calls)
+        again = await tool.execute({"uniprot_id": "P00533"}, context=ledger)
+        check(not again.failed, "按 UniProt 编号再取一次成功")
+        check(len(text_calls) == downloads, f"坐标不重下：新增 {len(text_calls) - downloads} 次")
+        check(len(json_calls) == 2, f"元数据每次问一次：{len(json_calls)} 次")
+        check(len(ledger.entries()) == 1, "同一份坐标不重复登记")
+
+        # 4. refresh 强制重下
+        refreshed = await tool.execute({"uniprot_id": "P00533", "refresh": True}, context=ledger)
+        check(not refreshed.failed, "refresh 成功")
+        check(len(text_calls) == downloads + 1, f"refresh 真的重下：新增 {len(text_calls) - downloads} 次")
+
+        # 5. 没有 pdbUrl 时走 cifUrl + gemmi 转换，meta 记下来源格式。
+        # 转换后给一份**内容不同**的坐标：同一份内容指纹相同，会命中上一次那条登记，
+        # 而那条的 source_format 是 PDB——断言就看不见这一次的结果了。
+        payload[:] = _af_payload(pdbUrl="")
+        structure_module._cif_to_pdb = lambda _text: _af_model_pdb(low=5, high=8)
+        converted = await tool.execute({"uniprot_id": "P00533", "refresh": True}, context=ledger)
+        check(not converted.failed, f"只有 mmCIF 时能转换：{converted.output.splitlines()[0]}")
+        check(
+            any(entry.meta.get("source_format") == "mmCIF" for entry in ledger.entries()),
+            f"转换过的记下来源格式：{[e.meta.get('source_format') for e in ledger.entries()]}",
+        )
+        structure_module._cif_to_pdb = original_cif
+
+        # 6. 接口说「没有模型」时给可走的路
+        payload[:] = []
+        missing = await tool.execute({"uniprot_id": "P69905"}, context=ledger)
+        check(missing.failed and "没有可用模型" in missing.output, f"空结果照实说：{missing.output}")
+
+        # 7. 超长蛋白被切片时要说出来
+        payload[:] = _af_payload() + [
+            {**_af_payload()[0], "entryId": "AF-P00533-F2", "uniprotStart": 21, "uniprotEnd": 40}
+        ]
+        sliced = await tool.execute({"uniprot_id": "P00533", "refresh": True}, context=ledger)
+        check(not sliced.failed, "有片段时仍成功")
+        check("切成 2 段" in sliced.output, f"切片说清了：{sliced.output.splitlines()[-1]}")
+    finally:
+        structure_module.http.get_json = original_json
+        structure_module.http.get_text_or_none = original_text
+        structure_module.structure_dir = original_dir
+        structure_module._cif_to_pdb = original_cif
 
 
 def check_structure_parse() -> None:
@@ -12040,7 +15054,7 @@ async def check_structure_tools() -> None:
         )
 
         # 收路径的动作只有三个：其余工具的参数里不该出现 path。
-        from opencode_tui.core.agent.domain import corpus as corpus_tools
+        from vsagent.core.agent.domain import corpus as corpus_tools
 
         path_takers = [
             tool.spec.name
@@ -12658,54 +15672,37 @@ async def check_chembl_tools() -> None:
             "找类似物没拿到登记表时报装配问题",
         )
 
-        # ---- describe_molecule ----
-        describe = chembl_module.DescribeMoleculeTool()
-        before_entries = len(ledger.entries())
+        # ---- describe_molecule：库函数（工具入口并进了 pubchem 的 lookup_compound）----
+        # 合并之后不再有独立的 describe_molecule 工具，但画像这一段渲染仍归本模块管，
+        # 所以在这里按库函数验；两半怎么接起来在 check_pubchem 的第 11 段。
         calls.clear()
-        profile = await describe.execute({"molecule": "chembl939"}, context=ledger)
-        check(not profile.failed, f"查画像成功：{profile.output.splitlines()[0]}")
+        profile_text, profile_meta = chembl_module.describe_molecule("chembl939")
         check(
-            "ChEMBL 分子 CHEMBL939 · GEFITINIB" in profile.output,
-            f"首行报出编号与药名：{profile.output.splitlines()[0]}",
+            "ChEMBL 分子 CHEMBL939 · GEFITINIB" in profile_text,
+            f"首行报出编号与药名：{profile_text.splitlines()[0]}",
         )
-        check("已上市药物" in profile.output, f"max_phase 4 说成已上市：{profile.output}")
-        check("2015 年首次批准" in profile.output, "报出首次批准年份")
-        check("XGALLCVXEZPNRQ-UHFFFAOYSA-N" in profile.output, "报出 InChIKey")
+        check("已上市药物" in profile_text, "max_phase 4 说成已上市")
+        check("2015 年首次批准" in profile_text, "报出首次批准年份")
+        check("XGALLCVXEZPNRQ-UHFFFAOYSA-N" in profile_text, "报出 InChIKey")
+        check("Lipinski 五规则违反 0 项" in profile_text, "报出类药性")
+        check("QED 0.63" in profile_text, "报出 QED")
         check(
-            "Lipinski 五规则违反 0 项" in profile.output,
-            f"报出类药性：{profile.output}",
+            "Epidermal growth factor receptor" in profile_text
+            and "（INHIBITOR）" in profile_text,
+            "作用机制里的靶点名解析出来了",
         )
+        check("Carcinoma, Non-Small-Cell Lung" in profile_text, "适应症拼出来了")
+        check("IRESSA" in profile_text, "报出别名")
+        check("L01EB01" in profile_text, "报出 ATC 分类")
+        check("每次调用现查，不写盘缓存" in profile_text, "说明这是现查的，数据会随远端变")
         check(
-            "QED 0.63" in profile.output,
-            f"报出 QED：{profile.output}",
-        )
-        check(
-            "Epidermal growth factor receptor" in profile.output
-            and "（INHIBITOR）" in profile.output,
-            f"作用机制里的靶点名解析出来了：{profile.output}",
-        )
-        check(
-            "Carcinoma, Non-Small-Cell Lung" in profile.output,
-            f"适应症拼出来了：{profile.output}",
-        )
-        check("IRESSA" in profile.output, "报出别名")
-        check("L01EB01" in profile.output, "报出 ATC 分类")
-        check(
-            "每次调用现查，不写盘缓存" in profile.output,
-            "说明这是现查的，数据会随远端变",
-        )
-
-        check(
-            len(ledger.entries()) == before_entries,
-            f"describe_molecule 不登记条目（纯查询）：{len(ledger.entries())} == {before_entries}",
+            profile_meta["inchikey"] == "XGALLCVXEZPNRQ-UHFFFAOYSA-N",
+            f"meta 带 InChIKey（合并入口靠它接 PubChem）：{profile_meta}",
         )
         check(
-            describe.context_argument == "",
-            "纯查询不声明 context_argument（挂了登记表会让模型以为它留下了东西）",
-        )
-        check(
-            "ledger" not in (describe.spec.parameters.get("properties") or {}),
-            "参数模式里不列 ledger",
+            profile_meta["molecule_chembl_id"] == "CHEMBL939"
+            and profile_meta["max_phase"] == 4.0,
+            f"meta 带编号与阶段：{profile_meta}",
         )
 
         # 生物药（只有序列）要单独一档说明，不能带着空串去撞 500。
@@ -12727,30 +15724,33 @@ async def check_chembl_tools() -> None:
             }
 
         chembl_module._request_json = biological_transport
-        not_small = await describe.execute({"molecule": "CHEMBL1201583"}, context=ledger)
-        chembl_module._request_json = transport
-        check(not not_small.failed, "生物药也能出画像（结构那一段说明它不能对接）")
+        try:
+            not_small, _meta = chembl_module.describe_molecule("CHEMBL1201583")
+        finally:
+            chembl_module._request_json = transport
         check(
-            "没有结构式" in not_small.output and "不能拿来对接" in not_small.output,
-            f"说清没有结构的后果：{not_small.output}",
+            "没有结构式" in not_small and "不能拿来对接" in not_small,
+            f"说清没有结构的后果：{not_small}",
         )
 
-        bad_id = await describe.execute({"molecule": "gefitinib"}, context=ledger)
-        check(
-            bad_id.failed and "CHEMBL939" in bad_id.output,
-            f"非编号输入被拦下并指路：{bad_id.output[:60]}",
-        )
+        # 编号格式不对：当场拦下，不去撞 404。
+        try:
+            chembl_module.describe_molecule("gefitinib")
+            check(False, "非编号输入应当被拦下")
+        except chembl_module.http.ToolError as error:
+            check("CHEMBL939" in str(error), f"非编号输入被拦下并指路：{error}")
 
+        # ---- 装配：模块导出两个工具，两个都要登记表 ----
         # ---- 装配：模块导出三个工具，收登记表的只有前两个 ----
         tools = chembl_module.domain_tools()
         check(
             [tool.spec.name for tool in tools]
-            == ["search_actives", "find_analogs", "describe_molecule"],
-            f"模块导出三个工具：{[t.spec.name for t in tools]}",
+            == ["search_actives", "find_analogs"],
+            f"模块导出两个工具（画像的入口在 pubchem 族）：{[t.spec.name for t in tools]}",
         )
         check(
-            [tool.context_argument for tool in tools] == ["ledger", "ledger", ""],
-            f"只有会登记的两个收登记表：{[t.context_argument for t in tools]}",
+            [tool.context_argument for tool in tools] == ["ledger", "ledger"],
+            f"两个都会登记，都要登记表：{[t.context_argument for t in tools]}",
         )
         for tool in tools:
             check(
@@ -12774,10 +15774,11 @@ def check_chemistry_gate() -> None:
     # 没装化学依赖的人连会话都开不起来，而它们本该只影响一个工具。
     # 除了化学栈，深度学习栈也不许进主仓顶层：torch/dgl 只存在于 DTA 自己的
     # 解释器里（affinity 工具走子进程），顶层 import 会让应用起不来、exe 膨胀 2GB。
-    CHEM_NAMES = {"rdkit", "meeko", "gemmi", "torch", "dgl", "transformers"}
+    # plip / openbabel 同理：35 MB 的 C++ 绑定，只有 analyze_pose 的一个开关要它。
+    CHEM_NAMES = {"rdkit", "meeko", "gemmi", "torch", "dgl", "transformers", "plip", "openbabel"}
     offenders: list[str] = []
     scanned = 0
-    for path in sorted((ROOT / "opencode_tui").rglob("*.py")):
+    for path in sorted((ROOT / "vsagent").rglob("*.py")):
         scanned += 1
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in tree.body:
@@ -12817,7 +15818,7 @@ def check_chemistry_gate() -> None:
     )
 
     # ---- 二、真导入探测，不是 find_spec ----
-    source = (ROOT / "opencode_tui" / "core" / "agent" / "domain" / "chemistry.py").read_text(
+    source = (ROOT / "vsagent" / "core" / "agent" / "domain" / "chemistry.py").read_text(
         encoding="utf-8"
     )
     check(
@@ -12900,6 +15901,14 @@ def check_chemistry_gate() -> None:
     check(
         chem_file.name in chemistry_module.CHEM_INSTALL_HINT,
         "安装指令指的就是这个文件",
+    )
+    # 反向的那一条**刻意不成立**：plip 在这份文件里，但不在 CHEM_DEPS 里。
+    # CHEM_DEPS 管的是「准备受体、准备配体」那条链，把 plip 加进去会让没装它的人
+    # 连 prepare_receptor 都调不了——两件事没有关系。这里写成断言是为了挡住
+    # 后来「看见两份清单不一致就顺手对齐」的改动。
+    check(
+        "plip" in listed and "plip" not in chemistry_module.CHEM_DEPS,
+        "plip 在依赖文件里但不在 CHEM_DEPS 里（prepare_receptor 不该因它失败）",
     )
 
     # ---- 四、工具照常出现在清单里，只是调用时报错 ----
@@ -13852,7 +16861,7 @@ async def check_listing_tools() -> None:
     ):
         check(expected in names, f"新工具 {expected} 装上了（写了却没装，界面上完全看不出来）")
     # 搜索类工具是只读的：Plan 方式下必须放行（放进去就等于「查文献都做不到」）。
-    from opencode_tui.core.agent.permission import PLAN_DENY
+    from vsagent.core.agent.permission import PLAN_DENY
 
     for readonly in (
         "search_pdb",
@@ -14423,7 +17432,10 @@ async def check_selective_compression() -> None:
     check(len(fed) <= MODEL_OUTPUT_LIMIT, f"给模型的那一份没超限：{len(fed)}")
     check(mid_error in fed, "中段的报错原文保住了")
     check(conclusion in fed, "结论行保住了")
-    check(progress.format(50, 50) not in fed, "成片的过程行被丢掉了")
+    # 中间段改成「关键行 + 每 8 行留 1 行」之后，过程行不会再被一条不留地扫掉；
+    # 判据换成「压掉绝大部分」——留 1/8 是骨架的代价，全丢会把结构化输出一起吃掉。
+    kept_progress = sum(1 for index in range(300) if progress.format(index, index) in fed)
+    check(kept_progress <= 60, f"成片的过程行被压掉大半：留了 {kept_progress}/300")
     check(truncate_for_model("短输出") == "短输出", "不超限的输出原样返回")
 
     # 整段只有一行时没有行结构可挑，退回按位置留首尾——不能因为换了压缩就把信息丢掉。
@@ -14470,6 +17482,25 @@ async def check_selective_compression() -> None:
     check(compress_tool_output(deeper, deep=True) is None, "深档压过之后不再压")
     check(compress_tool_output(deeper) is None, "深档压过之后非深档也不会再动它")
     check(compress_tool_output("很短") is None, "短到不值一压的正文不动它")
+
+    # ---- 三之二、结构化清单不能被整段吃掉 ----
+    #
+    # 实测：20 个口袋的清单（11.4K 字符）里没有一行匹配「报错 / 结论」，
+    # 旧写法把它压成 161 字符（4 行），模型下一句是「The output got compressed」，
+    # 然后重跑了一遍命令——多花一整步换回它已经拿到手的数据。
+    dump = "\n".join(
+        f"--- {index}\n   center : [{index}.0, 2.0, 3.0]\n   radius : 5.0\n"
+        f"   source : ligand\n   residues : 12 个"
+        for index in range(20)
+    )
+    packed = compress_tool_output(dump)
+    check(packed is not None, "结构化清单该压还是要压")
+    assert packed is not None
+    check(len(packed) < len(dump), f"压短了：{len(dump)} -> {len(packed)}")
+    check(len(packed) >= len(dump) * 0.1, f"但没压成一句省略：留了 {len(packed)}/{len(dump)} 字符")
+    heads = sum(1 for index in range(20) if f"--- {index}" in packed)
+    check(heads >= 5, f"每条记录至少留了个头：{heads}/20")
+    check(OMISSION_MARK in packed, "省略的行数写明了")
 
     # ---- 四、装配器：只动推理与工具输出正文 ----
     #
@@ -14868,6 +17899,87 @@ async def check_context_metrics(server: FakeModelServer) -> None:
     check(plain["window_used"] == 0.0, "没有用量时窗口占比为 0")
 
 
+def check_reasoning() -> None:
+    """跨轮推理只留占位（P1-2）。
+
+    三件必须成立的事：
+      · 每条 assistant 消息都带 `reasoning_content` 字段——这是 DeepSeek 的硬协议，
+        缺一条就 400，所以「省」只能省内容、不能省字段；
+      · 上一轮的推理换成占位符，本轮的是原文（同一轮内要能看见自己上一步的推理）；
+      · 总量下降，而 `stable_prefix` 逐字节不变（前缀缓存不能被打断）。
+    """
+    from vsagent.core.agent import context as context_module
+
+    prefix = "系统提示。" * 20
+    session = Session(id="ses_reason", title="推理")
+
+    first = session.add_message(Message(role="user"))
+    first.add_part(Part(type=PartType.TEXT, text="先取结构"))
+    old = session.add_message(Message(role="assistant"))
+    old.add_part(Part(type=PartType.STEP_START, text="1"))
+    old.add_part(Part(type=PartType.REASONING, text="旧推理" + "甲" * 4000))
+    old.add_part(Part(type=PartType.TEXT, text="取到了"))
+    # 一步只有工具调用、没有推理：补的是 `EMPTY_REASONING`，不该被当成「已压缩」。
+    silent = session.add_message(Message(role="assistant"))
+    silent.add_part(Part(type=PartType.STEP_START, text="2"))
+    silent.add_part(Part(type=PartType.TEXT, text="继续"))
+
+    second = session.add_message(Message(role="user"))
+    second.add_part(Part(type=PartType.TEXT, text="再算口袋"))
+    fresh = session.add_message(Message(role="assistant"))
+    fresh.add_part(Part(type=PartType.STEP_START, text="3"))
+    fresh.add_part(Part(type=PartType.REASONING, text="新推理" + "乙" * 4000))
+    fresh.add_part(Part(type=PartType.TEXT, text="算好了"))
+
+    assembler = ContextAssembler(128_000)
+    built = assembler.build(session, prefix)
+    assistants = [item for item in built.messages if item.get("role") == "assistant"]
+    check(len(assistants) == 3, f"三条 assistant 都在请求体里：{len(assistants)}")
+    check(
+        all("reasoning_content" in item for item in assistants),
+        "每条 assistant 都有 reasoning_content 字段（协议不变）",
+    )
+    check(
+        assistants[0]["reasoning_content"] == REASONING_PLACEHOLDER,
+        f"上一轮的推理换成占位符：{assistants[0]['reasoning_content'][:30]}",
+    )
+    check(
+        assistants[1]["reasoning_content"] == EMPTY_REASONING,
+        f"本来就没有推理的那一步保持原样：{assistants[1]['reasoning_content'][:30]}",
+    )
+    check(
+        str(assistants[2]["reasoning_content"]).startswith("新推理"),
+        "本轮的推理仍是原文",
+    )
+    check(built.metrics["reasoning_placeholder"] == 1, f"度量里记了换掉几条：{built.metrics['reasoning_placeholder']}")
+
+    # 不清理的那一次：临时把函数换成空实现，比 total 与 system 消息。
+    original = context_module.placeholder_stale_reasoning
+    try:
+        context_module.placeholder_stale_reasoning = lambda turns, messages: 0
+        before = assembler.build(session, prefix)
+    finally:
+        context_module.placeholder_stale_reasoning = original
+
+    check(
+        built.metrics["total"] < before.metrics["total"],
+        f"清理之后总量下降：{built.metrics['total']} < {before.metrics['total']}",
+    )
+    check(
+        built.messages[0] == before.messages[0] == {"role": "system", "content": prefix},
+        "stable_prefix 逐字节不变（前缀缓存不被打断）",
+    )
+    # 原始 Part 不能被动过：`read_turn` 取回的是逐字节原文。
+    reasoning_parts = [
+        part for message in session.messages for part in message.parts
+        if part.type is PartType.REASONING
+    ]
+    check(
+        all("甲" * 10 in part.text or "乙" * 10 in part.text for part in reasoning_parts),
+        "会话里的推理原文一个字都没改",
+    )
+
+
 def check_evidence_ref() -> None:
     """证据引用名：不同的调用不能撞成一条，结构化读数优先于关键行。"""
 
@@ -15169,8 +18281,8 @@ def check_debug_tools() -> None:
     check(len(plan) == len(debug_tools.CALLS), f"CALLS 有几条就跑几次：{len(plan)}/{len(debug_tools.CALLS)}")
     repeated = [name for name, _ in debug_tools.CALLS if names.count(name) > 1]
     check(
-        len(repeated) == 3 and set(repeated) == {"import_ligandset"},
-        f"同名的那几条（三次导入）都还在计划里：{repeated}",
+        len(repeated) == 5 and set(repeated) == {"import_ligandset", "lookup_compound"},
+        f"同名的那几条都还在计划里（三次导入 + 两个方向的合并入口）：{repeated}",
     )
     by_position = [arguments for _label, tool, arguments in plan if tool.spec.name == "import_ligandset"]
     check(
@@ -15233,6 +18345,10 @@ async def check_tool_family() -> None:
         "load_tools 的说明带上了族 → 工具那张表",
     )
     check(f"{len(groups)} 族" in description, "说明里的族数就是目录里的族数")
+    check(
+        "一次把本阶段要用的族都装上" in description,
+        "load_tools 的说明里也写了「一次装完」（模型先读说明，再读返回）",
+    )
     # 光比对内容抓不到「写死一个恰好正确的数」。原先这条拿 "13 族" 当哨兵，
     # 族数真的涨到 13 之后哨兵永远成立，等于没测——改成看源码：说明必须是
     # `len(families())` 现算，类体里不许出现「数字 + 族」这种字面量。
@@ -15269,6 +18385,12 @@ async def check_tool_family() -> None:
     check(not loaded.failed, f"装一族不报错：{loaded.output}")
     check(session.tool_families == ["docking"], f"族记在会话上：{session.tool_families}")
     check("dock" in loaded.output, "装完告诉模型这一族里有什么")
+    # 每装一次都改工具清单，而清单是请求前缀的一部分——实测 8 次装族里有 5 次
+    # 让下一步的命中率掉到 0.22–0.39。提示写在第一次装的返回里才有用。
+    check(
+        "一次" in loaded.output and "缓存" in loaded.output,
+        f"第一次装时提示「一次装完，否则下一步缓存失效」：{loaded.output}",
+    )
     after = {spec["function"]["name"] for spec in registry.specs(exclude=hidden_names(session))}
     check("dock" in after, "装过的族出现在清单里")
     check(
@@ -15286,6 +18408,7 @@ async def check_tool_family() -> None:
         not again.failed and again.meta["already"] and session.tool_families == ["docking"],
         "重复装同一族不重复记账",
     )
+    check("缓存" not in again.output, "装过的族不再重复这句提醒（否则每步都是噪音）")
 
     unknown = await LoadToolsTool().execute(
         {"family": "nope"}, session=session, registry=registry
@@ -15293,12 +18416,41 @@ async def check_tool_family() -> None:
     check(unknown.failed and "docking" in unknown.output, f"未知族列出可选项：{unknown.output}")
     check(session.tool_families == ["docking"], "未知族不改会话状态")
 
+    # Phase 封存时收敛（P2-1）：族只装不卸的话，装到八族之后每步都发 12K token
+    # 的工具定义，而典型的一个阶段只用得上两三个族。
+    prune_session = Session(id="ses_family_prune")
+    prune_session.tool_families = ["docking"]
+    prune_session.family_phase = {"docking": 1}
+    check(
+        prune_families(prune_session, {"dock"}, 1) == []
+        and prune_session.tool_families == ["docking"],
+        "本阶段用过的族不会被移除",
+    )
+    check(
+        prune_families(prune_session, {"fetch_structure"}, 1) == [],
+        "本阶段刚装的族不卸（还没轮到用）",
+    )
+    dropped = prune_families(prune_session, {"fetch_structure"}, 2)
+    check(
+        dropped == ["docking"] and prune_session.tool_families == [],
+        f"下一个阶段没用过就卸掉：{dropped}",
+    )
+    check(
+        prune_families(prune_session, set(), 3) == [],
+        "一个工具都没用过时不卸（纯聊天的一轮没有依据）",
+    )
+
     # 被关掉的工具不许报「已装入」：那句话说出去，模型下一步就会去调它，
     # 撞上禁用文案之后转去 bash 自己实现了一遍（实测 20 步）。
+    # **名单从 catalog() 现取**：literature 族原先只有一个工具，关一个就等于关整族；
+    # 接上 Europe PMC 之后它有三个，写死一个名字时这条会变成「只关了一部分」，
+    # 而断言还在等「整族被关掉」——测试自己先漂了。
+    literature_tools = set(catalog()["literature"])
+    check(len(literature_tools) >= 3, f"literature 族的工具数：{sorted(literature_tools)}")
     dead = await LoadToolsTool().execute(
         {"family": "literature"},
         session=Session(id="ses_family_dead"),
-        registry=ToolRegistry(disabled={"search_literature"}),
+        registry=ToolRegistry(disabled=literature_tools),
     )
     check(dead.failed, f"整族被关掉时装它没有意义：{dead.output[:60]}")
     check("已装入" not in dead.output, "不许说「已装入」")
@@ -15315,7 +18467,8 @@ async def check_tool_family() -> None:
     )
     check(not part.failed, f"只关掉一部分时其余照装：{part.output}")
     check(
-        part.meta["tools"] == ["fetch_structure", "import_structure", "assess_structure"],
+        part.meta["tools"]
+        == ["fetch_structure", "fetch_alphafold", "import_structure", "assess_structure"],
         f"装进来的只有可用的那些：{part.meta['tools']}",
     )
     check(
@@ -15407,9 +18560,9 @@ async def check_tool_retry() -> None:
     但循环层原先用 `except ToolError` 把它一起接住了——工具层一次都不重试，
     那个标签等于白写。这一组盯的就是这条：分档要真的分档。
     """
-    from opencode_tui.core.agent.domain import complexes as complexes_module  # noqa: E402
-    from opencode_tui.core.agent.domain import http as http_module  # noqa: E402
-    from opencode_tui.core.agent.domain import rsearch as rsearch_module  # noqa: E402
+    from vsagent.core.agent.domain import complexes as complexes_module  # noqa: E402
+    from vsagent.core.agent.domain import http as http_module  # noqa: E402
+    from vsagent.core.agent.domain import rsearch as rsearch_module  # noqa: E402
 
     config = ProviderConfig(base_url="http://127.0.0.1:1", api_key="x", model="fake")
     bus = EventBus()
@@ -15529,132 +18682,362 @@ def _event_fixture(steps: int) -> Session:
 
 
 async def check_event_log() -> None:
-    """事件：本地汇编、连续覆盖、手动吞自动、写盘、装配、召回。"""
-    session = _event_fixture(4)
-    event = record_local_event(session, 8, "auto")
-    check(event is not None, "溢出时记下一条本地事件")
-    check(event.kind == "auto" and event.degraded, "自动兜底事件标成 auto / degraded")
-    check(event.actions == ["dock"], f"动作从 Part 数出来：{event.actions}")
-    check(
-        "docking#0" in event.artifacts and "docking#3" in event.artifacts,
-        f"产物取自 tool_meta：{event.artifacts}",
-    )
-    check(event.issues and "结果1" in event.issues[0], f"未决项是失败的那一条：{event.issues}")
-    check(session.compact_upto == 8, "事件把压缩位置推到了覆盖末端")
-    check(record_local_event(session, 8, "auto") is None, "同一段再收一次是 no-op")
+    """阶段流水：每步自动记、封存不花请求、渲染三条规则、三级召回。"""
+    session = _event_fixture(2)  # 4 条消息，2 次 dock（第 2 次失败）
+    check(session.events == [] and session.pending_steps == [], "新会话没有阶段也没有待封存的步")
 
-    for index in range(4, 6):
-        user = session.add_message(Message(role="user"))
-        user.add_part(Part(type=PartType.TEXT, text=f"第 {index} 步：跑对接"))
-        assistant = session.add_message(Message(role="assistant"))
-        assistant.add_part(
-            Part(
-                type=PartType.TOOL,
-                tool_name="dock",
-                tool_status=ToolStatus.COMPLETED,
-                tool_input={"receptor": "receptor#1", "ligands": f"ligandset#{index}"},
-                tool_output=f"结果{index}",
-                tool_meta={"handle": f"docking#{index}"},
-            )
+    # 第一步：从 Part 折出来，零请求。
+    assistant = session.messages[1]
+    calls = [part for part in assistant.parts if part.type is PartType.TOOL]
+    step = record_step(
+        session,
+        step_no=1,
+        parts=calls,
+        message_index=1,
+        part_start=0,
+        part_end=len(assistant.parts),
+    )
+    check(step is not None and step.seq == 1, "每步自动记一条 Step")
+    check(
+        "dock(" in step.intent and "ligandset#0" in step.intent,
+        f"intent 从工具名与参数拼：{step.intent}",
+    )
+    check(
+        step.result.startswith("成功") and "docking#0" in step.result,
+        f"结果带产出：{step.result}",
+    )
+    check(step.artifacts == ["docking#0"], f"产物取自 tool_meta：{step.artifacts}")
+    check(
+        (step.part_start, step.part_end) == (0, 1),
+        f"Part 区间记下来了（Step 级召回靠它）：{step.part_start}-{step.part_end}",
+    )
+    check(len(session.pending_steps) == 1, "待封存的步挂在会话上")
+    check(phase_tokens(session) > 0, "软预算读得到这一段的大小")
+
+    # 第二步是失败的那一条：失败要长在它自己那一步上。
+    assistant = session.messages[3]
+    calls = [part for part in assistant.parts if part.type is PartType.TOOL]
+    failed = record_step(
+        session, step_no=2, parts=calls, message_index=3, part_start=0, part_end=1
+    )
+    check(failed is not None and failed.issues and "结果1" in failed.issues[0], f"失败项取自 Part：{failed.issues}")
+    check("失败：" in failed.result, f"结果里写明失败：{failed.result}")
+
+    event = seal_phase(session, upto=4)
+    check(event is not None and event.kind == "auto", "轮末自动封存成一条阶段")
+    check(event.degraded, "模型没写标题时标成降级")
+    check(event.phase_index == 1 and len(event.steps) == 2, f"阶段号与步数：{event.phase_index}/{len(event.steps)}")
+    check(event.start == 0 and event.end == 4, f"覆盖整段：{event.start}–{event.end}")
+    check(event.tokens > 0, "记下了原文估算")
+    check("第 0 步：跑对接" in event.title, f"标题用用户原话：{event.title}")
+    check("2 步" in event.summary and "docking#0" in event.summary, f"结论本地拼：{event.summary}")
+    check(event.issues and "结果1" in event.issues[0], f"未决从 steps 聚合：{event.issues}")
+    check(event.actions == ["dock"], f"动作从 steps 聚合：{event.actions}")
+    check(session.pending_steps == [], "封存之后待封存的步清空")
+    check(session.event_end == 4, "事件覆盖到第 4 条")
+    check(session.compact_upto == 0, "自动封存不推手动压缩位置（最近一段还要留原文）")
+    check(seal_phase(session, upto=4) is None, "同一段再封一次是 no-op")
+    check(phase_start(session) == 4, "下一个阶段从这一条的末端开始")
+
+    # 纯聊天的一轮没有流水可记，轮末跳过；溢出 / compact 那种强行封存必须盖住。
+    chat = Session(id="ses_chat")
+    user = chat.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="你好"))
+    chat.add_message(Message(role="assistant"))
+    check(seal_phase(chat, upto=2) is None, "没有流水的一轮不封阶段")
+    forced = seal_phase(chat, kind="local", upto=2, force=True)
+    check(
+        forced is not None and (forced.start, forced.end) == (0, 2),
+        "强行封存仍要盖住那一段，不能留缝",
+    )
+    check(
+        forced.steps == [] and "覆盖第 1–2 条消息" in forced.summary,
+        f"没有流水时结论不假装有步：{forced.summary}",
+    )
+
+    # 回填：Step 没记下来（进程重启、旧版本写的历史）时按 Part 现数。
+    backfill = _event_fixture(2)
+    restored_event = seal_phase(backfill, upto=4)
+    check(
+        restored_event is not None and len(restored_event.steps) == 2,
+        "没记过 Step 时按 Part 回填流水",
+    )
+
+    # 一条 assistant 消息里装着**一整轮**的多步（`STEP_START` 切开）：封存时不能压成一步。
+    # 实测一次四轮会话，第二轮「先 load_tools 再 fetch_target」两步只留下了一步，
+    # 判据「每个 Step 恰好被一个 Phase 收走一次」当场不成立。
+    def _multi_step() -> Session:
+        built = Session(id="ses_multi")
+        built.add_message(Message(role="user")).add_part(
+            Part(type=PartType.TEXT, text="装族再用")
         )
-    merged = record_local_event(session, 12, "auto")
-    check(merged is not None and merged.id == event.id, "相邻的自动事件合并成一条")
-    check(merged.end == 12 and len(session.events) == 1, f"合并之后仍是一条：{len(session.events)}")
-
-    # 合并之后标题要覆盖整段，不是只描述开头：只取第一句的话，后面几段做的事
-    # 在索引里一个字都不留，而模型以为自己已经知道这一段了。
-    check(
-        "／" in merged.title and "等 6 段" in merged.title,
-        f"标题拼上整段的诉求：{merged.title}",
-    )
-    check(
-        "产物 docking#0、docking#1" in merged.summary,
-        f"产物排在调用之前，不会被挤掉：{merged.summary}",
-    )
-    check("调用 dock" in merged.summary, f"调用清单还在：{merged.summary}")
-
-    # 工具一多，调用清单要压成「前三个 等 N 个」，否则它把产物挤到 160 字外面。
-    wide = Session(id="ses_wide")
-    for name in (
-        "fetch_structure",
-        "prepare_receptor",
-        "detect_pockets",
-        "import_ligandset",
-        "prepare_ligands",
-        "dock",
-        "score_affinity",
-        "write_run",
-        "open_viewer",
-        "export_summary",
-    ):
-        assistant = wide.add_message(Message(role="assistant"))
-        assistant.add_part(
-            Part(
-                type=PartType.TOOL,
-                tool_name=name,
-                tool_status=ToolStatus.COMPLETED,
-                tool_input={},
-                tool_output="ok",
-                tool_meta={"handle": f"{name}#1"},
+        message = built.add_message(Message(role="assistant"))
+        for name in ("load_tools", "fetch_target"):
+            message.add_part(Part(type=PartType.STEP_START))
+            message.add_part(
+                Part(
+                    type=PartType.TOOL,
+                    tool_name=name,
+                    tool_status=ToolStatus.COMPLETED,
+                    tool_input={},
+                    tool_output="ok",
+                )
             )
-        )
-    wide_event = record_local_event(wide, len(wide.messages), "auto")
-    check("等 10 个" in wide_event.title, f"没有用户原话时标题数得出工具个数：{wide_event.title}")
-    wide_line = event_line(wide_event)
+        return built
+
+    folded = _multi_step()
+    folded_event = seal_phase(folded, upto=2)
     check(
-        "产物 fetch_structure#1" in wide_line and "prepare_ligands#1" in wide_line,
-        f"五个产物一个都没被截掉：{wide_line}",
-    )
-    check(
-        wide_line.endswith("…") and wide_line.index("产物") < wide_line.index("调用"),
-        f"截断只吃掉尾巴上的调用清单：{wide_line}",
+        folded_event is not None and [step.tools for step in folded_event.steps]
+        == [["load_tools"], ["fetch_target"]],
+        f"回填按 STEP_START 分段，一步不丢：{[s.tools for s in folded_event.steps] if folded_event else None}",
     )
 
-    # 事件多到装不下时，被裁掉的那几条必须留一句提示：它们覆盖的消息既不在
-    # 事件块里、也不在 RECENT 里（compact 已推到事件末端），不说就是无声消失。
+    recorded = _multi_step()
+    for order, name in enumerate(("load_tools", "fetch_target"), 1):
+        parts = recorded.messages[1].parts
+        positions = [
+            position
+            for position, part in enumerate(parts)
+            if part.type is PartType.TOOL and part.tool_name == name
+        ]
+        record_step(
+            recorded,
+            step_no=order,
+            parts=[parts[position] for position in positions],
+            message_index=1,
+            part_start=min(positions),
+            part_end=max(positions) + 1,
+        )
+    recorded_event = seal_phase(recorded, upto=2)
+    check(
+        recorded_event is not None
+        and [step.tools for step in recorded_event.steps]
+        == [["load_tools"], ["fetch_target"]],
+        f"当场记的那份与回填不重复也不丢：{[s.tools for s in recorded_event.steps] if recorded_event else None}",
+    )
+
+    # 软预算把一个 Phase 切成两段时，两边的步号都要从 1 开始。
+    split = _event_fixture(4)
+    for index in (1, 3, 5, 7):
+        message = split.messages[index]
+        record_step(
+            split,
+            step_no=len(split.pending_steps) + 1,
+            parts=[part for part in message.parts if part.type is PartType.TOOL],
+            message_index=index,
+        )
+    head = seal_phase(split, upto=4)
+    check(head is not None and [item.seq for item in head.steps] == [1, 2], "前半段的步号从 1 起")
+    check(
+        [item.seq for item in split.pending_steps] == [1, 2],
+        f"剩下那一段的步号重新从 1 起：{[item.seq for item in split.pending_steps]}",
+    )
+    check([item.message_index for item in split.pending_steps] == [5, 7], "剩下的步没被前一段收走")
+
+    # close_phase：只记名字与结论，**不切分阶段**（阶段仍在一轮结束时封）。
+    # 轮中途「提前切开」表达不了：一条 assistant 消息装着一整轮的所有步，
+    # 而 `Event.end` 是消息下标——实测照提示调了 11 次，每次都是「没有可封存的内容」。
+    manual_session = _event_fixture(2)
+    runtime = EventRuntime(session=manual_session, current_index=4)
+    missing = await ClosePhaseTool().execute({}, event_runtime=runtime)
+    check(missing.failed and "缺少 title" in missing.output, f"没给标题就退回：{missing.output}")
+    blank = await ClosePhaseTool().execute({"title": "   "}, event_runtime=runtime)
+    check(blank.failed and "缺少 title" in blank.output, f"空白标题也算缺：{blank.output}")
+    recorded = await ClosePhaseTool().execute(
+        {"title": "跑完两轮对接", "summary": "两轮都产出了 docking"},
+        event_runtime=runtime,
+    )
+    check(not recorded.failed and "已记下" in recorded.output, f"记下标题：{recorded.output}")
+    check(manual_session.events == [], "记名字不当场封存")
+    check(
+        (manual_session.phase_title, manual_session.phase_summary)
+        == ("跑完两轮对接", "两轮都产出了 docking"),
+        "名字与结论挂在会话上，等封存时取",
+    )
+    manual = seal_phase(manual_session, upto=4)
+    check(manual is not None and not manual.degraded, "封存时取用模型给的那份，不标降级")
+    check(
+        manual.title == "跑完两轮对接" and manual.summary.startswith("两轮"),
+        "标题与结论照模型给的那份",
+    )
+    check(manual_session.phase_title == "", "用过一次就清掉，不会顶到下一段")
+    check(len(manual.steps) == 2 and manual.actions == ["dock"], f"流水仍从 Part 数出来：{manual.actions}")
+    again = await ClosePhaseTool().execute({"title": "再来一次"}, event_runtime=runtime)
+    check(
+        "已记下" in again.output and manual_session.phase_title == "再来一次",
+        f"再调一次是覆盖，不是报错：{again.output}",
+    )
+    manual_session.phase_title = ""
+
+    # close_phase 是记账不是干活：它不进流水，单独调它也不产生一步。
+    # 它封的是它前面那几步，写进流水只会让「第 3 步」那一行变成「close_phase」。
+    accounting = _event_fixture(1)
+    close_part = Part(
+        type=PartType.TOOL,
+        tool_name="close_phase",
+        tool_status=ToolStatus.COMPLETED,
+        tool_input={"title": "定口袋"},
+        tool_output="已记下这一大步的标题",
+    )
+    check(
+        record_step(accounting, step_no=1, parts=[close_part], message_index=1) is None,
+        "单独调 close_phase 不产生流水",
+    )
+    mixed = record_step(
+        accounting,
+        step_no=1,
+        parts=[accounting.messages[1].parts[0], close_part],
+        message_index=1,
+    )
+    check(
+        mixed is not None and mixed.tools == ["dock"],
+        f"同一步里的记账调用不占流水：{mixed.tools if mixed else None}",
+    )
+
+    # 渲染三条规则：每步一行、失败留在流水里、结论与未决是阶段级的。
+    line = event_line(manual)
+    check("阶段 1" in line and "跑完两轮对接" in line, f"索引行带阶段号与标题：{line}")
+    block = ContextAssembler(128_000)._event_block([manual])
+    check("  1. " in block and "  2. " in block, f"流水每步一行：{block}")
+    check("结论：" in block, "结论是阶段级的单独一行")
+    check("失败" in block, "失败留在流水里，不挪进单独的列表")
+
+    # 超过 12 步只留「前 3 + 后 3」，中间用 step 召回。
+    long_event = Event(
+        id="evt_0099",
+        title="很长的阶段",
+        summary="三十步",
+        phase_index=9,
+        steps=[Step(seq=index, intent=f"调用 {index}", result="成功") for index in range(1, 31)],
+    )
+    long_block = ContextAssembler(128_000)._event_block([long_event])
+    check("中间省略 24 步" in long_block, f"超过 12 步只留首尾：{long_block}")
+    check("  1. " in long_block and "  30. " in long_block, "首尾两步都在")
+    check("  15. " not in long_block, "中间那些确实没铺开")
+    check("recall_event evt_0099 step=" in long_block, "省略处写明怎么取回来")
+
+    # event_step_detail：压成「一阶段一行」，标题与结论还在。
+    flat = ContextAssembler(128_000)._event_block([manual], detail=False)
+    check("  1. " not in flat and "结论：" in flat, "压流水只丢过程，不丢结论")
+    check(
+        DEGRADE_ORDER.index("event_step_detail") < DEGRADE_ORDER.index("event_layer"),
+        "压流水排在丢事件之前",
+    )
+
+    # 事件多到装不下时，被裁掉的那几条必须留一句提示。
     many = [
         Event(id=f"evt_{index:04d}", title=f"第 {index} 段", summary="做完了一段", start=index, end=index + 1)
         for index in range(1, 9)
     ]
-    kept, block = ContextAssembler(128_000)._cap_events(many, 60)
-    check(len(kept) < len(many) and "更早还有" in block, f"裁掉的事件要留提示：{block}")
+    kept, capped = ContextAssembler(128_000)._cap_events(many, 60)
+    check(len(kept) < len(many) and "更早还有" in capped, f"裁掉的事件要留提示：{capped}")
 
-    runtime = EventRuntime(session=session, current_index=len(session.messages))
-    recorded = await RecordEventTool().execute(
-        {"title": "手动收口", "summary": "这一段做完了"}, event_runtime=runtime
-    )
-    check(not recorded.failed and "evt_" in recorded.output, f"手动收口成功：{recorded.output}")
-    check(len(session.events) == 1 and session.events[0].kind == "manual", "手动事件吞掉自动事件")
-    manual = session.events[0]
-    check(manual.title == "手动收口" and manual.summary == "这一段做完了", "标题与摘要照模型给的那份")
-    check(manual.start == 0 and manual.end == 12, f"覆盖整段：{manual.start}–{manual.end}")
-
-    again = await RecordEventTool().execute({}, event_runtime=runtime)
-    check("没有可收口" in again.output, f"没有新内容时不动手：{again.output}")
-
-    built = ContextAssembler(128_000).build(session, "系统提示。" * 20)
-    body = "\n".join(str(item.get("content") or "") for item in built.messages)
-    check("手动收口" in body, "事件标题进了上下文")
-    check("第 0 步：跑对接" not in body, "被事件覆盖的原文不再发出去")
-    check(built.usage[Layer.EVENT] > 0, "事件层有用量")
-    check(built.dropped == 0, f"被事件覆盖的组不算「本次移出」：{built.dropped}")
-    check(len(built.messages) == 3, f"一个事件只多一条消息：{len(built.messages)}")
-    check(built.metrics["events"] == 1, "度量里数得到事件")
-
-    restored = Session.from_dict(session.to_dict())
-    check(
-        len(restored.events) == 1 and restored.events[0].title == "手动收口",
-        "事件随状态写盘、读回来还在",
-    )
-    check(restored.compact_upto == 12, "读回来之后压缩位置仍在")
-
-    listing = await RecallEventTool().execute({}, session=session)
-    check(manual.id in listing.output and "手动收口" in listing.output, "不带参数时列出清单")
-    detail = await RecallEventTool().execute({"event": manual.id}, session=session)
+    # 三级召回：清单 / 一个阶段 / 某一步的原文。
+    listing = await RecallEventTool().execute({}, session=manual_session)
+    check(manual.id in listing.output and "跑完两轮对接" in listing.output, "不带参数时列出阶段")
+    detail = await RecallEventTool().execute({"event": manual.id}, session=manual_session)
+    check("流水：" in detail.output and "  1. " in detail.output, "详情里有流水")
     check("第 0 步：跑对接" in detail.output, "recall_event 取回原文")
-    check("这一段做完了" in detail.output, "摘要也在详情里")
-    missing = await RecallEventTool().execute({"event": "evt_9999"}, session=session)
-    check(missing.failed and manual.id in missing.output, f"未知编号时列出可用编号：{missing.output}")
+    one = await RecallEventTool().execute(
+        {"event": manual.id, "step": 1}, session=manual_session
+    )
+    check(
+        "第 1 步" in one.output and "结果0" in one.output,
+        f"Step 级召回取到那一次工具输出：{one.output}",
+    )
+    # 单步召回也要分页：一次 bash 的输出可以很长，参数说明里承诺的是「原文按
+    # offset / limit 分页」，只对整段生效而漏掉单步的话，模型按说明传 limit 也拦不住。
+    long_session = Session(id="ses_long_step")
+    long_session.add_message(Message(role="user")).add_part(
+        Part(type=PartType.TEXT, text="跑一条长输出")
+    )
+    long_message = long_session.add_message(Message(role="assistant"))
+    long_message.add_part(Part(type=PartType.STEP_START))
+    long_message.add_part(
+        Part(
+            type=PartType.TOOL,
+            tool_name="bash",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"command": "seq 1 300"},
+            tool_output="\n".join(str(index) for index in range(1, 301)),
+        )
+    )
+    long_message.add_part(Part(type=PartType.STEP_FINISH))
+    long_event = seal_phase(long_session, upto=2)
+    assert long_event is not None
+    page = await RecallEventTool().execute(
+        {"event": long_event.id, "step": 1, "limit": 5}, session=long_session
+    )
+    check(
+        page.output.count("\n") <= 9 and "用 offset=5 继续" in page.output,
+        f"单步召回按 limit 分页：{page.output[-80:]!r}",
+    )
+    tail_page = await RecallEventTool().execute(
+        {"event": long_event.id, "step": 1, "offset": 298, "limit": 5}, session=long_session
+    )
+    check("300" in tail_page.output and "继续" not in tail_page.output, "翻到最后一页时不再提示继续")
+
+    missing_step = await RecallEventTool().execute(
+        {"event": manual.id, "step": 99}, session=manual_session
+    )
+    check("没有第 99 步" in missing_step.output, f"步号不存在时说清楚：{missing_step.output}")
+    unknown = await RecallEventTool().execute({"event": "evt_9999"}, session=manual_session)
+    check(unknown.failed and manual.id in unknown.output, f"未知编号时列出可用编号：{unknown.output}")
+
+    # 装配：更早的阶段进上下文，最近一个阶段留原文（keep_last_phase_raw = 1）。
+    two = _event_fixture(4)
+    first = seal_phase(two, upto=4)
+    second = seal_phase(two, upto=8)
+    check(first is not None and second is not None, "两段各封成一个阶段")
+    built = ContextAssembler(128_000).build(two, "系统提示。" * 20)
+    body = "\n".join(str(item.get("content") or "") for item in built.messages)
+    check(first.title in body, "更早的阶段以流水形式进上下文")
+    check("  1. " in body, "流水进了上下文")
+    raw = sum(
+        1 for item in built.messages if str(item.get("content") or "").startswith("第 ")
+    )
+    check(raw == 2, f"只有最近一个阶段的原文还发出去：{raw} 条")
+    check("第 2 步：跑对接" in body, "最近一个阶段的原文还在 RECENT 里")
+    check("阶段 2：" not in body, "最近一个阶段不再重复铺一份流水")
+    check(built.usage[Layer.EVENT] > 0, "事件层有用量")
+    check(built.dropped == 0, f"被阶段覆盖的组不算「本次移出」：{built.dropped}")
+    check(built.metrics["events"] == 1, "度量里数得到已归档的阶段")
+
+    # 写盘与读回：流水跟着状态走，派生字段也还原得出来。
+    restored = Session.from_dict(manual_session.to_dict())
+    check(
+        len(restored.events) == 1 and len(restored.events[0].steps) == 2,
+        "阶段与流水随状态写盘、读回来还在",
+    )
+    check(
+        restored.events[0].steps[0].intent == manual.steps[0].intent,
+        "步的意图逐字读回来",
+    )
+    check(restored.events[0].actions == ["dock"], "派生字段读回来也还在")
+    check(restored.event_end == 4, "读回来之后事件覆盖位置仍在")
+
+    # 旧形状（没有 steps）的事件也要读得回来：升级不该让已有会话丢历史。
+    legacy = Event.from_dict(
+        {
+            "id": "evt_0001",
+            "title": "旧格式",
+            "summary": "旧的",
+            "actions": ["dock"],
+            "artifacts": ["docking#1"],
+            "issues": ["炸了"],
+            "start": 0,
+            "end": 2,
+        }
+    )
+    check(
+        len(legacy.steps) == 1 and legacy.steps[0].tools == ["dock"],
+        "旧形状的事件折成一步，内容不丢",
+    )
+    check(
+        legacy.artifacts == ["docking#1"] and legacy.issues == ["炸了"],
+        "旧字段仍读得出来",
+    )
 
     # 越界与断点：这两类都必须在进装配之前裁掉。
     broken = _event_fixture(2)
@@ -15673,52 +19056,69 @@ async def check_event_log() -> None:
     check(event_boundary(tail, 2) == 1, "紧邻的用户消息不进事件")
     check(event_boundary(_event_fixture(2), 4) == 4, "正常情况收到当前位置")
     check(render_range(tail, 0, 2).count("\n") >= 0, "render_range 可用（read_turn 与 recall 共用）")
+    check(PHASE_SOFT_LIMIT == 120_000, "软预算按方案定的 120K")
 
 
 async def check_event_capture(server: FakeModelServer) -> None:
-    """事件收口：标题与摘要随调用给出，缺一个就当场退回，全程不另发请求。"""
+    """阶段封存：标题随调用给出，没给结论就本地兜底，全程不另发请求。"""
     bus = EventBus()
     loop = build_loop(server, bus, ToolRegistry())
-    session = _event_fixture(4)
+    session = _event_fixture(2)
     session.summary_upto = 0
-    session.add_event(Event(id="evt_0001", title="前一段", summary="前一段做完了", start=0, end=4, kind="manual"))
+    session.add_event(
+        Event(
+            id="evt_0001",
+            title="前一段",
+            summary="前一段做完了",
+            phase_index=1,
+            start=0,
+            end=2,
+            kind="manual",
+        )
+    )
     session.event_seq = 1
     session.sanitize_events()
+
+    # 当前这一段的流水：第 3 条消息上那一次 dock。
+    assistant = session.messages[3]
+    record_step(
+        session,
+        step_no=1,
+        parts=[part for part in assistant.parts if part.type is PartType.TOOL],
+        message_index=3,
+    )
+    # 再挂一条「正在写」的助手消息：封存停在它之前（它还没写完）。
     session.add_message(Message(role="assistant", session_id=session.id))
 
     server.clear()
     runtime = loop._event_runtime(session)
-    missing = await RecordEventTool().execute({}, event_runtime=runtime)
+    missing = await ClosePhaseTool().execute({}, event_runtime=runtime)
     check(missing.failed and "缺少 title" in missing.output, f"没给标题就退回：{missing.output}")
-    only_title = await RecordEventTool().execute({"title": "只有标题"}, event_runtime=runtime)
-    check(
-        only_title.failed and "缺少 summary" in only_title.output,
-        f"没给摘要就退回：{only_title.output}",
-    )
-    blank = await RecordEventTool().execute(
-        {"title": "   ", "summary": "有摘要"}, event_runtime=runtime
-    )
+    blank = await ClosePhaseTool().execute({"title": "   "}, event_runtime=runtime)
     check(blank.failed and "缺少 title" in blank.output, f"空白标题也算缺：{blank.output}")
     check(len(server.requests) == 0, f"退回时不发任何请求：{len(server.requests)}")
     check(not session.events[1:], "退回时不落半条事件")
 
-    recorded = await RecordEventTool().execute(
-        {"title": "准备受体", "summary": "取了 4HJO 结构并准备了受体"},
-        event_runtime=runtime,
-    )
-    check(not recorded.failed, f"标题摘要都给时记下来：{recorded.output}")
-    check(len(server.requests) == 0, "收口全程零请求")
-    newest = session.events[-1]
-    check(
-        newest.title == "准备受体" and newest.summary.startswith("取了 4HJO"),
-        "标题与摘要照模型给的那份",
-    )
-    check(not newest.degraded, "两份都给全时不算降级")
-    check(newest.actions == ["dock"], f"动作仍从 Part 数出来：{newest.actions}")
-    check("docking#3" in newest.artifacts, f"产物仍从 tool_meta 取：{newest.artifacts}")
-    check(session.events[-2].id == "evt_0001", "前面那条事件没被动过")
+    recorded = await ClosePhaseTool().execute({"title": "准备受体"}, event_runtime=runtime)
+    check(not recorded.failed, f"只给标题也能用：{recorded.output}")
+    check(len(server.requests) == 0, "记名字不花请求")
+    check(session.events[-1].id == "evt_0001", "记名字不当场封存（阶段仍在一轮结束时封）")
+    check(session.phase_title == "准备受体", "名字挂在会话上，等封存时取")
 
-    # 已有事件时溢出：补本地事件，不额外请求模型。
+    # 轮末封存：取用模型给的那一份，用完就清。
+    ended = loop._seal_phase(session, kind="auto", upto=4)
+    check(ended is not None, "轮末照常封存")
+    newest = session.events[-1]
+    check(newest.title == "准备受体" and newest.summary, "封存用模型写的标题，结论本地拼一份")
+    check(not newest.degraded, "标题是模型写的不算降级")
+    check(newest.actions == ["dock"], f"动作仍从 Part 数出来：{newest.actions}")
+    check("docking#1" in newest.artifacts, f"产物仍从 tool_meta 取：{newest.artifacts}")
+    check(newest.start == 2 and newest.end == 4, f"只封到正在写的那条之前：{newest.start}–{newest.end}")
+    check(session.events[-2].id == "evt_0001", "前面那条事件没被动过")
+    check(session.events[-1].phase_index == 2, "阶段号接着往下排")
+    check(session.phase_title == "", "名字用过一次就清掉，不会顶到下一段")
+
+    # 已有事件时溢出：补一个阶段，不额外请求模型。
     crowded = _event_fixture(3)
     crowded.add_event(Event(id="evt_0001", title="开头", summary="开头", start=0, end=2, kind="auto"))
     for index in range(3, 25):
@@ -15732,11 +19132,11 @@ async def check_event_capture(server: FakeModelServer) -> None:
     answer = await loop.stream_reply(crowded, "")
     loop.context_window = 200_000
     check(answer is not None, "小窗口下这一轮照常结束")
-    check(len(server.requests) == 1, f"溢出走本地事件，不多发请求：{len(server.requests)}")
-    check(crowded.events[-1].kind in ("auto", "local"), f"补上的是本地事件：{crowded.events[-1].kind}")
+    check(len(server.requests) == 1, f"溢出走本地阶段，不多发请求：{len(server.requests)}")
+    check(crowded.events[-1].kind in ("auto", "local"), f"补上的是本地阶段：{crowded.events[-1].kind}")
     check(crowded.events[-1].end > 2, "覆盖范围往前推了")
 
-    # 已经有一份摘要、还没有事件时：新的溢出也交给事件（摘要从此冻结）。
+    # 已经有一份摘要、还没有事件时：新的溢出也交给阶段（摘要从此冻结）。
     # 否则事件层永远等不到第一条，长会话只会一路摘要下去。
     switched = _event_fixture(3)
     switched.summary = "一、目标\n早前做过的事"
@@ -16044,7 +19444,8 @@ def check_plan_deny() -> None:
         ("import_structure", {"path": "model.pdb"}),
         ("search_actives", {"uniprot_id": "P00533"}),
         ("find_analogs", {"smiles": "CCO"}),
-        ("describe_molecule", {"chembl_id": "CHEMBL25"}),
+        # 分子画像的入口现在在 lookup_compound（合并之后没有 describe_molecule 了）
+        ("lookup_compound", {"compound": "CHEMBL25"}),
     ):
         decision = judge(name, arguments)
         check(
@@ -16225,7 +19626,7 @@ async def check_subagent() -> None:
     state = ROOT / ".probe" / "state_subagent.toml"
     state.parent.mkdir(parents=True, exist_ok=True)
     state.unlink(missing_ok=True)
-    app = OpenCodeApp(root=ROOT, state_path=state)
+    app = VSAgentApp(root=ROOT, state_path=state)
     root_session = app.session_manager.new_session()
     check(
         "spawn_agent" in app.agent.registry.names(),
@@ -16421,7 +19822,7 @@ async def check_subagent_ui() -> None:
         connection_path_for(state),
         Connection("http://127.0.0.1:1/v1", "k", "subagent-ui"),
     )
-    app = OpenCodeApp(root=ROOT, state_path=state)
+    app = VSAgentApp(root=ROOT, state_path=state)
     async with app.run_test(size=(120, 40)) as pilot:
         app.switch_screen(ChatScreen(ROOT))
         await pilot.pause()
@@ -16743,11 +20144,11 @@ async def check_embed() -> None:
     import tempfile
     from pathlib import Path as _Path
 
-    from opencode_tui.core import corpus as corpus_module
-    from opencode_tui.core import corpus_config as corpus_config_module
-    from opencode_tui.core import embed as embed_module
-    from opencode_tui.core import index as index_module
-    from opencode_tui.core.agent.domain import corpus as corpus_tools
+    from vsagent.core import corpus as corpus_module
+    from vsagent.core import corpus_config as corpus_config_module
+    from vsagent.core import embed as embed_module
+    from vsagent.core import index as index_module
+    from vsagent.core.agent.domain import corpus as corpus_tools
 
     root = _Path(tempfile.mkdtemp(prefix="vsa-embed-"))
     model = "fake/model"
@@ -16954,9 +20355,9 @@ def check_paths() -> None:
     了（onefile 退出即删）。原先 `corpus_root()` / `runs_dir()` 都按 `__file__`
     算，正好落在这里面。
     """
-    from opencode_tui.core.agent.domain.export import runs_dir
-    from opencode_tui.core.corpus import corpus_root
-    from opencode_tui.core.paths import project_root
+    from vsagent.core.agent.domain.export import runs_dir
+    from vsagent.core.corpus import corpus_root
+    from vsagent.core.paths import project_root
 
     check(project_root() == ROOT, f"源码运行时项目根是仓根：{project_root()}")
     check(corpus_root() == ROOT / "corpus", f"语料根：{corpus_root()}")
@@ -16968,7 +20369,7 @@ def check_paths() -> None:
     old_executable = sys.executable
     old_cwd = os.getcwd()
     sys.frozen = True
-    sys.executable = "/opt/vsagent/bin/opencode-tui"
+    sys.executable = "/opt/vsagent/bin/VSAgent"
     os.chdir(frozen_cwd)
     try:
         check(
@@ -16995,10 +20396,13 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("connection", check_connection_file),
     ("trace", check_trace),
     ("rules", check_rules),
+    ("prefix", check_prefix),
     ("permission", check_permission),
     ("hooks-config", check_hook_config),
     ("hooks-runner", check_hook_runner),
     ("workspace", check_workspace),
+    ("config-paths", check_config_paths),
+    ("config-migrate", check_config_migrate),
     ("paths", check_paths),
     ("ledger", check_ledger),
     ("ledger-digest", check_ledger_digest),
@@ -17016,6 +20420,9 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("pocket-tools", check_pocket_tools),
     ("rank-candidates", check_rank_candidates),
     ("analyze-pose", check_analyze_pose),
+    ("contact-map", check_contact_map),
+    ("hydrophobic", check_hydrophobic),
+    ("efficiency", check_efficiency),
     ("curate-ligands", check_curate_ligands),
     ("reference-set", check_reference_set),
     ("screen-similarity", check_screen_similarity),
@@ -17026,17 +20433,23 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("assess-structure", check_assess_structure),
     ("admet", check_admet),
     ("sar", check_sar),
+    ("hypothesis", check_hypothesis),
     ("pharmacophore", check_pharmacophore),
+    ("identity", check_identity_floor),
     ("align-prior", check_align_and_prior),
     ("write-run", check_write_run),
     ("write-run-docking", check_write_run_docking),
     ("rsearch", check_rsearch),
     ("literature", check_literature),
+    ("europepmc", check_europepmc),
+    ("pubchem", check_pubchem),
+    ("opentargets", check_opentargets),
     ("websearch", check_websearch),
     ("corpus", check_corpus),
     ("embed", check_embed),
     ("structure-parse", check_structure_parse),
     ("structure-tools", check_structure_tools),
+    ("alphafold", check_alphafold),
     ("chembl", check_chembl_tools),
     ("chemistry-gate", check_chemistry_gate),
     ("receptor", check_receptor_tool),
@@ -17055,6 +20468,8 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("subagent-ui", check_subagent_ui),
     ("selective-compression", check_selective_compression),
     ("context-budget", check_context_budget),
+    ("reasoning", check_reasoning),
+    ("output-limit", check_output_limit),
     ("evidence-ref", check_evidence_ref),
     ("evidence-dedupe", check_evidence_dedupe),
     ("tool-clear", check_tool_clear),
@@ -17078,7 +20493,7 @@ SERVER_GROUPS: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("context-metrics", check_context_metrics),
     ("tool-family-loop", check_tool_family_loop),
     ("event-capture", check_event_capture),
-    ("summary-compaction", check_summary_compaction),
+    ("phase-compaction", check_overflow_phase),
     ("live-app", check_live_app),
 )
 

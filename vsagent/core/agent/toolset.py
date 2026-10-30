@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 from ..models import Session
 from .domain.all_tools import catalog, families
@@ -47,6 +47,44 @@ def family_of(name: str) -> str:
     return ""
 
 
+def prune_families(session: Session, used: Iterable[str], phase_index: int) -> list[str]:
+    """Phase 封存时收敛工具族：本阶段没用过的族卸掉，返回卸了哪些。
+
+    只有「装」没有「卸」的话，一次会话装到八族之后每一步都发 12K token 的
+    工具定义，而典型的一个阶段只用得上两三个族（准备受体的阶段不需要
+    `docking`）。Phase 边界天然是「换阶段」的地方，所以收敛挂在那里。
+
+    三条边界：
+
+    - **本阶段一个工具都没用过就不卸**。那多半是纯聊天的一轮，没有依据说
+      「这些族用不上」，而卸了要模型下一步重新装一次，那一步的缓存全废。
+    - **本阶段刚装的族不卸**。`session.family_phase` 记着每一族是第几个阶段
+      装进来的；模型常常先装后几步才用，装完立刻被收走等于白装一次。
+    - **卸掉不等于忘掉**：`load_tools` 随时能装回来。这是刻意的取舍——
+      省下的是每步都发的固定成本，代价是换阶段时一次缓存失效。
+    """
+    used = set(used)
+    if not used:
+        return []
+    table = catalog()
+    keep: list[str] = []
+    dropped: list[str] = []
+    for family in session.tool_families:
+        names = set(table.get(family, ()))
+        loaded_at = session.family_phase.get(family, 0)
+        if names & used or loaded_at >= phase_index:
+            keep.append(family)
+        else:
+            dropped.append(family)
+    if dropped:
+        session.tool_families = keep
+        session.family_phase = {
+            name: value for name, value in session.family_phase.items() if name in keep
+        }
+        session.touch()
+    return dropped
+
+
 def catalog_text() -> str:
     """一族一行「族名：这一族里有哪些工具」。
 
@@ -71,7 +109,9 @@ class LoadToolsTool(Tool):
             f"{len(families())} 族，要先用这里装进来，**下一步起**才出现在工具清单里。\n"
             "族与工具：\n"
             + catalog_text()
-            + "\n装一次对整个会话有效；已经装过的再装一次只会把清单再列一遍。"
+            + "\n装一次对整个会话有效；已经装过的再装一次只会把清单再列一遍。\n"
+            "**建议一次把本阶段要用的族都装上**：每装一次都会改动工具清单，"
+            "而工具清单是请求前缀的一部分，下一步的 prompt cache（前缀缓存）会整段失效。"
         ),
         parameters={
             "type": "object",
@@ -112,7 +152,7 @@ class LoadToolsTool(Tool):
                 output=(
                     f"{family} 族里的工具都被项目配置关掉了（{ '、'.join(skipped) }），"
                     "装进来也用不了。\n"
-                    "这是 `.opencode_tui/tools.toml` 里的开关，不是网络或参数问题；"
+                    "这是 `.vsagent/tools.toml` 里的开关，不是网络或参数问题；"
                     "不要用 bash 自己实现它，也不要换数据源绕过——"
                     "要么请用户在 /tools 面板里打开，要么按用户的指示换方案。"
                 ),
@@ -122,14 +162,26 @@ class LoadToolsTool(Tool):
         already = family in session.tool_families
         if not already:
             session.tool_families.append(family)
+        # 记下它是第几个阶段装进来的：收敛时不卸「本阶段刚装、还没轮到用」的族，
+        # 否则模型刚装完就被拿走，下一步还得再装一次（那一次缓存又白费）。
+        session.family_phase[family] = len(session.events) + 1
         prefix = "已经装过" if already else "已装入"
         listed = "、".join(available) + (
             f"（{'、'.join(skipped)} 被项目配置关掉了，没有列进来）" if skipped else ""
         )
+        # 第一次装才提醒：装过的族再提一次「一次装完」只会变成噪音。
+        hint = (
+            ""
+            if already
+            else (
+                "\n**这一段还要用别的族的话，现在就一起装**："
+                "每装一次都会改动工具清单，下一步的 prompt cache（前缀缓存）会整段失效。"
+            )
+        )
         return ToolResult(
             output=(
                 f"{prefix} {family}：{listed}。"
-                "下一步起这些工具出现在清单里，参数按各工具的说明给。"
+                "下一步起这些工具出现在清单里，参数按各工具的说明给。" + hint
             ),
             meta={
                 "family": family,

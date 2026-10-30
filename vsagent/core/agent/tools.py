@@ -31,6 +31,23 @@ DEFAULT_TIMEOUT = 120.0
 READ_LIMIT = 2000
 GREP_LIMIT = 200
 GREP_FILE_LIMIT = 40
+
+# bash 一次调用返回给模型的字符上限，以及超限时头尾各留多少。
+#
+# `read` 有 offset/limit、`grep` 有条数上限，只有 bash 原样全给。实测一个
+# 「看看产物里有什么」的步骤：`python -c` 把整份 meta.json 打印出来，27.8 KB /
+# 42 行、6,984 token，占那一步上下文的 36%，而模型要的只是 20 个口袋的中心与
+# 残基数。这类输出还会一直留在 RECENT 里（1M 窗口下没有驱逐），所以要在入口处
+# 封顶。
+#
+# 头尾都留：构建与测试的结论在尾巴上，清单和表头在开头；中间那一段重跑一次
+# 用 head/tail/grep 取，比整份塞进上下文便宜。12K 字符约 3K token（英文）。
+#
+# 「会截断」这件事不写进工具定义：定义每一步都要重发，为偶尔一次的截断给
+# 每一步加几十 token 不划算；截断发生时结果里那行省略说明就够了。
+BASH_OUTPUT_CHARS = 12_000
+BASH_OUTPUT_HEAD = 9_000
+BASH_OUTPUT_TAIL = 3_000
 CODE_EXTENSIONS = {
     ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".java", ".kt", ".go", ".rs", ".rb", ".php", ".c", ".h", ".cc",
@@ -363,7 +380,7 @@ class ToolRegistry:
     工具清单里，模型看不到它。这与「装进来但调用时拒绝」是两件事——
     后者模型会一直重试，上下文里攒下一串失败记录；前者它连这个工具存在都不知道。
 
-    禁用清单的读法见 `permission.load_disabled`，配置在 `.opencode_tui/tools.toml`，
+    禁用清单的读法见 `permission.load_disabled`，配置在 `.vsagent/tools.toml`，
     应用里用 `/tools` 面板改（改完由 `app.toggle_tool` 重装注册表，不必重启）。
     这里只负责一件事：把清单里那些名字挡在门外。放在注册表而不是装配处，
     是因为装配处有八次 `register` 调用，逐个加判断会漏；一个入口收口最省事。
@@ -619,6 +636,39 @@ def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def clip_bash_output(
+    text: str,
+    limit: int = BASH_OUTPUT_CHARS,
+    head: int = BASH_OUTPUT_HEAD,
+    tail: int = BASH_OUTPUT_TAIL,
+) -> str:
+    """把超长输出压成「开头 + 省略说明 + 结尾」，没超限就原样返回。
+
+    说明里必须写清三件事：省掉了多少、完整输出有多大、怎么只看中间那段。
+    少写一句，模型就会把「看见的」当成「全部的」——本仓的领域工具纪律里
+    「返回要有预算」说的就是这一条。
+    """
+    if len(text) <= limit:
+        return text
+    kept = head + tail
+    if kept >= len(text):
+        return text
+    omitted = len(text) - kept
+    total_lines = text.count("\n") + 1
+    omitted_lines = text[head : len(text) - tail].count("\n")
+    # 单行输出（压缩过的 JSON、minified 脚本）省掉的是「行内的一段」，
+    # 写成「约 0 行」会让人以为什么都没省。
+    dropped = f"{omitted:,} 字符" + (f" / 约 {omitted_lines:,} 行" if omitted_lines else "")
+    return (
+        f"{text[:head]}\n"
+        f"…（中间省略 {dropped}；"
+        f"完整输出 {len(text):,} 字符 / {total_lines:,} 行。"
+        f"要中间那段就重跑一次，接 `| head -n 200`、`| tail -n 200` 或 "
+        f"`| grep 关键词`，别整段打印）\n"
+        f"{text[-tail:]}"
+    )
+
+
 class BashTool(Tool):
     """执行一条 shell 命令，把标准输出与标准错误合并作为结果。
 
@@ -656,7 +706,9 @@ class BashTool(Tool):
             **extra,
         )
         stdout = await self._collect(process)
-        output = decode_output(stdout).strip()
+        # 封顶放在这里而不是交给装配器：工具结果是「这一步看见了什么」的原文，
+        # 之后每一步都要重发，进来多少就留多少。
+        output = clip_bash_output(decode_output(stdout).strip())
         return ToolResult(output=output or "（命令没有输出）", failed=process.returncode != 0)
 
     async def _collect(self, process: asyncio.subprocess.Process) -> bytes:

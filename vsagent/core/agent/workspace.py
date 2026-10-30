@@ -4,11 +4,12 @@ import time
 from pathlib import Path
 
 from ..models import Session
+from ..paths import config_home
 
 
 def workspace_root() -> Path:
     """会话工作目录的默认根。只在没有指定根时用到。"""
-    return Path.home() / ".opencode_tui" / "workspaces"
+    return config_home() / "workspaces"
 
 
 class Workspace:

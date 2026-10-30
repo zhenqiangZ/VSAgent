@@ -7,15 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from ..event_bus import EventBus
-from ..models import Message, Part, PartType, Session, ToolStatus
+from ..models import Event, Message, Part, PartType, Session, ToolStatus
 from .context import (
     ContextAssembler,
     ContextAssemblyError,
     ContextBundle,
     EvidenceStore,
 )
-from .event_log import EventRuntime, event_boundary, record_local_event
-from .toolset import family_of, hidden_names
+from .event_log import (PHASE_SOFT_LIMIT, EventRuntime, event_boundary,
+                        phase_tokens, record_step, seal_phase)
+from .toolset import family_of, hidden_names, prune_families
 from .hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from .permission import PermissionDecision, PermissionPolicy, Verdict
 from .prompt import (
@@ -132,7 +133,7 @@ def missing_tool_reason(
         # **不许写「改用别的办法」**：那句话是在教模型绕道。实测一次这样的
         # 误判，模型转去 bash + urllib 自己实现了 search_pdb，烧掉 20 步。
         return (
-            f"{name} 已被禁用（配置在 .opencode_tui/tools.toml 里，可在 /tools 面板里打开），"
+            f"{name} 已被禁用（配置在 .vsagent/tools.toml 里，可在 /tools 面板里打开），"
             "本次会话不会提供这个工具，重试无用。\n"
             "不要用 bash 自己实现它，也不要换数据源绕过——"
             "把这件事告诉用户，由用户决定是否打开它。"
@@ -203,7 +204,7 @@ class AgentLoop:
         self.context_window = context_window
         self.workspace_root = workspace_root
         # 状态目录（`state.toml` / `ledgers/` / `connection.toml` 所在）。
-        # 它**不在工作目录下**，而模型默认它在那儿——实测它会 `cd .opencode_tui`
+        # 它**不在工作目录下**，而模型默认它在那儿——实测它会 `cd .vsagent`
         # 找东西，失败之后才去 `~`。所以这一段要写进每一步的上下文。
         self.state_dir = state_dir
         self.policy = policy or PermissionPolicy()
@@ -294,26 +295,51 @@ class AgentLoop:
         self.provider = OpenAICompatProvider(self.config, self.provider.timeout)
         return self.config
 
-    def compact_session(self, session: Session, keep: int = KEEP_MESSAGES) -> int:
-        """手动把会话前面的一段压掉，返回压掉之后还剩几条。
+    def compact_session(self, session: Session) -> int:
+        """手动把当前这一段封存掉，返回还剩几条原文要发。
 
-        这里只推位置，不在这里生成摘要：摘要是给下一次发问用的，
-        而下一次发问会自己按 `dropped` 判据跑一遍。自动压缩是窗口装不下时才发生，
-        这一条是用户按出来的，两种触发的产物因此长得一样。
+        新语义是「封存当前 Phase」：不再按 `total - keep` 算要丢几条——那个口径
+        按**条数**压，压掉的是最便宜的那几条，最贵的那条原样留着（P1-4）。
+        现在整段封成一个阶段，`compact_upto` 推到它的末端，原文全部让位给流水。
 
-        已经有事件时，被推掉的那一段先用**本地事件**盖住：事件必须连续，
-        中间留缝的话那一段原文就既不在事件里、也不在 RECENT 里。
+        与自动封存的区别只在**硬边界**：自动封存在轮末发生，最近一个阶段还留在
+        RECENT 里（`keep_last_phase_raw`）；`/compact` 是用户主动要腾地方，
+        连这一份也不留。
+
+        所以「没有新的一段可封」不等于「什么都不用做」：带工具的轮次在轮末已经
+        自动封存过，这里 `_seal_phase` 会返回 `None`，但硬边界仍要推到最后一个
+        事件的末端。不推的话 `/compact` 就是个空操作——界面回「这一段已经压过了」，
+        而那一轮的原文还在发。
         """
         total = len(session.messages)
-        if total <= keep:
-            return total
-        target = max(session.compact_upto, total - keep)
-        if session.events and target > session.event_end:
-            record_local_event(session, target, "local")
+
+        def remaining() -> int:
+            """还剩几条原文会发出去。
+
+            从**软边界**算起：最近一个阶段按 `keep_last_phase_raw` 留在 RECENT 里，
+            装配时 `compact = max(compact_upto, events[-1].start)`。只减
+            `compact_upto` 会把已经归档的那几段也报成「还要发」。
+            """
+            live = session.compact_upto
+            if session.events:
+                live = max(live, session.events[-1].start)
+            return total - live
+
+        if total <= KEEP_MESSAGES:
+            return remaining()
+        event = self._seal_phase(
+            session, kind="local", upto=event_boundary(session, total), force=True
+        )
+        if event is not None:
+            target = event.end
+        elif session.events:
+            target = session.events[-1].end
+        else:
+            target = session.compact_upto
         session.compact_upto = max(session.compact_upto, target)
         session.sanitize_events()
         self.bus.publish("status.update", {"session_id": session.id})
-        return keep
+        return remaining()
 
     async def stream_reply(self, session: Session, prompt: str) -> Message | None:
         """对一段用户输入生成流式回复。
@@ -330,6 +356,16 @@ class AgentLoop:
         self.last_input_tokens = 0
         self.last_cached_tokens = 0
         self._summary_failures = 0
+        # 上一轮如果是被中断的，它那一段的 Step 还在内存里：新消息进来时先封掉。
+        # 不封的话这些步会跟着下一轮一起算进新的 Phase，流水的阶段号就错位了。
+        # 只封「真有没封存的步」的那一段：没有 pending 时按历史回填会把整份旧会话
+        # 收成一个阶段，那不是「补上一轮」，是改写历史。
+        if session.pending_steps:
+            self._seal_phase(
+                session,
+                kind="local",
+                upto=event_boundary(session, len(session.messages)),
+            )
         started = time.time()
         message = Message(
             role="assistant",
@@ -354,6 +390,13 @@ class AgentLoop:
             # 用户最不知道发生了什么的时候。
             if exit_reason:
                 await self._wrap_up(session, message, exit_reason)
+            # 一轮 = 一大步：轮末自动封存当前 Phase。这是**默认边界**，也是
+            # 「记录不依赖模型判断」的落点——模型不调 close_phase 也照样有流水。
+            self._seal_phase(
+                session,
+                kind="auto",
+                upto=event_boundary(session, len(session.messages)),
+            )
         finally:
             self.last_latency_ms = int((time.time() - started) * 1000)
         # 中断那一条不收尾：`_finish` 会发 turn.done，而这一轮是用户按停的，
@@ -620,17 +663,17 @@ class AgentLoop:
                 exit_reason = EXIT_ERROR
                 break
             if context.dropped:
-                if session.events or session.summary_upto > 0:
-                    # 已经有一份摘要（或已有事件）时，新的溢出交给事件，摘要冻结：
-                    # 再让摘要往前推会与事件重叠，同一段内容被说两遍。
-                    # 这一段补一条本地事件，零模型请求。
-                    boundary = event_boundary(session, max(0, len(session.messages) - 1))
-                    covered = min(context.dropped_upto, boundary)
-                    if record_local_event(session, covered, "auto"):
-                        context = self._assemble(session, prefix)
+                # 装不下时先把当前这一段封成阶段：流水比原文便宜得多，
+                # 封完再装一次通常就够了。封不动（这一段已经全在事件里）
+                # 才退回摘要那一条路——那是旧机制，只给「首轮就溢出」兜底。
+                boundary = event_boundary(session, max(0, len(session.messages) - 1))
+                covered = min(context.dropped_upto, boundary)
+                if self._seal_phase(session, kind="auto", upto=covered, force=True):
+                    # 装不下是硬约束：这一段的原文必须让位，不能因为
+                    # 「最近一个阶段留原文」又把它留在 RECENT 里。
+                    session.compact_upto = max(session.compact_upto, covered)
+                    context = self._assemble(session, prefix)
                 elif await self._summarize(session, message, context.dropped_upto):
-                    # 第一次溢出：先让模型写一份摘要，把「很久以前」压成一份结论。
-                    # 之后的溢出才交给事件——两者覆盖的区间是分开的。
                     context = self._assemble(session, prefix)
             elif context.dropped_upto > 0:
                 # 判据是「上下文里有没有已经不在的内容」，不是「这一步新丢了没有」：
@@ -674,6 +717,9 @@ class AgentLoop:
             if not await self._run_tools(session, message, calls):
                 exit_reason = EXIT_CANCELLED
                 break
+            # 这一步做完了，立刻记进当前 Phase 的流水。**零请求**：读的是 Part 上
+            # 已经算好的工具名、参数、状态与 handle，不碰 reasoning。
+            self._record_step(session, message, calls)
             # 连续这么多次「整步工具全失败」才算卡住。
             #
             # 不能一次全失败就停下：工具失败的原因是模型下一步的输入，
@@ -688,6 +734,55 @@ class AgentLoop:
             else:
                 failed_streak = 0
         return message, step, int((time.time() - started) * 1000), exit_reason
+
+    def _seal_phase(self, session: Session, **options: Any) -> Event | None:
+        """封存一个 Phase，顺手收敛工具族（P2-1）。
+
+        两件事绑在一起：Phase 边界就是「换阶段」的地方，准备受体的阶段不需要
+        `docking` 族。族只装不卸的话，装到八族之后每一步都发 12K token 的定义，
+        而典型阶段只用得上两三个。
+        """
+        event = seal_phase(session, **options)
+        if event is None or not event.steps:
+            return event
+        dropped = prune_families(
+            session,
+            {name for step in event.steps for name in step.tools},
+            event.phase_index,
+        )
+        if dropped:
+            self.bus.publish("status.update", {"session_id": session.id})
+        return event
+
+    def _record_step(
+        self, session: Session, message: Message, calls: list[Part]
+    ) -> None:
+        """把这一步折成一条 Step，并在超出软预算时提前切开 Phase。
+
+        软预算（120K token）管的是「一轮跑了三十步」那种情况：不切的话单个
+        Phase 会一直长到把 RECENT 撑爆，而流水本来只是「一大步」的粒度。
+        """
+        positions = [
+            index
+            for index, part in enumerate(message.parts)
+            if any(part is call for call in calls)
+        ]
+        record_step(
+            session,
+            # 步号是 Phase 内连号，不是循环层的 step 计数：那一个会把
+            # 「没有工具调用、因此没记步」的那几步也算进去，读起来像漏了号。
+            step_no=len(session.pending_steps) + 1,
+            parts=calls,
+            message_index=max(0, len(session.messages) - 1),
+            part_start=min(positions) if positions else 0,
+            part_end=(max(positions) + 1) if positions else 0,
+        )
+        if phase_tokens(session) > PHASE_SOFT_LIMIT:
+            self._seal_phase(
+                session,
+                kind="auto",
+                upto=event_boundary(session, len(session.messages)),
+            )
 
     @staticmethod
     def _all_tools_failed(calls: list[Part]) -> bool:
@@ -799,8 +894,7 @@ class AgentLoop:
         target = max(session.compact_upto, total // 2)
         if total < 2 or target <= session.compact_upto:
             return False
-        if session.events:
-            record_local_event(session, target, "local")
+        self._seal_phase(session, kind="local", upto=target, force=True)
         session.compact_upto = max(session.compact_upto, target)
         session.sanitize_events()
         return True
@@ -818,10 +912,10 @@ class AgentLoop:
             # 就会把已经被事件替代的那一段重新收一遍。
             return False
         if upto <= session.summary_upto:
-            self._publish(
-                message,
-                Part(type=PartType.COMPACTION, text=f"已丢弃 {upto} 条更早的消息"),
-            )
+            # 这一段已经在摘要里了，**不发 Part**。`/compact` 之后 `summary_upto`
+            # 就等于 `upto`，于是每一步都会走到这里——实测一条消息里堆了 6 条
+            # 「已丢弃 N 条更早的消息」，占地方又没有任何新信息。
+            # 界面要知道「压过了」的话，`/compact` 自己那条 toast 已经说了。
             return False
         if self._summary_failures >= MAX_SUMMARY_FAILURES:
             # 熔断：接口或模型那一侧坏了，每一步再试一次只是每步多等一个超时。

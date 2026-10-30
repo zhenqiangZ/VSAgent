@@ -493,5 +493,5 @@ if __name__ == "__main__":
         )
         _embed_after_reindex()
     else:
-        print("用法：python -m opencode_tui.core.index reindex")
+        print("用法：python -m vsagent.core.index reindex")
         raise SystemExit(2)

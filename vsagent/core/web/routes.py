@@ -2,7 +2,7 @@
 
 这份代码原先是 `tools/serve_web.py` 的全部内容。搬进来有两个原因：
 
-1. **服务要进包**。`opencode_tui.spec` 的 `datas` 早先只有 `app.tcss`，
+1. **服务要进包**。`vsagent.spec` 的 `datas` 早先只有 `app.tcss`，
    `tools/` 不在冻结产物里，exe 上跑不到那个脚本（方案稿 §0.3）。
 2. **形状只能一份**。命令行的 `serve_web.py` 与包内的后台服务走同一套接口，
    路由与字段名分成两份时，改一处忘一处会让页面上的字段悄悄少一个。
@@ -38,6 +38,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlparse
 
 from .. import corpus, corpus_config, index
+from ..paths import config_home
 from ..session_manager import SessionManager
 
 # 状态文件是原子换名写出的（`SessionManager.save_to_toml`）。但读的人仍可能
@@ -287,7 +288,7 @@ def archive_directory() -> Path:
     从 `core/web` 导入 `core/agent/domain` 会把依赖方向倒过来（网页端不该认识
     领域工具），所以这一处按同一个约定拼路径，注释指回那个函数。
     """
-    return Path.home() / ".opencode_tui" / "search"
+    return config_home() / "search"
 
 
 def library_payload(root: Path) -> dict:
@@ -724,7 +725,7 @@ def _library_ingest(request: "WebHandler", _rest: str) -> dict:
     不碰 `library.db`。「索引只有一个写者」是这条链上唯一不能破的约定——破了
     就会有两个进程同时改 `sources` / `chunks`，级联删除互相踩。
 
-    所以独立运行的服务（`tools/serve_web.py`、`python -m opencode_tui.core.web`）
+    所以独立运行的服务（`tools/serve_web.py`、`python -m vsagent.core.web`）
     没有可转交的对象，直接回 503 并说清楚去哪儿做，而不是退化成自己写。
     """
     _guard_write(request)
@@ -732,7 +733,7 @@ def _library_ingest(request: "WebHandler", _rest: str) -> dict:
     if server.ingest is None:
         raise HttpError(
             503,
-            "这个进程不负责入库：用 python -m opencode_tui 启动应用之后再从网页上入库，"
+            "这个进程不负责入库：用 python -m vsagent 启动应用之后再从网页上入库，"
             "或者在 TUI 里让模型 import_documents。",
         )
     files = _inbox_selection(request, _json_body(request))

@@ -43,7 +43,7 @@ def web_root() -> Path:
 
     两处必须指向同一个地方：
     - **源仓库**：仓根下的 `web/`，与 `tools/serve_web.py` 的默认值一致；
-    - **打包产物**：`datas` 把它放到了 `_MEIPASS` 下（见 `opencode_tui.spec`），
+    - **打包产物**：`datas` 把它放到了 `_MEIPASS` 下（见 `vsagent.spec`），
       冻结后 `__file__` 指不到仓根，只能按 `sys._MEIPASS` 找。
 
     找不到时回一个不存在的路径：服务照常起来，访问页面得到 404。

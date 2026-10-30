@@ -293,6 +293,25 @@
     return `${formatter(list[0])} … ${formatter(list[list.length - 1])}（共 ${list.length} 个）`;
   }
 
+  // 画像：一句判断 + 壁的组成。`profile` 是 `pockets.build_profile` 写的，
+  // 旧运行目录没有这个字段——那时整行不挂，不写「未知」。
+  function pocketProfileLabel(pocket) {
+    const profile = pocket && pocket.profile;
+    if (!profile || typeof profile !== "object") return "";
+    const parts = [];
+    if (profile.verdict) parts.push(profile.verdict);
+    const walls = profile.walls || {};
+    if (walls.named) {
+      parts.push(
+        `芳香 ${walls.aromatic || 0} · 疏水 ${walls.hydrophobic || 0}` +
+          ` · 极性 ${walls.polar || 0} · 带电 ${walls.charged || 0}`,
+      );
+    }
+    const ligand = profile.ligand || {};
+    if (ligand.atoms) parts.push(`配体 ${ligand.atoms} 个重原子`);
+    return parts.join("　");
+  }
+
   function isStructureView() {
     return !!(meta && meta.provenance && meta.provenance.view === "structure");
   }
@@ -458,6 +477,14 @@
       metaLine.textContent = pocketResidueLabel(pocket);
 
       item.append(head, metaLine);
+      // 画像：壁的组成与那句判断。旧运行目录没有这个字段，整块不挂。
+      const profileText = pocketProfileLabel(pocket);
+      if (profileText) {
+        const profileLine = document.createElement("div");
+        profileLine.className = "pocket-profile";
+        profileLine.textContent = profileText;
+        item.append(profileLine);
+      }
       item.addEventListener("click", () => selectPocket(pocket.id));
       list.appendChild(item);
     }

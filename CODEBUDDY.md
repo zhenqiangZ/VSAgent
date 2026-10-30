@@ -406,6 +406,14 @@ graph TD
   输出不能让读者以为算过。
 - 不登记工具的模块（`pockets` / `complexes` / `prankweb` / `align` / `chemistry` / `pdbtext` / `http` / `products`）
   是库层，被 `WriteRunTool` 之类调用。口袋来源因此是四层叠合：共晶配体 → 复合物 → p2rank 预测 → 先验叠合。
+  四层在聚簇之前都先剔掉脂质与去垢剂（`preprocess.screen_lipids`）：碳数 ≥ 8、极性原子
+  （N/O/S）≤ 2 或含磷、重原子 ≥ 16、包围盒最长边 ≥ 16 埃，四条全中才算；最后那条是
+  类固醇药物与膜成分的分界（睾酮、地塞米松四个并环只有 11–13 埃）。它**不进
+  `screen_ligands`**——那个函数同时决定 `clean_structure` 留哪些杂原子，准备后的受体
+  丢掉膜成分是另一回事，`prepare_receptor` 的 `keep_hetero` 管那一头。
+  每处口袋带一份画像（`pockets.build_profile`）：配体的元素组成与伸展尺寸、壁按
+  芳香/疏水/极性/带电分四类计数、最近残基与 3.5 埃内的个数、一句判断。**画像不给分**，
+  与「实验定位没有打分」同一口径；`detect_pockets`、`write_run` 与网页端读的是同一份。
 - `http.py` 是**全仓唯一的网络出口**，测试整体替换的就是它。4xx → `ToolError`，
   429/5xx/网络 → `RetryableToolError`。
 - `chemistry.py` 是不许在顶层 import 可选依赖的守门人，测试用 AST 断言这一条

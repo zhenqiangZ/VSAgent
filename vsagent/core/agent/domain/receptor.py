@@ -113,7 +113,7 @@ COORDINATE_ERROR_HINT = (
 
 def prepared_receptor_dir() -> Path:
     """准备后受体的产物目录，与结构文件、登记表同处一个家目录。"""
-    return Path.home() / ".opencode_tui" / "receptors"
+    return Path.home() / ".vsagent" / "receptors"
 
 
 # ---------------------------------------------------------------------------
@@ -795,10 +795,16 @@ def _meeko_lines(situation: Situation) -> list[str]:
     ]
     if result.ignored:
         lines.append(f"被忽略的单体：{'、'.join(result.ignored)}")
-    lines.append(
-        f"补氢：{result.residues_with_added_h} 个残基按模板补齐"
-        "（实验结构里通常本来就没有氢，这属正常）"
-    )
+    # 「补氢」这一行原来报的是 `residues_with_added_h`，而那个数只统计
+    # `H_miss > 0` 的**异常**残基——实测 1970 个残基的氢全是模板补的，
+    # 文案却写「补氢：20 个残基」，读起来像只补了 20 个（P3-2）。
+    # 补氢总数就是被接受的单体数：输入在这一步之前已经去氢了。
+    lines.append(f"补氢：{result.monomers} 个残基（输入已去氢，氢全部由模板补齐）")
+    if result.residues_with_added_h:
+        lines.append(
+            f"其中 {result.residues_with_added_h} 个残基补后仍有缺失"
+            "　模板没覆盖到那部分原子，值得单独看一眼"
+        )
     if result.residues_with_excess_h:
         lines.append(
             f"氢超量的残基：{'、'.join(result.residues_with_excess_h)}"
@@ -807,9 +813,12 @@ def _meeko_lines(situation: Situation) -> list[str]:
     if result.excess_bonds:
         lines.append(f"多出的残基间键：{'、'.join(result.excess_bonds)}")
     if result.chosen_by_fewest_missing_h:
+        # 这一串可能有几百个，全列出来会把报告撑满——列前五个，其余报数。
+        names = list(result.chosen_by_fewest_missing_h)
+        shown = "、".join(names[:5]) + (f" 等 {len(names)} 个" if len(names) > 5 else "")
         lines.append(
-            f"靠「缺氢最少」定下模板的残基：{'、'.join(result.chosen_by_fewest_missing_h)}"
-            "　它们匹配到不止一个模板，选中的不一定对"
+            f"其中 {len(names)} 个残基匹配到不止一个模板（{shown}），"
+            "按「缺氢最少」选的，不一定对"
         )
     return lines
 

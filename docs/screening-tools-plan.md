@@ -64,7 +64,7 @@ P2–P4 才是新增的 ADME、SAR 与药效团。
 不新增 handle 类型，登记成 `artifact`：
 
 ```
-path: ~/.opencode_tui/pockets/<stem>-<hash8>/
+path: ~/.vsagent/pockets/<stem>-<hash8>/
   pockets.json      # 口袋集（detect_pockets 写）
   pocket.json       # 单个口袋（define_pocket 写）
   params.json       # 提交标记，最后写
@@ -104,7 +104,7 @@ artifact 三类，`__init__.py` 明写「不要再细分——类型一旦膨胀
 所有筛选通道写同一张表，`rank_candidates` 只合并不重算：
 
 ```
-path: ~/.opencode_tui/candidates/<stem>-<hash8>/
+path: ~/.vsagent/candidates/<stem>-<hash8>/
   candidates.json
   candidates.csv
   params.json
@@ -192,7 +192,7 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
 | 项 | 值 |
 |---|---|
 | kind | `artifact` |
-| path | `~/.opencode_tui/pockets/<stem>-<hash8>/` |
+| path | `~/.vsagent/pockets/<stem>-<hash8>/` |
 | summary | `口袋集 · 3 处 · 主来源 复合物` |
 | fingerprint | `fingerprint_path(目录)` |
 | parents | `[receptor]` |
@@ -905,7 +905,7 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
 
 ## 11. 待确认
 
-1. **产物目录**：`~/.opencode_tui/{pockets,candidates,scaffolds}/` 还是放 `runs/` 下？
+1. **产物目录**：`~/.vsagent/{pockets,candidates,scaffolds}/` 还是放 `runs/` 下？
    倾向前者——它们是过程产物，`runs/` 只收交付物。
 2. **`record_assay` 收路径**：作为第四个收路径的动作是否可接受？
    倾向可以，理由写在 §6.5。
@@ -920,7 +920,7 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
 
 ### 11.1 结账（2026-10-27 晚）
 
-第 1–4 条的落地结果：产物目录按倾向放在 `~/.opencode_tui/{pockets,candidates,scaffolds}/`；
+第 1–4 条的落地结果：产物目录按倾向放在 `~/.vsagent/{pockets,candidates,scaffolds}/`；
 `record_assay` 收 `file` 路径（`§6.5` 的理由成立，`domain/__init__.py` 的「收 handle」纪律
 因此从三个例外变成四个）；最低档叫 `below_cutoff`；**第 3 条与倾向相反**——
 `rank_candidates` 进了 `PLAN_DENY`，因为它写产物（候选表要落盘才排得出来），
@@ -932,7 +932,7 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
 
 - 买到的是**一份实现**：错误分档（4xx → `ComplexError`、429/5xx/连不上 → `RetryableToolError`
   穿过去）、id 解析、原子写、时效，原先两份一样但不保证一直一样。
-- 买到的是**一个目录**（`~/.opencode_tui/search/`）与**一套键**：同一条查询换个模块走，
+- 买到的是**一个目录**（`~/.vsagent/search/`）与**一套键**：同一条查询换个模块走，
   第二遍不发请求（`check_complexes` 里那条「同一条查询换条路走也命中同一份缓存」）。
 - **没买到**的是「同一个 UniProt 只查一次」：`search_pdb(uniprot=X)` 与
   `list_complexes(X)` 问的不是同一件事——后者多一个 `nonpolymer_entity_count > 0`、
@@ -985,7 +985,7 @@ P4 药效团     build_pharmacophore / screen_pharmacophore（技术风险最高
    配体），并在 `ligands.smi` 头部放**厄洛替尼**——它必须落在 `dock` 的 `limit` 之内，
    否则重对接仍无可比分子。
 
-跑完自清：`--clean` 删掉本轮登记表指向的 `~/.opencode_tui/` 产物并删登记表，
+跑完自清：`--clean` 删掉本轮登记表指向的 `~/.vsagent/` 产物并删登记表，
 `runs/` 与 `corpus/` 不动（前者是交付物，后者是语料库）。
 
 ### 11.4 同一次真跑挖出的第三个工具 bug

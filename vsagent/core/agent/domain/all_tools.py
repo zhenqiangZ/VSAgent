@@ -31,6 +31,7 @@ from ..tools import Tool
 from . import (
     admet,
     affinity,
+    finetune,
     analysis,
     chembl,
     corpus,
@@ -39,8 +40,10 @@ from . import (
     ligand,
     listing,
     literature,
+    opentargets,
     pharmacophore,
     pockets,
+    pubchem,
     receptor,
     rsearch,
     sar,
@@ -64,6 +67,19 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     # 与「查条目 → 取坐标」的代价不在一个量级。
     ("pocket", (pockets,)),
     ("chembl", (chembl,)),
+    # 化合物身份与全库相似检索。**与 chembl 分成两族**，因为问题不同：
+    # chembl 那条认 ChEMBL 编号、回答「有什么活性」；这条认任意标识（名称 / CID /
+    # SMILES / InChIKey / ChEMBL 编号）、回答「这是什么结构、是不是已知药、全库有没有
+    # 近亲」。对接产物与枚举出来的类似物只有 SMILES，没有 ChEMBL 编号——那条路对它们
+    # 不成立。**2026-10 起 `lookup_compound` 把 ChEMBL 的分子画像也接进来了**（两半靠
+    # InChIKey 对上），原先单立的 `describe_molecule` 因此删掉：模型不必先判断手里是
+    # 编号还是结构串再挑工具。
+    ("pubchem", (pubchem,)),
+    # 靶点的成药性与临床证据。**与 uniprot / chembl 分成三族**：uniprot 回答「这是什么
+    # 蛋白」，chembl 回答「有什么已知活性」，这一族回答更靠前的「值不值得做、做了会撞上
+    # 什么」——可成药性标志、化学探针、安全性、临床候选、疾病关联。它不产生产物，也不参与
+    # 后续计算，只是判断依据，所以不跟 structure / chembl 混在一起。
+    ("opentargets", (opentargets,)),
     ("literature", (literature,)),
     ("corpus", (corpus,)),
     ("websearch", (websearch,)),
@@ -74,9 +90,15 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     ("screen", (screen,)),
     ("docking", (docking,)),
     ("affinity", (affinity,)),
+    # 微调排在打分之后：它吃的是「这个靶点上的活性数据 + 打分结果」，不是原始结构。
+    # 单独成族是因为它训练一次 5–10 分钟、还要 DTA 环境，与只想打一批分的会话
+    # 完全不是一个量级。
+    ("finetune", (finetune,)),
     # 分析排在打分之后：它吃的是 docking / affinity 的产物，不是原始结构。
     # 单独成族是因为「跑完一次」与「看完所有结果」是两件事——前者要引擎，
     # 后者只读产物，装在一起会让只想排序的会话连 vina 的说明一起背上。
+    # 五个工具：合成候选表（rank_candidates）、看位姿（analyze_pose）、
+    # 拆疏水（analyze_hydrophobic）、效率体检（efficiency_profile）、重对接验证。
     ("analysis", (analysis,)),
     # 类药性与构效关系排在最后：它们吃的是已经排好序的候选表，而不是原始结构。
     # 两者分开成族，是因为「这批分子能不能成药」与「下一轮该改哪个基团」是

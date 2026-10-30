@@ -66,7 +66,7 @@ CYP_ALERTS: tuple[tuple[str, str, str], ...] = (
 
 def admet_dir() -> Path:
     """类药性产物的根。测试替换它，避免写用户家目录。"""
-    return Path.home() / ".opencode_tui" / ADMET_DIR
+    return Path.home() / ".vsagent" / ADMET_DIR
 
 
 def esol(logp: float, mw: float, rotatable: int, aromatic_atoms: int, heavy_atoms: int) -> float:

@@ -191,7 +191,7 @@ def normalize_accession(raw: str) -> str:
 # ---------------------------------------------------------------------------
 def target_cache_dir() -> Path:
     """靶点记录的本地缓存目录，与状态文件同处。"""
-    return Path.home() / ".opencode_tui" / "targets"
+    return Path.home() / ".vsagent" / "targets"
 
 
 def _record_path(accession: str) -> Path:

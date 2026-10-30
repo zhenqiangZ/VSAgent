@@ -13,7 +13,7 @@
    所以那边设 15 秒短超时、超时就写 `unavailable`，另给 `/pockets refresh` 走长超时
    慢慢补齐（§7.7）。**不引后台线程池**——多一个线程池就多一套生命周期要管。
 
-缓存放 `~/.opencode_tui/prankweb/<PDBID>.json`，**默认不自动过期**（§7.6）：
+缓存放 `~/.vsagent/prankweb/<PDBID>.json`，**默认不自动过期**（§7.6）：
 p2rank 的预测结果不会因为时间而改变，一个已算出的结构永远算过了。
 """
 
@@ -114,7 +114,7 @@ class PredictionResult:
 # ---------------------------------------------------------------------------
 def prankweb_cache_dir() -> Path:
     """按 §7.6 定的位置。"""
-    return Path.home() / ".opencode_tui" / "prankweb"
+    return Path.home() / ".vsagent" / "prankweb"
 
 
 def _cache_file(pdb_id: str) -> Path:

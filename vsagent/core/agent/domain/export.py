@@ -35,13 +35,14 @@ from pathlib import Path
 from typing import Any
 
 from ...paths import project_root
+from ...models import Hypothesis
 from ..ledger import (
     ArtifactHandle,
     LigandSetHandle,
     ReceptorHandle,
     SessionLedger,
     expect_handle,
-    fingerprint_text,
+    fingerprint_path,
 )
 from ..tools import Tool, ToolResult, ToolSpec
 from . import pdbtext, preprocess, products, structure
@@ -722,9 +723,9 @@ def runs_dir() -> Path:
     换一处，网页上就是空的，而写盘那一步又是「成功」的——用户看到的是
     「导出了但页面上没有」，这比直接报错难查得多。
 
-    这里原先回的是 `opencode_tui/runs/`（当时 `_project_root()` 给的是
-    `opencode_tui` 而不是仓根），而服务的两个入口（`tools/serve_web.py` 与
-    `python -m opencode_tui.core.web`）默认扫的是仓根 `runs/`。结果是
+    这里原先回的是 `vsagent/runs/`（当时 `_project_root()` 给的是
+    `vsagent` 而不是仓根），而服务的两个入口（`tools/serve_web.py` 与
+    `python -m vsagent.core.web`）默认扫的是仓根 `runs/`。结果是
     `write_run` 产出的目录**服务一直看不见**，两边各自的判据却都是绿的：
     写盘的判据查文件在不在，服务的判据查读数与它扫的那个目录一致。
 
@@ -827,6 +828,9 @@ class WriteRunTool(Tool):
     )
     primary_argument = "receptor"
     context_argument = "ledger"
+    # 假设随运行目录一起导出：没有它，网页上看得到的只有分子与分数，
+    # 而「为什么是这批」恰恰是这个项目的产出。
+    task_argument = "state"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         ledger = arguments.get("ledger")
@@ -835,6 +839,9 @@ class WriteRunTool(Tool):
                 output="内核装配问题：write_run 需要一个会话登记表，但这次调用没有拿到。",
                 failed=True,
             )
+        # 假设整份导出（含已结的）：运行目录是留档，不是当下的工作台。
+        state = arguments.get("state")
+        hypotheses = tuple(getattr(state, "hypotheses", ()) or ())
 
         raw = arguments.get("receptor")
         if raw is None or str(raw).strip() == "":
@@ -1049,6 +1056,7 @@ class WriteRunTool(Tool):
                 poses=poses,
                 view=view,
                 preprocess_report=display.report,
+                hypotheses=hypotheses,
             )
             _write_json(target / RUN_META, payload)
         except OSError as error:
@@ -1061,11 +1069,15 @@ class WriteRunTool(Tool):
             )
 
         # ---- 登记成 artifact，父项挂受体 ----
+        # 指纹必须按**目录**算，与 `ledger._file_state` 对账时用的是同一个函数；
+        # 按 `json.dumps(payload)` 的文本算的话，两边永不相等，handle 一出生就是
+        # `stale`——模型看到的是「这个产物可能已经坏了」，而它其实刚写完。
+        # 也算在这里而不是 `_write_json` 之前：meta.json 落盘之后目录才是最终形态。
         artifact = ledger.add(
             "artifact",
             path=target,
             summary=_run_summary(name, pdb_id, chains, reference),
-            fingerprint=fingerprint_text(json.dumps(payload, sort_keys=True)),
+            fingerprint=fingerprint_path(target),
             parents=[entry.handle],
             meta={"kind": "run", "run_id": run_id, "origin": bundle.origin, "view": view},
         )
@@ -1407,9 +1419,14 @@ def _poses_provenance(
 ) -> dict[str, Any]:
     counts = manifest.get("counts") or {}
     engine = manifest.get("engine") or {}
+    # 力场必须跟着走：Vina 引擎能跑三种力场，三种的分数**互不可比**
+    # （官方文档明写 AutoDock 与 Vina 的分数不能互相比）。写死成 vina 的话，
+    # 一份 AD4 的产物在网页上会自称 Vina，而两者差着好几个 kcal/mol 的量级。
+    scoring = str(engine.get("scoring") or "vina")
     return {
-        "source": "vina",
+        "source": f"{engine.get('name') or 'vina'}:{scoring}",
         "engine": str(engine.get("version") or engine.get("name") or "vina"),
+        "scoring": scoring,
         "score_direction": "lower_is_better",
         "score_unit": "kcal/mol",
         "ranked_by": "score",
@@ -1455,6 +1472,7 @@ def _build_meta(
     poses: dict[str, Any] | None = None,
     view: str = "pockets",
     preprocess_report: Any = None,
+    hypotheses: Sequence[Hypothesis] = (),
 ) -> dict[str, Any]:
     """装配 `meta.json`。
 
@@ -1496,6 +1514,10 @@ def _build_meta(
     }
     if preprocess_report is not None:
         payload["provenance"]["preprocess"] = preprocess_report.as_dict()
+    # 假设挂在 provenance 下而不是新增顶层键：顶层键与演示数据同键是判据的一部分
+    # （见本函数说明），而「为什么是这批分子」本来就属于来源与依据。
+    if hypotheses:
+        payload["provenance"]["hypotheses"] = [item.to_dict() for item in hypotheses]
     if prior:
         payload["provenance"]["pockets"]["prior"] = [
             {
@@ -1504,6 +1526,7 @@ def _build_meta(
                 "reason": item.reason,
                 "pair": item.pair,
                 "identity": item.identity,
+                "coverage": item.coverage,
                 "rmsd": item.rmsd,
                 "ligands": list(item.ligands),
             }
@@ -1635,7 +1658,9 @@ def _run_report(
             f"，共 {len(bundle.pockets)} 个口袋。"
         )
     if preprocess_report is not None:
-        lines.append("  结构预处理：" + preprocess_report.describe() + "。")
+        # 前缀写「受体预处理」而不是「结构预处理」：末尾还有一行「配体集累计」，
+        # 两行都叫「杂原子组」时，10 与 45 并排读起来像自相矛盾（P3-4）。
+        lines.append("  受体预处理：" + preprocess_report.describe() + "。")
     if view == "structure":
         if reference:
             lines.append(f"  参考配体：{reference}。")
@@ -1684,8 +1709,12 @@ def _run_report(
 
     excluded = dict(bundle.excluded or {})
     if excluded:
+        total = sum(excluded.values())
         detail = "、".join(f"{reason} {count} 个" for reason, count in sorted(excluded.items()))
-        lines.append(f"  筛掉的杂原子组：{detail}。")
+        # 「配体集累计」是**另一个对象、另一个阶段**：上面那一行数的是受体 PDB 里的
+        # 杂原子组，这里数的是候选复合物的配体集。两处都叫「杂原子组」而不说对象时，
+        # 10 与 45 并排看着像对不上（P3-4）。
+        lines.append(f"  配体集累计：筛掉 {total} 个杂原子组（{detail}）。")
     lines.append(
         "  提示：参考配体留空时页面不标 is_reference；用 open_viewer 打开这一份看结构。"
     )

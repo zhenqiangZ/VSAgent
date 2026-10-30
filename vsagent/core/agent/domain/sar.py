@@ -28,6 +28,7 @@ from ..ledger import (
     expect_handle,
     fingerprint_path,
 )
+from ...models import TaskState
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
 from . import export, ligand, products
 from .chemistry import CHEM_TOOL_DESCRIPTION_NOTE, require_chem
@@ -52,7 +53,7 @@ ACYCLIC = "acyclic"
 
 def sar_dir() -> Path:
     """SAR 产物的根。测试替换它，避免写用户家目录。"""
-    return Path.home() / ".opencode_tui" / SAR_DIR
+    return Path.home() / ".vsagent" / SAR_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +962,121 @@ ASSAY_COLUMNS: tuple[str, ...] = (
     "molecule", "value", "qualifier", "assay", "campaign", "recorded_at",
 )
 
+# 预期里那个「比较号 + 数值」。`IC50 < 100 nM` → ("<", 100.0)。
+_EXPECTED_NUMBER = re.compile(r"([<>≤≥~=]{1,2})\s*([0-9]+(?:\.[0-9]+)?)")
+# 预期里只给了一个数（`IC50 100 nM`）时的读法：按「不高于」。
+_BARE_NUMBER = re.compile(r"([0-9]+(?:\.[0-9]+)?)")
+
+
+def parse_expected(text: str) -> tuple[str, float] | None:
+    """从预期里取出「比较号 + 阈值」。取不到返回 None。
+
+    取不到不是错——有些假设本来就没有数值预期（「对照组无活性」）。那时回填只能说
+    「判不了」，而不是替它判一个。**不要**把没有阈值的预期默认成达标：
+    那是把「没法验证」写成了「已验证」，比不判更坏。
+    """
+    raw = str(text or "")
+    match = _EXPECTED_NUMBER.search(raw)
+    if match is not None:
+        op = {"≤": "<=", "≥": ">=", "=": "="}.get(match.group(1), match.group(1))
+        try:
+            return op, float(match.group(2))
+        except ValueError:
+            return None
+    bare = _BARE_NUMBER.search(raw)
+    if bare is None:
+        return None
+    try:
+        return "<=", float(bare.group(1))
+    except ValueError:
+        return None
+
+
+def judge_measurement(value: float, qualifier: str, op: str, threshold: float) -> str:
+    """一条实测与预期比：`pass` / `fail` / `unknown`。
+
+    **限定符决定能不能下结论**：实测写的是 `>10000`（真值比这个大），而预期是
+    `< 100`——这一条判 fail 是稳的（真值只会更大）；反过来实测 `<1`、预期 `<100`，
+    真值可能更小也可能更大，只能算 unknown。把 unknown 当 pass 就是自欺。
+    """
+    if op == "~":
+        low, high = threshold * 0.5, threshold * 1.5
+        if qualifier == "=":
+            return "pass" if low <= value <= high else "fail"
+        if qualifier == ">" and value > high:
+            return "fail"
+        if qualifier == "<" and value < low:
+            return "fail"
+        return "unknown"
+    if op in ("<", "<="):
+        if qualifier == "=":
+            return "pass" if value <= threshold else "fail"
+        if qualifier == ">":
+            return "fail" if value > threshold else "unknown"
+        if qualifier == "<":
+            return "pass" if value <= threshold else "unknown"
+        return "unknown"
+    if op in (">", ">="):
+        if qualifier == "=":
+            return "pass" if value >= threshold else "fail"
+        if qualifier == "<":
+            return "fail" if value < threshold else "unknown"
+        if qualifier == ">":
+            return "pass" if value >= threshold else "unknown"
+        return "unknown"
+    return "unknown"
+
+
+def _judge_batch(
+    expected: str, received: dict[str, dict[str, Any]], assay: str
+) -> tuple[str, list[str]]:
+    """把一批实测与预期比一遍，返回 (状态, 报告行)。"""
+    parsed = parse_expected(expected)
+    if parsed is None:
+        return "inconclusive", [
+            f"预期里取不到阈值（{expected}），这一批判不了真假。"
+            "把预期写成「< 100 nM」这种形式，下一次回填就能自动结案。"
+        ]
+    op, threshold = parsed
+    passed: list[str] = []
+    failed: list[str] = []
+    unknown: list[str] = []
+    for molecule, row in sorted(received.items()):
+        verdict = judge_measurement(
+            float(row["value"]), str(row["qualifier"]), op, threshold
+        )
+        shown = f"{molecule} {row['qualifier'] if row['qualifier'] != '=' else ''}{row['value']:g}"
+        if verdict == "pass":
+            passed.append(shown)
+        elif verdict == "fail":
+            failed.append(shown)
+        else:
+            unknown.append(shown)
+
+    lines = [f"预期：{assay} {op} {threshold:g}；本批实测 {len(received)} 条"]
+    if passed:
+        lines.append(f"  达标 {len(passed)} 条：{'、'.join(passed[:5])}"
+                     + ("……" if len(passed) > 5 else ""))
+    if failed:
+        lines.append(f"  不达标 {len(failed)} 条：{'、'.join(failed[:5])}"
+                     + ("……" if len(failed) > 5 else ""))
+    if unknown:
+        lines.append(
+            f"  判不了 {len(unknown)} 条：{'、'.join(unknown[:5])}"
+            + ("……" if len(unknown) > 5 else "")
+            + "（限定符只给出一侧边界，结论要更多数据）"
+        )
+    if passed:
+        status = "supported"
+        lines.append("结论：supported——至少一条实测落在预期一侧。")
+    elif failed and not unknown:
+        status = "refuted"
+        lines.append("结论：refuted——本批全部落在预期的另一侧。")
+    else:
+        status = "inconclusive"
+        lines.append("结论：inconclusive——本批还判不出真假。")
+    return status, lines
+
 
 class RecordAssayTool(Tool):
     """把用户测回来的实验数据记进运行目录。"""
@@ -974,6 +1090,9 @@ class RecordAssayTool(Tool):
             "value / ic50 / activity）；数值支持限定符 `>10000`、`<1`。"
             "同一个 (分子, 测定) 重复出现时**保留最新的那条**，旧值进 "
             "`assay-history.csv`，不丢。\n"
+            "**给了 `hypothesis` 就顺手结案**：把预期与这一批实测逐条比，"
+            "返回达标 / 不达标 / 判不了各几条，并把那条假设改成 supported / refuted / "
+            "inconclusive。这是假设闭环的唯一入口——没有它，假设提了就没人管。\n"
             "写盘是原子的：中途失败不会留下半截表。别的 campaign 的文件一个字节都不动。"
         ),
         parameters={
@@ -982,6 +1101,13 @@ class RecordAssayTool(Tool):
                 "file": {"type": "string", "description": "实验数据 CSV 的路径"},
                 "campaign": {"type": "string", "description": "项目名，落 runs/<campaign>/"},
                 "assay": {"type": "string", "description": "测定类型，如 IC50"},
+                "hypothesis": {
+                    "type": "string",
+                    "description": (
+                        "要结案的假设编号（hyp#1）。给了就按它的 expected 与这批实测比，"
+                        "自动改状态；不给只记数据"
+                    ),
+                },
             },
             "required": ["file", "campaign", "assay"],
             "additionalProperties": False,
@@ -989,6 +1115,9 @@ class RecordAssayTool(Tool):
     )
     primary_argument = "campaign"
     context_argument = "ledger"
+    # 只在给了 `hypothesis` 时用得上；声明在这里是为了让内核把它塞进来，
+    # 而不是让工具自己去会话上翻。
+    task_argument = "state"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         ledger = arguments.get("ledger")
@@ -1005,6 +1134,22 @@ class RecordAssayTool(Tool):
                 output="缺少参数：file（CSV 路径）、campaign（项目名）、assay（测定类型）都要给。",
                 failed=True,
             )
+        # 假设要在**写盘之前**确认存在：写到一半才发现编号写错，数据已经落盘，
+        # 调用方看到的却是一条失败——两边对不上。
+        state: TaskState = arguments.get("state")
+        hypothesis = None
+        hypothesis_id = str(arguments.get("hypothesis") or "").strip()
+        if hypothesis_id:
+            hypothesis = state.find_hypothesis(hypothesis_id)
+            if hypothesis is None:
+                known = "、".join(item.id for item in state.hypotheses) or "（还没有任何假设）"
+                return ToolResult(
+                    output=(
+                        f"没有 {hypothesis_id} 这条假设，数据没有写入。现有：{known}。"
+                        "先用 hypothesis(action=\"list\") 看编号。"
+                    ),
+                    failed=True,
+                )
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", campaign):
             return ToolResult(
                 output=f"campaign 只能是字母数字与 . _ -（现在是 {campaign!r}）：它会当目录名用。",
@@ -1157,7 +1302,17 @@ class RecordAssayTool(Tool):
                 f"molecule={first['molecule'] or '（空）'} value={first['raw']!r}）"
             )
         lines.append(f"文件：{main_path}")
-        lines.append("下一步：把这些活性当参考集（build_reference_set 的输入），或做匹配分子对。")
+        judged = ""
+        if hypothesis is not None:
+            judged, hypothesis_lines = _judge_batch(hypothesis.expected, received, assay)
+            hypothesis.status = judged
+            hypothesis.result_ref = handle
+            state.version += 1
+            lines.append("")
+            lines.append(f"{hypothesis.id}（{hypothesis.label()}）：{hypothesis.claim}")
+            lines.extend(hypothesis_lines)
+        else:
+            lines.append("下一步：把这些活性当参考集（build_reference_set 的输入），或做匹配分子对。")
         return ToolResult(
             output="\n".join(lines),
             meta={
@@ -1166,6 +1321,8 @@ class RecordAssayTool(Tool):
                 "merged": len(merged),
                 "skipped": len(skipped),
                 "superseded": len(superseded),
+                "hypothesis": hypothesis.id if hypothesis is not None else "",
+                "hypothesis_status": judged,
             },
         )
 

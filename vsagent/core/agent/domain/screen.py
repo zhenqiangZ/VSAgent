@@ -58,7 +58,7 @@ SCORE_COLUMN = "similarity"
 
 def candidates_dir() -> Path:
     """相似度产物的根。测试替换它，避免写用户家目录。"""
-    return Path.home() / ".opencode_tui" / "screens"
+    return Path.home() / ".vsagent" / "screens"
 
 
 # ---------------------------------------------------------------------------

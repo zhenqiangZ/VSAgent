@@ -58,7 +58,7 @@ MAX_TOP = 500
 
 def pharmacophore_dir() -> Path:
     """药效团产物的根。测试替换它，避免写用户家目录。"""
-    return Path.home() / ".opencode_tui" / PHARMACOPHORE_DIR
+    return Path.home() / ".vsagent" / PHARMACOPHORE_DIR
 
 
 def _factory():

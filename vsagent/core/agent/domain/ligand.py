@@ -144,7 +144,7 @@ class LoadedLigands:
 # ---------------------------------------------------------------------------
 def ligands_dir() -> Path:
     """配体产物的根。测试替换它，避免写用户家目录。"""
-    return Path.home() / ".opencode_tui" / "ligands"
+    return Path.home() / ".vsagent" / "ligands"
 
 
 def raw_ligandset_dir() -> Path:
@@ -1658,19 +1658,35 @@ def _render_curated(
     total: int,
     mode: str,
     target: Path,
+    flagged: int | None = None,
 ) -> str:
     removed = sum(dropped.values())
     lines = [
         f"已筛过一遍，登记为 {handle}。" if not reused else f"登记表里已有同一份：{handle}（未重筛）。",
-        f"输入 {total} 条，保留 {kept} 条，淘汰 {removed} 条（mode={mode}）。",
     ]
+    if mode == "flag":
+        # flag 模式下「保留 / 淘汰」两个桶**不互斥**：被标记的条目仍在库里。
+        # 原先照 drop 的口径写「保留 832，淘汰 246」，832 + 246 = 1078 看着像算错了，
+        # 实际是 246 条被标了记但一条没少（P3-3）。
+        unparsed = dropped.get("无法解析", 0)
+        line = f"输入 {total} 条：登记 {kept} 条"
+        if flagged is not None:
+            line += f"，其中 {flagged} 条带标记"
+        line += "（**仍在库里**，按 flags 列筛出来看；要真的去掉得用 mode=drop）。"
+        if unparsed:
+            line += f"另有 {unparsed} 条无法解析，没有登记。"
+        lines.append(line)
+    else:
+        lines.append(f"输入 {total} 条，保留 {kept} 条，淘汰 {removed} 条（mode={mode}）。")
     if dropped:
         detail = "、".join(f"{name} {count} 条" for name, count in dropped.items() if count)
         lines.append(f"按规则：{detail}。")
     else:
         lines.append("按规则：没有一条命中——这套库在这一组判据下是干净的。")
     if examples:
-        lines.append("淘汰示例：")
+        # flag 模式下这些条目并没有被去掉，只是带了标记——叫「淘汰示例」
+        # 会让读者以为它们不在库里了。
+        lines.append("标记示例：" if mode == "flag" else "淘汰示例：")
         for item in examples[:MAX_DROP_EXAMPLES]:
             lines.append(
                 f"  · {item['id']}（{item['smiles'][:40]}）：{'、'.join(item['flags'])}"
@@ -1917,6 +1933,10 @@ class CurateLigandsTool(Tool):
                 failed=True,
             )
 
+        # flag 模式下被标记的条目仍在 `records` 里，这个数就是「标了几条」。
+        # 它与 `dropped` 不是一回事：`dropped` 按规则计数，同一个分子命中两条
+        # 规则会被数两次；这里数的是**分子**。
+        flagged = sum(1 for record in records if record.get("flags"))
         manifest = {
             "kind": "ligandset",
             "stage": "curated",
@@ -1926,6 +1946,7 @@ class CurateLigandsTool(Tool):
             "counts": {
                 "input": len(items),
                 "kept": len(records),
+                "flagged": flagged,
                 "dropped": sum(dropped.values()),
             },
             "dropped": dropped,
@@ -1983,10 +2004,12 @@ class CurateLigandsTool(Tool):
                 total=len(items),
                 mode=mode,
                 target=target,
+                flagged=flagged,
             ),
             meta={
                 "handle": handle,
                 "kept": len(records),
+                "flagged": flagged,
                 "dropped": sum(dropped.values()),
                 "reused": False,
             },

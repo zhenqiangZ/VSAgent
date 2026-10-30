@@ -1,24 +1,24 @@
 """领域工具的调试入口：**直接跑，不用敲任何参数**。
 
-放在仓库根目录，不放在 `opencode_tui/core/agent/domain/` 里：它是开发期用的东西，
-不该和那 42 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
+放在仓库根目录，不放在 `vsagent/core/agent/domain/` 里：它是开发期用的东西，
+不该和那 51 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
 
-    # 一、全跑：19 个模块、44 次调用（42 个工具），按依赖顺序一个接一个（不需要任何参数）
+    # 一、全跑：22 个模块、54 次调用（51 个工具），按依赖顺序一个接一个（不需要任何参数）
     .venv/Scripts/python.exe debug_tools.py
 
-    # 二、只跑一个模块（10 个工具模块末尾的块就是这么用的）
-    .venv/Scripts/python.exe -m opencode_tui.core.agent.domain.structure
+    # 二、只跑一个模块（每个工具模块末尾的块就是这么用的）
+    .venv/Scripts/python.exe -m vsagent.core.agent.domain.structure
 
 想看清单而不是跑，加 `--list`：
 
     .venv/Scripts/python.exe debug_tools.py --list
-    .venv/Scripts/python.exe -m opencode_tui.core.agent.domain.structure --list
+    .venv/Scripts/python.exe -m vsagent.core.agent.domain.structure --list
 
 参数与顺序都在本文件的 `CALLS` 里（一次一行，真实的检索词、真实的编号），所以上面
 几条命令**一个参数都不用敲**。要单独盯某个工具、或换一组参数时，才用得上显式写法：
 
     .venv/Scripts/python.exe debug_tools.py structure fetch_structure pdb_id=4HJO
-    .venv/Scripts/python.exe -m opencode_tui.core.agent.domain.structure fetch_structure '{"pdb_id": "4HJO"}'
+    .venv/Scripts/python.exe -m vsagent.core.agent.domain.structure fetch_structure '{"pdb_id": "4HJO"}'
 
 显式写法的参数三种给法：一段 JSON、`键=值`、`--file 路径`（`-` 读标准输入）。
 两个开关：`--reset` 清掉上一轮攒下的登记表，`--raw` 跳过参数模式校验
@@ -35,7 +35,7 @@
   「内核装配问题」，而 `fetch_target` / `list_workspace` 这类工具里还有
   `isinstance(ledger, SessionLedger)` 的硬校验——所以这里造一个真的 `SessionLedger`，
   拿 None 糊弄只会得到一句与参数无关的报错。
-- **登记表写在 `.probe/debug-ledger.json`**，不碰 `~/.opencode_tui/ledger/` 里真实的
+- **登记表写在 `.probe/debug-ledger.json`**，不碰 `~/.vsagent/ledger/` 里真实的
   会话快照。单个工具模式下它在两次命令之间是**接着用**的：先跑 `fetch_structure`，
   再跑 `list_workspace`，能看到刚登记的那一条——正好当一轮会话使。全跑模式开跑前
   清空，保证每次跑的都是同一份起点。
@@ -47,7 +47,7 @@
 
 有一条是环境决定的：`open_viewer` 要本地结构服务在监听，`python debug_tools.py`
 单独跑起来时那个服务不在，它会照实报「没连上」。先起应用或
-`python -m opencode_tui.core.web`，这一条才会是绿的。`dock` 同理：PATH 里要有
+`python -m vsagent.core.web`，这一条才会是绿的。`dock` 同理：PATH 里要有
 `vina`，或用 `VSA_VINA_BIN` 指向它；没有引擎时这一条会照实失败，`--list` 不受影响。
 """
 
@@ -62,11 +62,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from opencode_tui.core.agent.context import EvidenceStore
-from opencode_tui.core.agent.ledger import SessionLedger
-from opencode_tui.core.agent.tools import Tool, ToolError, argument_error
-from opencode_tui.core.models import TaskState
-from opencode_tui.env import load_env
+from vsagent.core.agent.context import EvidenceStore
+from vsagent.core.agent.ledger import SessionLedger
+from vsagent.core.agent.tools import Tool, ToolError, argument_error
+from vsagent.core.models import TaskState
+from vsagent.env import load_env
 
 # 全跑时依次调用的每一个工具：**顺序与参数都写在这里，一次一行**。
 #
@@ -85,6 +85,11 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     # 靶点：检索 → 取详情
     ("search_targets", {"query": "EGFR", "limit": 5}),
     ("fetch_target", {"accession": "P00533"}),
+    # 靶点值不值得做：可成药性 / 安全性 / 临床候选 / 疾病关联（纯查询，不登记产物）。
+    # 用的是基因名而不是 Ensembl 编号——解析那一步本身也要跑通。
+    ("check_druggability", {"target": "EGFR", "disease_limit": 3, "drug_limit": 3}),
+    # 反方向：从疾病找候选靶点（同样纯查询）
+    ("disease_targets", {"disease": "lung adenocarcinoma", "limit": 5}),
     # 取一份远端结构（1M17，EGFR 激酶域），登记成 raw 的受体
     ("fetch_structure", {"pdb_id": "1M17"}),
     # 先看一眼这套结构能不能用：方法、分辨率、缺口、交替构象
@@ -148,7 +153,22 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "top": 5,
     }),
     # 看某一条的接触依据：只读，不登记。分子用 id（夹具里的名字，不是序号）。
-    ("analyze_pose", {"docking": "{artifact:docking}", "molecule": "aspirin"}),
+    # interactions 打开 PLIP 指纹：本机没装 plip 时这一段变成一句安装说明，
+    # 调用本身照样成功（可选依赖不拖垮主结果）。
+    ("analyze_pose", {
+        "docking": "{artifact:docking}",
+        "molecule": "aspirin",
+        "interactions": True,
+    }),
+    # 同一个位姿换个问法：分数是疏水堆出来的，还是极性原子白埋了。纯几何，不需要 plip。
+    ("analyze_hydrophobic", {"docking": "{artifact:docking}", "molecule": "aspirin"}),
+    # 整批的接触频次：这一批是不是都挤在同一个亚口袋。只读，不登记。
+    ("contact_map", {"docking": "{artifact:docking}", "top": 10}),
+    # 整批的效率体检：每颗重原子换来多少分、有没有靠亲脂性堆出来的「大而油」。
+    ("efficiency_profile", {"docking": "{artifact:docking}", "top": 5}),
+    # 对照分子：正向 / 阴性 / 背离各挑一个，并说明为什么算对照。
+    # 只读候选表；候选表没生成时这一条会照实失败并说清缺哪个 handle。
+    ("pick_controls", {"source": "{artifact:candidates}"}),
     # 参考活性集：导一份带 pChEMBL 的 CSV（第三个收路径的动作），按活性下限筛一遍。
     # 4 条里 1 条低于 6、1 条命中 PAINS（只标不删），所以参考集只有 3 条 → too_small。
     ("import_ligandset", {"path": "tests/fixtures/actives.csv"}),
@@ -190,11 +210,26 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     }),
     # 两个搜索工具：只给候选、不给结论
     ("search_pdb", {"query": "EGFR kinase", "limit": 5}),
-    # 已知活性 → 类似物 → 分子画像
+    # 已知活性 → 类似物
     ("search_actives", {"accession": "P00533"}),
     ("find_analogs", {"query": "CHEMBL939"}),
-    ("describe_molecule", {"molecule": "CHEMBL25"}),
+    # PubChem：同一件事的另一条路——认任意标识（名称/CID/SMILES/InChIKey/ChEMBL 编号），
+    # 回答「这是什么结构、是不是已知药」而不是「有什么活性」。下面两条各走一个方向：
+    # 给名称（PubChem → 按 InChIKey 补 ChEMBL 画像），与给编号（ChEMBL → 按 InChIKey
+    # 补 PubChem 身份）。再按结构在**全库**里找近亲。三条都是纯查询，不登记任何产物。
+    ("lookup_compound", {"compound": "aspirin", "synonyms": True}),
+    ("lookup_compound", {"compound": "CHEMBL25"}),
+    ("find_similar_compounds", {
+        "smiles": "CC(=O)OC1=CC=CC=C1C(=O)O",
+        "threshold": 98,
+        "limit": 5,
+    }),
     ("search_literature", {"query": "EGFR inhibitor resistance", "limit": 5}),
+    # Europe PMC：一步检索（含预印本与被引次数），再从 OA 条目里读一节正文。
+    # 后面那条用的是一篇 2025 年的开放获取文章（Frontiers in Pharmacology）；
+    # 它哪天被撤下，这一条会照实失败，换成 search_europepmc 结果里的任意 PMCID 即可。
+    ("search_europepmc", {"query": "EGFR T790M resistance", "limit": 5}),
+    ("read_fulltext", {"article": "PMC12545111", "section": "results", "max_chars": 800}),
     # 本地语料：把仓里那份夹具文献导进去 → 检索 → 按页读。
     # 导入会**真的写进 `corpus/doc/`**（已 gitignore），用一份小 PDF 而不是整篇论文。
     # 同一份文件导两次是「重复」，所以重复跑这条也是绿的。
@@ -221,6 +256,19 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("open_viewer", {"run": "{artifact}"}),
     # 最后回来看准备后的受体那一条
     ("describe_entry", {"handle": "{receptor:prepared}"}),
+    # 微调：**这里只跑预演**（confirm=false）。真训一次要 5–10 分钟、还要 DTA 的
+    # 独立环境，把它塞进全跑会让这个脚本从「几分钟」变成「半小时」。
+    # 预演仍然走完整的前置校验：受体必须是 prepared 且留了 ligand.pdb，
+    # 配体集必须有 pchembl 列——这两条恰好是最容易配错的地方。
+    ("fit_affinity", {
+        "receptor": "{receptor:prepared}",
+        "ligands": "{ligandset:raw}",
+        "confirm": False,
+    }),
+    # AlphaFold 预测模型（免费，无 key）。**排在最后是故意的**：它也会登记一条 raw
+    # 受体，插在中间就会把「当前受体」和 `{receptor:raw}` 指到它上面，后面的整条链
+    # 都跟着换靶点。用 P69905（血红蛋白 α，142 残基）而不是 P00533：坐标只有一百多 KB。
+    ("fetch_alphafold", {"uniprot_id": "P69905"}),
 )
 
 # 按工具名查样例参数：单个工具模式（`debug_tools.py <模块> <工具名>`）用它兜底，
@@ -239,7 +287,7 @@ DEBUG_LEDGER_PATH = REPO_ROOT / ".probe" / "debug-ledger.json"
 USAGE_ROOT = (
     "python debug_tools.py [<模块>] [<工具名> [参数…]] [--list] [--raw] [--reset] [--clean]"
 )
-USAGE_MODULE = "python -m opencode_tui.core.agent.domain.<模块> [<工具名> [参数…]] [--list] [--raw] [--reset]"
+USAGE_MODULE = "python -m vsagent.core.agent.domain.<模块> [<工具名> [参数…]] [--list] [--raw] [--reset]"
 
 SWITCHES = ("--raw", "--reset", "--list", "--clean")
 LIST_FLAGS = ("-h", "--help", "--list")
@@ -355,7 +403,7 @@ def _tool_modules() -> list[tuple[str, list[Tool]]]:
 
     顺序也是**全跑时的顺序**，`__all__` 里就是依赖顺序。
     """
-    package = importlib.import_module("opencode_tui.core.agent.domain")
+    package = importlib.import_module("vsagent.core.agent.domain")
     found: list[tuple[str, list[Tool]]] = []
     for name in package.__all__:
         module = importlib.import_module(f"{package.__name__}.{name}")
@@ -366,7 +414,7 @@ def _tool_modules() -> list[tuple[str, list[Tool]]]:
 
 
 def _clean_products() -> None:
-    """删掉这一轮登记表指向的产物，只删 `~/.opencode_tui/` 下的那些。
+    """删掉这一轮登记表指向的产物，只删 `~/.vsagent/` 下的那些。
 
     **不碰 `runs/` 与 `corpus/`**：前者是交付物（`write_run` 的产物，用户可能要拿去
     看页面），后者是语料库，删了要重新入库。只清缓存性质的东西——受体、配体集、
@@ -376,7 +424,7 @@ def _clean_products() -> None:
     import shutil
 
     ledger = _debug_ledger(quiet=True)
-    root = Path.home() / ".opencode_tui"
+    root = Path.home() / ".vsagent"
     removed: list[str] = []
     kept: list[str] = []
     for entry in ledger.entries(include_archived=True):
@@ -407,7 +455,7 @@ def _clean_products() -> None:
     if len(removed) > 8:
         print(f"  …… 还有 {len(removed) - 8} 个")
     if kept:
-        print("没删（不在 ~/.opencode_tui 下，或删不掉）：")
+        print("没删（不在 ~/.vsagent 下，或删不掉）：")
         for item in kept[:6]:
             print(f"  · {item}")
 

@@ -36,12 +36,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from opencode_tui.core.agent.memory import (  # noqa: E402
+from vsagent.core.agent.memory import (  # noqa: E402
     MAX_ENTRIES,
     RESIDENT_LIMIT,
     MemoryStore,
 )
-from opencode_tui.core.agent.prompt import estimate_tokens  # noqa: E402
+from vsagent.core.agent.prompt import estimate_tokens  # noqa: E402
 
 
 def normalize(text: str) -> str:

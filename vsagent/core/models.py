@@ -88,7 +88,7 @@ def sync_sequences(session_ids: Iterable[str], message_ids: Iterable[str], part_
 
 
 class PartType(Enum):
-    """Part 的类型，对应 OpenCode 的 Part 模型。"""
+    """Part 的类型，对应上游 Agent 的 Part 模型。"""
 
     TEXT = "text"
     REASONING = "reasoning"
@@ -307,6 +307,109 @@ TASK_RENDER_LIMITS: dict[str, int] = {
     "blockers": 10,
 }
 
+# 假设只渲染未结的、最多这么多条。与任务状态同理：这一段每一步都进上下文，
+# 十几条假设全铺开会把窗口吃满，而模型当下只需要看到「还有哪几条没验证」。
+HYPOTHESIS_RENDER_LIMIT = 3
+
+# 假设的两种粒度。**策略**是「这一轮该怎么筛」（聚焦库还是多样性库、先扩张还是先收窄），
+# **机制**是「这批分子为什么活」（结合哪个亚位点、靠什么相互作用）。两者都要能提，
+# 因为只谈机制会在错误的库上做精细分析，只谈策略则永远不知道为什么要这么筛。
+HYPOTHESIS_KINDS: tuple[str, ...] = ("strategy", "mechanism")
+# 策略假设必须带方向：扩张（找新骨架）还是收窄（在已有骨架里优化）。
+HYPOTHESIS_MODES: tuple[str, ...] = ("expand", "narrow")
+# 状态只由「实验数据回填」与「显式关闭」两条路改，不由 `update` 改——
+# 否则模型可以绕过证据把一条假设标成 supported。
+HYPOTHESIS_STATUSES: tuple[str, ...] = ("open", "supported", "refuted", "inconclusive")
+
+
+def _clip(text: str, limit: int) -> str:
+    """压成一行并截断。渲染用，不改原值。"""
+    line = " ".join(str(text or "").split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+@dataclass
+class Hypothesis:
+    """一条**可以被证伪**的判断。六要素缺一不可，缺了就不是假设而是印象。
+
+    为什么要有这个对象：没有它的时候，模型交上来的是一张排名表——「前 10 个分子、
+    各自的分数」。那种产出无法被证伪，也无法指导下一步该合哪个分子。有了它，
+    「这批 hit 为什么活」才有地方落，实验数据回来才有东西可以对。
+
+    字段对应 Roche 那篇 Perspective 的判据（`docs/molecular-design-principles.md`）：
+    `claim` 是主张，`mechanism` 是机制，`evidence` 是已有证据，`test` 是怎么检验，
+    `expected` 是预期结果（必须可判真假），`result_ref` 是回填的证据出处。
+    """
+
+    id: str
+    kind: str = "mechanism"
+    mode: str = ""          # 只有 strategy 用：expand / narrow
+    claim: str = ""
+    mechanism: str = ""
+    evidence: str = ""
+    test: str = ""
+    expected: str = ""
+    status: str = "open"
+    result_ref: str = ""
+
+    def is_open(self) -> bool:
+        return self.status == "open"
+
+    def label(self) -> str:
+        """给人看的一小段标签：`策略·扩张` / `机制`。"""
+        kind = "策略" if self.kind == "strategy" else "机制"
+        if self.mode == "expand":
+            kind += "·扩张"
+        elif self.mode == "narrow":
+            kind += "·收窄"
+        return kind
+
+    def render(self) -> str:
+        """压成一行。进 TASK 层的那一份，所以要短。"""
+        parts = [f"{self.id} [{self.label()}] {_clip(self.claim, 70)}"]
+        if self.test:
+            parts.append(f"检验：{_clip(self.test, 40)}")
+        if self.expected:
+            parts.append(f"预期：{_clip(self.expected, 30)}")
+        if not self.is_open():
+            tail = f"状态：{self.status}"
+            if self.result_ref:
+                tail += f"（{self.result_ref}）"
+            parts.append(tail)
+        return "；".join(parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "mode": self.mode,
+            "claim": self.claim,
+            "mechanism": self.mechanism,
+            "evidence": self.evidence,
+            "test": self.test,
+            "expected": self.expected,
+            "status": self.status,
+            "result_ref": self.result_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Hypothesis:
+        """从字典还原。认不出的 kind / status 一律回落到安全值，不抛。"""
+        kind = str(data.get("kind") or "mechanism")
+        status = str(data.get("status") or "open")
+        return cls(
+            id=str(data.get("id") or ""),
+            kind=kind if kind in HYPOTHESIS_KINDS else "mechanism",
+            mode=str(data.get("mode") or ""),
+            claim=str(data.get("claim") or ""),
+            mechanism=str(data.get("mechanism") or ""),
+            evidence=str(data.get("evidence") or ""),
+            test=str(data.get("test") or ""),
+            expected=str(data.get("expected") or ""),
+            status=status if status in HYPOTHESIS_STATUSES else "open",
+            result_ref=str(data.get("result_ref") or ""),
+        )
+
 
 @dataclass
 class TaskState:
@@ -325,14 +428,33 @@ class TaskState:
     done: list[str] = field(default_factory=list)
     todo: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
+    # 本会话提出的假设。与 `done` 那几类不同，它们不整段替换：每条有自己的 id 与状态，
+    # 由 `hypothesis` 工具与 `record_assay` 分别写。
+    hypotheses: list[Hypothesis] = field(default_factory=list)
     version: int = 0  # 每次真的改了才 +1，供 trace 与判据比对
 
     def is_empty(self) -> bool:
-        """五个字段全空时返回 True。空的就不必往上下文里塞一段废话。"""
+        """所有字段全空时返回 True。空的就不必往上下文里塞一段废话。"""
         return not (
             self.goal or self.constraints or self.done
-            or self.todo or self.blockers
+            or self.todo or self.blockers or self.hypotheses
         )
+
+    def find_hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
+        """按 `hyp#N` 找一条。找不到返回 None，由调用方给可读的错。"""
+        wanted = str(hypothesis_id or "").strip()
+        for item in self.hypotheses:
+            if item.id == wanted:
+                return item
+        return None
+
+    def next_hypothesis_id(self) -> str:
+        """下一个编号。按已有条数推，不按最大 id 推：删过也不复用旧号。"""
+        used = {item.id for item in self.hypotheses}
+        index = len(self.hypotheses) + 1
+        while f"hyp#{index}" in used:
+            index += 1
+        return f"hyp#{index}"
 
     def render(self) -> str:
         """渲染成给模型看的一段文字。空字段整段不出现。
@@ -358,6 +480,25 @@ class TaskState:
             if len(items) > len(shown):
                 block += f"\n- （另有 {len(items) - len(shown)} 条未列出）"
             blocks.append(block)
+        # 假设只铺未结的：已结的留着是给导出与复盘用的，每一步都看一遍没有意义。
+        opened = [item for item in self.hypotheses if item.is_open()]
+        if opened:
+            shown = opened[:HYPOTHESIS_RENDER_LIMIT]
+            block = "假设（未结）：\n" + "\n".join(f"- {item.render()}" for item in shown)
+            if len(opened) > len(shown):
+                block += (
+                    f"\n- （另有 {len(opened) - len(shown)} 条未列出，"
+                    'hypothesis(action="list") 看全部）'
+                )
+            blocks.append(block)
+        closed = [item for item in self.hypotheses if not item.is_open()]
+        if closed:
+            counts = "、".join(
+                f"{status} {sum(1 for item in closed if item.status == status)}"
+                for status in HYPOTHESIS_STATUSES
+                if status != "open" and any(item.status == status for item in closed)
+            )
+            blocks.append(f"已结假设：{len(closed)} 条（{counts}）")
         return "\n".join(blocks)
 
     def apply(
@@ -441,6 +582,7 @@ class TaskState:
             "done": list(self.done),
             "todo": list(self.todo),
             "blockers": list(self.blockers),
+            "hypotheses": [item.to_dict() for item in self.hypotheses],
             "version": self.version,
         }
 
@@ -454,65 +596,76 @@ class TaskState:
                 return []
             return [str(item).strip() for item in raw if str(item).strip()]
 
+        raw_hypotheses = data.get("hypotheses")
+        hypotheses = [
+            Hypothesis.from_dict(item)
+            for item in (raw_hypotheses if isinstance(raw_hypotheses, list) else [])
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
+
         return cls(
             goal=str(data.get("goal") or ""),
             constraints=strings("constraints"),
             done=strings("done"),
             todo=strings("todo"),
             blockers=strings("blockers"),
+            hypotheses=hypotheses,
             version=int(data.get("version") or 0),
         )
 
 
 # 事件怎么来的。三种都要能读回来，区别只在「谁写的」：
-# manual 是模型主动收口，auto 是溢出时本地兜底，local 是用户 /compact 时补的。
+# manual 是模型主动封存（close_phase），auto 是轮末由内核自动封存，
+# local 是用户 /compact 或装不下时强推的。
 EVENT_KINDS: tuple[str, ...] = ("manual", "auto", "local")
+
+# 一步里几段文本的长度上限。**代码里截**，不只写在提示词里：
+# 这些行要进每步都发的索引，一条长参数能把整块流水撑爆。
+STEP_INTENT_MAX = 60
+STEP_RESULT_MAX = 120
 
 
 @dataclass
-class Event:
-    """一段已经收口的工作：用标题与摘要代替那段原文。
+class Step:
+    """一个 Phase 里的一小步：一次模型往返加它调用的那些工具。
 
-    它是摘要与 RECENT 之间的那一层。摘要回答「很久以前发生过什么」，
-    事件回答「刚才那几步做了什么、留下了什么」；粒度比摘要细、比逐条消息粗。
+    只记**已经算好的事实**——工具名、参数、状态、产物 handle。不记 reasoning，
+    也不让模型写自述：记录必须零请求，而自述会美化过程（「验证受体质量」比
+    「读了一下文件」好听，但后者才是过程）。见 `docs/session-review-plan.md` §4.3。
 
-    `start` / `end` 是消息下标（闭开区间），与 `compact_upto` 同一套口径。
-    事件**连续覆盖**一段：首条从 `summary_upto` 开始，后一条接着前一条的 `end`，
-    RECENT 从最后一条的 `end` 开始。这条不变式由 `Session.sanitize_events` 保证，
-    装配层因此只需要发一段 RECENT，不必拼补。
+    `part_start` / `part_end` 是本步那几个 Part 在消息里的下标区间（开区间），
+    Step 级召回（`recall_event evt_0003 7`）靠它切原文。
     """
 
-    id: str = ""
-    title: str = ""
-    summary: str = ""
-    actions: list[str] = field(default_factory=list)    # 用过的工具名
-    artifacts: list[str] = field(default_factory=list)  # 产出的文件与登记条目
-    issues: list[str] = field(default_factory=list)     # 失败项的首行
-    start: int = 0
-    end: int = 0
-    kind: str = "manual"  # manual / auto / local，见 EVENT_KINDS
-    degraded: bool = False  # 摘要来自本地汇编而不是模型
-    created_at: float = field(default_factory=time.time)
+    seq: int = 0                 # Phase 内连号，1 起
+    intent: str = ""             # 这一步干了什么，本地从工具名 + 关键参数拼
+    tools: list[str] = field(default_factory=list)
+    args: list[str] = field(default_factory=list)
+    result: str = ""             # 成功 / 失败 + 首行，含产出的 handle
+    artifacts: list[str] = field(default_factory=list)
+    issues: list[str] = field(default_factory=list)
+    message_index: int = 0
+    part_start: int = 0
+    part_end: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为可写入 TOML 的字典。"""
         return {
-            "id": self.id,
-            "title": self.title,
-            "summary": self.summary,
-            "actions": list(self.actions),
+            "seq": self.seq,
+            "intent": self.intent,
+            "tools": list(self.tools),
+            "args": list(self.args),
+            "result": self.result,
             "artifacts": list(self.artifacts),
             "issues": list(self.issues),
-            "start": self.start,
-            "end": self.end,
-            "kind": self.kind,
-            "degraded": self.degraded,
-            "created_at": self.created_at,
+            "message_index": self.message_index,
+            "part_start": self.part_start,
+            "part_end": self.part_end,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Event:
-        """从字典还原事件。字段类型不对时当空，不让一条坏记录毁掉整份状态。"""
+    def from_dict(cls, data: dict[str, Any]) -> Step:
+        """从字典还原一步。字段类型不对时当空，不让一条坏记录毁掉整份状态。"""
 
         def strings(key: str) -> list[str]:
             raw = data.get(key)
@@ -520,16 +673,145 @@ class Event:
                 return []
             return [str(item) for item in raw if str(item).strip()]
 
+        return cls(
+            seq=int(data.get("seq") or 0),
+            intent=str(data.get("intent") or ""),
+            tools=strings("tools"),
+            args=strings("args"),
+            result=str(data.get("result") or ""),
+            artifacts=strings("artifacts"),
+            issues=strings("issues"),
+            message_index=int(data.get("message_index") or 0),
+            part_start=int(data.get("part_start") or 0),
+            part_end=int(data.get("part_end") or 0),
+        )
+
+
+@dataclass
+class Event:
+    """一个 Phase 的过程记录：一串 Step，加一句结论。
+
+    语义与旧版不同：旧版是「一段工作的摘要」，模型觉得话题变了才写；新版是
+    「一个 Phase 的流水」，**内核每步都记，Phase 结束自动封存**。记录因此
+    不依赖任何模型判断，也就不可能一次都不触发。
+
+    `actions` / `artifacts` / `issues` 不再单独存，从 `steps` 聚合出来——
+    存两份必然漂移（这次会话里已经出现过同一件事两个数字对不上）。
+
+    `start` / `end` 是消息下标（闭开区间），与 `compact_upto` 同一套口径。
+    事件**连续覆盖**一段：首条从 `summary_upto` 开始，后一条接着前一条的 `end`，
+    RECENT 从最后一条的 `end` 开始。这条不变式由 `Session.sanitize_events` 保证。
+    """
+
+    id: str = ""
+    title: str = ""
+    summary: str = ""
+    phase_index: int = 0
+    steps: list[Step] = field(default_factory=list)
+    start: int = 0
+    end: int = 0
+    tokens: int = 0          # 这一段原文的估算 token，软预算用
+    kind: str = "manual"     # manual / auto / local，见 EVENT_KINDS
+    degraded: bool = False   # 标题与结论是本地拼的
+    created_at: float = field(default_factory=time.time)
+
+    @property
+    def actions(self) -> list[str]:
+        """本阶段用过的工具名，按首次出现的顺序去重。"""
+        names: list[str] = []
+        for step in self.steps:
+            for name in step.tools:
+                if name not in names:
+                    names.append(name)
+        return names
+
+    @property
+    def artifacts(self) -> list[str]:
+        """本阶段产出的 handle / 文件，按首次出现的顺序去重。"""
+        found: list[str] = []
+        for step in self.steps:
+            for item in step.artifacts:
+                if item not in found:
+                    found.append(item)
+        return found
+
+    @property
+    def issues(self) -> list[str]:
+        """本阶段失败项的首行，按首次出现的顺序去重。"""
+        found: list[str] = []
+        for step in self.steps:
+            for item in step.issues:
+                if item not in found:
+                    found.append(item)
+        return found
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为可写入 TOML 的字典。
+
+        `actions` / `artifacts` / `issues` 是派生字段，不落盘。
+        """
+        return {
+            "id": self.id,
+            "title": self.title,
+            "summary": self.summary,
+            "phase_index": self.phase_index,
+            "steps": [step.to_dict() for step in self.steps],
+            "start": self.start,
+            "end": self.end,
+            "tokens": self.tokens,
+            "kind": self.kind,
+            "degraded": self.degraded,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Event:
+        """从字典还原事件。
+
+        **旧的形状也要读得回来**：旧版把 `actions` / `artifacts` / `issues` 平铺在
+        事件上，没有 `steps`。那种事件被折成「只有一步的流水」——内容一个字不丢，
+        只是粒度和新记录不同。`state.toml` 里已经存在的会话不会因为升级而丢掉历史。
+        """
+
+        def strings(key: str) -> list[str]:
+            raw = data.get(key)
+            if not isinstance(raw, list):
+                return []
+            return [str(item) for item in raw if str(item).strip()]
+
+        raw_steps = data.get("steps")
+        if isinstance(raw_steps, list):
+            steps = [
+                Step.from_dict(item) for item in raw_steps if isinstance(item, dict)
+            ]
+        else:
+            actions = strings("actions")
+            artifacts = strings("artifacts")
+            issues = strings("issues")
+            steps = (
+                [
+                    Step(
+                        seq=1,
+                        intent="、".join(actions),
+                        tools=actions,
+                        artifacts=artifacts,
+                        issues=issues,
+                    )
+                ]
+                if (actions or artifacts or issues)
+                else []
+            )
+
         kind = str(data.get("kind") or "manual")
         return cls(
             id=str(data.get("id") or ""),
             title=str(data.get("title") or ""),
             summary=str(data.get("summary") or ""),
-            actions=strings("actions"),
-            artifacts=strings("artifacts"),
-            issues=strings("issues"),
+            phase_index=int(data.get("phase_index") or 0),
+            steps=steps,
             start=int(data.get("start") or 0),
             end=int(data.get("end") or 0),
+            tokens=int(data.get("tokens") or 0),
             kind=kind if kind in EVENT_KINDS else "manual",
             degraded=bool(data.get("degraded")),
             created_at=float(data.get("created_at") or time.time()),
@@ -557,10 +839,22 @@ class Session:
     # 连续覆盖 `[summary_upto, events[-1].end)`，RECENT 从那里往后接。
     events: list[Event] = field(default_factory=list)
     event_seq: int = 0
+    # 当前这个 Phase 已经走完、还没封存的步。**只在内存里**：每步落盘要重写整份
+    # 状态文件，而丢几步是可以接受的（原文还在 RECENT 里，最坏是这一阶段少几行流水）。
+    pending_steps: list[Step] = field(default_factory=list)
+    # 模型给当前 Phase 起的名字与结论（`close_phase`）。**只是标注**，封存仍发生在
+    # 轮末 / 溢出这些真边界上——一条 assistant 消息装着一整轮的所有步，而 `Event.end`
+    # 是消息下标，切不开一条消息的中间。所以「轮中途提前切开」这件事表达不了
+    # （实测调了 11 次，每次都是「没有可封存的内容」）。封存时取用并清空。
+    phase_title: str = ""
+    phase_summary: str = ""
     # 已经用 load_tools 装入的领域工具族。核心工具不受它影响，
     # 装在会话上而不是注册表上：注册表按「根 / 子 agent」共享两份，
     # 记在那里会让一个会话装过的工具漏到另一个会话。
     tool_families: list[str] = field(default_factory=list)
+    # 每一族是第几个 Phase 装进来的。收敛（`toolset.prune_families`）用它判断
+    # 「刚装、还没轮到用」的族，别刚装完就卸掉。
+    family_phase: dict[str, int] = field(default_factory=dict)
     # 结构化的任务状态：目标、用户约束、进度、阻塞。整块进上下文的 TASK 层，不参与淘汰
     task_state: TaskState = field(default_factory=TaskState)
     # ---- 子 agent ----
@@ -627,11 +921,15 @@ class Session:
         return self.events[-1].end if self.events else 0
 
     def sanitize_events(self) -> None:
-        """丢掉越界、非连续的事件，并把 `compact_upto` 推到覆盖范围末尾。
+        """丢掉越界、非连续的事件。
 
-        事件必须连续：中间缺一段的话，那一段原文就既不在事件里、也不在 RECENT 里，
+        事件必须连续：中间缺一段的话，那一段原文就既不在事件里也不在 RECENT 里，
         内容无声消失，而装配出来的上下文看起来完全正常。
         所以一旦发现断点，断点之后的事件一律丢掉——保留前面能用的那一段。
+
+        **不推 `compact_upto`**：那是「手动/强行压缩」的位置，与「事件归档到哪儿」
+        是两件事。装配时最近一个阶段还要留在 RECENT 里（`keep_last_phase_raw`），
+        把硬边界推到事件末端会让刚做完的那一步立刻失去原文。
         """
         limit = len(self.messages)
         kept: list[Event] = []
@@ -643,8 +941,6 @@ class Session:
             cursor = event.end
         self.events = kept
         self.event_seq = max(self.event_seq, len(kept))
-        if kept:
-            self.compact_upto = max(self.compact_upto, kept[-1].end)
 
     def touch(self) -> None:
         """刷新更新时间戳。"""
@@ -683,6 +979,7 @@ class Session:
             "events": [event.to_dict() for event in self.events],
             "event_seq": self.event_seq,
             "tool_families": list(self.tool_families),
+            "family_phase": dict(self.family_phase),
             "task_state": self.task_state.to_dict(),
             "parent_id": self.parent_id,
             "root_id": self.root_id,
@@ -735,6 +1032,13 @@ class Session:
         raw_families = data.get("tool_families")
         if isinstance(raw_families, list):
             session.tool_families = [str(item) for item in raw_families if str(item)]
+        raw_phases = data.get("family_phase")
+        if isinstance(raw_phases, dict):
+            session.family_phase = {
+                str(key): int(value)
+                for key, value in raw_phases.items()
+                if str(key) and isinstance(value, int) and not isinstance(value, bool)
+            }
         # 读回来就校验一次：手工改过状态文件、或者旧版本写了一半的事件，
         # 都在进装配之前被裁掉，而不是等到发请求时才露馅。
         session.sanitize_events()

@@ -2,7 +2,8 @@
 #
 # 不装它也能用整个程序——检索靶点、查已知活性、取结构、会话与界面全都不受影响，
 # 只有 prepare_receptor / prepare_ligands / import_ligandset / dock 的位姿转换
-# 会返回一条带这份文件路径的安装指令。
+# 会返回一条带这份文件路径的安装指令；analyze_pose 只是少掉 interactions=true
+# 那一节（接触、氢键、冲突照算）。
 #
 #   pip install -r requirements-chem.txt
 #
@@ -24,3 +25,9 @@ gemmi
 # 同上：meeko 不声明依赖，这两个是它实际用到的数值库。
 numpy
 scipy
+
+# 交互指纹（盐桥 / π 堆积 / 疏水 / 卤键 / 水桥 / 金属配位），analyze_pose 的
+# interactions=true 用它。**不列进 chemistry.CHEM_DEPS**：那个清单管的是
+# 「准备受体、准备配体」那条链，把 plip 加进去会让没装它的人连 prepare_receptor
+# 都用不了，而这两件事没有关系。装它会顺带装上 openbabel（35 MB 的 C++ 绑定）。
+plip

@@ -1,9 +1,9 @@
-# 源码地图（opencode_tui）
+# 源码地图（vsagent）
 
-这份文件把 `opencode_tui/` 全部源码逐层分开讲：每个文件管什么、每个类管什么、  
+这份文件把 `vsagent/` 全部源码逐层分开讲：每个文件管什么、每个类管什么、  
 每个函数做什么、以及它们之间怎么连起来。
 
-**范围**：`opencode_tui/` 下 56 个 `.py`、约 17,669 行、133 个类、约 882 个函数与方法。  
+**范围**：`vsagent/` 下 96 个 `.py`、约 45,063 行、246 个类、约 1,639 个函数与方法。  
 不含 `viz/`（前端库）、`web/`（网页端）、`runs/`（数据）、`.probe/`（判据）。
 
 **取向**：只读不改。文中标出「值得注意」的地方是**观察**，不是施工单——  
@@ -49,7 +49,7 @@ __main__.py  →  app.py  ──────────────────
 
 | 函数       | 作用                                                           |
 | -------- | ------------------------------------------------------------ |
-| `main()` | 唯一入口：`OpenCodeApp().run()`。没有参数解析——窗口尺寸走 `.env`，模型与凭据走应用内 `/model` 填的 `connection.toml` |
+| `main()` | 唯一入口：`VSAgentApp().run()`。没有参数解析——窗口尺寸走 `.env`，模型与凭据走应用内 `/model` 填的 `connection.toml` |
 
 刻意保持这么薄：入口里写逻辑，就没法被断言用「建一个 App 敲两个键」的方式覆盖。
 
@@ -62,7 +62,7 @@ __main__.py  →  app.py  ──────────────────
 
 ### 1.3 `app.py`（619 行 / 1 个类 / 49 个方法）
 
-`OpenCodeApp(App[None])`：**顶层组装 + 命令中枢**。它一个文件干三件事，  
+`VSAgentApp(App[None])`：**顶层组装 + 命令中枢**。它一个文件干三件事，  
 是三件事里唯一一个「知道全部」的地方，也是最容易长歪的地方——所以它的方法分了四组。
 
 #### 第一组：装配（建好内核的五个部件）
@@ -151,7 +151,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 | 写   | `undo()` / `redo()`                     | 撤销 / 重做两道记录                               |
 | 写   | `save_to_toml()`                        | **原子写**：临时文件 → flush+fsync → `os.replace` |
 | 内部  | `_replace_with_retry()`                 | `os.replace` 遇占用隔 5ms 重试，最多 40 次          |
-| 模块级 | `default_state_path()`                  | `~/.opencode_tui/state.toml`              |
+| 模块级 | `default_state_path()`                  | `~/.vsagent/state.toml`              |
 
 **六处写盘点位**（改内存就写盘）：新建会话、重命名、删除会话、撤销、重做、中断生成。
 
@@ -320,7 +320,7 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 > `permission.project_config_directory` 是同一套判断，只有源码运行那一支不同——
 > 那两个跟着启动目录走（用户在哪就认哪），规则这一份跟着代码走，因为规则是写给
 > 这个项目本身的。所以从任何目录启动，读到的都是开发中那份 `AGENTS.md`。
-> 打包后读 exe 旁边那份，**要记得把它放在 exe 旁边**（与 `.env`、`.opencode_tui/` 同一批）。
+> 打包后读 exe 旁边那份，**要记得把它放在 exe 旁边**（与 `.env`、`.vsagent/` 同一批）。
 
 > **压缩原语为什么在这一层**：`context.py` 从 `prompt.py` 导入，反过来不行，所以
 > 两处都要用的东西只能放这里。而这两处**必须**共用一套——翻译层给模型的那一份
@@ -364,9 +364,9 @@ ID 生成（`new_part_id` / `new_message_id` / `new_session_id`）用的是**模
 
 要「彻底不让模型用某个工具」用 `tools.toml`，不要用 `deny`。
 
-**配置放哪儿**：项目侧那份跟着**可执行文件**走——打包后读 `exe 同目录/.opencode_tui/tools.toml`，
-源码运行时读 `<启动目录>/.opencode_tui/tools.toml`（`project_config_directory()`，与 `env.env_file()` 同一套判断）。
-用户侧始终是 `~/.opencode_tui/tools.toml`，两份都读、任一处说关就关。
+**配置放哪儿**：项目侧那份跟着**可执行文件**走——打包后读 `exe 同目录/.vsagent/tools.toml`，
+源码运行时读 `<启动目录>/.vsagent/tools.toml`（`project_config_directory()`，与 `env.env_file()` 同一套判断）。
+用户侧始终是 `~/.vsagent/tools.toml`，两份都读、任一处说关就关。
 这样 exe 挪到哪、从哪个目录启动，开关都读得到。
 
 **改开关不必手写文件**：`/tools` 面板（`screens/tools_panel.py`）列出全部工具逐条开关，
@@ -896,15 +896,18 @@ JSONL 事件日志。
 >    把整条链删空；留着 `altLoc` 字母则会被 Meeko 直接拒收。同一残基的多个构象必须整体二选一。
 >    修饰残基（`MODRES`）虽然写着 `HETATM`，却是聚合物的一部分，必须按名字保留。
 
-### 4.6 `chembl.py`（2290 行 / 7 个类 / 61 个函数）
+### 4.6 `chembl.py`（2268 行 / 6 个类 / 58 个函数）
 
-已知活性与类似物。3 个工具。**全仓最大的文件。**
+已知活性与类似物。2 个工具。**全仓最大的文件。**
 
-| 工具                     | 作用                                    |
-| ---------------------- | ------------------------------------- |
-| `SearchActivesTool`    | 按 UniProt 编号取已知活性分子，登记成 **ligandset** |
-| `FindAnalogsTool`      | 按相似度找类似物                              |
-| `DescribeMoleculeTool` | 取一个分子的详情（机制、适应症、性质）                   |
+| 工具                  | 作用                                    |
+| ------------------- | ------------------------------------- |
+| `SearchActivesTool` | 按 UniProt 编号取已知活性分子，登记成 **ligandset** |
+| `FindAnalogsTool`   | 按相似度找类似物                              |
+
+原先的第三个工具 `DescribeMoleculeTool` 在 2026-10-29 并进了 `pubchem.lookup_compound`
+（模型不必先判断手里是编号还是结构串再挑工具）。画像本身留在这里当库函数：
+`describe_molecule(编号) -> (文本, meta)`，合并入口靠 `find_by_inchikey` 把两半接起来。
 
 关键内部类：
 
@@ -921,7 +924,7 @@ JSONL 事件日志。
 | 靶点  | `_resolve_target` / `_sole_component_accession`                                 |
 | 活性  | `_count` / `_fetch_activities` / `_assay_facts` / `_normalize` / `_select`      |
 | 类似物 | `_similarity_url` / `_fetch_analogs` / `_normalize_analog` / `_select_analogs`  |
-| 分子  | `_molecule_query` / `_mechanisms` / `_indications`                              |
+| 分子  | `_molecule_query` / `_mechanisms` / `_indications` / `describe_molecule` / `find_by_inchikey` |
 | 校验  | `sanity_check_smiles` / `normalize_molecule_id`                                 |
 | 缓存  | `_cache_path` / `_write_cache` / `_read_cache` / `_snapshot_from_cache`         |
 | 渲染  | `_render_digest` / `_render_analog_digest` / `_render_molecule` / `_render_csv` |
@@ -1404,7 +1407,7 @@ JSONL 事件日志。
 | 位置                 | 现状                    | 观察                                    |
 | ------------------ | --------------------- | ------------------------------------- |
 | `app.py`           | 1 个类 / 50 个方法         | 其中一半是两行的转发；再加一组命令就该考虑分出 `commands/` 包 |
-| `chembl.py`        | 2290 行 / 61 个函数       | 最大的文件；渲染函数与取数函数混在一起，是可以先分开的一处         |
+| `chembl.py`        | 2268 行 / 58 个函数       | 最大的文件；渲染函数与取数函数混在一起，是可以先分开的一处         |
 | `ledger.py`        | 880 行 / 48 个方法        | 句柄、指纹、条目、登记表四块概念挤在一个文件里               |
 | `messages_pane.py` | 893 行 / 8 个类 / 70 个方法 | 8 个视图类 + 窗口机制；机制部分可以单独成文件             |
 
@@ -1416,5 +1419,5 @@ JSONL 事件日志。
   §八.3（两处必须同时改）——这两处列的就是「改了 A 忘了 B」的高发组合。
 - **新增领域模块**：§四 加一节，§四.9 的顺序表也可能要动。
 - **行数与计数**：本文开头引的数字可以用  
-  `for f in $(find opencode_tui -name "*.py" -not -path "*__pycache__*"); do wc -l $f; done`  
+  `for f in $(find vsagent -name "*.py" -not -path "*__pycache__*"); do wc -l $f; done`  
   重新核一遍。数字会漂，结论（哪几处贴到临界）不会。

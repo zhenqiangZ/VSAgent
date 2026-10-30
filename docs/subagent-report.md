@@ -256,10 +256,10 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `opencode_tui/core/agent/host.py` | 每会话循环层、后台任务、共享 ledger、状态机 |
-| `opencode_tui/core/agent/spawn.py` | fork、任务书、`spawn_agent`、`agent_status` |
-| `opencode_tui/screens/subagent.py` | 子 agent 聊天界面与返回栏 |
-| `opencode_tui/screens/spawn_agent.py` | 派发模态 |
+| `vsagent/core/agent/host.py` | 每会话循环层、后台任务、共享 ledger、状态机 |
+| `vsagent/core/agent/spawn.py` | fork、任务书、`spawn_agent`、`agent_status` |
+| `vsagent/screens/subagent.py` | 子 agent 聊天界面与返回栏 |
+| `vsagent/screens/spawn_agent.py` | 派发模态 |
 | `docs/subagent-plan.md` | 设计与 13 条落地补充 |
 
 主要修改：

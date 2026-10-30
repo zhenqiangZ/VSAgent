@@ -19,14 +19,14 @@
 | 数据形状 | **有**。`meta.json` 的 target / structure / pockets / molecules / contacts / provenance | `runs/1iep-molstar/meta.json` |
 | 前端约定 | 前端**只读** `meta.json` + 结构文件；字段缺失时降级（如缺 `provenance.session_id` 就不显示跳转入口） | `docs/web-frontend-architecture.md` |
 | 会话归属 | `meta.json` 的 `provenance.session_id`，服务据此反查 | 同上 |
-| 登记表 | handle / 血缘 / 指纹 / 对账 / `Entry.meta` | `opencode_tui/core/agent/ledger.py` |
-| 零依赖坐标解析 | `pdbtext.py`：`AtomRecord.coord`、`HeteroGroup.center` / `coords`、`hetero_groups()`、`ATOM_*` 列位 | `opencode_tui/core/agent/domain/pdbtext.py` |
-| 杂原子组筛选的一半判据 | `structure.py` 已收 `MODRES` 登记名（`modified_names`）与 `ligands` 口径 | `opencode_tui/core/agent/domain/structure.py:339,383` |
-| UniProt 位点注释 | **已取回但本轮不当坐标用**：`_domains()` 取 `Domain`、`_binding_ligands()` 取 `Binding site` 的配体名；给的是 UniProt 编号，**不能直接当残基编号**（见 2.3.3 的说明） | `opencode_tui/core/agent/domain/uniprot.py:363,379` |
+| 登记表 | handle / 血缘 / 指纹 / 对账 / `Entry.meta` | `vsagent/core/agent/ledger.py` |
+| 零依赖坐标解析 | `pdbtext.py`：`AtomRecord.coord`、`HeteroGroup.center` / `coords`、`hetero_groups()`、`ATOM_*` 列位 | `vsagent/core/agent/domain/pdbtext.py` |
+| 杂原子组筛选的一半判据 | `structure.py` 已收 `MODRES` 登记名（`modified_names`）与 `ligands` 口径 | `vsagent/core/agent/domain/structure.py:339,383` |
+| UniProt 位点注释 | **已取回但本轮不当坐标用**：`_domains()` 取 `Domain`、`_binding_ligands()` 取 `Binding site` 的配体名；给的是 UniProt 编号，**不能直接当残基编号**（见 2.3.3 的说明） | `vsagent/core/agent/domain/uniprot.py:363,379` |
 | **复合物结构检索** | **可用，本轮的主键**：RCSB 属性搜按 UniProt 列出该蛋白**所有**带配体的已发布结构（ABL1 实测 69 个），GraphQL 批量取配体，`files.rcsb.org/download/` 下载坐标。**这是 P0 主来源的第一半**（见 2.3.3） | `https://search.rcsb.org/rcsbsearch/v2/query` |
 | **口袋预测结果** | **可网络取回**：prankweb.cz 的 REST API v2 按 PDB 条目给出 p2rank 口袋（残基 + 打分 + 置信度 + 三维中心）。**本轮作为 P1 副选**：只在「该蛋白一个复合物都没有」时才用（见 2.3.4 / 2.3.9） | `https://prankweb.cz/api/v2/...` |
-| **检索类接口** | **可用，但项目里还没接**：RCSB 文本/属性搜 + GraphQL、PubMed E-utilities、Europe PMC。HTTP 层现成（`http.py` 走 `httpx`），**本轮做成给模型用的搜索工具**（见 2.3.11） | `opencode_tui/core/agent/domain/http.py` |
-| 化学依赖守门人 | `chemistry.require_chem()`（本机**未装**化学依赖） | `opencode_tui/core/agent/domain/chemistry.py` |
+| **检索类接口** | **可用，但项目里还没接**：RCSB 文本/属性搜 + GraphQL、PubMed E-utilities、Europe PMC。HTTP 层现成（`http.py` 走 `httpx`），**本轮做成给模型用的搜索工具**（见 2.3.11） | `vsagent/core/agent/domain/http.py` |
+| 化学依赖守门人 | `chemistry.require_chem()`（本机**未装**化学依赖） | `vsagent/core/agent/domain/chemistry.py` |
 | 领域工具装配 | `domain/all_tools.py`：**现 11 个**，`app.py` 一次装完；本轮加到 **15 个**（+`write_run`/`open_viewer`/`search_pdb`/`search_literature`） | 第 7 步 |
 
 ### 0.2 缺的三段（本轮要补）
@@ -40,10 +40,10 @@
 
 ### 0.3 打包产物里有什么（关键约束）
 
-`opencode_tui.spec` 的 `datas` **只有一项**：`opencode_tui/styles/app.tcss`。
+`vsagent.spec` 的 `datas` **只有一项**：`vsagent/styles/app.tcss`。
 
 ```
-datas = [(str(root / "opencode_tui" / "styles" / "app.tcss"), "opencode_tui/styles")]
+datas = [(str(root / "vsagent" / "styles" / "app.tcss"), "vsagent/styles")]
 ```
 
 `tools/`、`web/`、`viz/`、`runs/` **都没有进包**。所以：
@@ -459,25 +459,25 @@ P0 会搜到这个蛋白的**所有**复合物（ABL1 有 69 个）。**不逐�
 
 ```
 新增：
-  opencode_tui/core/agent/domain/export.py      write_run 工具 + 几何算法（纯 Python）
-  opencode_tui/core/agent/domain/pockets.py     P0/P1/P2 三层口袋来源
-  opencode_tui/core/agent/domain/prankweb.py    prankweb.cz 客户端：状态轮询 + 取结果 + 磁盘缓存
-  opencode_tui/core/agent/domain/complexes.py   P0 复合物：RCSB 属性搜 + 排序 + 下载（2.3.6）
-  opencode_tui/core/agent/domain/rsearch.py     搜索工具：RCSB 文本/属性搜 + GraphQL 批量取配体
-  opencode_tui/core/agent/domain/literature.py  文献工具：PubMed E-utilities 检索（2.3.11）
-  opencode_tui/core/web/__init__.py
-  opencode_tui/core/web/service.py              包内只读服务（后台线程）
-  opencode_tui/core/web/routes.py               路由与 JSON 形状（唯一真相）
-  opencode_tui/core/agent/domain/viewer.py      open_viewer 工具
+  vsagent/core/agent/domain/export.py      write_run 工具 + 几何算法（纯 Python）
+  vsagent/core/agent/domain/pockets.py     P0/P1/P2 三层口袋来源
+  vsagent/core/agent/domain/prankweb.py    prankweb.cz 客户端：状态轮询 + 取结果 + 磁盘缓存
+  vsagent/core/agent/domain/complexes.py   P0 复合物：RCSB 属性搜 + 排序 + 下载（2.3.6）
+  vsagent/core/agent/domain/rsearch.py     搜索工具：RCSB 文本/属性搜 + GraphQL 批量取配体
+  vsagent/core/agent/domain/literature.py  文献工具：PubMed E-utilities 检索（2.3.11）
+  vsagent/core/web/__init__.py
+  vsagent/core/web/service.py              包内只读服务（后台线程）
+  vsagent/core/web/routes.py               路由与 JSON 形状（唯一真相）
+  vsagent/core/agent/domain/viewer.py      open_viewer 工具
 
 修改：
-  opencode_tui/app.py                       启动时起服务，退出时停；把 URL 交给领域工具
-  opencode_tui/core/agent/domain/__init__.py 模块表加 export / pockets / prankweb / complexes / rsearch / literature / viewer
-  opencode_tui/core/agent/domain/all_tools.py 装配加 write_run / open_viewer / search_pdb / search_literature
-  opencode_tui/core/agent/permission.py      PLAN_DENY 加 write_run（它往磁盘写交付物）；搜索两件只读，**放行**
-  opencode_tui/core/agent/prompt.py          身份段提一句「结构可以导出到网页看；找候选结构/文献走搜索工具」
+  vsagent/app.py                       启动时起服务，退出时停；把 URL 交给领域工具
+  vsagent/core/agent/domain/__init__.py 模块表加 export / pockets / prankweb / complexes / rsearch / literature / viewer
+  vsagent/core/agent/domain/all_tools.py 装配加 write_run / open_viewer / search_pdb / search_literature
+  vsagent/core/agent/permission.py      PLAN_DENY 加 write_run（它往磁盘写交付物）；搜索两件只读，**放行**
+  vsagent/core/agent/prompt.py          身份段提一句「结构可以导出到网页看；找候选结构/文献走搜索工具」
   tools/serve_web.py                        改为调用 core/web/routes.py，不另写一份
-  opencode_tui.spec                         datas 加 web/ 静态资产
+  vsagent.spec                         datas 加 web/ 静态资产
 
 不改：
   runs/1iep-molstar/（演示数据原样留着，当回归基线）
@@ -556,7 +556,7 @@ open_viewer(run: ArtifactHandle | None, open_browser: bool = False)
 >
 > **第 6 步已完成**：新建 `core/web/{__init__,routes,service,__main__}.py`，
 > 路由与 JSON 形状搬进 `routes.py`（唯一真相），`tools/serve_web.py` 由 349 行缩到 74 行的命令行壳，
-> `tools/check_web_api.py` 改指向 `python -m opencode_tui.core.web`（**19 → 20 条，全绿**）。
+> `tools/check_web_api.py` 改指向 `python -m vsagent.core.web`（**19 → 20 条，全绿**）。
 > 新增判据 `.probe/check_web_service.py`（形状 / 端口避让 / 线程收尾 / 路由注入 / 默认端口 五节），
 > 已进 `run_all_checks.sh` 注册表（**总数 67 → 70**）。
 >
@@ -578,13 +578,13 @@ open_viewer(run: ArtifactHandle | None, open_browser: bool = False)
 >
 > **第 7 步已完成**（接线与应用集成）：
 >
-> - `export.runs_dir()` 从 `opencode_tui/runs/` 改指**仓根** `runs/`——两个服务入口默认都是仓根，
+> - `export.runs_dir()` 从 `vsagent/runs/` 改指**仓根** `runs/`——两个服务入口默认都是仓根，
 >   两处不一致会造出「工具写进去、网页看不见」的运行目录；已把 10 个写错位置的目录迁过去，
 >   服务可见运行数 2 → 12。
 > - `Tool` 加第四个注入通道 `viewer_argument`，`AgentLoop` 收 `viewer=`，`app.py` 装配
 >   `WebService` 并在 `on_mount` / `on_unmount` 启停（`__init__` 里只装配不启动，
 >   因为 `on_mount` 之前事件循环还没接上）。
-> - `opencode_tui.spec` 的 `datas` 加 `web/`；`service.web_root()` 按 `sys._MEIPASS` 分支取目录。
+> - `vsagent.spec` 的 `datas` 加 `web/`；`service.web_root()` 按 `sys._MEIPASS` 分支取目录。
 > - `web/pages/structure.js` 按 `pockets[].source` 挂来源徽标（三态），
 >   `provenance.pockets` 的**对象与字符串两种形状都能读**；`web/app.css` 加对应样式。
 > - `tools/check_web_ui.js` 加两条：`sourced`（新形状，两个口袋「实验配体」、两个「预测」）
@@ -734,7 +734,7 @@ prankweb 的响应 39 KB 可直接存盘，不需要筛）。
   **不引入任何换算逻辑**（换算是上一版 PDBe 路线才需要的，这里有这一步就是错的）
 - **只留受体的那条链**：`1iep` 的 `structure.regions` 有 A / B 两段，
   受体链是 A 时，B 段的残基**不能**进 `residues`
-- **缓存命中**：同一条目第二次调用不发起请求（打桩计数），缓存文件写在 `~/.opencode_tui/prankweb/<PDBID>.json`
+- **缓存命中**：同一条目第二次调用不发起请求（打桩计数），缓存文件写在 `~/.vsagent/prankweb/<PDBID>.json`
 
 ### 第 4 步　`write_run`（把 P0/P1 的结果写成一个运行目录）
 
@@ -813,7 +813,7 @@ prankweb 的响应 39 KB 可直接存盘，不需要筛）。
   把 `source` 删掉，徽标消失而页面不报错
 - **前端认 `provenance.pockets` 的两种形状**：对象（读 `note`）与字符串（原样显示）
   都能打开；`runs/1iep-demo/`（旧形状）与新一轮产出的目录（新形状）都能打开
-- 打包产物里带上 `web/`（查 `build/opencode_tui/Analysis-00.toc`，不是 `strings`）
+- 打包产物里带上 `web/`（查 `build/vsagent/Analysis-00.toc`，不是 `strings`）
 
 ### 第 8 步　端到端与回归
 
@@ -867,7 +867,7 @@ prankweb 的响应 39 KB 可直接存盘，不需要筛）。
 5. **`MONATOMIC_IONS` / `BUFFER_LIKE` 收十来个最常见的**：宁可漏（漏了会把缓冲液当配体、多出一个口袋、
    看得见）也不要错杀（错杀会把真配体丢掉、看不见）。名单放在 `export.py` 顶部，每条后面写理由。
    **按这个下限先收，不追求收全。**
-6. **prankweb 缓存放 `~/.opencode_tui/prankweb/<PDBID>.json`**，默认不自动过期
+6. **prankweb 缓存放 `~/.vsagent/prankweb/<PDBID>.json`**，默认不自动过期
    （p2rank 的预测结果不常变）；另给一个 `/prankweb` 命令看缓存状态与手动清。
 7. **超时与同步**：`write_run` 里同步查但设 **15 秒**超时，超时就写 `unavailable` 并降级；
    另给 `/pockets refresh` 命令走长超时慢慢补齐。**不引入后台线程池**。
@@ -876,13 +876,13 @@ prankweb 的响应 39 KB 可直接存盘，不需要筛）。
 8. **`radius` 沿用 `POCKET_RADIUS = 5.0`**（与 `build_demo_data.py` 一致），使 P0 与 P1 的口袋
    在页面上视觉尺度一致；**不用** prankweb 的 `surface` 原子集反推半径（那是另一套概念）。
 9. **P0 的下载上限与缓存**：**N = 12**，按 2.3.6 排序取前 N，返回里报 `total=69, used=12`；
-   **不设按需下载**（口袋要靠这些坐标算出来）。缓存放 `~/.opencode_tui/rcsb/`，按条目 id 存 `.pdb`，
+   **不设按需下载**（口袋要靠这些坐标算出来）。缓存放 `~/.vsagent/rcsb/`，按条目 id 存 `.pdb`，
    不自动过期。搜索那一步也缓存，时效一天——**目录见第 11 条**（原定 `rcsb/search/`，
    2026-10-27 与 `search_pdb` 那套合并成一处）。
 10. **搜索工具做两个**：`search_pdb`（收 `{"query": "..."}` 或属性条件如 `{"uniprot": "Q15858"}`，
     内部决定走文本搜还是属性搜）与 `search_literature`（收 `{"query": "..."}`）。
     返回条目 id 列表 + 每个条目的配体代号与名称 + 命中总数；文献则是 id + 标题 + 摘要片段。
     **不带任何归类或「是否真配体」的判断**。**不**为「按 UniProt 列结构」单列工具。
-11. **搜索结果缓存到磁盘**：`~/.opencode_tui/search/<kind>-<哈希>.json`，时效一天，理由同
+11. **搜索结果缓存到磁盘**：`~/.vsagent/search/<kind>-<哈希>.json`，时效一天，理由同
     prankweb 缓存。**这是唯一一处**：`rsearch` / `complexes` / `literature` / `websearch`
     都从这里读写，实现只在 `rsearch._cache_path` / `_read_cache` / `_write_cache` 一份。

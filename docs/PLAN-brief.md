@@ -82,7 +82,7 @@ agent **开不了页面**（没有返回 URL 的工具）。
 `core/web/{routes,service}.py`（服务）。
 
 **修改**：`app.py`（启停服务）、`all_tools.py`（装配，工具 11 → 15 个）、`permission.py`、
-`prompt.py`、`tools/serve_web.py`、`opencode_tui.spec`（`datas` 加 `web/` 静态资产）。
+`prompt.py`、`tools/serve_web.py`、`vsagent.spec`（`datas` 加 `web/` 静态资产）。
 
 **前端只动一处**：口袋组件加 `source` 徽标，且 `provenance.pockets` 新旧两种形状都认。
 
@@ -99,5 +99,5 @@ agent **开不了页面**（没有返回 URL 的工具）。
 - **服务形态**：包内常驻、随应用启停、只绑 `127.0.0.1`。
 - **零散参数全部按默认拍定**（详细稿 §7 有 11 条）：`web/` 整目录进包、`VSA_WEB_PORT` 默认 8860、
   `open_viewer` 进 Plan 白名单、`CLUSTER_GAP = 4.0 Å`、P0 下载上限 **N = 12**、
-  prankweb 同步查 **15 秒**超时、`POCKET_RADIUS = 5.0`、缓存都在 `~/.opencode_tui/` 下。
+  prankweb 同步查 **15 秒**超时、`POCKET_RADIUS = 5.0`、缓存都在 `~/.vsagent/` 下。
   **执行时不再回头讨论。**

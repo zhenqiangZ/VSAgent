@@ -17,7 +17,7 @@
 | --- | --- | --- | --- | --- |
 | `AGENTS.md` | 你**必须怎么做** | 人工维护 | 项目根 | `prompt.project_rules` |
 | `TaskState` | 这一轮**要做什么**、约束是什么 | 会话内 | `Session` | 见 `context-design.md` |
-| `Ledger` | 这次会话**我手上有哪些产物** | 会话内 | `~/.opencode_tui/ledgers/` | `ledger.py` |
+| `Ledger` | 这次会话**我手上有哪些产物** | 会话内 | `~/.vsagent/ledgers/` | `ledger.py` |
 | **Memory** | 这个项目**已知什么** | **跨会话** | 项目 | 本文设计 |
 | 上下文 | 这一步**发给模型什么** | 一步 | 内存 | `context-design.md` |
 
@@ -80,7 +80,7 @@
 
 ## 五、数据结构
 
-新增 `opencode_tui/core/agent/memory.py`（设计稿）。
+新增 `vsagent/core/agent/memory.py`（设计稿）。
 
 ```python
 class MemoryKind(Enum):

@@ -2,8 +2,8 @@
 #
 # 装法：
 #     pip install -r requirements-embed.txt
-#     python -m opencode_tui.core.embed download      # 220MB，只下载一次
-#     python -m opencode_tui.core.embed index         # 给已有语料补向量（换模型后也跑这条）
+#     python -m vsagent.core.embed download      # 220MB，只下载一次
+#     python -m vsagent.core.embed index         # 给已有语料补向量（换模型后也跑这条）
 #
 # 为什么单独一份：onnxruntime + tokenizers 约 60MB，而绝大多数使用者不需要语义召回。
 # 把它并进 requirements.txt 会让每个人都为「可能用得上」付一次安装与打包的代价。

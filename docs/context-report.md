@@ -1,6 +1,6 @@
 # 上下文组织方式分析报告
 
-> 分析对象：`opencode_tui` 的上下文装配链路（设计第 1~4a 期已完成，4b 待实施）。
+> 分析对象：`vsagent` 的上下文装配链路（设计第 1~4a 期已完成，4b 待实施）。
 > 依据代码：`core/agent/context.py`(729) / `prompt.py`(435) / `loop.py`(897) / `memory.py`(576) / `core/models.py`(456)。
 > 设计文档：`docs/context-design.md`、`docs/context-plan.md`、`docs/memory-design.md`、`docs/subagent-design.md`。
 > 日期：2026-10-09。

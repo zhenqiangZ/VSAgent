@@ -12,7 +12,7 @@
 本文件是「把用户报告的三处故障修掉」这一轮的实施方案与执行清单。动笔之前先把
 **已核对过的事实**列清楚，本轮每个判断都建立在这些读数上。
 
-三个问题来自同一次排查（会话 `ses_0034` + 事件日志 `~/.opencode_tui/logs/ses_0034.jsonl`），
+三个问题来自同一次排查（会话 `ses_0034` + 事件日志 `~/.vsagent/logs/ses_0034.jsonl`），
 详细现场记在 `.workbuddy-ai/memory/2026-10-05.md`。三者的共同特征是
 **症状在一个地方，根因在另一个地方**，所以三处要分开改，不要合并成一个提交。
 
@@ -73,7 +73,7 @@
 
 ### 第 1 步　`_translate_assistant`：无推理的段也补上 `reasoning_content`
 
-`opencode_tui/core/agent/prompt.py`
+`vsagent/core/agent/prompt.py`
 
 `flush()` 的两个分支共用 `if reasoning:` 这个前提。改成**两个分支都无条件挂**，
 reasoning 为空时写一个占位文案（常量 `EMPTY_REASONING`，写清「本步没有推理输出」）。
@@ -105,7 +105,7 @@ EMPTY_REASONING = "（本步没有推理输出）"
 
 ### 第 3 步　`_ask_model`：把请求失败换成独立的 Part 类型
 
-`opencode_tui/core/models.py` + `opencode_tui/core/agent/loop.py` + `opencode_tui/widgets/messages_pane.py`
+`vsagent/core/models.py` + `vsagent/core/agent/loop.py` + `vsagent/widgets/messages_pane.py`
 
 1. `PartType` 加成员 `ERROR = "error"`（放在 `RETRY` 旁边，语义同类：都不是模型说出来的）。
 2. `loop.py::_ask_model` 非重试分支改成 `Part(type=PartType.ERROR, text=f"请求没有成功：{error}")`。
@@ -119,7 +119,7 @@ EMPTY_REASONING = "（本步没有推理输出）"
 
 ### 第 4 步　`PermissionPolicy.remember`：记住整个工具　【2026-10-06 补做】
 
-`opencode_tui/core/agent/permission.py`
+`vsagent/core/agent/permission.py`
 
 **实装时没有沿用「pattern 改成 `*`」这个做法**，改成了集合：`_session_tools: set[str]`，
 `check()` 里一句 `if name in self._session_tools`。理由是这个语义本来就只归到工具名上，
@@ -144,7 +144,7 @@ EMPTY_REASONING = "（本步没有推理输出）"
 
 ### 第 5 步　弹窗文案：说清 a 键的真实范围
 
-`opencode_tui/screens/permission.py`
+`vsagent/screens/permission.py`
 
 | 位置 | 原文案 | 现在 |
 |---|---|---|
@@ -174,7 +174,7 @@ EMPTY_REASONING = "（本步没有推理输出）"
 
 ### 第 7 步　BashTool：超时上限可配
 
-`opencode_tui/core/agent/tools.py`
+`vsagent/core/agent/tools.py`
 
 `DEFAULT_TIMEOUT` 是模块常量，`BashTool.__init__` 已经收 `timeout` 参数，
 但 `app.py::_build_registry`（第 173 行）装配时没传，实际用的永远是 120 秒。
@@ -191,7 +191,7 @@ EMPTY_REASONING = "（本步没有推理输出）"
 
 ### 第 8 步　系统提示：写清「每次调用是新的 shell」
 
-`opencode_tui/core/agent/prompt.py`
+`vsagent/core/agent/prompt.py`
 
 在纪律段里加一句（与现有的「收 handle 不收路径」那段同级）：
 
@@ -224,9 +224,9 @@ EMPTY_REASONING = "（本步没有推理输出）"
 界面有改动（多了 ERROR 类型的 Part、弹窗文案变了），**必须重新打包 + 成对抓帧七帧**：
 
 ```
-mv dist/opencode-tui.exe .probe/opencode-tui-YYYYMMDD.exe
-C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/opencode_tui_pack/Scripts/pyinstaller.exe \
-    --clean opencode_tui.spec
+mv dist/VSAgent.exe .probe/VSAgent-YYYYMMDD.exe
+C:/Users/Administrator/.workbuddy-ai/binaries/python/envs/vsagent_pack/Scripts/pyinstaller.exe \
+    --clean vsagent.spec
 <pack python> tests/verify_exe.py --source
 <pack python> tests/verify_exe.py
 <pack python> tests/verify_modal_transparency.py --source

@@ -424,4 +424,4 @@ def domain_tools() -> list[Tool]:
 if __name__ == "__main__":  # pragma: no cover
     from debug_tools import main
 
-    main()
+    raise SystemExit(main(__name__, domain_tools()))

@@ -26,6 +26,7 @@ P2 与 P0 的分工在**清单从哪来**：P0 拿 UniProt 编号去检索，返
 from __future__ import annotations
 
 import dataclasses
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,7 @@ __all__ = [
     "PocketBundle",
     "DetectPocketsTool",
     "DefinePocketTool",
+    "bundle_from_set",
     "complex_pockets",
     "domain_tools",
     "p2rank_pockets",
@@ -104,6 +106,9 @@ class _Cluster3D:
     origin: dict[str, Any]
     atoms: tuple[pdbtext.AtomRecord, ...] = ()
     """这一簇配体的原子。画像要按元素数它，只有坐标数不出来。"""
+
+    protein: tuple[tuple[float, float, float], ...] = ()
+    """算这处口袋的那份结构里受体侧的重原子。空腔体积与包埋度按它算。"""
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +277,7 @@ def _clusters_from_structures(
                     "resolution": facts.resolution,
                 },
                 atoms=tuple(atom for group in cluster.groups for atom in group.atoms),
+                protein=_protein_points(doc, chains),
             )
             index += 1
 
@@ -340,9 +346,10 @@ def _merge(clusters: dict, *, radius: float) -> list[dict[str, Any]]:
         # 用户要看的是这一处口袋整体的样子，不是某一份结构的。配体原子取第一份
         # （成员已按支持数排过序），其余几份的配体只影响残基集合，不改画像。
         primary = items[members[0]]
+        center = export.ligand_center(points) if points else items[members[0]].center
         pockets.append(
             {
-                "center": export.ligand_center(points) if points else items[members[0]].center,
+                "center": center,
                 "radius": radius,
                 # P0 出来的每一条都是「实验配体」——**没有 score**，
                 # 实验定位本来就没有打分这回事（§2.1）。
@@ -353,6 +360,8 @@ def _merge(clusters: dict, *, radius: float) -> list[dict[str, Any]]:
                     [r.as_dict() for r in ordered],
                     ligand_atoms=primary.atoms,
                     ligand_names=(str(primary.origin.get("ligand") or ""),),
+                    protein=primary.protein,
+                    center=center,
                 ),
             }
         )
@@ -391,6 +400,140 @@ CHARGED_RESIDUES = frozenset({"ASP", "GLU", "LYS", "ARG"})
 TIGHT_CONTACT = 3.5
 """「贴得紧」的距离口径（埃）。重原子之间 3.5 埃以内已经进了范德华距离，
 再远就是围一圈而不是贴着。"""
+
+# 可药性的两个可算量。**分开报，不合成一个分数**，与画像其余项同一口径。
+#
+# 空腔体积：中心 10 埃内、探针球滚不进去的那些 1 埃网格点。药物结合位点常在
+# 300–1000 立方埃；低于 250 是浅槽，撑不起三个以上相互作用。
+# 包埋度：从中心向 500 个球面方向射线，10 埃内被蛋白挡住的比例。半开放的口袋，
+# 配体有一半在水里，形状互补无从谈起。
+#
+# **原子按「范德华半径 + 探针半径」占位**：只按范德华半径算的话，蛋白内部原子之间
+# 那些半埃宽的空隙也会被数成空腔，一个完整折叠的蛋白中心同样能数出几千立方埃，
+# 250 这个阈值就失去了判别力。加上 1.4 埃的探针，空隙被填掉，剩下的是配体能真正
+# 占住的空间。
+VOID_RADIUS = 10.0
+VOID_STEP = 1.0
+PROBE_RADIUS = 1.4
+VOID_MIN_VOLUME = 250.0
+ENCLOSURE_RAYS = 500
+ENCLOSURE_STEP = 0.5
+ENCLOSURE_MIN = 0.5
+TIGHT_MIN_RESIDUES = 12
+
+# 范德华半径（埃）。认不出的元素按碳算：宁可把空腔算小一点，也不要凭空造出空腔。
+VDW_RADII: dict[str, float] = {
+    "C": 1.70, "N": 1.55, "O": 1.52, "S": 1.80, "P": 1.80,
+    "F": 1.47, "CL": 1.75, "BR": 1.85, "I": 1.98, "B": 1.92, "SI": 2.10,
+}
+DEFAULT_VDW = 1.70
+
+
+def _protein_points(
+    doc: pdbtext.PdbDocument, chains: Sequence[str] = ()
+) -> tuple[tuple[float, float, float, float], ...]:
+    """受体侧的重原子：`(x, y, z, 范德华半径)`。给了链就只取那几条链。
+
+    **只取 `ATOM` 记录**：`HETATM` 里是配体、水、离子，把它们算成「蛋白原子」会把
+    空腔填掉一块——而那一块正是配体要占的地方。
+    """
+    wanted = set(chains)
+    points: list[tuple[float, float, float, float]] = []
+    for atom in doc.atoms:
+        if atom.is_hetero or not pdbtext.is_heavy(atom):
+            continue
+        if wanted and atom.chain not in wanted:
+            continue
+        element = pdbtext.element_of(atom) or ""
+        points.append((*atom.coord, VDW_RADII.get(element, DEFAULT_VDW)))
+    return tuple(points)
+
+
+def _solid_cells(
+    points: Sequence[Sequence[float]],
+) -> set[tuple[int, int, int]]:
+    """被蛋白（含 1.4 埃探针）占据的 1 埃格子：探针球滚不进去的点。
+
+    以原子为中心标记邻格，比「对每个网格点找最近原子」快两个量级：一处口袋有几千
+    个原子、四千多个网格点，反过来做是千万次距离计算。
+    """
+    cells: set[tuple[int, int, int]] = set()
+    for point in points:
+        vdw = float(point[3]) if len(point) > 3 else DEFAULT_VDW
+        radius = vdw + PROBE_RADIUS
+        base = tuple(int(round(value / VOID_STEP)) for value in point[:3])
+        reach = int(radius / VOID_STEP) + 1
+        for dx in range(-reach, reach + 1):
+            for dy in range(-reach, reach + 1):
+                for dz in range(-reach, reach + 1):
+                    if math.sqrt(dx * dx + dy * dy + dz * dz) * VOID_STEP >= radius:
+                        continue
+                    cells.add((base[0] + dx, base[1] + dy, base[2] + dz))
+    return cells
+
+
+def _sphere_directions(count: int) -> list[tuple[float, float, float]]:
+    """球面上均匀分布的 `count` 个方向（Fibonacci 球）。"""
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    out: list[tuple[float, float, float]] = []
+    for index in range(count):
+        y = 1.0 - 2.0 * index / max(1, count - 1)
+        radius = math.sqrt(max(0.0, 1.0 - y * y))
+        theta = golden * index
+        out.append((math.cos(theta) * radius, y, math.sin(theta) * radius))
+    return out
+
+
+def cavity_facts(
+    protein: Sequence[Sequence[float]], center: Sequence[float]
+) -> dict[str, Any]:
+    """空腔体积与包埋度。没有蛋白坐标或中心时返回空字典，不编一个数。
+
+    两个量都是**几何量**：体积按 1 埃网格点数，包埋度按射线被挡的比例。它们回答的
+    是「这处口袋撑不撑得起一个药物分子」，不回答「这处口袋好不好」——后者要看壁的
+    组成与配体的形状，那是画像其余几项。
+    """
+    if not protein or len(center) < 3:
+        return {}
+    origin = (float(center[0]), float(center[1]), float(center[2]))
+    solid = _solid_cells(protein)
+    if not solid:
+        return {}
+    reach = int(VOID_RADIUS / VOID_STEP)
+    free = 0
+    for dx in range(-reach, reach + 1):
+        for dy in range(-reach, reach + 1):
+            for dz in range(-reach, reach + 1):
+                if math.dist((0.0, 0.0, 0.0), (dx, dy, dz)) * VOID_STEP > VOID_RADIUS:
+                    continue
+                cell = (
+                    int(round(origin[0] / VOID_STEP)) + dx,
+                    int(round(origin[1] / VOID_STEP)) + dy,
+                    int(round(origin[2] / VOID_STEP)) + dz,
+                )
+                if cell not in solid:
+                    free += 1
+    volume = free * VOID_STEP**3
+
+    blocked = 0
+    steps = int(VOID_RADIUS / ENCLOSURE_STEP)
+    for direction in _sphere_directions(ENCLOSURE_RAYS):
+        for step in range(1, steps + 1):
+            distance = step * ENCLOSURE_STEP
+            point = (
+                origin[0] + direction[0] * distance,
+                origin[1] + direction[1] * distance,
+                origin[2] + direction[2] * distance,
+            )
+            cell = tuple(int(round(value / VOID_STEP)) for value in point)
+            if cell in solid:
+                blocked += 1
+                break
+    return {
+        "volume": int(round(volume)),
+        "enclosure": round(blocked / ENCLOSURE_RAYS, 2),
+        "radius": VOID_RADIUS,
+    }
 
 
 def _residue_class(name: str) -> str:
@@ -471,6 +614,13 @@ def _profile_verdict(profile: dict[str, Any]) -> str:
             parts.append("配体全疏水")
         elif polar >= 4:
             parts.append("配体偏极性")
+    cavity = profile.get("cavity") or {}
+    volume = cavity.get("volume")
+    if isinstance(volume, int) and volume < VOID_MIN_VOLUME:
+        parts.append("空腔浅")
+    enclosure = cavity.get("enclosure")
+    if isinstance(enclosure, (int, float)) and float(enclosure) < ENCLOSURE_MIN:
+        parts.append("半开放")
     return "、".join(parts)
 
 
@@ -479,6 +629,8 @@ def build_profile(
     *,
     ligand_atoms: Sequence[pdbtext.AtomRecord] = (),
     ligand_names: Sequence[str] = (),
+    protein: Sequence[Sequence[float]] = (),
+    center: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """一处口袋的画像。
 
@@ -487,6 +639,9 @@ def build_profile(
 
     `ligand_atoms` 为空（预测口袋、用户手给残基的口袋）时画像只有壁那一半——
     没有配体就没有「配体长什么样」这一项，留空而不是编一个。
+
+    `protein` 是受体侧的重原子坐标，`center` 是口袋中心。两者都给了才算空腔体积与
+    包埋度；缺一个就不出现这两项——**预测来源手上没有受体坐标**，编不出来。
     """
     if not residues:
         return {}
@@ -535,6 +690,9 @@ def build_profile(
         if names:
             facts["names"] = names
         profile["ligand"] = facts
+    cavity = cavity_facts(protein, center or ())
+    if cavity:
+        profile["cavity"] = cavity
     profile["verdict"] = _profile_verdict(profile)
     return profile
 
@@ -582,6 +740,13 @@ def profile_lines(profile: dict[str, Any]) -> list[str]:
         else "；这一层没有距离，贴紧程度算不出来"
     )
     lines.append(wall_text)
+    cavity = profile.get("cavity") or {}
+    if cavity:
+        lines.append(
+            f"    空腔 {cavity.get('volume')} 立方埃 · 包埋度 {cavity.get('enclosure')}"
+            f"（判据 ≥{VOID_MIN_VOLUME:g} 立方埃、≥{ENCLOSURE_MIN:g}；"
+            f"≤{TIGHT_CONTACT:g} 埃内 {profile.get('tight')} 个残基，判据 ≥{TIGHT_MIN_RESIDUES}）"
+        )
     if profile.get("verdict"):
         lines.append(f"    画像：{profile['verdict']}")
     return lines
@@ -1060,6 +1225,8 @@ def _ligand_bundle(
             [item.as_dict() for item in residues],
             ligand_atoms=tuple(atom for atom in ligand_doc.atoms if pdbtext.is_heavy(atom)),
             ligand_names=(ligand_label,),
+            protein=_protein_points(doc, chains),
+            center=export.ligand_center(coords),
         ),
     }
     return PocketBundle(
@@ -1100,6 +1267,51 @@ def _structure_bundle(
         used=1,
         excluded=excluded,
         sources=sources,
+    )
+
+
+def bundle_from_set(entry: Any) -> PocketBundle:
+    """读一份已经算好的口袋集（`detect_pockets` 的产物），交给 `write_run` 写网页。
+
+    `detect_pockets` 能一次叠四路来源，但它不写运行目录；`write_run` 能写网页，原先
+    一次只取一路。这一层把两件事接上：**口袋集的每一条都带着 layer 与画像**，
+    网页那边已经能逐条渲染，缺的只是有人把这份清单递过去。
+
+    `origin` 按层归并成既有三档（`complex` / `predicted` / `none`）——网页的措辞表
+    只认这三档，多一档会让它退回显示原始字符串。
+    """
+    path = Path(str(getattr(entry, "path", "") or ""))
+    try:
+        payload = products.read_json(path / POCKET_SET_FILE)
+    except (OSError, ValueError) as error:
+        raise ToolError(
+            f"{entry.handle} 的口袋集读不出来（{path / POCKET_SET_FILE}）：{error}"
+        ) from error
+    pockets = [dict(item) for item in (payload.get("pockets") or []) if isinstance(item, dict)]
+    if not pockets:
+        raise ToolError(
+            f"{entry.handle} 里一处口袋都没有。重新跑一次 detect_pockets，"
+            "或用 write_run 自己的来源参数（uniprot / candidates / pdb_id）。"
+        )
+    layers = sorted(
+        {str(item.get("layer") or "") for item in pockets if item.get("layer")},
+        key=lambda name: LAYER_PRIORITY.get(name, 9),
+    )
+    if {"ligand", "complex", "prior"} & set(layers):
+        origin = "complex"
+    elif "predicted" in layers:
+        origin = "predicted"
+    else:
+        origin = "none"
+    return PocketBundle(
+        pockets=pockets,
+        origin=origin,
+        note=(
+            f"来自口袋集 {entry.handle}（{len(pockets)} 处，"
+            f"层 {'、'.join(layers) or '未知'}）"
+        ),
+        total=len(pockets),
+        used=len(pockets),
     )
 
 
@@ -2055,8 +2267,12 @@ class DefinePocketTool(Tool):
                     "size": [round(value, 3) for value in size],
                     "source": "residues",
                 },
-                # 用户手给残基的口袋没有配体，画像只有壁那一半。
-                "profile": build_profile(residues),
+                # 用户手给残基的口袋没有配体，画像只有壁与空腔那一半。
+                "profile": build_profile(
+                    residues,
+                    protein=_protein_points(doc, chains),
+                    center=center,
+                ),
             }
             source = "residues"
 

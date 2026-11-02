@@ -1459,6 +1459,9 @@ def _entry_meta(
     values = [float(item["pchembl_value"]) for item in molecules]
     return {
         "source": "chembl",
+        # 配体管线的阶段是 raw / curated / prepared 那一条；这一份不来自那条管线，
+        # 标记成 actives 是为了让人与脚本都能一眼认出「这是唯一带实测活性的配体集」。
+        "stage": "actives",
         "accession": accession,
         "target_chembl_id": choice.chembl_id,
         "target_name": choice.name,
@@ -1844,6 +1847,148 @@ def _render_molecule(
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
+def activity_cache_path(
+    code: str,
+    *,
+    floor: float,
+    measure: str,
+    confidence_floor: int,
+    spread: bool = False,
+) -> Path:
+    """这份条件对应的缓存文件。
+
+    **取数与登记必须走同一个函数**：`search_actives` 要把缓存文件登记成配体集，
+    自己再算一遍键的话，两处只要有一处把参数换了类型（`8` 与 `"8"` 在
+    `fingerprint_parts` 里是两个不同的值），登记表就会指向一个不存在的路径。
+    """
+    parts = [code, f"{floor:g}", measure, confidence_floor]
+    if spread:
+        parts.append("spread")
+    return _cache_path(code, fingerprint_parts(*parts, length=8))
+
+
+def activity_snapshot(
+    code: str,
+    *,
+    floor: float = 7.0,
+    measure: str = DEFAULT_MEASURE_TYPES,
+    confidence_floor: int = 8,
+    want: int = 2000,
+    refresh: bool = False,
+    spread: bool = False,
+) -> tuple[_Snapshot, _TargetChoice, str]:
+    """取一个靶点的定量活性快照：缓存优先，没有就联网。
+
+    **不登记任何东西**，也不写产物目录以外的文件。`search_actives` 与
+    `assess_campaign` 共用这一份取数：盘点要在会话里问「这个靶点有多少活性」，
+    但它不该在登记表里留下模型没打算用的产物。
+
+    `spread=True` 时额外取回最弱的 `want` 条，与最强的那些合在一起。默认的
+    「按活性降序取前 N 条」在活性记录很多的靶点上只覆盖到最高的一小段：实测
+    P00533 取回 325 个分子，pChEMBL 全在 9.49–11.00，匹配分子对的活性差最大
+    只有 1.3，Δ≥2 的对子恒为 0。盘点要看的是分布，两端都要有。
+
+    失败时抛 `http.ToolError`（网络或接口不可用），由调用方转成可回灌的文字。
+    """
+    conditions = f"pChEMBL ≥ {floor:g}、{measure}、置信度 ≥ {confidence_floor}"
+    if spread:
+        conditions += f"、最强与最弱两端各取至多 {want} 条"
+    # 缓存键只用「编号 + 条件」，**不含 ChEMBL 靶点编号**——靶点编号得先联网解析才
+    # 知道，把它算进键里就意味着缓存永远不可能纯读盘（每次调用都得先打一次网络）。
+    path = activity_cache_path(
+        code,
+        floor=floor,
+        measure=measure,
+        confidence_floor=confidence_floor,
+        spread=spread,
+    )
+
+    if not refresh:
+        try:
+            cached = _read_cache(
+                path, numbers=_ACTIVITY_NUMBERS, required=_ACTIVITY_REQUIRED
+            )
+        except OSError:
+            cached = None
+    else:
+        cached = None
+
+    if cached is not None:
+        rows, meta = cached
+        snapshot = _snapshot_from_cache(rows, meta)
+        choice = _TargetChoice(
+            chembl_id=str(meta.get("target_chembl_id") or ""),
+            name=str(meta.get("target_name") or ""),
+            alternatives=[str(item) for item in meta.get("target_alternatives") or []],
+            skipped_complexes=_as_int(meta.get("skipped_complexes")) or 0,
+        )
+        return snapshot, choice, f"读自本地缓存 {_relative(path)}（未联网；要刷新用 refresh=true）"
+
+    choice = _resolve_target(code, timeout=TIMEOUT)
+
+    # 服务端确实生效的四个条件。别往这里加 confidence_score 或 assay__* ——
+    # ChEMBL 会静默忽略它们，结果看起来筛过了其实没筛。
+    base_params = {"target_chembl_id": choice.chembl_id}
+    matched_params = {
+        **base_params,
+        "pchembl_value__gte": f"{floor:g}",
+        "standard_type__in": measure,
+        "potential_duplicate": "0",
+        "order_by": "-pchembl_value",
+    }
+    total_all = _count(ACTIVITY_URL, base_params, timeout=TIMEOUT)
+    total_matched = _count(ACTIVITY_URL, matched_params, timeout=TIMEOUT)
+
+    rows = (
+        _fetch_activities(matched_params, want=want, timeout=TIMEOUT)
+        if total_matched
+        else []
+    )
+    if spread and total_matched > len(rows):
+        rows.extend(
+            _fetch_activities(
+                {**matched_params, "order_by": "pchembl_value"}, want=want, timeout=TIMEOUT
+            )
+        )
+    facts = _assay_facts(
+        (str(item.get("assay_chembl_id") or "") for item in rows), timeout=TIMEOUT
+    )
+    molecules, dropped = _select(rows, confidence=facts, min_confidence=confidence_floor)
+
+    text = _render_csv(molecules)
+    snapshot = _Snapshot(
+        molecules=molecules,
+        total_all=total_all,
+        total_matched=total_matched,
+        fetched=len(rows),
+        dropped=dropped,
+        fingerprint=fingerprint_text(text),
+    )
+    _write_cache(
+        path,
+        text=text,
+        fingerprint=snapshot.fingerprint,
+        meta=_activity_meta(
+            snapshot,
+            {
+                "accession": code,
+                "conditions": conditions,
+                "target_chembl_id": choice.chembl_id,
+                "target_name": choice.name,
+                "target_alternatives": choice.alternatives,
+                "skipped_complexes": choice.skipped_complexes,
+                "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            },
+        ),
+    )
+    return (
+        snapshot,
+        choice,
+        f"已下载 {len(rows):,} 条活性记录并写盘 {_relative(path)}"
+        f"（指纹 {snapshot.fingerprint}）",
+    )
+
+
 class SearchActivesTool(Tool):
     """按 UniProt 编号取 ChEMBL 里的已知活性分子，登记成 ligandset。"""
 
@@ -1912,102 +2057,29 @@ class SearchActivesTool(Tool):
         refresh = bool(arguments.get("refresh"))
 
         conditions = f"pChEMBL ≥ {floor:g}、{measure}、置信度 ≥ {confidence_floor}"
+        path = activity_cache_path(
+            code, floor=floor, measure=measure, confidence_floor=confidence_floor
+        )
 
-        # 缓存键只用「编号 + 条件」，**不含 ChEMBL 靶点编号**——靶点编号得先联网解析才
-        # 知道，把它算进键里就意味着缓存永远不可能纯读盘（每次调用都得先打一次网络）。
-        key = fingerprint_parts(code, f"{floor:g}", measure, confidence_floor, length=8)
-        path = _cache_path(code, key)
-
-        if not refresh:
-            try:
-                cached = _read_cache(
-                    path, numbers=_ACTIVITY_NUMBERS, required=_ACTIVITY_REQUIRED
-                )
-            except OSError:
-                cached = None
-        else:
-            cached = None
-
-        if cached is not None:
-            rows, meta = cached
-            snapshot = _snapshot_from_cache(rows, meta)
-            choice = _TargetChoice(
-                chembl_id=str(meta.get("target_chembl_id") or ""),
-                name=str(meta.get("target_name") or ""),
-                alternatives=[str(item) for item in meta.get("target_alternatives") or []],
-                skipped_complexes=_as_int(meta.get("skipped_complexes")) or 0,
+        try:
+            snapshot, choice, origin = activity_snapshot(
+                code,
+                floor=floor,
+                measure=measure,
+                confidence_floor=confidence_floor,
+                want=want,
+                refresh=refresh,
             )
-            origin = f"读自本地缓存 {_relative(path)}（未联网；要刷新用 refresh=true）"
-        else:
-            try:
-                choice = _resolve_target(code, timeout=TIMEOUT)
-
-                # 服务端确实生效的四个条件。别往这里加 confidence_score 或 assay__* ——
-                # ChEMBL 会静默忽略它们，结果看起来筛过了其实没筛。
-                base_params = {"target_chembl_id": choice.chembl_id}
-                matched_params = {
-                    **base_params,
-                    "pchembl_value__gte": f"{floor:g}",
-                    "standard_type__in": measure,
-                    "potential_duplicate": "0",
-                    "order_by": "-pchembl_value",
-                }
-                total_all = _count(ACTIVITY_URL, base_params, timeout=TIMEOUT)
-                total_matched = _count(ACTIVITY_URL, matched_params, timeout=TIMEOUT)
-
-                rows = (
-                    _fetch_activities(matched_params, want=want, timeout=TIMEOUT)
-                    if total_matched
-                    else []
-                )
-                facts = _assay_facts(
-                    (str(item.get("assay_chembl_id") or "") for item in rows), timeout=TIMEOUT
-                )
-                molecules, dropped = _select(
-                    rows, confidence=facts, min_confidence=confidence_floor
-                )
-            except http.ToolError as error:
-                return ToolResult(output=str(error), failed=True)
-
-            text = _render_csv(molecules)
-            snapshot = _Snapshot(
-                molecules=molecules,
-                total_all=total_all,
-                total_matched=total_matched,
-                fetched=len(rows),
-                dropped=dropped,
-                fingerprint=fingerprint_text(text),
-            )
-            try:
-                _write_cache(
-                    path,
-                    text=text,
-                    fingerprint=snapshot.fingerprint,
-                    meta=_activity_meta(
-                        snapshot,
-                        {
-                            "accession": code,
-                            "conditions": conditions,
-                            "target_chembl_id": choice.chembl_id,
-                            "target_name": choice.name,
-                            "target_alternatives": choice.alternatives,
-                            "skipped_complexes": choice.skipped_complexes,
-                            "retrieved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        },
-                    ),
-                )
-            except OSError as error:
-                return ToolResult(
-                    output=(
-                        f"写盘 {_relative(path)} 失败（{type(error).__name__}：{error}）。"
-                        "数据已经在手上，但登记表里的条目要指出一个磁盘位置，"
-                        "写不进去就不登记——请检查该目录是否可写"
-                    ),
-                    failed=True,
-                )
-            origin = (
-                f"已下载 {len(rows):,} 条活性记录并写盘 {_relative(path)}"
-                f"（指纹 {snapshot.fingerprint}）"
+        except http.ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+        except OSError as error:
+            return ToolResult(
+                output=(
+                    f"写盘 {_relative(path)} 失败（{type(error).__name__}：{error}）。"
+                    "数据已经在手上，但登记表里的条目要指出一个磁盘位置，"
+                    "写不进去就不登记——请检查该目录是否可写"
+                ),
+                failed=True,
             )
 
         # 登记而不是每次新建：同一组条件被反复问是常态（问完有哪些分子，再问最强的几个），

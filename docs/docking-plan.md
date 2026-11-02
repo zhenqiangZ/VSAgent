@@ -62,7 +62,6 @@ receptor#2 (prepared) ─────── dock ──▶ artifact#3 (docking)
 | `vsagent/core/agent/domain/ligand.py` | `ImportLigandsetTool`、`PrepareLigandsTool`；文件解析、去盐、去重、ETKDGv3、Meeko。 |
 | `vsagent/core/agent/domain/docking.py` | `DockTool`；定位 Vina、读盒子、构造命令、跑子进程、解析分数、PDBQT→PDB。 |
 | `tests/fixtures/ligands.smi` | 给 `debug_tools.py` 的固定配体样例（含一条盐、一条无效 SMILES，第一条伊马替尼是 1IEP 的共晶配体本身——`validate_docking` 靠它才比得出 RMSD）。 |
-| `tools/check_docking_ui.js` | 对接排名与详情降级的前端判据（Playwright，手工跑）。 |
 
 `products.py` 关键函数：
 
@@ -403,11 +402,11 @@ function rankedMolecules() {
 
 ### 前端
 
-- 旧 `node tools/check_demo_ui.js`、`check_demo_datadriven.js` 必须仍绿。
-- 新 `node tools/check_docking_ui.js` 自建 `.probe/docking-ui/` 运行目录：`meta.molecules` 里 `rank` 与 `score` 故意乱序、`score` 为负、`provenance.poses.score_direction="lower_is_better"`，且不给 `contacts`、不给 `pockets`、`chain` 缺失；用 `web/` 静态服务打开，断言：
-  1. 首行是 rank 1（或最负分数）；
-  2. 点详情不抛异常，缺失字段显示 `—`；
-  3. 旧 demo（无 `rank`、`provenance.poses` 为字符串）仍按高分在前。
+- `node tools/check_web_ui.js` 必须绿（数据驱动与对接排序方向那几条现在也在这里）。
+- 排序方向：脚本手写一份 `docking` 夹具（`rank` 与 `score` 故意不同序、`score` 为负、
+  `provenance.poses.score_direction="lower_is_better"`、不给 `contacts`、不给 `pockets`），
+  断言首行是 rank 1、第二行是最负的分数、详情按对接口径写分数、缺 `contacts` 给空态；
+  再用一份没有 `provenance.poses` 的运行确认仍按高分在前。
 
 ## 8. 实施顺序与验收
 
@@ -416,7 +415,7 @@ function rankedMolecules() {
 3. **prepare_ligands**：3D/Meeko/复用 + `ligand-prep` 判据。跑 `--only ligand-prep`。
 4. **dock**：`docking.py` + `docking` 判据。跑 `--only docking`。
 5. **write_run 接入**：`docking` 参数、复制/清理、`provenance.poses` + `write-run-docking` 判据。跑 `--only write-run`。
-6. **前端**：排序与降级 + `check_docking_ui.js`。跑旧的两个 node 判据与 `node tools/check_docking_ui.js`。
+6. **前端**：排序与降级。跑 `node tools/check_web_ui.js`。
 7. **权限/提示/文档/调试**：`permission.py`、`prompt.py`、`structure.py`、`chemistry.py`、`debug_tools.py`、`AGENTS.md`、`CODEBUDDY.md`、`requirements-chem.txt`；修 `check_web_api.py` 的 1IEP 夹具依赖。跑 `--only plan-deny`、`--only prompt`、`--only loop`、`debug_tools.py --list`。如果 `check_loop` 的「历史降到窗口八折以内」因提示变长而超支，按惯例提高 `tests/test_agent.py` 里的 `COMPACT_WINDOW`，**不要**放宽那条比例断言。
 8. **全量回归**：`tests/test_agent.py`、`tests/test_smoke.py`、`tools/check_web_api.py`。
 9. **真实 Vina 手工闭环**（有二进制时）：`import_ligandset` → `prepare_ligands(confirm=true)` → `dock(limit≤5)` → `write_run(docking=...)` → `open_viewer`。没有 Vina 时 `debug_tools.py` 全跑会在 `dock` 这一步失败，这是预期的环境缺失，不是代码回归；`--list` 仍应正常。

@@ -19,6 +19,18 @@
   const POCKET_SURFACE_COLOR = "#4a9eff";
   const CONTACT_COLOR = "#e08a3c";
 
+  // 三维作用线的颜色。Mol* 的 InteractionsShape 自带一套，这里给残基高亮用同一套语义。
+  const INTERACTION_COLORS = {
+    "hydrogen-bond": "#2f6fd0",
+    ionic: "#d94141",
+    "pi-stacking": "#8b5cf6",
+    "cation-pi": "#a855f7",
+    hydrophobic: "#8a8f98",
+    "halogen-bond": "#2f9e6b",
+    "water-bridge": "#0e9aa7",
+    "metal-coordination": "#d68a2e",
+  };
+
   const MOLECULE_COLORS = [
     "#e0503a", "#2f8f4e", "#8a4fd8", "#e0a020", "#1a9aa8",
     "#c9407f", "#4a6fdc", "#7a8b1e", "#b45309", "#0f766e",
@@ -111,6 +123,10 @@
         <section id="panel-pockets" class="panel">
           <h2>口袋清单</h2>
           <p class="hint">点一行，在三维视图里只突出这一个口袋，其余部分变暗。</p>
+          <div id="pocket-scope">
+            <button id="scope-local" class="is-active">局部视图</button>
+            <button id="scope-whole">全景</button>
+          </div>
           <ul id="pocket-list"></ul>
           <p id="pocket-excluded" class="note is-hidden"></p>
         </section>
@@ -142,6 +158,13 @@
             </thead>
             <tbody></tbody>
           </table>
+          <h3>相互作用</h3>
+          <table id="interaction-table">
+            <thead>
+              <tr><th>类型</th><th>残基</th><th>原子</th><th>距离</th><th>角度</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
         </section>
       </aside>
     </main>
@@ -157,6 +180,7 @@
   let meta = null;
   let mode = "pockets";
   let activePocketId = null;
+  let pocketScope = "local";
   let visibleMolecules = new Set();
   let detailMoleculeId = null;
   let allChains = [];
@@ -293,13 +317,38 @@
     return `${formatter(list[0])} … ${formatter(list[list.length - 1])}（共 ${list.length} 个）`;
   }
 
-  // 画像：一句判断 + 壁的组成。`profile` 是 `pockets.build_profile` 写的，
-  // 旧运行目录没有这个字段——那时整行不挂，不写「未知」。
+  // 画像：一句判断 + 空腔与贴紧程度 + 壁的组成 + 配体形状。
+  // `profile` 是 `pockets.build_profile` 写的，旧运行目录没有这个字段——那时整行
+  // 不挂，不写「未知」。
   function pocketProfileLabel(pocket) {
     const profile = pocket && pocket.profile;
     if (!profile || typeof profile !== "object") return "";
     const parts = [];
     if (profile.verdict) parts.push(profile.verdict);
+
+    // 空腔体积与包埋度要受体坐标才算得出来。预测来源的口袋没有这两项，
+    // 缺就整段不出现——补 0 会把「没量」说成「量出来是 0」。
+    const cavity = profile.cavity || {};
+    const cavityParts = [];
+    if (Number.isFinite(cavity.volume)) cavityParts.push(`空腔 ${cavity.volume} 立方埃`);
+    if (Number.isFinite(cavity.enclosure)) cavityParts.push(`包埋度 ${cavity.enclosure}`);
+    if (cavityParts.length) parts.push(cavityParts.join(" · "));
+
+    // 贴紧的残基个数（最小距离 ≤ 3.5 埃）。一条距离都没量到时整项不出现：
+    // 预测来源只有残基编号，写「0 个」会被读成量过了、一个都不贴。
+    const total = Number.isFinite(profile.residues) ? profile.residues : 0;
+    const measured = Number.isFinite(profile.measured) ? profile.measured : 0;
+    if (measured > 0) {
+      const tight = Number.isFinite(profile.tight) ? profile.tight : 0;
+      // 只量到一部分残基时这个数是下界，把口径一起写出来。
+      const scope = measured < total ? `（${measured}/${total} 条量到距离）` : "";
+      const closest = profile.closest || {};
+      const nearest = Number.isFinite(closest.distance)
+        ? ` · 最近 ${closest.resname ? `${closest.resname} ` : ""}${closest.distance} 埃`
+        : "";
+      parts.push(`3.5 埃内 ${tight} 个${scope}${nearest}`);
+    }
+
     const walls = profile.walls || {};
     if (walls.named) {
       parts.push(
@@ -485,7 +534,10 @@
         profileLine.textContent = profileText;
         item.append(profileLine);
       }
-      item.addEventListener("click", () => selectPocket(pocket.id));
+      item.addEventListener("click", () => {
+        pocketScope = "local";
+        selectPocket(pocket.id);
+      });
       list.appendChild(item);
     }
   }
@@ -540,7 +592,76 @@
     });
   }
 
-  function showDetail(moleculeId) {
+  function residueRefFromLabel(label) {
+    const parts = String(label || "").split(":");
+    if (parts.length < 2) return null;
+    const resseq = Number.parseInt(parts[1], 10);
+    if (!Number.isFinite(resseq)) return null;
+    return {
+      chain: parts[0] === "·" ? "" : parts[0],
+      resseq,
+      resname: parts[2] || "",
+    };
+  }
+
+  function contactRows(molecule) {
+    if (molecule && Array.isArray(molecule.contacts)) return molecule.contacts;
+    return Array.isArray(meta.contacts) ? meta.contacts : [];
+  }
+
+  function contactRef(contact) {
+    if (contact && Number.isFinite(Number(contact.resseq))) {
+      return {
+        chain: String(contact.chain || ""),
+        resseq: Number(contact.resseq),
+        resname: String(contact.resname || ""),
+      };
+    }
+    return residueRefFromLabel(contact && contact.residue);
+  }
+
+  function renderInteractionTable(molecule) {
+    const body = root.querySelector("#interaction-table tbody");
+    body.innerHTML = "";
+    const items = molecule && Array.isArray(molecule.interactions)
+      ? molecule.interactions
+      : [];
+    if (!items.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 5;
+      cell.textContent = "这份运行没有相互作用数据（PLIP 未算或 write_run 未开启 interactions）。";
+      row.appendChild(cell);
+      body.appendChild(row);
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement("tr");
+      const kind = document.createElement("td");
+      const dot = document.createElement("span");
+      dot.className = "interaction-dot";
+      dot.style.background = INTERACTION_COLORS[item.kind] || "#8a8f98";
+      kind.append(dot, document.createTextNode(item.label || item.kind || "作用"));
+      const residue = document.createElement("td");
+      residue.textContent = item.residue || "—";
+      const atom = document.createElement("td");
+      atom.textContent = item.ligand_atom || "—";
+      const distance = document.createElement("td");
+      distance.textContent = Number.isFinite(item.distance)
+        ? `${item.distance.toFixed(2)} A`
+        : "—";
+      const angle = document.createElement("td");
+      angle.textContent = Number.isFinite(item.angle) ? `${item.angle.toFixed(0)}°` : "—";
+      row.append(kind, residue, atom, distance, angle);
+      row.addEventListener("click", () => {
+        const ref = residueRefFromLabel(item.residue);
+        if (ref) window.vsViewer.focusResidues("interaction-focus", [ref], 8, 10);
+      });
+      body.appendChild(row);
+    }
+  }
+
+  async function showDetail(moleculeId) {
     detailMoleculeId = moleculeId;
     const molecule = moleculeList().find((item) => item.id === moleculeId);
     if (!molecule) return;
@@ -557,13 +678,18 @@
     const pockets = pocketList();
     const rows = [
       ["对接打分", formatScore(molecule.score)],
+    ];
+    if (Number.isFinite(molecule.affinity_pk)) {
+      rows.push(["亲和力 pK", Number(molecule.affinity_pk).toFixed(2)]);
+    }
+    rows.push(
       ["位姿文件", molecule.pose || "—"],
       ["作用链", molecule.chain || "—"],
       [
         "口袋",
         pockets.length ? (pockets[0].label || pockets[0].id || "—") : "—",
       ],
-    ];
+    );
     for (const [key, value] of rows) {
       const dt = document.createElement("dt");
       dt.textContent = key;
@@ -574,22 +700,24 @@
 
     const body = root.querySelector("#contact-table tbody");
     body.innerHTML = "";
-    // 对接结果只有分数与位姿，没有逐原子接触；这里必须是空态而不是抛异常。
-    const contacts = Array.isArray(meta.contacts) ? meta.contacts : [];
+    const contacts = contactRows(molecule);
     if (!contacts.length) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
       cell.colSpan = 3;
-      cell.textContent = "这份运行没有接触数据（对接结果只给分数与位姿）。";
+      cell.textContent = "这份运行没有接触数据（write_run 未开启 interactions，或位姿读不出来）。";
       row.appendChild(cell);
       body.appendChild(row);
     } else {
       for (const contact of contacts) {
         const row = document.createElement("tr");
         const residue = document.createElement("td");
-        residue.textContent = contact.residue || "—";
+        residue.textContent = contact.residue
+          || (contact.chain !== undefined
+            ? `${contact.chain}:${contact.resseq}:${contact.resname || ""}`
+            : "—");
         const kind = document.createElement("td");
-        kind.textContent = contact.kind || "—";
+        kind.textContent = contact.kind || "接触";
         const distance = document.createElement("td");
         distance.textContent = Number.isFinite(contact.distance)
           ? `${contact.distance.toFixed(2)} A`
@@ -599,17 +727,19 @@
       }
     }
 
+    renderInteractionTable(molecule);
     renderMoleculeTable();
-    drawMolecules();
+    await drawMolecules();
+    await drawInteractions(molecule);
   }
 
-  function backToList() {
+  async function backToList() {
     detailMoleculeId = null;
     root.querySelector("#panel-detail").classList.add("is-hidden");
     root.querySelector("#panel-pockets").classList.add("is-hidden");
     root.querySelector("#panel-molecules").classList.remove("is-hidden");
     renderMoleculeTable();
-    drawMolecules();
+    await drawMolecules();
   }
 
   // 受体底色的重建：先清掉旧表示，再按当前可见的链逐条上色。
@@ -649,8 +779,15 @@
     await window.vsViewer.focusChainsOnly(chains, 0);
   }
 
-  async function selectPocket(pocketId) {
+  function renderPocketScope() {
+    root.querySelector("#scope-local").classList.toggle("is-active", pocketScope === "local");
+    root.querySelector("#scope-whole").classList.toggle("is-active", pocketScope === "whole");
+  }
+
+  async function selectPocket(pocketId, scope = pocketScope) {
     activePocketId = pocketId;
+    pocketScope = scope;
+    renderPocketScope();
     if (pocketId === null) {
       await paintReceptor(null);
       await focusShownChains();
@@ -667,15 +804,26 @@
     }
     const residues = Array.isArray(pocket.residues) ? pocket.residues : [];
     await paintReceptor({ residues, color: POCKET_COLOR, surface: true });
-    // 视野对准整份结构，口袋在蛋白里的位置才看得出来。
-    await focusShownChains();
+    if (pocketScope === "local" && residues.length) {
+      // 局部取景：多给一段边距，相机不会贴进卡通里，近裁剪面也切不开口袋。
+      await window.vsViewer.focusResidues("pocket-focus", residues, 6, 12);
+    } else {
+      // 全景回答的是「口袋在蛋白的哪一面」。
+      await focusShownChains();
+    }
     renderPocketList();
   }
 
   async function drawMolecules() {
+    await window.vsViewer.clearInteractions();
     const detail = detailMoleculeId;
     const visible = detail ? new Set([detail]) : visibleMolecules;
-    const contacts = Array.isArray(meta.contacts) ? meta.contacts : [];
+    const detailMolecule = detail
+      ? moleculeList().find((item) => item.id === detail)
+      : null;
+    const contacts = detailMolecule
+      ? contactRows(detailMolecule).map(contactRef).filter(Boolean)
+      : [];
 
     let highlight = null;
     if (detail && contacts.length) {
@@ -713,6 +861,38 @@
       await window.vsViewer.focusStructures(refs, framingMargin(refs.length));
     } else {
       await focusShownChains();
+    }
+  }
+
+  async function drawInteractions(molecule) {
+    const items = molecule && Array.isArray(molecule.interactions)
+      ? molecule.interactions
+      : [];
+    const ligand = ligandIndexes.find((item) => item.moleculeId === molecule.id);
+    if (!ligand || !items.length) return;
+
+    await window.vsViewer.showInteractions(items, ligand.structureIndex);
+
+    // 残基按作用类型着色。同一残基有多种作用时保留第一种颜色，完整列表在侧栏。
+    const groups = new Map();
+    const seen = new Set();
+    for (const item of items) {
+      const ref = residueRefFromLabel(item.residue);
+      if (!ref) continue;
+      const key = `${ref.chain}:${ref.resseq}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const bucket = groups.get(item.kind) || [];
+      bucket.push(ref);
+      groups.set(item.kind, bucket);
+    }
+    for (const [kind, residues] of groups) {
+      await window.vsViewer.addResidueRepresentation(
+        residues,
+        "ball-and-stick",
+        { color: INTERACTION_COLORS[kind] || "#8a8f98", size: 0.16 },
+        0
+      );
     }
   }
 
@@ -842,9 +1022,18 @@
     });
 
     root.querySelector("#detail-back").addEventListener("click", backToList);
+
+    root.querySelector("#scope-local").addEventListener("click", () => {
+      pocketScope = "local";
+      selectPocket(activePocketId);
+    });
+    root.querySelector("#scope-whole").addEventListener("click", () => {
+      pocketScope = "whole";
+      selectPocket(activePocketId);
+    });
   }
 
-  async function loadRun(runId) {
+  async function loadRun(runId, options = {}) {
     currentRunId = runId;
     base = `/runs/${encodeURIComponent(runId)}/`;
     window.__ready = false;
@@ -925,16 +1114,34 @@
     // 结构模式写出的运行目录默认停在「结构总览」：它本来就没有口袋，
     // 直接落在口袋页会先看到一句「这一份没有口袋」，像是出错了。
     const view = meta.provenance && meta.provenance.view;
-    await setMode(view === "structure" ? "structure" : "pockets");
-    // 浏览器在首次布局之前给的画布尺寸与最终尺寸不同。
+    const pocketWanted = String(options.pocket || "");
+    const moleculeWanted = String(options.molecule || "");
+    const pocketExists = pocketList().some((item) => item.id === pocketWanted);
+    const moleculeExists = moleculeList().some((item) => item.id === moleculeWanted);
+    let framed = false;
+    if (moleculeWanted && moleculeExists) {
+      await setMode("molecules");
+      await showDetail(moleculeWanted);
+      framed = true;
+    } else if (pocketWanted && pocketExists) {
+      pocketScope = options.view === "whole" ? "whole" : "local";
+      activePocketId = pocketWanted;
+      await setMode("pockets");
+      await selectPocket(pocketWanted, pocketScope);
+      framed = true;
+    } else {
+      await setMode(view === "structure" ? "structure" : "pockets");
+    }
+    // 浏览器在首次布局之前给的画布尺寸与最终尺寸不同。深链接已经取过景，
+    // 这里再 focusShownChains 会把口袋局部视图或分子详情顶掉。
     requestAnimationFrame(() => {
       window.vsViewer.handleResize();
-      focusShownChains();
+      if (!framed) focusShownChains();
     });
     window.__ready = true;
   }
 
-  async function mount(container, param) {
+  async function mount(container, param, query) {
     await ensureViewer();
     container.innerHTML = TEMPLATE;
     root = container;
@@ -950,7 +1157,11 @@
 
     bindControls();
     const wanted = param && runs.some((item) => item.id === param) ? param : runs[0].id;
-    await loadRun(wanted);
+    await loadRun(wanted, {
+      pocket: query ? query.get("pocket") || "" : "",
+      molecule: query ? query.get("molecule") || "" : "",
+      view: query ? query.get("view") || "" : "",
+    });
 
     return {
       unmount() {

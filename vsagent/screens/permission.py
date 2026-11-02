@@ -101,8 +101,8 @@ class PermissionDialog(ModalScreen[PermissionAnswer]):
         return (
             "[#0A0A0A on #4A9EFF] y [/] 允许一次    "
             "[#0A0A0A on #FFB300] a [/] 本会话放行所有工具    "
-            "[#0A0A0A on #666666] n [/] 拒绝\n"
-            "[#666666]a 放行的是工具，不是磁盘：工作目录之外仍会问；esc 等同拒绝[/]"
+            "[#0A0A0A on #8B949E] n [/] 拒绝\n"
+            "[#5A5A5A]a 放行的是工具，不是磁盘：工作目录之外仍会问；esc 等同拒绝[/]"
         )
 
     def argument_text(self) -> str:

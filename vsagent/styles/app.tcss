@@ -1,3 +1,29 @@
+/* 配色
+ *
+ * 全部装饰、分层与文字走同一条灰阶，语义色只有四个。
+ * 正文不使用语义色：强调由字重承担。
+ * 设计说明见 docs/chat-screen-design.md。
+ *
+ *   #000000  屏幕底
+ *   #0A0A0A  栏底（状态栏、侧栏、输入区块、弹窗里的输入框）
+ *   #1A1A1A  分层底（用户消息、选中项、普通提示、弹窗本体）
+ *   #2A2A2A  装饰线（未聚焦的指示线、启动界面聚焦时的抬亮）
+ *   #333333  分隔线（侧栏左边界、弹窗里的框线）
+ *   #4A4A4A  四级文字（快捷键提示、侧栏开关、弹窗里的元信息）
+ *   #5A5A5A  三级文字（状态栏、模式提示、历史提示、弹窗里的提示行）
+ *   #8B949E  次要文字（分节标题、系统事件、状态行、弹窗里的说明）
+ *   #E0E0E0  主文字（正文、列表标题、悬停时的文字）
+ *
+ *   #4A9EFF  蓝：焦点与选中
+ *   #2E7D32  绿：完成
+ *   #FFB300  橙：等待
+ *   #C62828  红：失败
+ *
+ * 纯白只留给输入光标那个方块：它落在空格上时只有底色看得见，
+ * 比主文字再亮一档才能在一行文字里认出当前格。
+ * 语义色底上的文字同理，不参与灰阶。
+ */
+
 /* 全局 */
 Screen {
     background: #000000;
@@ -27,7 +53,7 @@ ModalScreen {
 #home-logo {
     width: 82;
     max-width: 100%;
-    color: #FFFFFF;
+    color: #E0E0E0;
     text-align: center;
     height: auto;
 }
@@ -40,7 +66,7 @@ ModalScreen {
     margin-top: 1;
     margin-bottom: 1;
     text-align: center;
-    color: #666666;
+    color: #5A5A5A;
 }
 
 #home-box {
@@ -53,7 +79,7 @@ ModalScreen {
 
 /* 文本框自身也加一条聚焦规则，让 Textual 在焦点变化时重算整块子树 */
 #home-box:focus-within {
-    background: #1F1F1F;
+    background: #2A2A2A;
 }
 
 /* 左侧竖条：聚焦时点亮成蓝线，未聚焦时接近框底色 */
@@ -82,7 +108,7 @@ ModalScreen {
 #home-prompt-mark {
     width: auto;
     height: 1;
-    color: #888888;
+    color: #8B949E;
 }
 
 /* 输入框随内容换行增高，到高度上界后由自身滚动掩盖最早的内容 */
@@ -98,13 +124,13 @@ ModalScreen {
 }
 
 #home-input .text-area--placeholder {
-    color: #777777;
+    color: #5A5A5A;
 }
 
-/* 输入区跟着区块一起在聚焦时提亮。`#home-box:focus-within` 把区块底色抬到 #1F1F1F，
+/* 输入区跟着区块一起在聚焦时提亮。`#home-box:focus-within` 把区块底色抬到 #2A2A2A，
    而输入区自己写的是 #1A1A1A，不提亮的话焦点一进到输入框，输入区就比周围暗出一档 */
 #home-box:focus-within #home-input {
-    background: #1F1F1F;
+    background: #2A2A2A;
 }
 
 #home-info {
@@ -119,14 +145,14 @@ ModalScreen {
     height: 1;
     padding: 0 2;
     text-align: right;
-    color: #666666;
+    color: #4A4A4A;
 }
 
 #home-footer {
     width: 100%;
     height: 2;
     padding: 0 2 1 2;
-    color: #666666;
+    color: #4A4A4A;
     background: #000000;
 }
 
@@ -141,42 +167,8 @@ ModalScreen {
 }
 
 /* Chat 屏幕 */
-/* 标题栏：一行，左边会话名、右边侧栏开关。底色比消息区亮一档，
-   不画分隔线——一条 1 像素的横线要单独占一行，而这一行本来就在。 */
-#chat-header {
-    height: 1;
-    background: #0A0A0A;
-    padding: 0 1;
-}
-
-#chat-title {
-    width: 1fr;
-    height: 1;
-    color: #8B949E;
-    /* 长标题截成一行加省略号。不写 nowrap 的话它会在 1 行高的格子里折行，
-       第二行被裁掉，看起来像标题里混进了半截字。 */
-    text-wrap: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-/* 侧栏开关：未展开时暗灰、展开时亮蓝，鼠标移上去有底色。
-   宽度取 auto，文字在「◧ 侧栏」与「◨ 收起」之间切换时不会跳位太厉害。 */
-#side-toggle {
-    width: auto;
-    height: 1;
-    padding: 0 1;
-    color: #666666;
-}
-
-#side-toggle:hover {
-    background: #1E3A5F;
-    color: #FFFFFF;
-}
-
-#side-toggle.-open {
-    color: #4A9EFF;
-}
+/* 会话名、目录、分支、用量与侧栏开关全部在底部这一行（见 `#status-bar`）。
+   不单独设标题栏：那一行画的也是低优先级信息，而它要吃掉两行消息区。 */
 
 #chat-body {
     height: 1fr;
@@ -186,12 +178,12 @@ ModalScreen {
     width: 1fr;
     height: 100%;
     padding: 0 1;
-    /* 滚动条取纯白，轨道与屏幕底色同色所以不显形。默认档跟随主题的 $scrollbar，
-       在纯黑底上偏暗，长会话里几乎看不出现在滚到了哪 */
+    /* 轨道与屏幕底色同色所以不显形，条本身取三级文字那一档：在纯黑底上看得见，
+       又不会比正文更抢眼。悬停与拖动各提一档，告诉用户手指点在了什么上面 */
     scrollbar-background: #000000;
-    scrollbar-color: #FFFFFF;
-    scrollbar-color-hover: #FFFFFF;
-    scrollbar-color-active: #FFFFFF;
+    scrollbar-color: #5A5A5A;
+    scrollbar-color-hover: #8B949E;
+    scrollbar-color-active: #E0E0E0;
 }
 
 /* 上下文侧栏：默认隐藏，/sidebar 打开后占 30 列，消息区让出这块宽度 */
@@ -217,37 +209,37 @@ ModalScreen {
 #side-panel .side-section {
     height: 1;
     margin-top: 1;
-    color: #4A9EFF;
+    /* 分节标题是结构标签，不是交互元素，用次要文字那一档加粗；
+       亮蓝留给当前选中的条目。 */
+    color: #8B949E;
+    text-style: bold;
 }
 
 #side-panel .side-line {
     height: auto;
-    color: #AAAAAA;
+    color: #8B949E;
 }
 
 #side-panel .side-body {
     height: auto;
-    color: #888888;
+    color: #8B949E;
 }
 
-/* 输入框区块：深灰底、带左右内边距，最左侧那条竖线在聚焦时点亮成亮蓝。
-   区块高度取 auto 即可：里面的输入区高度固定，区块总高于是也不随输入变化 */
+/* 输入框区块：与状态栏同一层底色，底部四行连成一条，屏幕上方是消息、下方是操作区。
+   区块自身不再铺一层比屏幕亮两档的灰：那块灰与纯黑之间是一条横贯整屏的硬边，
+   聚焦时区块从 1 行长到 3 行，这条边还会跟着往上跳一下。
+   与消息区的分界由 1 列宽的竖线（聚焦转蓝）与下方状态行承担 */
 #editor-pane {
     height: auto;
-    border-top: solid #333333;
-    background: #1A1A1A;
-    /* 上下不留内边距：竖线的首行要与上界线下面第一行、也就是输入文字那一行同一行。
-       区块自己的上下留白会夹在竖线与上界线之间，看着像输入行上方还空着一行 */
-    padding: 0 2;
+    background: #0A0A0A;
+    /* 上下不留内边距：竖线的首行要与输入文字那一行同一行。
+       左内边距 3 列让输入的文字落在 x=5，与消息正文从同一列开始；
+       竖线占它左边那一列（x=3），落在消息正文左侧的空档里 */
+    padding: 0 3;
 }
 
-#editor-pane.mode-command {
-    border-top: solid #4A9EFF;
-}
-
-#editor-pane.mode-bash {
-    border-top: solid #EF6C00;
-}
+/* 模式切换用输入框下方的模式提示表达（见 `#editor-hint`），区块的上边界不跟着换色：
+   一条常驻的彩色横线在整屏里比输入框本身还显眼。 */
 
 #editor-body {
     width: 100%;
@@ -277,22 +269,24 @@ ModalScreen {
 }
 
 /* 输入区显式铺区块那层底色。不写的话会用到 TextArea 自带的 `background: $surface`，
-   主题换成 gruvbox 之后 `$surface` 是 #3C3836，比区块的 #1A1A1A 亮出一档，
+   主题换成 gruvbox 之后 `$surface` 是 #3C3836，比区块的 #0A0A0A 亮出一大截，
    输入区看起来像单独铺了一块灰。
 
-   高度与启动界面 `#home-input` 同一套：随内容长高，6 行封顶，再多出来的行由
-   输入框自己滚动。区别是这里给了 3 行底高：聊天界面空着的时候也常要一眼看清
-   刚打的那一行，1 行的框太窄，贴着上界线看起来像没地方输入。
+   左内边距 1 列把光标与竖线隔开：方块光标贴到竖线上时两段颜色连成一片，
+   看不出光标在第一格还是第二格。
 
-   区块贴着底边、高度 auto，所以长高时是上边缘往上退、消息区被压短，
-   状态栏与底边不动；提交清空后整块退回 6 行（上界线 1 + 输入 3 + 间距 1 + 状态 1）。 */
+   一行底高、随内容长高、6 行封顶，再多出来的行由输入框自己滚动。底高取 1 行：
+   输入框空着时也不该占三行，消息区每让出一行都是内容多看到一行。
+
+   区块贴着底边、高度 auto，所以长高时是上边缘往上退、消息区被压短。
+   失焦时状态行收起，整块只剩输入框；聚焦时是「输入 N 行 + 间距 1 + 状态 1」。 */
 #editor-input {
     height: auto;
-    min-height: 3;
+    min-height: 1;
     max-height: 6;
     padding: 0 1;
     border: none;
-    background: #1A1A1A;
+    background: #0A0A0A;
     color: #E0E0E0;
     scrollbar-size-vertical: 0;
 }
@@ -309,8 +303,10 @@ ModalScreen {
     color: #5A5A5A;
 }
 
-/* 状态行：Agent、模型、推理强度靠左，输入模式靠右；左侧内边距与输入区一致，
-   让状态行与上面输入的文字从同一列开始 */
+/* 状态行：Agent 与推理强度靠左，输入模式靠右；左侧内边距与输入区一致，
+   让状态行与上面输入的文字从同一列开始。
+
+   只在输入框聚焦时显示。失焦时用户是在读消息，这一行占的是消息区的高度。 */
 #editor-status {
     width: 100%;
     height: 1;
@@ -319,24 +315,21 @@ ModalScreen {
     layout: horizontal;
 }
 
+#editor-status.-hidden {
+    display: none;
+}
+
 #editor-agent {
     width: auto;
     height: 1;
-    color: #4A9EFF;
-}
-
-#editor-model {
-    width: auto;
-    height: 1;
-    padding-left: 1;
-    color: #C9D1D9;
+    color: #8B949E;
 }
 
 #editor-effort {
     width: auto;
     height: 1;
     padding-left: 1;
-    color: #E3B341;
+    color: #8B949E;
 }
 
 #editor-hint {
@@ -353,70 +346,58 @@ ModalScreen {
     text-align: center;
 }
 
-/* 消息样式 */
+/* 消息样式：两侧用同一档主文字。用户那一侧靠一块浅底区分，
+   不再单独调亮文字——底色已经足够说明这是谁说的 */
 .message-user {
     color: #E0E0E0;
     margin-bottom: 1;
 }
 
-/* 气泡自己已经留了一行顶部内边距，正文那段的后边距不要再叠一层：
-   叠上去之后单行提问的气泡是"上 1 行、下 2 行"，上下不对称 */
+/* 底色自带上下各一行内边距，正文那段的后边距不要再叠一层 */
 .message-user .part-text {
     margin-bottom: 0;
 }
 
 .message-assistant {
-    color: #CCCCCC;
+    color: #E0E0E0;
     margin-bottom: 1;
 }
 
 .part-text {
     margin-bottom: 1;
 }
-
-.part-file {
-    color: #4A9EFF;
-}
-
-.part-agent {
-    color: #AB47BC;
-}
-
+/* 系统事件：重试、压缩、子任务、派发标记、引用文件、补丁摘要。
+   一律取次要文字那一档，靠行首那个「·」认出来是系统说的话，不靠颜色。
+   步骤分隔不画在界面上（见 `SimplePartView` 的 CSS），一条都不占行。 */
+.part-file,
+.part-agent,
 .part-step_start,
-.part-step_finish {
-    color: #555555;
-}
-
-.part-patch {
-    color: #66BB6A;
-}
-
-.part-subtask {
-    color: #FFA726;
-}
-
-.part-retry {
-    color: #EF6C00;
-}
-
+.part-step_finish,
+.part-patch,
+.part-subtask,
+.part-retry,
 .part-compaction {
-    color: #78909C;
+    color: #8B949E;
 }
 
 .part-error {
-    color: #E53935;
+    color: #C62828;
 }
 
-/* 收尾总结：一轮停下时给的那份交代，与压缩摘要同一档视觉重量 */
+/* 正文不使用强调色：收尾总结靠字重与上方留白，与普通回复分开 */
 .part-summary {
-    color: #4a9eff;
+    color: #E0E0E0;
+    text-style: bold;
+    margin-top: 1;
 }
 
 .part-reasoning.-hidden {
     display: none;
 }
 
-/* 状态栏：贴在最底部，左端项目路径，右端用量与快捷键提示 */
+/* 状态栏：贴在最底部。左端会话名、目录、分支与生成中标记，右端占比数字与快捷键提示，
+   最右是侧栏开关。整行取三级文字那一档，会话名不另外加粗——
+   这一行的每一段都是背景信息，没有哪一段需要抢注意力。 */
 #status-bar {
     height: 1;
     background: #0A0A0A;
@@ -429,14 +410,23 @@ ModalScreen {
     width: 1fr;
     height: 1;
     text-align: left;
+    text-wrap: nowrap;
+    overflow: hidden;
     text-overflow: ellipsis;
     color: #5A5A5A;
 }
 
+/* 占比数字左右各留一格，点开它的命中区域不至于只有两个字符宽。 */
 #status-usage {
     width: auto;
     height: 1;
-    color: #5A5A5A;
+    padding: 0 1;
+}
+
+/* 上下文占比可以点开看每一项的用量：悬停时铺一层浅底，告诉用户这一块能点。
+   数字的颜色由 Rich Text 自己给，CSS 的 color 盖不过它。 */
+#status-usage:hover {
+    background: #1A1A1A;
 }
 
 #status-keys {
@@ -446,6 +436,24 @@ ModalScreen {
     color: #4A4A4A;
 }
 
+/* 侧栏开关：未展开时与快捷键提示同一档暗色，展开时用主文字那一档。
+   宽度取 auto，文字在「◧ 侧栏」与「◨ 收起」之间切换时不会跳位太厉害。
+   这里不染色——展开只是显示状态，不是当前焦点。 */
+#side-toggle {
+    width: auto;
+    height: 1;
+    padding-left: 2;
+    color: #4A4A4A;
+}
+
+#side-toggle:hover {
+    color: #E0E0E0;
+}
+
+#side-toggle.-open {
+    color: #8B949E;
+}
+
 /* 命令面板 */
 #command-palette {
     align: center middle;
@@ -453,7 +461,7 @@ ModalScreen {
     max-width: 80;
     height: auto;
     max-height: 20;
-    background: #1A1A1A 85%;
+    background: #1A1A1A 92%;
     border: tall #4A9EFF;
     padding: 0 1;
 }
@@ -469,11 +477,13 @@ ModalScreen {
 }
 
 #palette-hint {
-    color: #666666;
+    color: #5A5A5A;
     height: 1;
 }
 
-/* 会话选择器、模型、主题、帮助、Diff */
+/* 会话选择器、模型、主题、帮助、Diff
+   弹窗本体取分层底那一档、留一点透明透出下层的形状；边框与输入框的框线都取分隔线那一档，
+   只有需要用户注意的那个弹窗（询问）才换成橙色边框 */
 #session-picker,
 #theme-selector,
 #tools-panel,
@@ -489,7 +499,7 @@ ModalScreen {
     max-width: 90;
     height: auto;
     max-height: 26;
-    background: #101010 85%;
+    background: #1A1A1A 92%;
     border: tall #4A9EFF;
     padding: 0 1;
 }
@@ -514,7 +524,7 @@ ModalScreen {
 #connection-hint,
 #permission-hint,
 #message-hint {
-    color: #666666;
+    color: #5A5A5A;
     height: 1;
 }
 
@@ -524,8 +534,47 @@ ModalScreen {
 }
 
 .message-line {
-    color: #CCCCCC;
+    color: #E0E0E0;
     height: auto;
+}
+
+/* 上下文占比的柱状图：贴底显示，底部留 1 行让开状态栏。
+   宽度按内容固定：条 24 + 间隔 2 + 类别 10 + 数字 7，再留出边框与内边距。 */
+ContextUsageScreen {
+    align: center bottom;
+}
+
+#context-usage-dialog {
+    width: 48;
+    max-width: 90%;
+    height: auto;
+    max-height: 22;
+    margin-bottom: 1;
+    background: #1A1A1A 92%;
+    border: tall #4A9EFF;
+    padding: 0 1;
+}
+
+#context-usage-title {
+    color: #4A9EFF;
+    height: 1;
+    text-style: bold;
+}
+
+#context-usage-window {
+    color: #8B949E;
+    height: 1;
+    margin-bottom: 1;
+}
+
+.context-usage-line {
+    height: 1;
+}
+
+#context-usage-hint {
+    color: #5A5A5A;
+    height: 1;
+    margin-top: 1;
 }
 
 #session-list,
@@ -533,6 +582,39 @@ ModalScreen {
 #tools-list {
     height: auto;
     max-height: 16;
+    /* 列表本身透明，透出弹窗那一层的底色；聚焦时 Textual 默认再叠一层 5% 的亮色，
+       这里一并关掉——聚焦的反馈由光标那一行的底色承担 */
+    background: transparent;
+    background-tint: transparent;
+}
+
+/* 光标所在行抬一档底色加粗。默认档是主题的主色填充，整行铺一条亮蓝，
+   与「当前会话」那一条蓝色标题撞在一起，两个含义分不开 */
+#session-list ListItem.-highlight,
+#theme-list ListItem.-highlight,
+#tools-list ListItem.-highlight {
+    background: #2A2A2A;
+    color: #E0E0E0;
+}
+
+#session-list ListItem.-hovered,
+#theme-list ListItem.-hovered,
+#tools-list ListItem.-hovered {
+    background: #2A2A2A;
+}
+
+/* 弹窗里的滚动条与消息区同一套三档。默认档取主题的 $scrollbar，是一道偏蓝的窄条，
+   在这条灰阶里对不上；轨道跟着所在面板的底色走 */
+#help-screen,
+#diff-overlay,
+#session-list,
+#theme-list,
+#tools-list,
+#message-body {
+    scrollbar-background: #1A1A1A;
+    scrollbar-color: #5A5A5A;
+    scrollbar-color-hover: #8B949E;
+    scrollbar-color-active: #E0E0E0;
 }
 
 /* 会话列表：两行一条，标题与元信息分开配色 */
@@ -562,7 +644,7 @@ ModalScreen {
 
 .theme-row {
     height: 1;
-    color: #CCCCCC;
+    color: #E0E0E0;
 }
 
 .theme-row.-current {
@@ -576,22 +658,28 @@ ModalScreen {
 
 .tool-row-title {
     height: 1;
-    color: #CCCCCC;
+    color: #E0E0E0;
     text-wrap: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-.tool-row-title.-off {
-    color: #666666;
-}
-
+/* 关掉的工具整行退一档：名字降到三级文字，说明降到四级。
+   说明是打开这个面板要看的东西，开着的那一行取次要文字那一档，整句读得清 */
 .tool-row-meta {
     height: 1;
-    color: #666666;
+    color: #8B949E;
     text-wrap: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.tool-row.-off .tool-row-title {
+    color: #5A5A5A;
+}
+
+.tool-row.-off .tool-row-meta {
+    color: #4A4A4A;
 }
 
 .session-row {
@@ -600,7 +688,7 @@ ModalScreen {
 
 .session-row-title {
     height: 1;
-    color: #CCCCCC;
+    color: #E0E0E0;
     overflow: hidden;
     text-overflow: ellipsis;
 }
@@ -612,7 +700,7 @@ ModalScreen {
 
 .session-row-meta {
     height: 1;
-    color: #666666;
+    color: #5A5A5A;
     overflow: hidden;
     text-overflow: ellipsis;
 }
@@ -629,16 +717,22 @@ ModalScreen {
 }
 
 #connection-error {
-    color: #FF6B6B;
+    color: #C62828;
     height: 1;
 }
 
-#connection-form Input {
-    background: #161616;
-    border: tall #30363D;
+/* 表单里的输入框比弹窗本体暗一档：弹窗是抬起来的一层，输入框是这一层上凹下去的一格。
+   重命名与派发两个弹窗的输入框同一种处理 */
+#connection-form Input,
+#rename-dialog Input,
+#spawn-dialog Input {
+    background: #0A0A0A;
+    border: tall #333333;
 }
 
-#connection-form Input:focus {
+#connection-form Input:focus,
+#rename-dialog Input:focus,
+#spawn-dialog Input:focus {
     border: tall #4A9EFF;
 }
 
@@ -657,7 +751,7 @@ ModalScreen {
 }
 
 #permission-detail {
-    color: #666666;
+    color: #5A5A5A;
     height: 1;
 }
 
@@ -670,8 +764,8 @@ ModalScreen {
 /* 参数预览：命令与路径单独框起来，超过八行自己滚动，弹窗不会被撑破。
    滚动条压到一列宽：默认两列会挤掉一行正文的右侧，读长命令时很碍事。 */
 #permission-argument {
-    background: #161616;
-    border: round #30363D;
+    background: #0A0A0A;
+    border: round #333333;
     padding: 0 1;
     height: auto;
     max-height: 8;
@@ -679,7 +773,7 @@ ModalScreen {
 }
 
 #permission-argument-text {
-    color: #E6EDF3;
+    color: #E0E0E0;
     height: auto;
 }
 
@@ -705,12 +799,12 @@ ModalScreen {
 
 #help-keys,
 #help-commands {
-    color: #CCCCCC;
+    color: #E0E0E0;
     height: auto;
 }
 
 #help-hint {
-    color: #666666;
+    color: #5A5A5A;
     height: 1;
 }
 
@@ -720,32 +814,8 @@ ModalScreen {
     padding: 0 1;
 }
 
-/* Toast 通知 */
-.toast {
-    height: auto;
-    margin: 0 1 1 0;
-    padding: 0 1;
-}
-
-.toast.info {
-    background: #1565C0;
-    color: #FFFFFF;
-}
-
-.toast.success {
-    background: #2E7D32;
-    color: #FFFFFF;
-}
-
-.toast.warning {
-    background: #EF6C00;
-    color: #FFFFFF;
-}
-
-.toast.error {
-    background: #C62828;
-    color: #FFFFFF;
-}
+/* Toast 通知的尺寸与四档底色写在 `vsagent/widgets/toast.py` 的 DEFAULT_CSS 里：
+   容器与提示条是一对，拆到两个文件里改一处漏一处。 */
 
 /* ------------------------------------------------------------------ */
 /* 子 agent                                                            */
@@ -762,45 +832,46 @@ ModalScreen {
 }
 
 #side-agents > .option-list--option {
-    height: 3;
+    height: 2;
     padding: 0;
-    color: #DDDDDD;
+    color: #8B949E;
 }
 
 #side-agents > .option-list--option-highlighted {
-    background: #1E3A5F;
-    color: #FFFFFF;
+    background: #1A1A1A;
+    color: #E0E0E0;
 }
 
 #side-agents-title {
     height: 1;
 }
 
-/* 子 agent 界面顶部的返回栏：整条可点，颜色与右栏的分节标题一致。 */
+/* 子 agent 界面顶部的返回栏：整条可点。底色取分层底，文字取次要文字那一档；
+   悬停时文字转主文字那一档——这里没有「选中」的含义，不用蓝色。 */
 #subagent-banner {
     height: 1;
-    background: #12263A;
-    color: #4A9EFF;
+    background: #1A1A1A;
+    color: #8B949E;
     padding: 0 1;
 }
 
 #subagent-banner:hover {
-    background: #1E3A5F;
-    color: #FFFFFF;
+    background: #1A1A1A;
+    color: #E0E0E0;
 }
 
-/* 「仅创建」留下的任务：整条可点，提示它还没开始 */
+/* 「仅创建」留下的任务：整条可点，橙色表示它在等人决定要不要开始 */
 #subagent-start {
     height: 1;
     display: none;
-    background: #16212E;
+    background: #1A1A1A;
     color: #FFB300;
     padding: 0 1;
 }
 
 #subagent-start:hover {
-    background: #1E3A5F;
-    color: #FFFFFF;
+    background: #1A1A1A;
+    color: #E0E0E0;
 }
 
 /* 派发模态 */
@@ -812,7 +883,7 @@ SpawnAgentScreen {
     width: 72;
     height: auto;
     max-height: 90%;
-    background: #141414;
+    background: #1A1A1A 92%;
     border: solid #333333;
     padding: 1 2;
 }
@@ -823,10 +894,12 @@ SpawnAgentScreen {
     text-style: bold;
 }
 
+/* 字段名与 /model 表单的标签同一档：它们是结构标签，
+   亮蓝只留给焦点与选中 */
 .spawn-label {
     height: 1;
     margin-top: 1;
-    color: #4A9EFF;
+    color: #8B949E;
 }
 
 #spawn-range {
@@ -840,33 +913,38 @@ SpawnAgentScreen {
 #spawn-arrow {
     width: 3;
     content-align: center middle;
-    color: #888888;
+    color: #8B949E;
 }
 
 #spawn-total {
     width: 1fr;
     content-align: right middle;
-    color: #888888;
+    color: #8B949E;
 }
 
 #spawn-preview {
     height: auto;
-    color: #888888;
+    color: #8B949E;
 }
 
 #spawn-task {
     height: 7;
+    background: #0A0A0A;
     border: solid #333333;
+    scrollbar-background: #0A0A0A;
+    scrollbar-color: #5A5A5A;
+    scrollbar-color-hover: #8B949E;
+    scrollbar-color-active: #E0E0E0;
 }
 
 #spawn-error {
     height: 1;
-    color: #EF5350;
+    color: #C62828;
 }
 
 #spawn-hint {
     height: 2;
-    color: #666666;
+    color: #5A5A5A;
 }
 
 #spawn-buttons {
@@ -874,6 +952,28 @@ SpawnAgentScreen {
     align-horizontal: right;
 }
 
+/* 派发弹窗的按钮：默认档取分层底与分隔线；主按钮取焦点蓝配深色字，
+   与询问弹窗那三个按键色块同一种做法。悬停时默认档抬一档底色，
+   主按钮把框线换成主文字那一档，不另造一个蓝 */
 #spawn-buttons Button {
     margin-left: 2;
+    background: #1A1A1A;
+    color: #E0E0E0;
+    border: tall #333333;
+}
+
+#spawn-buttons Button:hover {
+    background: #2A2A2A;
+    border: tall #4A4A4A;
+}
+
+#spawn-buttons Button.-primary {
+    background: #4A9EFF;
+    color: #0A0A0A;
+    border: tall #4A9EFF;
+}
+
+#spawn-buttons Button.-primary:hover {
+    background: #4A9EFF;
+    border: tall #E0E0E0;
 }

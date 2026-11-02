@@ -186,7 +186,6 @@ class EditorPane(Container):
         self.history: list[str] = []
         self._history_index = -1
         self._agent = "Build"
-        self._model = ""
         self._effort = "low"
         self._written: dict[str, str] = {}
         # esc 关掉命令补全之后，这一次输入不再弹窗，直到输入不再是命令前缀。
@@ -204,11 +203,12 @@ class EditorPane(Container):
                 # 看着像那一行变灰。运行中改这个开关不会立刻生效：`render_line` 有一层行缓存，
                 # 键里不含这个字段，也没有清缓存的钩子。只能在构造时传。
                 yield PromptInput(id="editor-input", highlight_cursor_line=False)
-                with Horizontal(id="editor-status"):
-                    # 这四个标签画的是 Agent 名称、模型名称与提示语，取值来自连接配置与状态文件，
+                # 状态行只在输入框有焦点时出现：失焦时用户是在读消息，
+                # 「哪个 Agent、哪个模型」不当紧，占着那一行只是把消息区挤短。
+                with Horizontal(id="editor-status", classes="-hidden"):
+                    # 这三个标签画的是 Agent 名称、推理强度与模式提示，取值来自状态文件，
                     # 关掉标签解析，模型名里带方括号时不会被当成标签吞掉。
                     yield Static(self._agent, id="editor-agent", markup=False)
-                    yield Static(self._model, id="editor-model", markup=False)
                     yield Static(self._effort, id="editor-effort", markup=False)
                     yield Static(self._hint_text(), id="editor-hint", markup=False)
 
@@ -217,22 +217,26 @@ class EditorPane(Container):
         self.input.focus()
 
     def on_descendant_focus(self) -> None:
-        """焦点进到这一块时点亮最左侧那条指示线。
+        """焦点进到这一块时点亮最左侧那条指示线，并显示状态行。
 
-        只给 `#editor-accent` 一个类，不碰 `#editor-pane` 自己的类：
+        只给 `#editor-accent` 一个类、只切换状态行的显示，不碰 `#editor-pane` 自己的类：
         改区块的类会让整块（连同输入区与状态行）重算样式再重绘，
         焦点每进出一次就闪一下。
         """
         self.accent.add_class("-focused")
+        self.status_line.remove_class("-hidden")
 
     def on_descendant_blur(self) -> None:
-        """焦点离开这一块时把指示线收回暗色。"""
+        """焦点离开这一块时把指示线收回暗色，状态行收起。"""
         self.accent.remove_class("-focused")
+        self.status_line.add_class("-hidden")
 
-    def update_context(self, *, agent: str, model: str, effort: str) -> None:
-        """刷新输入框下方状态行的 Agent、模型与推理强度。"""
+    def update_context(self, *, agent: str, effort: str) -> None:
+        """刷新状态行上的 Agent 与推理强度。
+
+        模型名不在这里：底部状态栏已经写着，两处都写反而要用户去核对哪一个是真的。
+        """
         self._agent = agent
-        self._model = model
         self._effort = effort
         self.refresh_status_line()
 
@@ -241,7 +245,6 @@ class EditorPane(Container):
         if not self.is_mounted:
             return
         self._write("#editor-agent", self._agent)
-        self._write("#editor-model", self._model)
         self._write("#editor-effort", self._effort)
         self._write("#editor-hint", self._hint_text())
 
@@ -260,6 +263,11 @@ class EditorPane(Container):
     def accent(self) -> Static:
         """最左侧那条 1 列宽的指示线。"""
         return self.query_one("#editor-accent", Static)
+
+    @property
+    def status_line(self) -> Horizontal:
+        """输入框下方那一行 Agent、推理强度与模式提示。"""
+        return self.query_one("#editor-status", Horizontal)
 
     @property
     def input(self) -> PromptInput:

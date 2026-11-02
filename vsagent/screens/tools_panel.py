@@ -95,11 +95,11 @@ class ToolsPanelScreen(ModalScreen[None]):
         """一行两段：名字（带开关标记）与说明。"""
         mark = ON_MARK if entry.enabled else OFF_MARK
         title = Static(f"{mark} {entry.name}", classes="tool-row-title", markup=False)
-        if not entry.enabled:
-            title.add_class("-off")
         text = f"  {summarize(entry.description)}{self._origin_text(entry)}"
         meta = Static(text, classes="tool-row-meta", markup=False)
-        return Vertical(title, meta, classes="tool-row")
+        # 关掉的状态记在整行上：名字与说明要一起退一档，只给名字加类的话
+        # 说明会比名字还亮，一行里读起来是反的
+        return Vertical(title, meta, classes="tool-row -off" if not entry.enabled else "tool-row")
 
     def _origin_text(self, entry: ToolEntry) -> str:
         """说明后面补一句「这条是谁关的」，只在不是项目配置时出现。"""

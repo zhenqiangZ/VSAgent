@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 root = Path(SPECPATH)
 
@@ -25,10 +25,18 @@ datas = [
 # `data/` 都得带。`subdir="data"` 收 12 个文件（4 个顶层 json + params 下 8 个 + metal_vdw.toml）。
 datas += collect_data_files("meeko", subdir="data")
 
+# PLIP 与 openbabel 的数据、动态库。冻结版里 `from plip.structure.preparation import
+# PDBComplex` 会抛 `ValueError: not enough values to unpack`，源码环境同一次导入正常；
+# 原因是 openbabel 的 data 文件与动态库没跟着进包。相互作用指纹要用的正是这一条，
+# 漏了它，页面上只剩几何接触与几何氢键。
+datas += collect_data_files("plip")
+datas += collect_data_files("openbabel")
+binaries = collect_dynamic_libs("openbabel")
+
 a = Analysis(
     [str(root / "vsagent" / "__main__.py")],
     pathex=[str(root)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=[],
     hookspath=[],

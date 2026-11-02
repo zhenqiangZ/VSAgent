@@ -58,14 +58,20 @@ window.vsWeb.fetchJson = fetchJson;
 
 function parseHash() {
   const raw = window.location.hash.replace(/^#\/?/, "");
-  const [page, param] = raw.split("/");
-  return { page: page || "history", param: decodeURIComponent(param || "") };
+  const [path, queryText = ""] = raw.split("?");
+  const segments = path.split("/").filter((item) => item.length > 0);
+  return {
+    page: segments[0] ? decodeURIComponent(segments[0]) : "history",
+    param: decodeURIComponent(segments[1] || ""),
+    segments: segments.slice(1).map((item) => decodeURIComponent(item)),
+    query: new URLSearchParams(queryText),
+  };
 }
 
 let mounted = null;
 
 async function render() {
-  const { page, param } = parseHash();
+  const { page, param, segments, query } = parseHash();
   const module = window.vsPages[page] || window.vsPages.history;
 
   for (const link of document.querySelectorAll(".nav-link")) {
@@ -80,7 +86,7 @@ async function render() {
   const view = document.getElementById("app-view");
   view.innerHTML = "";
   try {
-    mounted = await module.mount(view, param);
+    mounted = await module.mount(view, param, query, segments);
   } catch (error) {
     const box = document.createElement("div");
     box.className = "page-error";

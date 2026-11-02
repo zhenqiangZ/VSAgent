@@ -2816,8 +2816,10 @@ def cmd_fit(args: argparse.Namespace) -> int:
         print("训练跑完了但没拿到 FIT_RESULT，检查 " + str(work / "out"), file=sys.stderr)
         return 1
 
-    print(f"\n完成（{elapsed:.0f}s）：验证 RMSE {result['best_val_rmse']}，"
-          f"checkpoint {result['checkpoint']}")
+    spearman = result.get("best_val_spearman")
+    print(f"\n完成（{elapsed:.0f}s）：验证 RMSE {result['best_val_rmse']}"
+          + (f"、Spearman ρ {spearman}" if spearman is not None else "")
+          + f"，checkpoint {result['checkpoint']}")
     print(f"下一步：python tools/retro_affinity.py run --target {target} --arm t1 --fit-tag {tag}")
     return 0
 

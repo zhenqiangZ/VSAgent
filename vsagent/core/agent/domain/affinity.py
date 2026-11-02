@@ -95,24 +95,39 @@ LOG_EXCERPT_LINES = 20
 # ---------------------------------------------------------------------------
 # 外部环境与路径
 # ---------------------------------------------------------------------------
-def default_dta_root() -> Path:
-    """仓根的 `models/DTA`。
+def dta_root_candidates() -> list[Path]:
+    """DTA 目录的候选位置，按优先级排列。
 
-    **模型代码不在包内**：`check_chemistry_gate` 用 `rglob("*.py")` 扫整个
-    `vsagent/`，DTA 有 45 处顶层的 torch / rdkit 导入，放进包里那条断言
-    当场就红；PyInstaller 还会顺着 collect 把 54MB 数据拖进 exe。放 `models/`
-    是为了既不进包、又不散落在仓库外面——整个目录被 `.gitignore` 挡住。
+    源码运行时仓根与当前目录都可能；打包之后 `__file__` 指向 `/tmp/_MEI...`，
+    所以先看 exe 所在目录。安装时把 `models/DTA` 放在 exe 旁边，权重与 venv
+    都不进包。
     """
-    return Path(__file__).resolve().parents[4] / "models" / "DTA"
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / "models" / "DTA")
+    else:
+        candidates.append(Path(__file__).resolve().parents[4] / "models" / "DTA")
+    candidates.append(Path.cwd() / "models" / "DTA")
+    return candidates
+
+
+def default_dta_root() -> Path:
+    """第一个候选位置。真正的查找在 `dta_root()` 里做。"""
+    return dta_root_candidates()[0]
 
 
 def dta_root() -> Path:
-    """DTA 子项目的根。默认是仓根的 `models/DTA`，可用 `VSA_DTA_ROOT` 覆盖。"""
+    """DTA 子项目的根。顺序：`VSA_DTA_ROOT` → exe 旁 → 仓根 → 当前目录。"""
     raw = os.environ.get(ROOT_ENV, "").strip()
-    root = Path(raw).expanduser() if raw else default_dta_root()
-    if not (root / "virtual_screen.py").is_file():
-        raise ToolError(f"找不到 DTA/virtual_screen.py：{root}。{INSTALL_HINT}")
-    return root
+    if raw:
+        candidates = [Path(raw).expanduser()]
+    else:
+        candidates = dta_root_candidates()
+    for candidate in candidates:
+        if (candidate / "virtual_screen.py").is_file():
+            return candidate
+    tried = "、".join(str(item) for item in candidates)
+    raise ToolError(f"找不到 DTA/virtual_screen.py。试过：{tried}。{INSTALL_HINT}")
 
 
 def dta_python() -> str:
@@ -141,6 +156,25 @@ def dta_python() -> str:
     raise ToolError(
         f"没有找到 DTA 的解释器（试过 {root}/.venv 与 {root.parent}/.venv-dta）。"
         f"{INSTALL_HINT}")
+
+
+def dta_readiness() -> tuple[bool, str]:
+    """环境能不能用，给 `assess_campaign` 的一行。
+
+    只看路径，不导入 torch：盘点工具是常驻的，每一步都可能调。
+    """
+    try:
+        root = dta_root()
+        python = dta_python()
+    except ToolError as error:
+        return False, str(error)
+    weights = Path(
+        os.environ.get("VSA_DTA_WEIGHTS", "").strip() or (root / "weights")
+    ).expanduser()
+    for name in ("esm2_t33_650M_UR50D", "ChemBERTa-77M-MTR"):
+        if not (weights / name).is_dir():
+            return False, f"权重缺 {weights / name}"
+    return True, f"{root}（{python}，权重 {weights}）"
 
 
 def scorings_dir() -> Path:
@@ -580,14 +614,18 @@ class ScoreAffinityTool(Tool):
     spec = ToolSpec(
         name="score_affinity",
         description=(
-            "用 VCrossFormer 给**已准备**的受体与配体预测结合亲和力（pK）。"
-            "**分数越高越好**（pK 越大结合越强），与 dock 的 kcal/mol 方向相反；"
-            "只能在同一受体、同一 aff_unit 条件下比较，不能跨靶点比较。"
-            "这是模型预测值，不是实验值，也不是对接打分。"
-            "需要 DTA 的独立 Python 环境（torch + dgl）；缺环境时返回安装指引，不抛异常。\n"
-            "可以用 `model` 换成 fit_affinity 微调出来的模型（同靶点、同口袋的那一份）。"
-            "默认 aff_unit=Ki、pocket_radius=10、limit=50、整批超时 900 秒；"
-            "参数由用户决定，不要自己改。"
+            "DTA 通道的第二段：用 `fit_affinity` 微调后的模型，给**已准备**的受体与配体"
+            "预测结合亲和力（pK）。**分数越高越好**（pK 越大结合越强），与 dock 的"
+            "kcal/mol 方向相反；只能在同一受体、同一模型、同一 aff_unit 条件下比较，"
+            "不能跨靶点或跨口袋比较。pK 是预测值，不是实验值。\n"
+            "**适用**：与 dock 同一批位姿、同一受体、同一口袋，对前 50 条做第二路证据；"
+            "与 dock 名次对照，找两路一致与背离的分子。\n"
+            "**局限**：只对训练时的口袋有效；对训练集覆盖不到的化学型外推弱；"
+            "40–100 个活性时排序力有限，结论要报样本量；不能与 dock 的分数直接比大小。\n"
+            "`model` 是必填参数，来自 `fit_affinity` 的 artifact（kind=model）。"
+            "先用该靶点的实测活性微调，再推理；零样本不进入流程。"
+            "需要 DTA 的独立 Python 环境（torch + dgl）；缺环境时返回安装指引，不抛异常。"
+            "默认 aff_unit=Ki、pocket_radius=10、limit=50、整批超时 900 秒。"
             "单条失败不中断整批，失败原因逐条写进 manifest。"
         ),
         parameters={
@@ -632,12 +670,12 @@ class ScoreAffinityTool(Tool):
                 "model": {
                     "type": "string",
                     "description": (
-                        "可选：用 fit_affinity 微调出来的模型（artifact#7，kind=model）。"
-                        "给出时用它自己的权重与口袋打分，而不是预训练权重"
+                        "必填：fit_affinity 产出的模型 artifact（kind=model）。"
+                        "用它自己的权重与口袋打分。先微调再推理，零样本不进入流程"
                     ),
                 },
             },
-            "required": ["receptor", "ligands"],
+            "required": ["receptor", "ligands", "model"],
             "additionalProperties": False,
         },
     )
@@ -668,6 +706,15 @@ class ScoreAffinityTool(Tool):
                 output="缺少参数 ligands。先 list_workspace 看清有哪份已准备的配体集。",
                 failed=True,
             )
+        raw_model = str(arguments.get("model") or "").strip()
+        if not raw_model:
+            return ToolResult(
+                output=(
+                    "缺少参数 model。DTA 通道要先 fit_affinity 用该靶点的实测活性微调，"
+                    "再把产出的 artifact 传给 score_affinity；零样本不进入流程。"
+                ),
+                failed=True,
+            )
 
         try:
             params = _params(arguments)
@@ -682,9 +729,7 @@ class ScoreAffinityTool(Tool):
             root = dta_root()
             receptor_pdb, center = _receptor_inputs(receptor_entry)
             source_kind, records = _ligand_records(ligand_entry)
-            model_entry, model_config, model_pocket = _model_inputs(
-                ledger, arguments.get("model")
-            )
+            model_entry, model_config, model_pocket = _model_inputs(ledger, raw_model)
         except Exception as error:          # LedgerError / ToolError / OSError
             return ToolResult(output=str(error), failed=True)
 

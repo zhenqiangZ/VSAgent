@@ -30,6 +30,7 @@ spec 的字段见 `finetune.build_spec`。
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import json
 import os
@@ -160,7 +161,7 @@ def build_db(config_path: Path) -> None:
     db.close_db()
 
 
-def train(config_path: Path, *, head_only: bool) -> tuple[Path | None, float]:
+def train(config_path: Path, *, head_only: bool) -> tuple[Path | None, float, int]:
     import torch
     from omegaconf import OmegaConf
     from task.task import Task
@@ -198,7 +199,31 @@ def train(config_path: Path, *, head_only: bool) -> tuple[Path | None, float]:
         infer_cfg = _OC.load(config_path)
         infer_cfg.model.load_model_path = str(checkpoint)
         _OC.save(infer_cfg, Path(cfg.model.model_save_path).parent / "config.infer.yaml")
-    return checkpoint, float(best_rmse)
+    return checkpoint, float(best_rmse), int(best_epoch)
+
+
+def val_spearman(out_dir: Path, epoch: int) -> float | None:
+    """选中那个 epoch 的验证集 Spearman。
+
+    训练循环把每个 epoch 的指标追加进 `training_results_<时间戳>.csv`，其中
+    `val_Spearman` 是排序力。**RMSE 只说绝对尺度对不对**：`mode=head` 能把 RMSE
+    从 1.66 压到 1.16，而 ρ 反而从 0.077 掉到 0.045。选中哪个 checkpoint 由
+    RMSE 决定，所以指标要按 epoch 对齐，取最后一行的值是错的。
+
+    没有这份 CSV（旧版本、debug 模式）时返回 None，摘要里就不提这一项。
+    """
+    # 新的在前：同一个目录里如果留了几次训练的 CSV，要读的是刚跑完那次。
+    paths = sorted(out_dir.glob("training_results_*.csv"), key=lambda p: p.stat().st_mtime)
+    for path in reversed(paths):
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if row.get("epoch") != str(epoch):
+                    continue
+                value = row.get("val_Spearman")
+                if value in (None, ""):
+                    return None
+                return round(float(value), 4)
+    return None
 
 
 def main() -> int:
@@ -216,11 +241,15 @@ def main() -> int:
     pocket_pkl, smi_pkl = build_embeddings(spec)
     config_path = write_config(spec, pocket_pkl, smi_pkl)
     build_db(config_path)
-    checkpoint, best_rmse = train(config_path, head_only=bool(spec.get("head_only", True)))
+    checkpoint, best_rmse, best_epoch = train(
+        config_path, head_only=bool(spec.get("head_only", True))
+    )
 
     result = {
         "checkpoint": None if checkpoint is None else str(checkpoint),
         "best_val_rmse": round(best_rmse, 4),
+        "best_val_spearman": val_spearman(out_dir / "runs", best_epoch),
+        "best_epoch": best_epoch,
         "config": str(config_path),
         "head_only": bool(spec.get("head_only", True)),
         "epochs": int(spec.get("epochs", 30)),

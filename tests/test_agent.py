@@ -306,7 +306,29 @@ COMPACT_WINDOW = 18_000
 
 # 领域工具的名字，**从装配处算出来**而不是手抄一份：抄一份的话，加了工具而忘了
 # 更新这里，断言会一直通过，而它要挡的恰好就是「写了却没装」。
+def _debug_tool_modules() -> list[tuple[str, list[Tool]]]:
+    """`domain` 包里带 `domain_tools()` 的模块，与 `debug_tools._tool_modules` 同一份遍历。"""
+    import importlib
+
+    import vsagent.core.agent.domain as package
+
+    found: list[tuple[str, list[Tool]]] = []
+    for name in package.__all__:
+        module = importlib.import_module(f"{package.__name__}.{name}")
+        maker = getattr(module, "domain_tools", None)
+        if callable(maker):
+            found.append((name, maker()))
+    return found
+
+
 DOMAIN_TOOL_NAMES = [tool.spec.name for tool in all_domain_tools()]
+
+# `domain` 包里全部模块的工具，比上面多一个：`assess_campaign` 常驻、不登记族
+# （它决定这一轮装哪几族，自己先要装族就反了），所以不在按族装的清单里。
+# 调试脚本的覆盖判据用它——那个工具同样要端到端跑过一遍。
+DOMAIN_PACKAGE_TOOL_NAMES = [
+    tool.spec.name for _name, tools in _debug_tool_modules() for tool in tools
+]
 
 CHECKS: list[str] = []
 
@@ -920,7 +942,7 @@ def check_trace() -> None:
 
 
 def check_rules() -> None:
-    """项目规则文件的读取、截断与每轮重读。"""
+    """项目规则文件的读取与每轮重读。"""
     RULES_FIXTURE.mkdir(parents=True, exist_ok=True)
     path = RULES_FIXTURE / "AGENTS.md"
     path.unlink(missing_ok=True)
@@ -935,14 +957,14 @@ def check_rules() -> None:
     path.write_text("# 改过之后的规则\n", encoding="utf-8")
     check("改过之后的规则" in project_rules(RULES_FIXTURE), "每轮重新读，改动立刻生效")
 
-    # 超限不再截一半：截断处会被模型当成规则的结尾，后面的门禁它根本不知道有。
+    # 规则文件不设大小上限：整份注入，不从开头截一段。
+    # 截断处会被模型当成规则的结尾，后面的门禁它根本不知道有。
     lines = [f"第 {index} 行" + "字" * 40 for index in range(819)]
     path.write_text("\n".join(lines), encoding="utf-8")
-    over = project_rules(RULES_FIXTURE)
-    check("没有注入" in over, f"超限时明说本次没有注入：{over}")
-    check("AGENTS.md" in over, "并写明是哪个文件，模型才知道该去读谁")
-    check("第 0 行" not in over, "超限时不给半份规则")
-    check(len(over.encode("utf-8")) < 400, f"替代提示本身要短：{len(over)} 字节")
+    big = project_rules(RULES_FIXTURE)
+    check(big.startswith("第 0 行"), "大文件从第一行开始注入")
+    check(big.endswith("第 818 行" + "字" * 40), "最后一行也在，没有截断")
+    check(len(big.encode("utf-8")) > 32 * 1024, f"这份样例确实超过原先的 32KB：{len(big.encode('utf-8'))} 字节")
 
     # 读不出来只让这一段缺席，不能让整轮挂掉：`stable_prefix` 在装配之前调，那里没有 try。
     path.write_bytes(b"\xff\xfe\x00bad")
@@ -1016,6 +1038,18 @@ def check_prefix() -> None:
         f"前缀点名的核心工具首步可见：{core_named}",
     )
     check("load_tools" in bare, "前缀说明工具按族加载，否则模型不知道怎么装")
+    check(
+        "没有地址就不要发这段描述" in bare,
+        "呈现纪律写明：具体的结构描述必须带页面地址",
+    )
+    check(
+        "write_run" in bare and "open_viewer" in bare,
+        "呈现纪律点名两个常驻工具（它们不属于任何族）",
+    )
+    check(
+        "scoring 族" in bare and "微调" in bare,
+        "打分纪律写明两路与 DTA 的微调后推理",
+    )
 
 
 def build_permission_registry(disabled: frozenset[str] | None = None) -> ToolRegistry:
@@ -1533,7 +1567,7 @@ def check_disabled_tools() -> None:
         live.register(tool)
     check(live.get("search_pdb") is None, "配置里关掉的领域工具，装配时真没进来")
     check(
-        live.get("search_literature") is not None and live.get("write_run") is not None,
+        live.get("search_literature") is not None and live.get("dock") is not None,
         "没在配置里点名的工具照旧装上",
     )
     check(
@@ -1541,7 +1575,7 @@ def check_disabled_tools() -> None:
         "被关的工具不在请求体的 tools 数组里（模型看不到它）",
     )
     check(
-        set(DOMAIN_TOOL_NAMES) - set(live.names()) == {"search_pdb"},
+        {tool.spec.name for tool in all_domain_tools()} - set(live.names()) == {"search_pdb"},
         "少的正好是那一个，没有连带别的",
     )
     path.unlink(missing_ok=True)
@@ -2320,8 +2354,11 @@ def check_prompt() -> None:
     )
     # 子 agent 在 37 步里一次都没被派过：前缀全文不含 spawn_agent，模型只在
     # 工具清单的一行 description 里见过它——那句话只在「已经想到要用」时才有用。
-    check("该派子 agent" in system_prompt, "前缀里有父会话视角的派发规则")
-    check("spawn_agent" in system_prompt, "派发规则点到具体工具名")
+    # 触发条件与盘点写在同一段：什么时候该派取决于口袋是否唯一、候选结构有几个。
+    check(
+        "候选结构 ≥3" in system_prompt and "spawn_agent" in system_prompt,
+        "前缀里有父会话视角的派发规则，且点到具体工具名",
+    )
     check(
         "子 agent 看不到你的推理" in system_prompt,
         "写清了「什么时候不该派」：子任务依赖当前推理时不该派",
@@ -2337,7 +2374,7 @@ def check_prompt() -> None:
         "本地没有时给出去处：PubMed 与联网搜索都点到名字",
     )
     check(
-        "本地语料与 PubMed 都没有查到" in system_prompt,
+        "明说没查到" in system_prompt,
         "查不到时要说「没查到」，不是「没有这回事」",
     )
     # 规则里点名的检索工具必须真的能装。规则教模型去调一个装不进来的工具，
@@ -3497,14 +3534,16 @@ async def check_overflow_phase(server: FakeModelServer) -> None:
     bus = EventBus()
     registry = ToolRegistry()
     registry.register(EchoTool())
-    # 24K 而不是 20K：20K 时这一份会话正好卡在边界上——封出来的事件块只有 110 token，
-    # 而前缀涨了 180 token（阶段纪律 + close_phase 的说明）就把那 110 挤出去了，
-    # 降级链于是先丢掉事件层（它排在 RECENT 之前）。要验的是「封存之后流水进场」，
-    # 不是「正好差一个 token 时先丢谁」，所以把窗口放宽到能容下那 110 token。
-    loop = build_loop(server, bus, registry, context_window=24_000)
-
     constraint = "约束：所有报告用中文写，分子编号保留原始大小写。"
     session = Session(id="ses_phase", title="阶段压缩")
+    # 窗口按前缀现算，不写固定数：这一份会话要造出「装不下」的局面，而前缀一涨，
+    # 固定窗口就会先丢掉事件层（降级链里它排在 RECENT 之前），这条判据于是假红。
+    # 规则文件 2026-10-31 从 843 涨到 2059 token，固定 24K 就是这么失效的。
+    # 24_900 是这份 31 条消息刚好溢出、又容得下事件块的余量。
+    prefix_tokens = estimate_tokens(
+        stable_prefix(Workspace(session.id, root=ROOT), session)
+    )
+    loop = build_loop(server, bus, registry, context_window=prefix_tokens + 24_900)
     ask(session, constraint)
     filler = "分子筛选过程的中间记录，" + "记" * 500
     for index in range(30):
@@ -4356,6 +4395,11 @@ async def check_live_app(server: FakeModelServer) -> None:
             all(app.agent.registry.get(name) is not None for name in DOMAIN_TOOL_NAMES),
             "界面这一侧把领域工具也装上了（写了却没装 = 模型看不见，"
             f"而这在界面上完全看不出来）：缺 {[n for n in DOMAIN_TOOL_NAMES if app.agent.registry.get(n) is None]}",
+        )
+        check(
+            app.agent.registry.get("write_run") is not None
+            and app.agent.registry.get("open_viewer") is not None,
+            "呈现工具常驻核心，不靠 load_tools 装族",
         )
         check(
             [spec["function"]["name"] for spec in app.agent.registry.specs()][:3]
@@ -6348,8 +6392,45 @@ async def check_affinity() -> None:
         affinity_module.dta_root = lambda: work / "DTA"
         affinity_module.run_batch = fake_run_batch
 
-        tool = affinity_module.ScoreAffinityTool()
+        raw_tool = affinity_module.ScoreAffinityTool()
         ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+
+        # 这一轮起 model 是必填：先造一份模型 artifact，下面所有打分都带上它。
+        model_dir = work / "model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model_config = model_dir / "config.infer.yaml"
+        model_pocket = model_dir / "pocket.pdb"
+        model_config.write_text("MODEL\n", encoding="utf-8")
+        model_pocket.write_text("ATOM\n", encoding="utf-8")
+        model = ledger.add(
+            "artifact",
+            path=model_dir,
+            summary="fine-tuned model",
+            fingerprint=fingerprint_path(model_dir),
+            meta={
+                "kind": "model",
+                "config": str(model_config),
+                "pocket": str(model_pocket),
+            },
+        )
+
+        class ScoreWithModel:
+            """测试里的便捷外壳：每次打分自动补上 model，省得十几处重复。"""
+
+            def __init__(self, inner):
+                self.inner = inner
+
+            @property
+            def spec(self):
+                return self.inner.spec
+
+            async def execute(self, arguments, context=None):
+                return await self.inner.execute(
+                    {"model": str(model.handle), **arguments}, context=context
+                )
+
+        scored = ScoreWithModel(raw_tool)
+        tool = scored
 
         receptor_dir = work / "receptor"
         receptor_dir.mkdir(parents=True, exist_ok=True)
@@ -6457,12 +6538,17 @@ async def check_affinity() -> None:
         argv = runs[-1]
         check(argv[0] == "/fake/python", "用解析到的解释器跑")
         check(argv[1].endswith("virtual_screen.py"), f"跑 DTA 的批量入口：{argv[1]}")
-        for flag in ("--receptor", "--pocket-center", "--pocket-radius",
-                     "--tasks", "--output", "--aff_unit", "--device"):
+        for flag in ("--pocket", "--tasks", "--output", "--aff_unit", "--device"):
             check(flag in argv, f"命令里有 {flag}")
-        check("--pocket" not in argv, "给了 receptor 就不再传 --pocket")
-        center = argv[argv.index("--pocket-center") + 1]
-        check(center == "1,2,3", f"口袋中心来自受体的 box.txt：{center}")
+        check(
+            all(flag not in argv for flag in ("--receptor", "--pocket-center", "--pocket-radius")),
+            "给了 model 就用模型训练时的口袋，不再从 box.txt 现截",
+        )
+        pocket_path = argv[argv.index("--pocket") + 1]
+        check(
+            pocket_path == str(model_pocket),
+            f"--pocket 指向模型自己的口袋：{pocket_path}",
+        )
 
         # ---- 四、limit ----
         limited = await tool.execute(
@@ -6632,8 +6718,8 @@ async def check_affinity() -> None:
         # ---- 十、参数与装配 ----
         properties = tool.spec.parameters.get("properties") or {}
         check(
-            tool.spec.parameters.get("required") == ["receptor", "ligands"],
-            "receptor 与 ligands 是必填",
+            tool.spec.parameters.get("required") == ["receptor", "ligands", "model"],
+            "receptor、ligands、model 都是必填",
         )
         check("ledger" not in properties, "参数模式里不列 ledger")
         check(
@@ -6647,6 +6733,14 @@ async def check_affinity() -> None:
         check(
             empty.failed and "缺少参数 receptor" in empty.output,
             f"空调用被拦下：{empty.output}",
+        )
+        missing_model = await raw_tool.execute(
+            {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle)},
+            context=ledger,
+        )
+        check(
+            missing_model.failed and "model" in missing_model.output,
+            f"零样本被拦下：{missing_model.output}",
         )
         missing_ledger = await tool.execute(
             {"receptor": str(receptor.handle), "ligands": str(ligand_set.handle)},
@@ -8744,8 +8838,20 @@ async def check_rank_candidates() -> None:
         # ---- 三、分档 ----
         counts = payload["counts"]
         check(sum(counts.values()) == len(payload["rows"]), f"四档之和等于行数：{counts}")
-        check(counts["high"] == 1, f"5 条时高档至少一条：{counts}")
+        # A 与 D 的对接分都是 -9.0，落在同一个并列组里；组内档位取最高，所以高档是两条。
+        # 1.0 kcal/mol 以内读不出差别（Vina 的标准误约 2.5），这正是并列组的由来。
+        check(counts["high"] == 2, f"A 与 D 并列，高档两条：{counts}")
         check(rows["A"]["tier"] == "high", f"榜首是 high：{rows['A']['tier']}")
+        check(rows["D"]["tier"] == "high", f"并列组内档位取最高：{rows['D']['tier']}")
+        check(
+            rows["A"]["tie"] and rows["A"]["tie"] == rows["D"]["tie"],
+            f"A 与 D 是同一个并列组：{rows['A']['tie']!r} / {rows['D']['tie']!r}",
+        )
+        check(
+            rows["B"]["tie"] == "",
+            f"D 与 B 差 1.0，刚好不到并列的线：{rows['B']['tie']!r}",
+        )
+        check(payload["tie_delta"] == 1.0, f"并列阈值写进产物：{payload.get('tie_delta')}")
         check(
             analysis_module._gate_failures({"redock_rmsd": 2.4}) == ["redock_rmsd=2.4>2"],
             "门禁阈值是写死的，不由模型给",
@@ -8822,7 +8928,7 @@ async def check_rank_candidates() -> None:
         )
         csv_text = (entry.path / analysis_module.CANDIDATES_CSV).read_text(encoding="utf-8")
         check(
-            csv_text.splitlines()[0].startswith("id,name,smiles,consensus_rank,tier,dock"),
+            csv_text.splitlines()[0].startswith("id,name,smiles,consensus_rank,tier,tie,dock"),
             f"CSV 表头：{csv_text.splitlines()[0]}",
         )
 
@@ -12857,6 +12963,230 @@ def _two_ligand_pdb() -> str:
         )
     lines.append("END")
     return "".join(lines)
+
+
+async def check_survey() -> None:
+    """结构全景：命中总数、全部取回、按配体分组、标题点名优先、产物与登记。
+
+    这一组盯的是 `ses_0014` 那个毛病的反面：拿到「命中 44 条」之后只看了 3 条，
+    就按名称（`TTX`）查了一次 0 条，把「没有参考构象」写进结论。所以这里不查
+    单个条目，查的是**分母有没有被摊开**：总数、每组套数、谁在标题里被点名。
+    """
+    import json as _json
+    import shutil
+    import tempfile
+    from pathlib import Path as _Path
+
+    from vsagent.core.agent.domain import http as http_module
+    from vsagent.core.agent.domain import rsearch as rsearch_module
+    from vsagent.core.agent.domain import survey as survey_module
+    from vsagent.core.agent.ledger import SessionLedger
+
+    tmp = _Path(tempfile.mkdtemp(prefix="vsa-survey-"))
+    original_dir = rsearch_module.search_dir
+    original_survey = survey_module.surveys_dir
+    original_post = http_module.post_json
+    original_get = http_module.get_json
+    original_text = http_module.get_text
+    rsearch_module.search_dir = lambda: tmp / "search"
+    survey_module.surveys_dir = lambda: tmp / "surveys"
+
+    ids = ["6J8I", "6J8G", "7W9K", "2EB2"]
+
+    def poly(entity_id, description, accession):
+        return {
+            "rcsb_id": entity_id,
+            "rcsb_polymer_entity": {"pdbx_description": description},
+            "rcsb_polymer_entity_container_identifiers": {"uniprot_ids": [accession]},
+        }
+
+    def comp(code, name):
+        return {
+            "nonpolymer_comp": {
+                "chem_comp": {
+                    "id": code,
+                    "name": name,
+                    "type": "non-polymer",
+                    "formula_weight": 300.0,
+                }
+            }
+        }
+
+    entries = {
+        # 河豚毒素那一套：代号 9SR，标题里写着 tetrodotoxin。
+        "6J8I": {
+            "rcsb_id": "6J8I",
+            "struct": {"title": "Nav1.7 with tetrodotoxin"},
+            "rcsb_entry_info": {
+                "nonpolymer_entity_count": 2,
+                "experimental_method": "ELECTRON MICROSCOPY",
+                "resolution_combined": [3.2],
+            },
+            "polymer_entities": [
+                poly("6J8I_1", "Sodium channel protein type 9 subunit alpha", "Q15858"),
+                poly("6J8I_2", "Sodium channel subunit beta-1", "Q07699"),
+            ],
+            "nonpolymer_entities": [
+                comp("9SR", "(1R,5R)-3-amino-14-(hydroxymethyl)-pentol"),
+                comp("NAG", "2-acetamido-2-deoxy-beta-D-glucopyranose"),
+            ],
+        },
+        "6J8G": {
+            "rcsb_id": "6J8G",
+            "struct": {"title": "Nav1.7 with saxitoxin"},
+            "rcsb_entry_info": {
+                "nonpolymer_entity_count": 2,
+                "experimental_method": "ELECTRON MICROSCOPY",
+                "resolution_combined": [3.2],
+            },
+            "polymer_entities": [
+                poly("6J8G_1", "Sodium channel protein type 9 subunit alpha", "Q15858"),
+                poly("6J8G_2", "Sodium channel subunit beta-1", "Q07699"),
+            ],
+            "nonpolymer_entities": [
+                comp("9SL", "[(3aS,4R,10aS)-2,6-diamino-purin-4-yl]methyl carbamate"),
+                comp("NAG", "2-acetamido-2-deoxy-beta-D-glucopyranose"),
+            ],
+        },
+        # 只有脂质的一套：标题里没有配体名，套数最多但排不到前面。
+        "7W9K": {
+            "rcsb_id": "7W9K",
+            "struct": {"title": "Nav1.7-beta1-beta2 complex"},
+            "rcsb_entry_info": {
+                "nonpolymer_entity_count": 2,
+                "experimental_method": "ELECTRON MICROSCOPY",
+                "resolution_combined": [2.2],
+            },
+            "polymer_entities": [
+                poly("7W9K_1", "Sodium channel protein type 9 subunit alpha", "Q15858"),
+                poly("7W9K_2", "Sodium channel subunit beta-1", "Q07699"),
+            ],
+            "nonpolymer_entities": [
+                comp("Y01", "CHOLESTEROL HEMISUCCINATE"),
+                comp("LPE", "LPC-ETHER"),
+            ],
+        },
+        # 无配体的一套。
+        "2EB2": {
+            "rcsb_id": "2EB2",
+            "struct": {"title": "EGFR kinase domain"},
+            "rcsb_entry_info": {
+                "nonpolymer_entity_count": 0,
+                "experimental_method": "X-RAY DIFFRACTION",
+                "resolution_combined": [2.5],
+            },
+            "polymer_entities": [
+                poly("2EB2_1", "Epidermal growth factor receptor", "P00533"),
+            ],
+            "nonpolymer_entities": [],
+        },
+    }
+
+    names = {"9SR": "Tetrodotoxin", "9SL": "Saxitoxin"}
+
+    def post_json(url, payload, **kwargs):
+        if "rcsbsearch" in url:
+            return {
+                "total_count": len(ids),
+                "result_set": [{"identifier": pid} for pid in ids],
+            }
+        if "graphql" in url:
+            wanted = payload.get("variables", {}).get("ids", [])
+            return {"data": {"entries": [entries[pid] for pid in wanted if pid in entries]}}
+        raise AssertionError(f"没预料到的 POST：{url}")
+
+    def get_json(url, params=None, **kwargs):
+        if "chemcomp" not in url:
+            raise AssertionError(f"没预料到的 GET：{url}")
+        code = url.rsplit("/", 1)[-1]
+        synonyms = (
+            [{"type": "Preferred Name", "name": names[code]}] if code in names else None
+        )
+        return {
+            "chem_comp": {"id": code, "name": names.get(code, code)},
+            "rcsb_chem_comp_synonyms": synonyms,
+        }
+
+    def get_text(url, **kwargs):
+        raise AssertionError(f"结构全景不该下载任何坐标：{url}")
+
+    http_module.post_json = post_json
+    http_module.get_json = get_json
+    http_module.get_text = get_text
+
+    try:
+        ledger = SessionLedger(session_id="", snapshot_path=tmp / "ledger.json")
+        tool = survey_module.SurveyStructuresTool()
+
+        # ---- 1. 摊开分母：命中几套、取回几套、按配体分几组 ----
+        result = await tool.execute({"accession": "Q15858"}, context=ledger)
+        check(not result.failed, f"全景跑通：{result.output[:200]}")
+        check(result.meta["total"] == 4, f"报命中总数：{result.meta['total']}")
+        check(result.meta["count"] == 4, f"全部取回：{result.meta['count']}")
+        check("全部取回" in result.output, f"正文写明没有抽样：{result.output[:120]}")
+        check(result.meta["groups"] == 4, f"四组配体：{result.meta['groups']}")
+
+        # ---- 2. 名称来自化学组分字典，代号与名称一起给 ----
+        check("9SR Tetrodotoxin" in result.output, f"9SR 的常用名要显示：{result.output}")
+        check("9SL Saxitoxin" in result.output, f"9SL 的常用名要显示：{result.output}")
+
+        # ---- 3. 标题点名过的排在脂质前面 ----
+        check("★" in result.output, f"标题点名的组要有标记：{result.output}")
+        star = result.output.index("9SR")
+        lipid = result.output.index("Y01")
+        check(star < lipid, "标题点名的配体排在按套数排的脂质前面")
+
+        # ---- 4. 添加剂、其他链、无配体各归各的 ----
+        check("添加剂与离子" in result.output and "NAG 2 套" in result.output,
+              f"糖归到添加剂那一节：{result.output}")
+        check("Sodium channel subunit beta-1" in result.output, "其他聚合物链单列")
+        check("无配体：1 套" in result.output, f"无配体单独报：{result.output}")
+
+        # ---- 5. 产物落盘、登记成 artifact、按目录名复用 ----
+        handle = result.meta["handle"]
+        check(handle.startswith("artifact#"), f"登记成 artifact：{handle}")
+        payload_path = tmp / "surveys"
+        files = list(payload_path.rglob("survey.json"))
+        check(len(files) == 1, f"写了一份 survey.json：{files}")
+        payload = _json.loads(files[0].read_text(encoding="utf-8"))
+        check(payload["accession"] == "Q15858", "产物里记着靶点")
+        check(len(payload["entries"]) == 4, f"产物里是全部条目：{len(payload['entries'])}")
+        check(payload["groups"][0]["title_hits"] > 0, "产物里也是点名组在前")
+        check(payload["groups"][-1]["title_hits"] == 0, "产物末尾是没被点名的组")
+        check(payload["apo"][0]["pdb_id"] == "2EB2", f"无配体记的是 2EB2：{payload['apo']}")
+
+        again = await tool.execute({"accession": "Q15858"}, context=ledger)
+        check(again.meta["handle"] == handle, f"同一份全景再跑一次复用 handle：{again.meta['handle']}")
+        check(again.meta["reused"] is True, "第二次标 reused")
+
+        # ---- 6. ligand_class 只筛不丢：apo 只留无配体的那套 ----
+        apo = await tool.execute({"accession": "Q15858", "ligand_class": "apo"}, context=ledger)
+        check(apo.meta["count"] == 1, f"apo 筛出 1 套：{apo.meta['count']}")
+        check("2EB2" in apo.output, f"正文里出现 2EB2：{apo.output}")
+
+        # ---- 7. 零命中与失败分开写 ----
+        # 换一个编号：同一个查询体在缓存里已经有结果了，拿它测零命中会读到旧响应。
+        http_module.post_json = lambda url, payload, **kw: {"total_count": 0, "result_set": []}
+        empty = await tool.execute({"accession": "P00000"}, context=ledger)
+        check(not empty.failed and empty.meta["reason"] == "checked",
+              f"零命中不是失败：{empty.output[:120]}")
+        check("查了，没有" in empty.output or "没有登记" in empty.output,
+              f"零命中的措辞：{empty.output[:120]}")
+
+        def boom(url, payload, **kwargs):
+            raise http_module.ToolError("模拟 502")
+
+        http_module.post_json = boom
+        failed = await tool.execute({"accession": "P00001"}, context=ledger)
+        check(failed.failed and "这次没查成" in failed.output,
+              f"接口挂了时明说没查成：{failed.output[:120]}")
+    finally:
+        http_module.post_json = original_post
+        http_module.get_json = original_get
+        http_module.get_text = original_text
+        rsearch_module.search_dir = original_dir
+        survey_module.surveys_dir = original_survey
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 async def check_rsearch() -> None:
@@ -17167,8 +17497,6 @@ async def check_listing_tools() -> None:
         f"领域工具条数与 DOMAIN_TOOL_NAMES 一致、且不少于 18 个：{len(all_tools)} 个 {names}",
     )
     for expected in (
-        "write_run",
-        "open_viewer",
         "search_pdb",
         "search_literature",
         "search_web",
@@ -17181,6 +17509,10 @@ async def check_listing_tools() -> None:
         "dock",
     ):
         check(expected in names, f"新工具 {expected} 装上了（写了却没装，界面上完全看不出来）")
+    check(
+        "write_run" not in names and "open_viewer" not in names,
+        "呈现工具常驻核心，不占领域族的条目",
+    )
     # 搜索类工具是只读的：Plan 方式下必须放行（放进去就等于「查文献都做不到」）。
     from vsagent.core.agent.permission import PLAN_DENY
 
@@ -18108,7 +18440,7 @@ async def check_tool_family_loop(server: FakeModelServer) -> None:
                             0,
                             call_id="c1",
                             name="load_tools",
-                            arguments=json.dumps({"family": "docking"}),
+                            arguments=json.dumps({"family": "scoring"}),
                         )
                     ]
                 ),
@@ -18129,7 +18461,7 @@ async def check_tool_family_loop(server: FakeModelServer) -> None:
     check("dock" not in sent[0], "没装的族不在请求体里")
     check("dock" in sent[1], "装过之后下一步就出现在请求体里")
     check("search_pdb" not in sent[1], "装一族只开一族")
-    check(session.tool_families == ["docking"], f"族记在会话上：{session.tool_families}")
+    check(session.tool_families == ["scoring"], f"族记在会话上：{session.tool_families}")
 
     # 下一轮重新问一次，装过的族仍然在：它是会话状态，不是一轮状态。
     ask(session, "接着说")
@@ -18585,9 +18917,9 @@ def check_debug_tools() -> None:
     import debug_tools
 
     names = [name for name, _ in debug_tools.CALLS]
-    missing = sorted(set(DOMAIN_TOOL_NAMES) - set(names))
+    missing = sorted(set(DOMAIN_PACKAGE_TOOL_NAMES) - set(names))
     check(not missing, f"每个领域工具都在 CALLS 里跑过一遍：缺 {missing}")
-    unknown = sorted(set(names) - set(DOMAIN_TOOL_NAMES))
+    unknown = sorted(set(names) - set(DOMAIN_PACKAGE_TOOL_NAMES))
     check(not unknown, f"CALLS 里没有拼错或改名后剩下的工具名：{unknown}")
     check(
         names.index("dock") < names.index("validate_docking"),
@@ -18595,15 +18927,16 @@ def check_debug_tools() -> None:
     )
 
     # **一条 CALLS 就是一次调用**，同名工具可以出现多次（三次 import_ligandset 各导入
-    # 一份夹具）。原先把同名工具从池子里 pop 掉、参数按名字查，于是三条合成一条、
-    # 用的是最后那条的参数：链看起来跑满 42 个，实际 ligands.smi 与 actives.csv
-    # 一次都没导入，参考集、指纹筛选、pose 分析全建在错的库上。
+    # 一份夹具，两次 fetch_structure 各取一套结构）。原先把同名工具从池子里 pop 掉、
+    # 参数按名字查，于是三条合成一条、用的是最后那条的参数：链看起来跑满 42 个，
+    # 实际 ligands.smi 与 actives.csv 一次都没导入，参考集、指纹筛选、pose 分析全建在错的库上。
     plan = debug_tools._plan(debug_tools._tool_modules())
     check(len(plan) == len(debug_tools.CALLS), f"CALLS 有几条就跑几次：{len(plan)}/{len(debug_tools.CALLS)}")
     repeated = [name for name, _ in debug_tools.CALLS if names.count(name) > 1]
     check(
-        len(repeated) == 5 and set(repeated) == {"import_ligandset", "lookup_compound"},
-        f"同名的那几条都还在计划里（三次导入 + 两个方向的合并入口）：{repeated}",
+        len(repeated) == 7
+        and set(repeated) == {"import_ligandset", "lookup_compound", "fetch_structure"},
+        f"同名的那几条都还在计划里（三次导入 + 两个方向的合并入口 + 两套结构）：{repeated}",
     )
     by_position = [arguments for _label, tool, arguments in plan if tool.spec.name == "import_ligandset"]
     check(
@@ -18619,6 +18952,27 @@ def check_debug_tools() -> None:
         all(arguments is not None for _label, _tool, arguments in plan),
         "每个工具都有 CALLS 里的参数（漏一行会变成「跳过」而不是悄悄少跑）",
     )
+
+    # 每个模块末尾那段 `if __name__ == "__main__"` 都要把模块名与工具表传进去。
+    # 写成裸的 `main()` 时，`python -m vsagent.core.agent.domain.analysis contact_map …`
+    # 这条单模块调试入口会抛 `main() missing 2 required positional arguments`——
+    # 报错发生在进入工具之前，看起来像脚本本身坏了，实际是那三行没跟上入口的签名。
+    import importlib
+    import inspect
+
+    import vsagent.core.agent.domain as package
+
+    broken: list[str] = []
+    for name in package.__all__:
+        module = importlib.import_module(f"{package.__name__}.{name}")
+        if not callable(getattr(module, "domain_tools", None)):
+            continue
+        source = inspect.getsource(module)
+        if '__name__ == "__main__"' not in source:
+            continue
+        if "main(__name__, domain_tools())" not in source:
+            broken.append(name)
+    check(not broken, f"模块末尾的调试入口把模块名与工具表传了进去：{broken}")
 
 
 async def check_tool_family() -> None:
@@ -18639,7 +18993,7 @@ async def check_tool_family() -> None:
         f"{sorted(set(covered) - set(DOMAIN_TOOL_NAMES))}",
     )
     check(len(covered) == len(set(covered)), "同一个工具不会被登记进两族")
-    check(tool_family("dock") == "docking", "tool_family 能反查")
+    check(tool_family("dock") == "scoring", "tool_family 能反查")
     check(tool_family("bash") == "", "核心工具不属于任何族")
     # `search_pdb` 原先单独立一个 `rsearch` 族，族里只有它一个，说明还写着
     # 「反向检索」——名不副实，模型因此先装 rsearch 才发现里面只有它。
@@ -18702,9 +19056,9 @@ async def check_tool_family() -> None:
         "不传 exclude 时照旧全量（评测脚本与 /tools 面板靠它）",
     )
 
-    loaded = await LoadToolsTool().execute({"family": "docking"}, session=session, registry=registry)
+    loaded = await LoadToolsTool().execute({"family": "scoring"}, session=session, registry=registry)
     check(not loaded.failed, f"装一族不报错：{loaded.output}")
-    check(session.tool_families == ["docking"], f"族记在会话上：{session.tool_families}")
+    check(session.tool_families == ["scoring"], f"族记在会话上：{session.tool_families}")
     check("dock" in loaded.output, "装完告诉模型这一族里有什么")
     # 每装一次都改工具清单，而清单是请求前缀的一部分——实测 8 次装族里有 5 次
     # 让下一步的命中率掉到 0.22–0.39。提示写在第一次装的返回里才有用。
@@ -18724,9 +19078,9 @@ async def check_tool_family() -> None:
         "过滤之后仍是装配顺序，不是集合顺序",
     )
 
-    again = await LoadToolsTool().execute({"family": "docking"}, session=session, registry=registry)
+    again = await LoadToolsTool().execute({"family": "scoring"}, session=session, registry=registry)
     check(
-        not again.failed and again.meta["already"] and session.tool_families == ["docking"],
+        not again.failed and again.meta["already"] and session.tool_families == ["scoring"],
         "重复装同一族不重复记账",
     )
     check("缓存" not in again.output, "装过的族不再重复这句提醒（否则每步都是噪音）")
@@ -18734,17 +19088,17 @@ async def check_tool_family() -> None:
     unknown = await LoadToolsTool().execute(
         {"family": "nope"}, session=session, registry=registry
     )
-    check(unknown.failed and "docking" in unknown.output, f"未知族列出可选项：{unknown.output}")
-    check(session.tool_families == ["docking"], "未知族不改会话状态")
+    check(unknown.failed and "scoring" in unknown.output, f"未知族列出可选项：{unknown.output}")
+    check(session.tool_families == ["scoring"], "未知族不改会话状态")
 
     # Phase 封存时收敛（P2-1）：族只装不卸的话，装到八族之后每步都发 12K token
     # 的工具定义，而典型的一个阶段只用得上两三个族。
     prune_session = Session(id="ses_family_prune")
-    prune_session.tool_families = ["docking"]
-    prune_session.family_phase = {"docking": 1}
+    prune_session.tool_families = ["scoring"]
+    prune_session.family_phase = {"scoring": 1}
     check(
         prune_families(prune_session, {"dock"}, 1) == []
-        and prune_session.tool_families == ["docking"],
+        and prune_session.tool_families == ["scoring"],
         "本阶段用过的族不会被移除",
     )
     check(
@@ -18753,7 +19107,7 @@ async def check_tool_family() -> None:
     )
     dropped = prune_families(prune_session, {"fetch_structure"}, 2)
     check(
-        dropped == ["docking"] and prune_session.tool_families == [],
+        dropped == ["scoring"] and prune_session.tool_families == [],
         f"下一个阶段没用过就卸掉：{dropped}",
     )
     check(
@@ -18801,18 +19155,18 @@ async def check_tool_family() -> None:
     # dock 还在，否则模型会以为自己没装过、又去 load 一次。
     restored_session = Session.from_dict(session.to_dict())
     check(
-        restored_session.tool_families == ["docking"],
+        restored_session.tool_families == ["scoring"],
         f"族跟着会话存盘走：{restored_session.tool_families}",
     )
     check("dock" in hidden_names(Session.from_dict({"id": "ses_x"})), "没存过族时按全藏处理")
 
     # 模型看不见 dock 时会直接叫它（它记不住清单里有什么）。那一句话必须告诉它
     # 「去装哪一族」——只说 unknown tool 的话，它下一步多半是绕 bash 或编参数。
-    check(family_of("dock") == "docking" and family_of("bash") == "", "family_of 与 tool_family 一致")
+    check(family_of("dock") == "scoring" and family_of("bash") == "", "family_of 与 tool_family 一致")
     unloaded = Session(id="ses_family2")
     hint = missing_tool_reason(registry, "dock", unloaded)
     check(
-        "docking" in hint and "load_tools" in hint,
+        "scoring" in hint and "load_tools" in hint,
         f"没装的族要说清装哪一族：{hint}",
     )
     check("unknown tool" not in hint, "这一句不是「没有这个工具」，是「还没装」")
@@ -20262,9 +20616,15 @@ async def check_subagent_ui() -> None:
         prompt = listing.get_option_at_index(0).prompt
         text = getattr(prompt, "plain", str(prompt))
         check("请求出错" in text, f"右栏写出了失败原因：{text}")
+        # 每条两行：第一行名字与时间，第二行失败原因或消息条数。
+        # 父会话历史区间与派发来源不常驻，它们只在打开之后才要读。
         check(
-            "无父会话历史" in text and "用户派发" in text,
-            f"右栏第三行写明区间与来源：{text}",
+            len(text.splitlines()) == 2,
+            f"右栏每条只有两行：{text}",
+        )
+        check(
+            "第 " not in text and "派发" not in text,
+            f"右栏不再常驻历史区间与派发来源：{text}",
         )
 
         # 后台子 agent 结束时，父会话给一句提示
@@ -20709,6 +21069,66 @@ def check_paths() -> None:
         shutil.rmtree(frozen_cwd, ignore_errors=True)
 
 
+async def check_id_sequences() -> None:
+    """载入状态只把编号往前推，网页端读一次盘不会把正在跑的这一轮拨回去。
+
+    现场出过这个事故：一轮跑到第 13 步，浏览器打开会话页（`/api/sessions`），
+    `read_settled` 新建一个 SessionManager 读盘，`sync_sequences` 按磁盘上的
+    最大编号重设，于是这一步的 part 又拿到第 1 步用过的号，正文写进了旧工具卡。
+    """
+    from vsagent.core.models import new_message_id, new_part_id
+    from vsagent.core.web.routes import read_settled
+
+    root = PROBE / "id_sequences"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "state.toml"
+
+    def state(max_part: int, message_id: str = "msg_0001") -> dict:
+        """一份只带编号的状态：够 `sync_sequences` 取最大值就行。"""
+        parts = [
+            {"id": f"prt_{index:04d}", "type": "text", "text": "x"}
+            for index in range(1, max_part + 1)
+        ]
+        return {
+            "version": 1,
+            "current_session_id": "ses_0001",
+            "sessions": [
+                {
+                    "id": "ses_0001",
+                    "messages": [{"id": message_id, "role": "user", "parts": parts}],
+                }
+            ],
+        }
+
+    # 计数器是整个进程共用的一份，别的检查组早就发过号，这里只能按相对位置断言。
+    serial = int(new_part_id().split("_")[1])
+    manager = SessionManager(path)
+    manager.load_from_state(state(serial + 5))
+    check(new_part_id() == f"prt_{serial + 6:04d}", "载入之后从磁盘最大值之后接着发号")
+
+    taken = [new_part_id(), new_part_id()]
+    check(taken == [f"prt_{serial + 7:04d}", f"prt_{serial + 8:04d}"], f"连号：{taken}")
+
+    # 磁盘上那一份还是老样子（状态只在一轮结束时写盘），网页端读它不能把号拨回去。
+    manager.save_to_toml(path)
+    check(read_settled(path) is not None, "网页端读得动这份状态")
+    after = new_part_id()
+    check(after == f"prt_{serial + 9:04d}", f"读盘不往回拨号：拿到 {after}")
+    check(after not in taken, "读盘之后不会重发已经用过的号")
+
+    # 反过来：磁盘上的编号比手里的大，就该往前推。
+    manager.load_from_state(state(serial + 40))
+    check(new_part_id() == f"prt_{serial + 41:04d}", "磁盘上的编号更大时往前推")
+
+    message_serial = int(new_message_id().split("_")[1])
+    manager.load_from_state(state(1, message_id=f"msg_{message_serial + 5:04d}"))
+    check(
+        new_message_id() == f"msg_{message_serial + 6:04d}",
+        "消息编号也只往前推",
+    )
+
+
 # 检查组：名字给 `--only` 过滤用，函数一律零参数（同步与异步混着，调用处看返回值）。
 # 名字取函数名里有意义的那一段，`--only permission` 能直接命中。
 GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
@@ -20724,6 +21144,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("workspace", check_workspace),
     ("config-paths", check_config_paths),
     ("config-migrate", check_config_migrate),
+    ("id-sequence", check_id_sequences),
     ("paths", check_paths),
     ("ledger", check_ledger),
     ("ledger-digest", check_ledger_digest),
@@ -20762,6 +21183,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("align-prior", check_align_and_prior),
     ("write-run", check_write_run),
     ("write-run-docking", check_write_run_docking),
+    ("survey", check_survey),
     ("rsearch", check_rsearch),
     ("literature", check_literature),
     ("europepmc", check_europepmc),

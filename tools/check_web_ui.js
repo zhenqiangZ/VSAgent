@@ -19,9 +19,16 @@ const PYTHON = process.env.VSA_PYTHON || (process.platform === "win32"
   ? path.join(ROOT, ".venv", "Scripts", "python.exe")
   : path.join(ROOT, ".venv", "bin", "python"));
 const FIXTURE = path.join(ROOT, ".probe", "web-ui-runs");
+const SURVEY_FIXTURE = path.join(ROOT, ".probe", "web-ui-surveys");
+const SURVEY_ID = "Q15858-survey-ui000001";
 const LOG_PATH = path.join(ROOT, ".probe", "web-ui-serve.log");
 const PORT = Number(process.env.WEB_PORT || 8866);
 const BASE = `http://127.0.0.1:${PORT}`;
+// 演示数据从仓库里带的那份原始结构现造，不依赖 `runs/` 下有没有留演示目录：
+// `runs/` 整个目录是 gitignore 的，靠它准备夹具在干净克隆上第一步就 ENOENT，
+// 而报错看起来像是判据脚本坏了。
+const SOURCE_PDB = path.join(ROOT, "tests", "fixtures", "1iep.pdb");
+const BUILDER = path.join(ROOT, "tools", "build_demo_data.py");
 
 // 与 history.js 里的状态文字一致。卡片上的文字对不上时说明状态映射错了，
 // 而徽标的颜色仍然正常，只看截图认不出来。
@@ -77,40 +84,90 @@ async function waitReady() {
   throw new Error(`服务没有在预期时间内就绪，日志在 ${LOG_PATH}`);
 }
 
-// 准备四个运行目录。
-//   demo   —— 复制一份真实运行，用来核对运行选择器与三维视图。
-//   linked —— 由真实构建脚本产出，带上产出它的会话，用来核对两个页面之间的跳转。
-//   legacy —— 复制一份旧演示数据（`runs/1iep-demo`），口袋项里没有 `source`，
-//             `provenance.pockets` 是字符串。用来核对旧形状仍能打开、且不会凭空长出徽标。
+// 准备五个运行目录，四个由 `tests/fixtures/1iep.pdb` 现造。
+//   demo   —— 一份完整运行，用来核对运行选择器与三维视图。
+//   legacy —— 旧形状：口袋项里没有 `source`，`provenance.pockets` 是字符串。
+//             用来核对旧数据仍能打开、且不会凭空长出徽标。
 //   sourced—— 在 legacy 的基础上给口袋补上 `source`、把 `provenance.pockets` 换成对象。
-//             旧数据里没有这个字段（那是第 3 步才定的口径），要核对新形状只能现造一份。
+//   linked —— 带上产出它的会话，用来核对两个页面之间的跳转。
+//   docking—— 手写的对接结果，用来核对「分数越低越好」的排序方向。
+function buildRun(targetDir, sessionId) {
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.copyFileSync(SOURCE_PDB, path.join(targetDir, "receptor_full.pdb"));
+  const args = [BUILDER, "--run-dir", targetDir];
+  if (sessionId) args.push("--session-id", sessionId);
+  execFileSync(PYTHON, args, { stdio: "ignore" });
+}
+
+// 对接夹具：数组顺序、分数顺序、id 顺序三者故意互不相同。
+//   delta 有 `rank: 1`，分数却是最差的 -7.00 —— 排序时 rank 压过分数；
+//   其余三个没有 rank，按分数从低到高（-9.00 / -8.20 / -7.50）。
+// 只按数组画、或者把方向当成「高分在前」时，首行都会错。
+const DOCKING_MOLECULES = [
+  { id: "alpha", score: -7.5, rank: null },
+  { id: "beta", score: -9.0, rank: null },
+  { id: "gamma", score: -8.2, rank: null },
+  { id: "delta", score: -7.0, rank: 1 },
+];
+
+function posePdb(resname) {
+  return [
+    `HETATM    1  C1  ${resname} A   1       0.000   0.000   0.000  1.00  0.00           C`,
+    `HETATM    2  C2  ${resname} A   1       1.200   0.000   0.000  1.00  0.00           C`,
+    `HETATM    3  O1  ${resname} A   1       2.000   1.000   0.000  1.00  0.00           O`,
+    "END",
+    "",
+  ].join("\n");
+}
+
+function buildDockingRun(targetDir) {
+  fs.mkdirSync(path.join(targetDir, "ligands"), { recursive: true });
+  fs.copyFileSync(SOURCE_PDB, path.join(targetDir, "receptor.pdb"));
+  const molecules = DOCKING_MOLECULES.map((item, index) => {
+    const pose = `ligands/pose-${String(index + 1).padStart(2, "0")}.pdb`;
+    fs.writeFileSync(path.join(targetDir, pose), posePdb("LIG"), "utf8");
+    return {
+      id: item.id,
+      name: item.id,
+      score: item.score,
+      pose,
+      chain: "A",
+      ...(item.rank === null ? {} : { rank: item.rank }),
+    };
+  });
+  const meta = {
+    run_id: path.basename(targetDir),
+    target: {
+      name: "对接排序夹具",
+      pdb_id: "1IEP",
+      chains: ["A"],
+      reference_chain: "A",
+      ligand: "",
+    },
+    structure: "receptor.pdb",
+    pockets: [],
+    molecules,
+    provenance: {
+      structure_source: "tests/fixtures/1iep.pdb",
+      poses: { score_direction: "lower_is_better", engine: "vina" },
+    },
+  };
+  fs.writeFileSync(
+    path.join(targetDir, "meta.json"),
+    JSON.stringify(meta, null, 2),
+    "utf8"
+  );
+}
+
 function prepareFixture(sessionId) {
   fs.rmSync(FIXTURE, { recursive: true, force: true });
   fs.mkdirSync(FIXTURE, { recursive: true });
 
-  fs.cpSync(path.join(ROOT, "runs", "1iep-molstar"), path.join(FIXTURE, "demo"), {
-    recursive: true,
-  });
-
-  const legacy = path.join(FIXTURE, "legacy");
-  fs.cpSync(path.join(ROOT, "runs", "1iep-demo"), legacy, { recursive: true });
-  makeSourcedRun(legacy, path.join(FIXTURE, "sourced"));
-
-  const linked = path.join(FIXTURE, "linked");
-  fs.mkdirSync(linked, { recursive: true });
-  fs.copyFileSync(
-    path.join(ROOT, "runs", "1iep-demo", "receptor_full.pdb"),
-    path.join(linked, "receptor_full.pdb")
-  );
-  execFileSync(
-    PYTHON,
-    [
-      path.join(ROOT, "tools", "build_demo_data.py"),
-      "--run-dir", linked,
-      "--session-id", sessionId,
-    ],
-    { stdio: "ignore" }
-  );
+  buildRun(path.join(FIXTURE, "demo"));
+  buildRun(path.join(FIXTURE, "legacy"));
+  makeSourcedRun(path.join(FIXTURE, "legacy"), path.join(FIXTURE, "sourced"));
+  buildRun(path.join(FIXTURE, "linked"), sessionId);
+  buildDockingRun(path.join(FIXTURE, "docking"));
 }
 
 // 把一份旧运行改写成新一轮工具会产出的形状：
@@ -135,8 +192,97 @@ function startServer() {
   const out = fs.openSync(LOG_PATH, "w");
   return spawn(
     PYTHON,
-    [path.join(ROOT, "tools", "serve_web.py"), "--runs", FIXTURE, "--port", String(PORT)],
+    [
+      path.join(ROOT, "tools", "serve_web.py"),
+      "--runs", FIXTURE,
+      "--surveys", SURVEY_FIXTURE,
+      "--port", String(PORT),
+    ],
     { stdio: ["ignore", out, out] }
+  );
+}
+
+// 结构全景的夹具。**判据不往家目录里写**：服务用 `--surveys` 指到这里。
+function prepareSurveys() {
+  const target = path.join(SURVEY_FIXTURE, SURVEY_ID);
+  fs.rmSync(SURVEY_FIXTURE, { recursive: true, force: true });
+  fs.mkdirSync(target, { recursive: true });
+  const payload = {
+    format: 1,
+    accession: "Q15858",
+    query: { method: "", ligand_class: "any", limit: 400 },
+    total: 3,
+    fetched: 3,
+    groups: [
+      {
+        code: "9SR",
+        name: "Tetrodotoxin",
+        names: ["Tetrodotoxin"],
+        kind: "non-polymer",
+        weight: 319.268,
+        count: 1,
+        title_hits: 1,
+        best: { pdb_id: "6J8I", resolution: 3.2, method: "ELECTRON MICROSCOPY" },
+        pdb_ids: ["6J8I"],
+      },
+      {
+        code: "Y01",
+        name: "CHOLESTEROL HEMISUCCINATE",
+        names: [],
+        kind: "non-polymer",
+        weight: 486.726,
+        count: 2,
+        title_hits: 0,
+        best: { pdb_id: "7W9K", resolution: 2.2, method: "ELECTRON MICROSCOPY" },
+        pdb_ids: ["7W9K", "7W9L"],
+      },
+    ],
+    polymers: [
+      {
+        description: "Sodium channel subunit beta-1",
+        uniprot_ids: ["Q07699"],
+        count: 2,
+        pdb_ids: ["6J8I", "7W9K"],
+      },
+    ],
+    additives: [{ code: "NAG", name: "N-acetylglucosamine", count: 2 }],
+    apo: [{ pdb_id: "2EB2", resolution: 2.5, method: "X-RAY DIFFRACTION" }],
+    missing: [],
+    entries: [
+      {
+        pdb_id: "6J8I",
+        title: "Nav1.7 with tetrodotoxin",
+        resolution: 3.2,
+        method: "ELECTRON MICROSCOPY",
+        ligands: ["9SR"],
+        additives: ["NAG"],
+        other_polymers: ["Sodium channel subunit beta-1"],
+      },
+      {
+        pdb_id: "7W9K",
+        title: "Nav1.7-beta1-beta2 complex",
+        resolution: 2.2,
+        method: "ELECTRON MICROSCOPY",
+        ligands: ["Y01"],
+        additives: ["NAG"],
+        other_polymers: ["Sodium channel subunit beta-1"],
+      },
+      {
+        pdb_id: "2EB2",
+        title: "EGFR kinase domain",
+        resolution: 2.5,
+        method: "X-RAY DIFFRACTION",
+        ligands: [],
+        additives: [],
+        other_polymers: [],
+      },
+    ],
+    names_unavailable: [],
+  };
+  fs.writeFileSync(
+    path.join(target, "survey.json"),
+    JSON.stringify(payload, null, 2),
+    "utf8"
   );
 }
 
@@ -504,7 +650,17 @@ async function checkStructurePage(page, runId, sessionId) {
   );
 
   const options = await page.locator("#run-picker option").allTextContents();
-  check("运行选择器列出全部运行", options.length === 4, `${options.length} 项：${options.join("，")}`);
+  // 夹具目录有几个就应当列出几项：写死一个数的话，夹具增删之后这条断言会先红一次、
+  // 改完数又永久绿着，而它要挡的正是「有的运行没列出来」。
+  const fixtureRuns = fs
+    .readdirSync(FIXTURE, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  check(
+    "运行选择器列出全部运行",
+    options.length === fixtureRuns.length,
+    `${options.length} 项，夹具目录 ${fixtureRuns.length} 个：${options.join("，")}`
+  );
 
   // 相机位置要等取景动画结束再读。
   await page.waitForTimeout(1600);
@@ -580,6 +736,29 @@ async function checkPocketSourceBadges(page, runId, expectAnySource, expectBadge
   await page.waitForFunction(() => window.__ready === true, undefined, { timeout: 120000 });
 
   const meta = await getJson(`/runs/${encodeURIComponent(runId)}/meta.json`);
+  // 深链接：地址里带 pocket 时，打开就选中那一处并切到局部视图。
+  if (meta.pockets.length && meta.pockets[0].id) {
+    const first = meta.pockets[0].id;
+    await page.goto(
+      `${BASE}/#/structure/${encodeURIComponent(runId)}?pocket=${encodeURIComponent(first)}&view=local`,
+      { waitUntil: "networkidle" }
+    );
+    await page.waitForFunction(() => window.__ready === true, undefined, { timeout: 120000 });
+    const active = await page.locator("#pocket-list li.is-active").getAttribute("data-pocket-id");
+    const local = await page.locator("#scope-local").evaluate((node) =>
+      node.classList.contains("is-active")
+    );
+    check(
+      `${runId}：深链接选中 ${first}`,
+      active === first,
+      `打开后选中的是「${active || "（没有）"}」`
+    );
+    check(`${runId}：深链接切到局部视图`, local === true, `scope-local 的状态是 ${local}`);
+    await page.goto(`${BASE}/#/structure/${encodeURIComponent(runId)}`, {
+      waitUntil: "networkidle",
+    });
+    await page.waitForFunction(() => window.__ready === true, undefined, { timeout: 120000 });
+  }
   const expected = meta.pockets.map((pocket) =>
     POCKET_SOURCE_TEXT[pocket.source] || ""
   );
@@ -645,8 +824,183 @@ async function checkPocketSourceBadges(page, runId, expectAnySource, expectBadge
   return { badges, text };
 }
 
+// 界面上的字是不是真的来自 meta.json：改掉数据再打开，看画面跟不跟着变。
+//
+// 这条抓的是「界面上写死了一份演示数据」。只核对「页面有内容」看不出来——
+// 写死的那份同样有内容，而且永远是同一份。
+async function checkDataDriven(page, runId) {
+  const metaPath = path.join(FIXTURE, runId, "meta.json");
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  const target = "改过的靶点名";
+  const label = "改过的口袋标签";
+  const pocketScore = 0.123;
+  const moleculeScore = 42.5;
+  meta.target.name = target;
+  meta.pockets[0].label = label;
+  meta.pockets[0].score = pocketScore;
+  meta.molecules[0].score = moleculeScore;
+  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
+
+  await page.goto(`${BASE}/#/structure/${encodeURIComponent(runId)}`, { waitUntil: "networkidle" });
+  // 地址与上一步相同，`goto` 只改哈希、不会重新挂载页面；不 reload 读到的是改之前的画面。
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForFunction(() => window.__ready === true, undefined, { timeout: 120000 });
+
+  const title = (await page.locator("#target-name").textContent()).trim();
+  const pocketText = (
+    await page.locator("#pocket-list li[data-pocket-id] .pocket-id").first().textContent()
+  ).trim();
+  const pocketScoreText = (
+    await page.locator("#pocket-list li[data-pocket-id] .pocket-score").first().textContent()
+  ).trim();
+
+  // 分子表在另一个面板里，切过去才有行。
+  await page.locator('.tab[data-mode="molecules"]').click();
+  await page.waitForTimeout(300);
+  const topScore = (
+    await page.locator("#molecule-table tbody tr td:nth-child(3)").first().textContent()
+  ).trim();
+
+  check(`${runId}：标题跟着 meta 变`, title.includes(target), `页面写的是「${title}」`);
+  check(`${runId}：口袋标签跟着 meta 变`, pocketText.includes(label), `页面写的是「${pocketText}」`);
+  check(
+    `${runId}：口袋打分跟着 meta 变`,
+    pocketScoreText.includes(String(pocketScore)),
+    `页面写的是「${pocketScoreText}」`
+  );
+  check(
+    `${runId}：分子打分跟着 meta 变`,
+    topScore.includes(String(moleculeScore)),
+    `表格首行写的是「${topScore}」`
+  );
+}
+
+// 对接结果的排序方向：`provenance.poses.score_direction = "lower_is_better"` 时，
+// 分数越低越靠前；分子带 `rank` 时以 rank 为准。
+//
+// 这条只有真跑一次页面才能确认：排序在浏览器里做，Python 侧看不到。
+// 三种错法都长得像对的——按数组顺序画（首行碰巧是 -9.00）、按分数绝对值排、
+// 方向写反成「高分在前」——只有逐行比对才分得出来。
+async function checkDockingOrder(page) {
+  const runId = "docking";
+  await page.goto(`${BASE}/#/structure/${runId}`, { waitUntil: "networkidle" });
+  await page.waitForFunction(() => window.__ready === true, undefined, { timeout: 120000 });
+  await page.locator('.tab[data-mode="molecules"]').click();
+  await page.waitForTimeout(300);
+
+  const rows = await page.locator("#molecule-table tbody tr").evaluateAll((nodes) =>
+    nodes.map((node) => ({
+      name: node.querySelector("td:nth-child(2)")?.textContent.trim() ?? "",
+      score: node.querySelector("td:nth-child(3)")?.textContent.trim() ?? "",
+    }))
+  );
+  // delta 有 rank=1 但分数最差；其余三个没有 rank，按分数从低到高。
+  const wantNames = ["delta", "beta", "gamma", "alpha"];
+  check(
+    `${runId}：分数越低越靠前，且 rank 压过分数`,
+    JSON.stringify(rows.map((row) => row.name)) === JSON.stringify(wantNames),
+    `页面顺序是 ${rows.map((row) => row.name).join("/")}，应为 ${wantNames.join("/")}`
+  );
+  check(
+    `${runId}：首行是 rank 1 而不是分数最低的`,
+    rows[0] && rows[0].name === "delta" && rows[0].score === "-7.00",
+    `首行是 ${rows[0] ? `${rows[0].name} ${rows[0].score}` : "（没有行）"}`
+  );
+  check(
+    `${runId}：第二行是最负的分数`,
+    rows[1] && rows[1].name === "beta" && rows[1].score === "-9.00",
+    `第二行是 ${rows[1] ? `${rows[1].name} ${rows[1].score}` : "（没有行）"}`
+  );
+
+  // 点进详情：分数按对接口径显示，缺 contacts 时给空态而不是抛异常。
+  await page.locator("#molecule-table tbody tr").first().click();
+  await page.waitForFunction(
+    () => !document.querySelector("#panel-detail").classList.contains("is-hidden"),
+    undefined,
+    { timeout: 30000 }
+  );
+  const summary = (await page.locator("#detail-summary").textContent()).trim();
+  check(
+    `${runId}：详情按对接口径写分数`,
+    summary.includes("对接打分") && summary.includes("-7.00"),
+    `详情是「${summary}」`
+  );
+  const contactText = (await page.locator("#contact-table tbody").textContent()).trim();
+  check(
+    `${runId}：没有 contacts 时详情给空态`,
+    contactText.includes("没有接触数据"),
+    `接触表是「${contactText}」`
+  );
+
+  // 没有 `provenance.poses` 的运行仍按「高分在前」。默认方向写反的话，
+  // 所有旧运行的第一行都会变成最差的那个分子。
+  const demoMeta = await getJson(`/runs/demo/meta.json`);
+  const best = demoMeta.molecules.reduce((left, right) =>
+    right.score > left.score ? right : left
+  );
+  await page.goto(`${BASE}/#/structure/demo`, { waitUntil: "networkidle" });
+  await page.waitForFunction(() => window.__ready === true, undefined, { timeout: 120000 });
+  await page.locator('.tab[data-mode="molecules"]').click();
+  await page.waitForTimeout(300);
+  const demoFirst = (
+    await page.locator("#molecule-table tbody tr td:nth-child(2)").first().textContent()
+  ).trim();
+  check(
+    "demo：没有 score_direction 时仍按高分在前",
+    demoFirst === (best.name || best.id),
+    `首行是「${demoFirst}」，分数最高的是「${best.name || best.id}」`
+  );
+}
+
+// 结构全景页：配体组、全部条目、无配体三节都要按接口给的数画出来。
+// 挑的是「画出来了但画错了」的那几处：组少了照样有内容、排序反了看不出、
+// 条目链不到源头。
+async function checkSurveyPage(page) {
+  await page.goto(`${BASE}/#/survey/${SURVEY_ID}`, { waitUntil: "networkidle" });
+  await page.waitForSelector("#survey-groups tr", { timeout: 15000 });
+
+  const stats = (await page.textContent("#survey-stats")).replace(/\s+/g, " ");
+  check(
+    "全景页报出靶点与命中数",
+    stats.includes("Q15858") && stats.includes("3 套"),
+    stats
+  );
+
+  const groupRows = await page.locator("#survey-groups tr").count();
+  check("配体组逐行画出来", groupRows === 2, `${groupRows} 行`);
+
+  const firstGroup = (await page.textContent("#survey-groups tr")).replace(/\s+/g, " ");
+  check(
+    "标题点名的配体排在第一行，代号与常用名一起给",
+    firstGroup.includes("★") && firstGroup.includes("9SR") && firstGroup.includes("Tetrodotoxin"),
+    firstGroup
+  );
+  check("最佳分辨率带单位", firstGroup.includes("3.20 Å"), firstGroup);
+
+  const entryRows = await page.locator("#survey-entries tr").count();
+  check("全部条目都列出来", entryRows === 3, `${entryRows} 行`);
+
+  const firstHref = await page.getAttribute("#survey-entries tr td a", "href");
+  check(
+    "条目链到 RCSB 的源头页",
+    (firstHref || "").includes("rcsb.org/structure/"),
+    String(firstHref)
+  );
+
+  const apoRows = await page.locator("#survey-apo tr").count();
+  check("无配体单独一节", apoRows === 1, `${apoRows} 行`);
+
+  const foot = (await page.textContent("#survey-foot")).replace(/\s+/g, " ");
+  check(
+    "页脚写明这是一份清单",
+    foot.includes("不下载坐标") && foot.includes("不算口袋"),
+    foot.slice(0, 80)
+  );
+}
+
 async function main() {
   fs.mkdirSync(path.join(ROOT, ".probe"), { recursive: true });
+  prepareSurveys();
   const server = startServer();
   let browser = null;
   try {
@@ -689,6 +1043,11 @@ async function main() {
       `来源徽标：sourced 挂了 ${sourced.badges.length} 个（${sourced.badges.join("，") || "无"}），`
         + `legacy 挂了 ${legacy.badges.length} 个`
     );
+
+    // 放在徽标之后：这一条会改掉 sourced 的 meta，改完那份数据就不能再当「原始形状」用。
+    await checkDataDriven(page, "sourced");
+    await checkDockingOrder(page);
+    await checkSurveyPage(page);
 
     check(
       "全程没有页面报错",

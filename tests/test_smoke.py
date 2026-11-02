@@ -48,6 +48,7 @@ from vsagent.core.project_scan import BEGIN_MARK, END_MARK  # noqa: E402
 from vsagent.core.session_manager import SessionManager  # noqa: E402
 from vsagent.screens.chat import ChatScreen, SidePanel  # noqa: E402
 from vsagent.screens.connection_form import ConnectionFormScreen  # noqa: E402
+from vsagent.screens.context_usage import ContextUsageScreen  # noqa: E402
 from vsagent.screens.help import HelpScreen  # noqa: E402
 from vsagent.screens.home import HomeInput, HomeScreen  # noqa: E402
 from vsagent.screens.message import MessageScreen  # noqa: E402
@@ -76,11 +77,13 @@ from vsagent.widgets.messages_pane import (  # noqa: E402
     ToolCard,
 )
 from vsagent.widgets.status_bar import (  # noqa: E402
+    SidebarToggle,
     StatusBar,
     format_tokens,
     git_branch,
     shorten_path,
 )
+from vsagent.widgets.toast import ToastNotification, ToastRack  # noqa: E402
 
 import vsagent.widgets.status_bar as status_bar_module  # noqa: E402
 
@@ -466,7 +469,7 @@ async def run() -> None:
 
 
 async def run_tool_card_checks() -> None:
-    """工具卡：两级折叠、工具图标、执行计时。
+    """工具卡：两级折叠、状态字形、执行计时。
 
     这几条不依赖会话，单独开一个只放一张卡片的小应用，断言不用绕开别的组件。
     """
@@ -493,7 +496,13 @@ async def run_tool_card_checks() -> None:
         await pilot.pause(0.2)
         card = app.card
         header = str(card.query_one(".tool-header").render())
-        check("$ bash" in header, f"卡片头上有工具图标：{header}")
+        check("✓ bash" in header, f"卡片头上有状态字形与工具名：{header}")
+        check("$" not in header, f"卡片头不再按工具类别挑图标：{header}")
+        check("完成" not in header, f"状态只用字形表达，不另写一遍中文：{header}")
+        check(
+            card.styles.border_left[0] in ("", "none"),
+            f"卡片不画左侧竖线：{card.styles.border_left}",
+        )
 
         output = card.query_one(".tool-output")
         tail = card.query_one(".tool-tail")
@@ -542,17 +551,17 @@ async def run_tool_card_checks() -> None:
         await pilot.pause()
         check(str(output.styles.display) == "block", "再点标题行展开整段输出")
 
-        # 执行计时：看到「执行中」才开始计时，完成后停在最终值。
+        # 执行计时：看到「●」才开始计时，完成后停在最终值。
         card.sync(make_part(ToolStatus.RUNNING, age=5))
         header = str(card.query_one(".tool-header").render())
         check(
-            re.search(r"执行中 \d+(\.\d+)?s", header) is not None,
+            re.search(r"● bash \d+(\.\d+)?s", header) is not None,
             f"执行中的卡片带耗时：{header}",
         )
         card.sync(make_part(ToolStatus.COMPLETED, age=5))
         header = str(card.query_one(".tool-header").render())
         check(
-            re.search(r"完成 \d+(\.\d+)?s", header) is not None,
+            re.search(r"✓ bash \d+(\.\d+)?s", header) is not None,
             f"完成之后耗时停在最终值：{header}",
         )
 
@@ -885,6 +894,11 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             "输入区底色与区块一致（不写的话用的是 TextArea 自带的 $surface，换成 gruvbox 就亮出一档）",
         )
         check(
+            editor.rich_style.bgcolor.name
+            == chat.query_one("#status-bar").rich_style.bgcolor.name,
+            "输入区块与状态栏同一层底色（底部四行连成一条，与消息区只差一档明度）",
+        )
+        check(
             accent.rich_style.bgcolor.name == "#4a9eff",
             f"输入框聚焦时指示线为亮蓝：{accent.rich_style.bgcolor.name}",
         )
@@ -911,26 +925,38 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             cursor_style.color.name == "#0a0a0a",
             f"光标下的字用深色，白底上才看得清：{cursor_style.color.name}",
         )
-        # 消息区右侧的滚动条取纯白。默认档跟随主题的 $scrollbar，在纯黑底上偏暗。
+        # 消息区右侧的滚动条取三级文字那一档：在纯黑底上看得见，又不会比正文更抢眼。
         # 这里读的是 `styles` 上的 textual 颜色对象，取 `.hex`（大写、带 #），不是 rich 的 `.name`。
         check(
-            pane.styles.scrollbar_color.hex.lower() == "#ffffff",
-            f"消息区滚动条为白色：{pane.styles.scrollbar_color.hex}",
+            pane.styles.scrollbar_color.hex.lower() == "#5a5a5a",
+            f"消息区滚动条取三级文字那一档：{pane.styles.scrollbar_color.hex}",
+        )
+        check(
+            pane.styles.scrollbar_color_hover.hex.lower() == "#8b949e"
+            and pane.styles.scrollbar_color_active.hex.lower() == "#e0e0e0",
+            f"滚动条悬停与拖动各提一档：{pane.styles.scrollbar_color_hover.hex}"
+            f" / {pane.styles.scrollbar_color_active.hex}",
         )
 
-        # 输入区的高度跟着内容走，与启动界面 `#home-input` 同一套：随内容长高、
-        # 6 行封顶，再多出来的行由输入框自己滚动。区别是这里给了 3 行底高——
-        # 聊天界面空着的时候框太窄，贴着上界线看起来像没地方输入。
+        # 输入区的高度跟着内容走：随内容长高、6 行封顶，再多出来的行由输入框自己滚动。
+        # 底高取 1 行——输入框空着时不该占三行，消息区每让出一行都是内容多看到一行。
         # 区块贴着底边、高度 auto，所以长高时是上边缘往上退、消息区被压短，
-        # 状态行与状态栏不动；提交清空之后整块退回 6 行。
+        # 状态行与状态栏不动；提交清空之后整块退回 3 行（输入 1 + 间距 1 + 状态行 1）。
         editor.input.text = ""
         await pilot.pause()
         await pilot.pause()
         empty_height = editor.input.region.height
-        check(empty_height == 3, f"空输入时输入区占 3 行底高：{empty_height}")
+        check(empty_height == 1, f"空输入时输入区占 1 行底高：{empty_height}")
         check(
-            editor.region.height == 6,
-            f"空输入时区块共 6 行（上界线 1 + 输入 3 + 间距 1 + 状态行 1）：{editor.region.height}",
+            editor.region.height == 3,
+            f"空输入时区块共 3 行（输入 1 + 间距 1 + 状态行 1）：{editor.region.height}",
+        )
+        check(
+            chat.query_one("#chat-body").region.height
+            == app.size.height
+            - editor.region.height
+            - chat.query_one(StatusBar).region.height,
+            "消息区占满剩下的整个高度：区块与状态栏之外的全部",
         )
         pane_bottom = editor.region.bottom
         status_bar = app.screen.query_one("#status-bar")
@@ -1004,12 +1030,11 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
 
         agent_label = editor.query_one("#editor-agent")
-        model_label = editor.query_one("#editor-model")
         effort_label = editor.query_one("#editor-effort")
         hint_label = editor.query_one("#editor-hint")
         check(
             editor.query_one("#editor-status").region.y > editor.input.region.y,
-            "模式与模型信息排在输入区下方",
+            "Agent 与模式信息排在输入区下方",
         )
         check(str(agent_label.render()) == "Build", f"状态行显示当前 Agent：{agent_label.render()}")
         check(
@@ -1018,26 +1043,34 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"状态行 {agent_label.region.y}",
         )
         check(
-            agent_label.rich_style.color.name == "#4a9eff",
-            f"Agent 标签为蓝色：{agent_label.rich_style.color.name}",
-        )
-        check(
-            str(model_label.render()) == app.current_model_label,
-            f"状态行显示当前模型：{model_label.render()}，实际 {app.current_model_label}",
-        )
-        check(
-            model_label.rich_style.color.name == "#c9d1d9",
-            f"模型名为浅灰：{model_label.rich_style.color.name}",
+            agent_label.rich_style.color.name == "#8b949e",
+            f"Agent 标签取次要文字那一档：{agent_label.rich_style.color.name}",
         )
         check(str(effort_label.render()) == "low", f"状态行显示推理强度：{effort_label.render()}")
         check(
-            effort_label.rich_style.color.name == "#e3b341",
-            f"推理强度为橙黄：{effort_label.rich_style.color.name}",
+            effort_label.rich_style.color.name == "#8b949e",
+            f"推理强度与 Agent 同一档颜色：{effort_label.rich_style.color.name}",
         )
+        check(len(editor.query("#editor-model")) == 0, "模型名不在输入框状态行上（底部状态栏已经有）")
         check(str(hint_label.render()) == "chat", f"状态行右端显示输入模式：{hint_label.render()}")
         check(
             hint_label.rich_style.color.name == "#5a5a5a",
             f"模式提示为暗灰：{hint_label.rich_style.color.name}",
+        )
+        # 状态行只在输入框有焦点时出现：失焦时用户是在读消息，这一行占的是消息区的高度。
+        editor.input.blur()
+        await pilot.pause()
+        await pilot.pause()
+        check(
+            str(editor.query_one("#editor-status").styles.display) == "none",
+            "输入框失焦时状态行收起",
+        )
+        editor.focus_input()
+        await pilot.pause()
+        await pilot.pause()
+        check(
+            str(editor.query_one("#editor-status").styles.display) == "block",
+            "输入框重新获得焦点后状态行出现",
         )
         # 输入每变一个字符都会走到 _update_mode，而模式绝大多数时候一个字都没变。
         # 原来的写法每次按键都把三个模式类删一遍再加回一个，并且把状态行四个标签全写一遍；
@@ -1070,36 +1103,111 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(str(hint_label.render()) == "chat", "清空之后模式提示回到 chat")
 
-        # 底部状态栏：左端项目路径，右端用量与快捷键提示，整体暗灰。
+        # 底部状态栏：左端会话名与项目路径，其后用量与快捷键提示，最右是侧栏开关。
+        # 没有单独的标题栏：会话名就在这里，那一行省下来的是消息区的高度。
         bar = chat.query_one(StatusBar)
         left = bar.query_one("#status-left")
         usage = bar.query_one("#status-usage")
         keys = bar.query_one("#status-keys")
+        toggle = chat.query_one(SidebarToggle)
         check(
-            str(left.render()).startswith(shorten_path(ROOT)),
-            f"状态栏左端显示项目路径：{left.render()}",
+            str(left.render()).startswith(app.session_manager.current.title),
+            f"状态栏左端先写会话名：{left.render()}",
+        )
+        check(
+            shorten_path(ROOT) in str(left.render()),
+            f"状态栏左端同时写着项目路径：{left.render()}",
         )
         check(
             left.rich_style.color.name == "#5a5a5a",
             f"路径为暗灰：{left.rich_style.color.name}",
         )
         check(
-            keys.region.right == app.size.width - 1,
-            f"快捷键提示靠右贴边：右端 {keys.region.right}，屏幕宽 {app.size.width}",
+            len(chat.query("#chat-header")) == 0 and len(chat.query("#chat-title")) == 0,
+            "聊天界面不再有单独的标题栏",
+        )
+        check(
+            toggle.region.right == app.size.width - 1,
+            f"侧栏开关贴在状态栏最右端：右端 {toggle.region.right}，屏幕宽 {app.size.width}",
+        )
+        check(
+            keys.region.right <= toggle.region.x,
+            f"快捷键提示排在侧栏开关左边：提示右端 {keys.region.right}，开关左端 {toggle.region.x}",
         )
         check(
             str(keys.render()) == "ctrl+p 命令",
-            f"右端提示为命令面板快捷键：{keys.render()}",
+            f"快捷键提示为命令面板快捷键：{keys.render()}",
         )
         usage_text = str(usage.render())
         check(
-            "(" in usage_text and "%)" in usage_text and "$" in usage_text and usage_text.endswith("s"),
-            f"右端用量是 用量(百分比) · 费用 · 耗时 的形式：{usage_text}",
+            len(usage_text.splitlines()) == 1
+            and usage_text.strip().endswith("%")
+            and "上下文" not in usage_text,
+            f"右端只写百分比数字：{usage_text!r}",
         )
+        check(usage.region.height == 1, f"占比数字占一行：{usage.region.height}")
         check(
             usage.region.right <= keys.region.x,
-            f"用量排在快捷键提示左边：用量右端 {usage.region.right}，提示左端 {keys.region.x}",
+            f"占比数字排在快捷键提示左边：数字右端 {usage.region.right}，提示左端 {keys.region.x}",
         )
+
+        # 占比数字可以点开：图从状态栏上方升起，左边是条，右边是类别与 token 数。
+        # 注入一份固定的度量，避免测试里那台假服务端的用量数字随脚本变化。
+        saved_history = list(chat.loop.context_history)
+        chat.loop.context_history.clear()
+        chat.loop.context_history.append(
+            {
+                "window": 1_000_000,
+                "input": 20_000,
+                "total": 16_000,
+                "tools": 4_000,
+                "usage": {
+                    "prefix": 1_000,
+                    "memory": 0,
+                    "task": 500,
+                    "event": 0,
+                    "recent": 14_000,
+                    "evidence": 500,
+                    "history": 0,
+                },
+                "degraded": [],
+                "dropped": 0,
+            }
+        )
+        bar.update_usage(context_tokens=20_000, context_window=1_000_000)
+        await pilot.pause()
+        usage_text = str(usage.render())
+        check(usage_text.strip() == "2%", f"数字就是当前占比：{usage_text!r}")
+        usage.on_click()
+        await pilot.pause()
+        check(isinstance(app.screen, ContextUsageScreen), "点占比数字打开柱状图")
+        shown_usage = " ".join(
+            str(getattr(node, "renderable", node.render()))
+            for node in app.screen.query(".context-usage-line")
+        )
+        check(
+            "近期对话" in shown_usage
+            and "14.0K" in shown_usage
+            and "█" in shown_usage,
+            f"柱状图右边写着类别与 token 数：{shown_usage[:120]}",
+        )
+        dialog = app.screen.query_one("#context-usage-dialog")
+        usage_center = usage.region.x + usage.region.width // 2
+        dialog_center = dialog.region.x + dialog.region.width // 2
+        check(
+            abs(dialog_center - usage_center) <= 1,
+            f"面板中心对准百分比数字：面板中心 {dialog_center}，数字中心 {usage_center}",
+        )
+        check(
+            dialog.region.bottom == app.size.height - 1,
+            f"面板下边界紧靠状态栏：底端 {dialog.region.bottom}，状态栏顶 {app.size.height - 1}",
+        )
+        await pilot.press("escape")
+        await pilot.pause()
+        chat.loop.context_history.clear()
+        chat.loop.context_history.extend(saved_history)
+        chat.refresh_status()
+
         chat._busy = True
         chat.refresh_status()
         check("● 生成中" in str(left.render()), f"生成中时路径后加标记：{left.render()}")
@@ -1139,8 +1247,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"后台线程把分支写回了状态栏：{bar._branch!r}，期望 {expected_branch!r}",
         )
         check(
-            str(left.render()).startswith(shorten_path(bar._cwd)),
-            f"补进分支之后左端仍以路径开头：{left.render()}",
+            shorten_path(bar._cwd) in str(left.render()) and expected_branch in str(left.render()),
+            f"补进分支之后左端同时写着路径与分支：{left.render()}",
         )
 
         await pilot.press("enter")
@@ -1174,19 +1282,19 @@ async def run_interface_checks(server: FakeModelServer) -> None:
                 "提交后会话首条消息为 user 消息",
             )
 
-            # 用户消息画成一条对话框：浅灰底 + 最左侧一条蓝线，不再写"你"这样的角色标签。
+            # 用户消息与回复同左边界，靠一块浅底分开；不画蓝线，也不写"你"这样的角色标签。
             # 先等这一轮跑完再看尺寸：回复还在流的时候消息区的高度正在长，
             # 纵向滚动条出现的那一帧与子视图重新排布的那一帧不是同一帧，
             # 中间读到的宽度会差滚动条的那两列。
             await wait_idle(app, pilot)
             user_view = pane.query(".message-user").first()
             check(
-                user_view.styles.background.hex.lower() == "#1e1e1e",
+                user_view.styles.background.hex.lower() == "#1a1a1a",
                 f"用户消息带浅灰底色：{user_view.styles.background}",
             )
             check(
-                user_view.styles.border_left[1].hex.lower() == "#4a9eff",
-                f"用户消息最左侧是蓝色竖线：{user_view.styles.border_left}",
+                user_view.styles.border_left[0] in ("", "none"),
+                f"用户消息不再画竖线，蓝线只留给输入框：{user_view.styles.border_left}",
             )
             # 按可滚动内容区的宽度比对：内容够长时消息区会出现纵向滚动条，
             # 滚动条占掉的那两列不算气泡该铺的范围。
@@ -1200,12 +1308,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             user_text = user_view.query(".part-text").first()
             check(
                 user_text.region.y - user_view.region.y == 1,
-                f"正文不贴着气泡顶边，蓝线高过文字：气泡 {user_view.region.y} 正文 {user_text.region.y}",
-            )
-            check(
-                user_view.region.height == 1 + user_text.region.height,
-                f"气泡只在顶部多一行内边距，正文的后边距不再叠一层："
-                f"气泡 {user_view.region.height} 行，正文 {user_text.region.height} 行",
+                f"正文不贴着气泡顶边：气泡 {user_view.region.y} 正文 {user_text.region.y}",
             )
             user_lines = rendered_lines(user_text)
             check(user_lines == ["from home"], f"用户消息只显示提问本身：{user_lines}")
@@ -1266,29 +1369,35 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         )
         user_text = user_view.query(".part-text").first()
         reply_text = reply_view.query(".part-text").first()
-        check(
-            user_text.region.x == reply_text.region.x,
-            f"用户提问与回复正文起始列相同：用户 {user_text.region.x}，回复 {reply_text.region.x}",
-        )
-        # 上面比的是组件位置，这里比真正画出来的文字起始列：`region` 含内边距，
-        # 而两边的内边距来源不同（正文是 Markdown 自带的，气泡与回复是外层给的）。
+        # 比的是真正画出来的文字起始列：`region` 含内边距，而两边的内边距来源
+        # 不同（正文是 Markdown 自带的，回复是外层容器给的），组件位置本来就不等。
         check(
             user_text.content_region.x == reply_text.content_region.x,
             f"用户提问与回复正文的文字起始列相同：{user_text.content_region.x}，{reply_text.content_region.x}",
         )
-        # 走 SimplePartView 的那几类（step 分隔线、引用文件、补丁摘要）自己补上与正文同一档的
+        # 走 SimplePartView 的那几类（引用文件、补丁摘要）自己补上与正文同一档的
         # 两列内边距，否则它们的文字会比同一条消息里别的行左移两列。
-        dividers = list(reply_view.query(".part-step_start"))
-        check(bool(dividers), "这一轮回复里出现了 step 分隔线，才谈得上比对它的文字起始列")
+        # 步骤分隔线不再画出来：它是内部计数，卡片之间的留白已经把每一步分开。
+        positioned = [
+            view
+            for view in reply_view.query(SimplePartView)
+            if view.has_class("part-step_start") or view.has_class("part-step_finish")
+        ]
+        check(bool(positioned), "这一轮回复里出现了步骤标记，才谈得上比对它的占位")
         check(
-            dividers[0].content_region.x == reply_text.content_region.x,
-            f"step 分隔线的文字起始列与正文一致：{dividers[0].content_region.x}，{reply_text.content_region.x}",
+            all(view.region.height == 0 for view in positioned),
+            f"步骤标记占 0 行，不画在界面上：{[view.region for view in positioned]}",
+        )
+        check(
+            positioned[0].render_part_text(positioned[0].part).startswith("step "),
+            f"步骤标记的正文仍在数据里，只是不显示：{positioned[0].render_part_text(positioned[0].part)}",
         )
 
         # 思考块默认折叠，标题上写着"点击展开"，点一下要真的展开。这条路径由 Textual
         # 按消息名回调，方法签名不带事件参数，能不能被调到只能实测。
         # 这一步趁消息区只有这一条回复、内容还放得下一屏时做，点的是屏幕坐标。
         fold = pane.query(ReasoningPartView).first()
+        fold_header = fold.query_one(".fold-header")
         check(not fold._expanded, "思考块默认是折叠的")
         check(
             str(fold._body.styles.display) == "none",
@@ -1309,12 +1418,12 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             if pane.scroll_y == settled:
                 break
         for _ in range(5):
-            header_region = fold._header.region
+            header_region = fold_header.region
             if window.y <= header_region.y and header_region.bottom <= window.y + window.height:
                 break
             pane.scroll_relative(y=header_region.y - window.y - 1, animate=False)
             await pilot.pause()
-        header_region = fold._header.region
+        header_region = fold_header.region
         check(
             header_region.height > 0
             and window.y <= header_region.y
@@ -1330,8 +1439,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         # 跟随本身在别处单独验，这一步测的是"点一下标题会不会展开"，先把跟随关掉，
         # 免得标题展开之后的高度变化又把画面挪走。
         pane._follow = False
-        before_click = (pane.scroll_y, fold._header.region)
-        landed = await pilot.click(fold._header)
+        before_click = (pane.scroll_y, fold_header.region)
+        landed = await pilot.click(fold_header)
         await pilot.pause()
         check(
             isinstance(app.screen, ChatScreen),
@@ -1341,7 +1450,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             landed,
             f"点击打在思考块标题上：点击前 scroll_y={before_click[0]} 标题 {before_click[1]}，"
             f"点击后 scroll_y={pane.scroll_y} following={pane.following} "
-            f"标题 {fold._header.region}，消息区 {pane.region}",
+            f"标题 {fold_header.region}，消息区 {pane.region}",
         )
         check(fold._expanded, "点一下标题之后展开")
         check(
@@ -1355,14 +1464,14 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"展开之后看得到思考正文：{str(fold._body.render())!r}",
         )
         check(
-            "点击折叠" in str(fold._header.content),
-            f"标题上的提示跟着换：{str(fold._header.content)!r}",
+            "点击折叠" in str(fold_header.content),
+            f"标题上的提示跟着换：{str(fold_header.content)!r}",
         )
         # 点正文不能把展开的思考收起来：展开之后点它，多半是想读或者选中。
         await pilot.click(fold._body)
         await pilot.pause()
         check(fold._expanded, "点正文不会把展开的思考收起来")
-        await pilot.click(fold._header)
+        await pilot.click(fold_header)
         await pilot.pause()
         check(not fold._expanded, "再点一下收回折叠")
         editor.focus_input()
@@ -1703,7 +1812,12 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(not editor.agent_popup.is_open, "焦点回到编辑器后 escape 关掉 Agent 补全")
 
-        check(editor.styles.border_top[1].hex.lower() == "#333333", "普通输入时编辑器上边框是灰色")
+        # 输入区块与消息区之间靠明度差分开，不画上界线：横贯屏幕的一条线拿不到信息，
+        # 而它常驻在整屏最显眼的位置上。
+        check(
+            editor.styles.border_top[0] in ("", "none"),
+            f"输入区块不画上界线：{editor.styles.border_top}",
+        )
 
         # 斜杠命令补全：打一个 / 就把全部命令列出来，接着打字按名字筛，上下键挪高亮，
         # 回车采纳。这份清单原先只有 ctrl+p 命令面板与帮助界面里有，输入框里看不到。
@@ -1779,20 +1893,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             panel._written == {},
             f"侧栏关着时不计算内容：{sorted(panel._written)}",
         )
-        # 标题栏：左边是当前会话名，右边是侧栏开关。开关必须能点——
+        # 侧栏开关在底部状态栏最右端。开关必须能点——
         # /sidebar 是一条要记住的命令，而折叠侧栏是随时会做一下的动作。
-        header = chat.query_one("#chat-header")
-        title_label = chat.query_one("#chat-title")
         toggle = chat.query_one("#side-toggle")
-        check(
-            str(title_label.render()) == app.session_manager.current.title,
-            f"标题栏写着当前会话名：{title_label.render()}",
-        )
-        check(header.region.height == 1, f"标题栏只占一行：{header.region.height}")
-        check(
-            toggle.region.right == app.size.width - 1,
-            f"侧栏开关贴在标题栏右端：右端 {toggle.region.right}，屏幕宽 {app.size.width}",
-        )
         check("侧栏" in str(toggle.render()), f"侧栏关着时开关写「侧栏」：{toggle.render()}")
         await pilot.click(toggle)
         await pilot.pause()
@@ -1816,10 +1919,12 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(panel.region.width == 30, "侧栏宽 30 列")
         check(panel.region.right == app.size.width, "侧栏贴在屏幕右边缘")
         check(pane.region.width == pane_width - 30, "消息区让出侧栏占用的宽度")
-        check("New Session" in str(chat.query_one("#side-session").content), "侧栏显示会话标题")
         check(
-            sorted(panel._written)
-            == ["#side-files", "#side-session", "#side-stats", "#side-tools"],
+            len(chat.query("#side-session")) == 0,
+            "侧栏不重复显示会话标题（它已经在底部状态栏最左端）",
+        )
+        check(
+            sorted(panel._written) == ["#side-files", "#side-stats", "#side-tools"],
             f"打开侧栏时把内容补齐：{sorted(panel._written)}",
         )
         check(
@@ -1836,7 +1941,12 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"{len(session_now.messages)} 条消息" in str(chat.query_one("#side-stats").content),
             "侧栏用量行按当前会话的消息条数统计",
         )
-        check("◆ bash" in str(chat.query_one("#side-tools").content), "侧栏列出调用过的工具与状态")
+        stats_now = str(chat.query_one("#side-stats").content)
+        check(
+            "缓存命中" in stats_now and "未命中" in stats_now and "输出" in stats_now,
+            f"侧栏把累计用量分成命中、未命中与输出：{stats_now}",
+        )
+        check("✓ bash" in str(chat.query_one("#side-tools").content), "侧栏列出调用过的工具与状态")
         check(
             str(accepted) in str(chat.query_one("#side-files").content),
             f"侧栏列出引用过的文件：{accepted}",
@@ -2106,7 +2216,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         ]
         check(not blank, f"每种 Part 都渲染出内容，渲染为空的：{blank}")
         check(
-            "▤" in SimplePartView.render_part_text(PART_SAMPLES[PartType.FILE]),
+            "vsagent/app.py" in SimplePartView.render_part_text(PART_SAMPLES[PartType.FILE]),
             "文件引用渲染成引用卡",
         )
         # 补丁那行的增删行数必须来自 Part 自己的字段，渲染层不能自己编一个常量：
@@ -2204,6 +2314,19 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             f"会话选择器在屏幕中间：左 {box.x} 右 {app.size.width - box.right}，"
             f"盒子 {box}，屏宽 {app.size.width}",
         )
+        # 弹窗与聊天界面共用同一条灰阶：本体取分层底那一档，光标行抬一档灰。
+        # 光标行原来是整行铺满主题的主色蓝，与「当前会话」那条蓝色标题撞在一起
+        body_style = app.screen.query_one("#session-picker").styles
+        check(
+            body_style.background.rgb == (0x1A, 0x1A, 0x1A)
+            and round(body_style.background.a, 2) == 0.92,
+            f"弹窗本体取分层底：{body_style.background.hex} / {body_style.background.a}",
+        )
+        picked = app.screen.query("ListItem.-highlight").first()
+        check(
+            picked.styles.background.hex.lower() == "#2a2a2a",
+            f"光标行取装饰线那一档灰：{picked.styles.background.hex}",
+        )
 
         await pilot.press("r")
         await pilot.pause()
@@ -2262,10 +2385,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.press("escape")
         await pilot.pause()
         check(isinstance(app.screen, ChatScreen), "关闭接口表单后回到聊天界面")
-        model_label_now = chat.query_one("#editor-model")
         check(
-            str(model_label_now.render()) == app.current_model_label,
-            f"输入框状态行与当前模型一致：{model_label_now.render()}",
+            len(chat.query("#editor-model")) == 0,
+            "换完模型之后输入框状态行上仍然没有模型名（只在底部状态栏那一处显示）",
         )
 
         app.execute_command("themes")
@@ -2309,6 +2431,18 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         top = app.screen
         check(bool(top.query(".toast")), "toast 挂载成功")
+        # 容器浮在界面上，宽度必须只到提示条那一块：铺满整行时它虽然看不见，却把底部
+        # 那几行的点击全吃了，消息区底部的「有新内容」提示挂在同一个位置。
+        rack = next(iter(app.screen.query(ToastRack)), None)
+        widest = max(
+            (toast.outer_size.width for toast in app.screen.query(ToastNotification)),
+            default=0,
+        )
+        check(
+            rack is not None and rack.region.width == widest < app.size.width,
+            f"提示条容器只占最宽那条提示的那一块：容器 {rack.region.width if rack else 0} 列，"
+            f"最宽一条 {widest} 列，屏幕 {app.size.width} 列",
+        )
         await pilot.pause(3.3)
         check(not app.screen.query(".toast"), "toast 在 3 秒后移除")
 
@@ -2605,7 +2739,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.press("home")
         await pilot.pause()
         check(not pane.following, "回到顶部之后跟随是关着的")
-        for _ in range(200):
+        for _ in range(400):
             await pilot.press("down")
             await pilot.pause()
             if pane._at_bottom():
@@ -2614,7 +2748,14 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             pane._at_bottom(),
             f"一路往下滚到底：scroll_y={pane.scroll_y}，max={pane.max_scroll_y}",
         )
-        check(pane.following, "一行一行滚到最底之后恢复自动跟随")
+        # 一路滚到底之后，恢复跟随排在下一次刷新之后：多等一帧再断言，
+        # 否则读到的是「已经贴底、回调还没跑」的中间状态。
+        await pilot.pause()
+        check(
+            pane.following,
+            f"一行一行滚到最底之后恢复自动跟随：scroll_y={pane.scroll_y}，"
+            f"max={pane.max_scroll_y}，提示条={len(app.screen.query('.toast'))}",
+        )
         await pilot.press("end")
         await pilot.pause()
 

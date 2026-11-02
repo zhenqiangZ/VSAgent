@@ -92,20 +92,55 @@ def _candidate_rows(entry: Any) -> tuple[list[dict[str, Any]], str, bool]:
 
 
 def _ligandset_rows(entry: Any) -> list[dict[str, Any]]:
+    """配体集 → `[{id,name,smiles,score}]`，`score` 取这一行的 **pChEMBL**。
+
+    原先这里把 `score` 固定写成 0.0，理由是「配体集没有分数」。但 `search_actives`
+    与 `build_reference_set` 的产物每一行都带 `pchembl_value`，扔掉它之后
+    `matched_pairs` 从配体集取对子时两侧都是 0，活性差恒为 0，全被 `min_delta`
+    滤掉——返回「没有对子」，看上去像这个库没有匹配对，实际是活性列被扔了。
+    方向与 `_rows_of` 对配体集返回的 `higher_is_better=True` 一致：pChEMBL 越大越强。
+
+    没有这一列（用户自己导的库）时仍写 0.0：那不是「活性为零」，只是「没有活性数据」，
+    下游 `min_delta` 会把它全部滤掉，与没有分数的语义相同。
+    """
+    table = _ligand_table(entry)
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(table, start=1):
+        smiles = str(row.get("smiles") or "").strip()
+        if not smiles:
+            continue
+        identifier = str(row.get("id") or row.get("molecule_chembl_id") or "").strip()
+        identifier = identifier or f"LIG-{index:04d}"
+        name = str(row.get("name") or row.get("molecule_pref_name") or "").strip()
+        score = 0.0
+        raw = row.get("pchembl_value")
+        if raw is not None and str(raw).strip():
+            try:
+                score = float(str(raw))
+            except ValueError:
+                score = 0.0
+        rows.append(
+            {"id": identifier, "name": name or identifier, "smiles": smiles, "score": score}
+        )
+    return rows
+
+
+def _ligand_table(entry: Any) -> list[dict[str, str]]:
+    """配体集的原始行。两种布局：产物目录里的 `ligands.csv`，或直接是 CSV 文件。
+
+    **按列名读，不按列位置**：`import_ligandset` 写的是 `id` / `name`，
+    `search_actives` 写的是 `molecule_chembl_id` / `molecule_pref_name`，
+    两套名字在 `_ligandset_rows` 里各自认。
+    """
+    path = Path(str(getattr(entry, "path", "") or ""))
+    csv_path = path / ligand.CSV_FILE if path.is_dir() else path
+    if not csv_path.is_file():
+        raise ToolError(f"{entry.handle} 的配体表读不出来：{csv_path} 不是文件")
     try:
-        items, _kind = ligand._source_cleaned(entry)
-    except ligand.LigandError as error:
-        raise ToolError(str(error)) from error
-    return [
-        {
-            "id": item.id,
-            "name": item.name,
-            "smiles": item.cleaned.smiles,
-            "score": 0.0,
-        }
-        for item in items
-        if item.cleaned.smiles
-    ]
+        with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+    except OSError as error:
+        raise ToolError(f"读 {csv_path} 失败（{type(error).__name__}：{error}）") from error
 
 
 def _rows_of(entry: Any) -> tuple[list[dict[str, Any]], str, bool]:
@@ -114,6 +149,89 @@ def _rows_of(entry: Any) -> tuple[list[dict[str, Any]], str, bool]:
     if kind == "artifact":
         return _candidate_rows(entry)
     return _ligandset_rows(entry), "", True
+
+
+def _batch_members(entry: Any) -> list[str]:
+    """一批候选的分子编号。配体集读 `ligands.csv`，候选表读 `candidates.json`。
+
+    `record_assay` 的 `batch` 参数指向 `pick_diverse` 的产物（配体集），也可能指向
+    一张候选表——两种都要能数出「这一批有几个」。
+    """
+    path = Path(str(getattr(entry, "path", "") or ""))
+    if path.is_dir() and (path / "candidates.json").is_file():
+        payload = products.read_json(path / "candidates.json")
+        return [
+            str(item.get("id") or "")
+            for item in (payload.get("rows") or [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+    if path.is_dir() and (path / ligand.CSV_FILE).is_file():
+        path = path / ligand.CSV_FILE
+    if not path.is_file():
+        raise ToolError(f"{entry.handle} 里没有可读的分子表：{path}")
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except OSError as error:
+        raise ToolError(f"读 {path} 失败（{type(error).__name__}：{error}）") from error
+    return [
+        str(row.get("id") or row.get("molecule_chembl_id") or "").strip()
+        for row in rows
+        if str(row.get("id") or row.get("molecule_chembl_id") or "").strip()
+    ]
+
+
+def _batch_account(
+    members: Sequence[str],
+    received: dict[str, dict[str, Any]],
+    hypothesis: Any,
+) -> tuple[list[str], dict[str, Any]]:
+    """这一批的账：挑出几个、实测几个、未测哪几个、达标几个、产出率多少。
+
+    **分母取实测数**：合成失败进不了 `assay.csv`，没排上实验的还能补测，两者混在
+    一起会把产出率压成一个与实验能力无关的数。未测清单每批都给，下一轮开头先看它。
+    """
+    seen = [molecule for molecule in members if molecule in received]
+    missing = [molecule for molecule in members if molecule not in received]
+    lines = [
+        f"本批 {len(members)} 个：实测 {len(seen)}、未测 {len(missing)}"
+        + (
+            f"（{'、'.join(missing[:10])}{'……' if len(missing) > 10 else ''}）"
+            if missing
+            else ""
+        )
+    ]
+    counts = {
+        "batch": len(members),
+        "tested": len(seen),
+        "untested": len(missing),
+        "pass": 0,
+        "fail": 0,
+        "unknown": 0,
+    }
+    parsed = parse_expected(hypothesis.expected) if hypothesis is not None else None
+    if hypothesis is None:
+        lines.append("达标数要按某条假设的预期判：这次没给 hypothesis，只报了分母。")
+        return lines, counts
+    if parsed is None:
+        lines.append(
+            f"预期里取不到阈值（{hypothesis.expected}），达标数算不出来。"
+            "把预期写成「< 100 nM」这种形式，下一次回填就能算。"
+        )
+        return lines, counts
+    op, threshold = parsed
+    for molecule in seen:
+        row = received[molecule]
+        verdict = judge_measurement(
+            float(row["value"]), str(row["qualifier"]), op, threshold
+        )
+        counts["pass" if verdict == "pass" else "fail" if verdict == "fail" else "unknown"] += 1
+    lines.append(
+        f"达标 {counts['pass']}、未达标 {counts['fail']}、判不了 {counts['unknown']}"
+    )
+    if seen:
+        lines.append(f"产出率 {counts['pass']}/{len(seen)} = {counts['pass'] / len(seen):.0%}")
+    return lines, counts
 
 
 # ---------------------------------------------------------------------------
@@ -1093,6 +1211,9 @@ class RecordAssayTool(Tool):
             "**给了 `hypothesis` 就顺手结案**：把预期与这一批实测逐条比，"
             "返回达标 / 不达标 / 判不了各几条，并把那条假设改成 supported / refuted / "
             "inconclusive。这是假设闭环的唯一入口——没有它，假设提了就没人管。\n"
+            "**给了 `batch` 就算这一批的账**：本批挑出几个、实测几个、哪几个还没测、"
+            "达标几个、产出率多少。产出率的分母是实测数，不是挑出数——合成失败进不了"
+            "这张表，没排上实验的还能补测，两者不能混成一个数。\n"
             "写盘是原子的：中途失败不会留下半截表。别的 campaign 的文件一个字节都不动。"
         ),
         parameters={
@@ -1106,6 +1227,13 @@ class RecordAssayTool(Tool):
                     "description": (
                         "要结案的假设编号（hyp#1）。给了就按它的 expected 与这批实测比，"
                         "自动改状态；不给只记数据"
+                    ),
+                },
+                "batch": {
+                    "type": "string",
+                    "description": (
+                        "这一批候选的 handle（pick_diverse 的产物，或候选表）。给了就算本批的账："
+                        "实测几个、未测哪几个、达标几个、产出率多少"
                     ),
                 },
             },
@@ -1155,6 +1283,24 @@ class RecordAssayTool(Tool):
                 output=f"campaign 只能是字母数字与 . _ -（现在是 {campaign!r}）：它会当目录名用。",
                 failed=True,
             )
+        # 批次同样在写盘之前解析：编号写错时数据已经落盘、调用方却看到一条失败，
+        # 两边对不上（与假设编号同一个理由）。
+        batch_members: list[str] = []
+        batch_handle = str(arguments.get("batch") or "").strip()
+        if batch_handle:
+            try:
+                batch_entry = ledger.get(batch_handle)
+            except Exception as error:
+                return ToolResult(output=str(error), failed=True)
+            try:
+                batch_members = _batch_members(batch_entry)
+            except ToolError as error:
+                return ToolResult(output=str(error), failed=True)
+            if not batch_members:
+                return ToolResult(
+                    output=f"{batch_entry.handle} 里没有任何分子，算不出这一批的账。",
+                    failed=True,
+                )
         path = Path(raw_path).expanduser()
         if not path.is_file():
             return ToolResult(output=f"找不到这个文件，或它不是普通文件：{path}", failed=True)
@@ -1303,6 +1449,7 @@ class RecordAssayTool(Tool):
             )
         lines.append(f"文件：{main_path}")
         judged = ""
+        batch_counts: dict[str, Any] = {}
         if hypothesis is not None:
             judged, hypothesis_lines = _judge_batch(hypothesis.expected, received, assay)
             hypothesis.status = judged
@@ -1313,6 +1460,13 @@ class RecordAssayTool(Tool):
             lines.extend(hypothesis_lines)
         else:
             lines.append("下一步：把这些活性当参考集（build_reference_set 的输入），或做匹配分子对。")
+        if batch_members:
+            lines.append("")
+            account_lines, batch_counts = _batch_account(
+                batch_members, received, hypothesis
+            )
+            lines.extend(account_lines)
+            lines.append("未测清单下一轮开头先看：补测比换一批便宜。")
         return ToolResult(
             output="\n".join(lines),
             meta={
@@ -1323,6 +1477,7 @@ class RecordAssayTool(Tool):
                 "superseded": len(superseded),
                 "hypothesis": hypothesis.id if hypothesis is not None else "",
                 "hypothesis_status": judged,
+                "batch": batch_counts,
             },
         )
 
@@ -1335,4 +1490,4 @@ def domain_tools() -> list[Tool]:
 if __name__ == "__main__":  # pragma: no cover
     from debug_tools import main
 
-    main()
+    raise SystemExit(main(__name__, domain_tools()))

@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import io
 import math
+import statistics
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +69,11 @@ TIER_MEDIUM = "medium"
 TIER_LOW = "low"
 TIER_BELOW = "below_cutoff"
 TIERS = (TIER_HIGH, TIER_MEDIUM, TIER_LOW, TIER_BELOW)
+TIER_ORDER = {TIER_HIGH: 0, TIER_MEDIUM: 1, TIER_LOW: 2}
+
+# 并列组的分数宽度（kcal/mol）。Vina 打分函数的标准误差约 2.5 kcal/mol，1.0 以内的
+# 差别读不出活性高低；按百分位切档会把这种差别切进不同的档，看上去像有先后。
+TIE_DELTA = 1.0
 
 # artifact 的 meta.kind -> (列名, 是否越高越好)。
 # 只认这里列出来的 kind：来源认不出来时不猜方向，直接拒绝——猜错方向得到的是
@@ -94,6 +100,7 @@ class CandidateRow:
     gates: dict[str, Any] = field(default_factory=dict)
     consensus: float = 0.0
     tier: str = TIER_LOW
+    tie: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +111,7 @@ class CandidateRow:
             "ranks": {k: v for k, v in self.ranks.items()},
             "consensus_rank": self.consensus,
             "tier": self.tier,
+            "tie": self.tie,
             "gates": self.gates,
             "sources": list(self.sources),
         }
@@ -349,12 +357,19 @@ def _gate_failures(gates: dict[str, Any]) -> list[str]:
     return failed
 
 
-def _assign_tiers(rows: list[CandidateRow], cutoffs: Sequence[float]) -> dict[str, int]:
+def _assign_tiers(
+    rows: list[CandidateRow], cutoffs: Sequence[float], dock_label: str = ""
+) -> dict[str, int]:
     """按名次分档：前 `cutoffs[0]`% 是 high，前 `cutoffs[1]`% 是 medium，其余 low。
 
     用**名次**而不是分数或百分位值：`rank / n * 100` 在小表上会把 top 5% 算成
     「0.25 个位置」，于是一个 20 条的表里没有任何一条能进 high。名次至少给高档留
     一个位置（`max(1, ...)`），20 条的表就是 1 个 high、3 个 medium。
+
+    分完档再并**并列组**：同一来源（对接）里相邻、分数差 < `TIE_DELTA` 的分子并成
+    一组，组内档位取最高的那一档。理由与 `TIE_DELTA` 的注释同一件事——百分位切在
+    噪声里，切出来的先后没有意义。门禁没过的（`below_cutoff`）不参与取档：
+    那是「这条不过关」，与名次高低是两件事。
     """
     counts = {tier: 0 for tier in TIERS}
     total = len(rows)
@@ -372,8 +387,48 @@ def _assign_tiers(rows: list[CandidateRow], cutoffs: Sequence[float]) -> dict[st
             row.tier = TIER_MEDIUM
         else:
             row.tier = TIER_LOW
+    _merge_ties(rows, dock_label)
+    for row in rows:
         counts[row.tier] += 1
     return counts
+
+
+def _merge_ties(rows: Sequence[CandidateRow], dock_label: str) -> None:
+    """把相邻、差 < `TIE_DELTA` 的分子并成并列组，组内取最高档。
+
+    只在**有对接分数**时做：别的来源是相似度或 pK，量纲不是 kcal/mol，1.0 这个宽度
+    对它们没有意义。没有对接来源时所有行的 `tie` 留空。
+    """
+    if not dock_label:
+        return
+    group: list[CandidateRow] = []
+    groups: list[list[CandidateRow]] = []
+    for row in rows:
+        score = row.scores.get(dock_label)
+        if score is None:
+            if group:
+                groups.append(group)
+                group = []
+            continue
+        if group and abs(float(score) - float(group[-1].scores[dock_label])) >= TIE_DELTA:
+            groups.append(group)
+            group = []
+        group.append(row)
+    if group:
+        groups.append(group)
+
+    index = 0
+    for members in groups:
+        if len(members) < 2:
+            continue
+        index += 1
+        label = f"T{index}"
+        ranked = [row for row in members if row.tier != TIER_BELOW]
+        best = min(ranked, key=lambda row: TIER_ORDER.get(row.tier, 9)) if ranked else None
+        for row in members:
+            row.tie = label
+            if best is not None and row.tier != TIER_BELOW:
+                row.tier = best.tier
 
 
 # ---------------------------------------------------------------------------
@@ -429,20 +484,65 @@ def _cutoffs(arguments: dict[str, Any]) -> tuple[float, float]:
 # ---------------------------------------------------------------------------
 def _csv_text(rows: Sequence[CandidateRow], labels: Sequence[str]) -> str:
     buffer = io.StringIO()
-    header = ["id", "name", "smiles", "consensus_rank", "tier"]
+    header = ["id", "name", "smiles", "consensus_rank", "tier", "tie"]
     for label in labels:
         header.extend([label, f"{label}_rank"])
     header.append("sources")
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(header)
     for row in rows:
-        line: list[Any] = [row.id, row.name, row.smiles, f"{row.consensus:g}", row.tier]
+        line: list[Any] = [
+            row.id, row.name, row.smiles, f"{row.consensus:g}", row.tier, row.tie
+        ]
         for label in labels:
             line.append("" if label not in row.scores else f"{row.scores[label]:g}")
             line.append("" if label not in row.ranks else f"{row.ranks[label]:g}")
         line.append(",".join(row.sources))
         writer.writerow(line)
     return buffer.getvalue()
+
+
+def _agreement(
+    rows: Sequence[CandidateRow], labels: Sequence[str]
+) -> list[dict[str, Any]]:
+    """两路来源的名次一致性。只在两路都出现的分子上算。"""
+    found: list[dict[str, Any]] = []
+    for left in range(len(labels)):
+        for right in range(left + 1, len(labels)):
+            a, b = labels[left], labels[right]
+            shared = [
+                (float(row.ranks[a]), float(row.ranks[b]), row.id)
+                for row in rows
+                if a in row.ranks and b in row.ranks
+            ]
+            if len(shared) < 3:
+                continue
+            try:
+                rho = statistics.correlation(
+                    [item[0] for item in shared], [item[1] for item in shared]
+                )
+            except statistics.StatisticsError:
+                rho = None
+            count = len(shared)
+            top_a = {item[2] for item in shared if item[0] <= min(10, count)}
+            top_b = {item[2] for item in shared if item[1] <= min(10, count)}
+            divergent = [
+                item[2]
+                for item in shared
+                if (item[0] <= min(10, count) and item[1] > count / 2)
+                or (item[1] <= min(10, count) and item[0] > count / 2)
+            ][:5]
+            found.append(
+                {
+                    "left": a,
+                    "right": b,
+                    "count": count,
+                    "rho": None if rho is None else round(rho, 3),
+                    "top_overlap": len(top_a & top_b),
+                    "divergent": divergent,
+                }
+            )
+    return found
 
 
 def _render(
@@ -466,6 +566,16 @@ def _render(
     lines.append(
         f"共 {total} 条，四档 {'/'.join(TIERS)} = {distribution}。"
     )
+    tied: dict[str, int] = {}
+    for row in rows:
+        if row.tie:
+            tied[row.tie] = tied.get(row.tie, 0) + 1
+    if tied:
+        lines.append(
+            "并列组："
+            + "、".join(f"{name} {count} 个" for name, count in sorted(tied.items()))
+            + f"（同一来源内相邻、差 <{TIE_DELTA:g} kcal/mol，组内档位取最高）"
+        )
     lines.append(
         "合并来源："
         + "、".join(
@@ -479,12 +589,22 @@ def _render(
         + "。"
     )
     if len(sources) == 1:
-        lines.append("只有一路来源：这是单路分位数，不是共识。")
+        lines.append("只有一路来源：这是单路分位数，不能当共识。")
     else:
         lines.append(
             "秩：每路先转秩再取平均；缺一路的不补 0，按已有几路取平均，"
             "平局时覆盖路数多的在前。"
         )
+        for item in _agreement(rows, [source.label for source in sources]):
+            rho = "算不出（名次没有变化）" if item["rho"] is None else f"{item['rho']:+.2f}"
+            line = (
+                f"两路一致性：{item['left']} × {item['right']}，"
+                f"ρ {rho}（{item['count']} 个共有分子），"
+                f"前 10 重合 {item['top_overlap']} 个。"
+            )
+            if item["divergent"]:
+                line += f" 背离：{'、'.join(item['divergent'])}。"
+            lines.append(line)
 
     header = f"{'#':>3}  {'分子':<14}{'名称':<14}"
     for label in labels:
@@ -499,6 +619,8 @@ def _render(
             line += f"{'—' if score is None else f'{score:.2f}':>10}"
             line += f"{'—' if rank is None else f'{rank:g}':>6}"
         line += f"{row.consensus:>7.1f}  {row.tier}"
+        if row.tie:
+            line += f" 并列{row.tie}"
         failures = _gate_failures(row.gates)
         if failures:
             line += f"（门禁未过：{', '.join(failures)}）"
@@ -543,11 +665,16 @@ class RankCandidatesTool(Tool):
             "把**多路**筛选分数合成一张候选表：先对齐分子，再按平均秩排共识名次，"
             "最后按名次分档（前 5% 是 high、前 20% 是 medium，其余 low；"
             "没过门禁的单列 below_cutoff）。\n"
+            "**分档之后并并列组**：同一来源里相邻、分数差 <1 kcal/mol 的分子并成一组，"
+            "档位取组内最高档，`tie` 列写组号。Vina 的标准误差约 2.5 kcal/mol，"
+            "1 分之内的先后读不出活性高低，结论里不要写「A 比 B 好」。\n"
             "来源写 handle，逗号分隔（如 artifact#4,artifact#5）。分数方向由来源类型"
             "决定——dock 的 kcal/mol 越低越好、affinity 的 pK 越高越好——**不要自己"
             "换算方向，也没有这个参数**。\n"
             "只合并、不重算：表里出现的分数与各路产物里逐字一致。某一路缺这个分子时"
             "该列留空，不补 0。\n"
+            "**局限**：平均秩只是一个排序量，没有物理单位；只对两路都出现的分子可靠；"
+            "分层间隔较宽；排名只作原料，结论要另外写。\n"
             "下一步：analyze_pose(docking=..., molecule=...) 看榜首那条的接触依据。"
         ),
         parameters={
@@ -706,15 +833,20 @@ class RankCandidatesTool(Tool):
             available = [row.ranks[label] for label in row.ranks]
             row.consensus = round(sum(available) / len(available), 3)
         rows.sort(key=lambda row: (row.consensus, -len(row.ranks), row.id))
-        counts = _assign_tiers(rows, cutoffs)
+        dock_label = next(
+            (source.label for source in sources if source.kind == "docking"), ""
+        )
+        counts = _assign_tiers(rows, cutoffs, dock_label)
 
         payload = {
             "kind": "candidates",
             "sources": [source.handle for source in sources],
-            "tier_method": "percentile",
+            "tier_method": "percentile+tie",
+            "tie_delta": TIE_DELTA,
             "cutoffs": [cutoffs[0], cutoffs[1]],
             "counts": counts,
             "alignment_warnings": unmatched,
+            "agreement": _agreement(rows, [source.label for source in sources]),
             "rows": [row.as_dict() for row in rows],
         }
         try:
@@ -747,7 +879,8 @@ class RankCandidatesTool(Tool):
                     "stage": "candidates",
                     "tool": "rank_candidates",
                     "sources": [source.handle for source in sources],
-                    "tier_method": "percentile",
+                    "tier_method": "percentile+tie",
+                    "tie_delta": TIE_DELTA,
                     "counts": counts,
                     "alignment_warnings": unmatched,
                     "params": params,
@@ -795,6 +928,7 @@ def _rows_from_payload(payload: dict[str, Any]) -> list[CandidateRow]:
                 gates=dict(item.get("gates") or {}),
                 consensus=float(item.get("consensus_rank") or 0.0),
                 tier=str(item.get("tier") or TIER_LOW),
+                tie=str(item.get("tie") or ""),
             )
         )
     return rows
@@ -1219,6 +1353,30 @@ def plip_fingerprint(
             + "），交互指纹没算——不是这个位姿没有相互作用。"
         )
     return _plip_hits(site), ""
+
+
+# 给 `domain/interactions.py` 的公开入口。`analyze_pose` 与 `write_run` 用同一份
+# 几何计算：各写一份的话，页面上的距离与聊天里的距离迟早对不上。
+def pose_contacts(
+    receptor: Sequence[pdbtext.AtomRecord],
+    ligand: Sequence[pdbtext.AtomRecord],
+    cutoff: float = CONTACT_CUTOFF,
+) -> list[_Contact]:
+    return _contacts(receptor, ligand, cutoff)
+
+
+def pose_clashes(
+    receptor: Sequence[pdbtext.AtomRecord],
+    ligand: Sequence[pdbtext.AtomRecord],
+) -> list[tuple[str, str, str, float]]:
+    return _clashes(receptor, ligand)
+
+
+def pose_hbonds(
+    receptor: Sequence[pdbtext.AtomRecord],
+    ligand: Sequence[pdbtext.AtomRecord],
+) -> list[_HBond]:
+    return _hbonds(receptor, ligand)
 
 
 def _render_fingerprint(hits: dict[str, list[_PlipHit]]) -> list[str]:
@@ -1767,7 +1925,9 @@ class ContactMapTool(Tool):
 
         table = _contact_map(receptor.atoms, poses, cutoff)
         meta = {
-            "handle": entry.handle,
+            # 字符串而不是 handle 对象：meta 会被调试脚本与网页端整段序列化，
+            # 塞对象进去在 `json.dumps` 那一步就崩，而工具本身已经跑完了。
+            "handle": str(entry.handle),
             "poses": len(poses),
             "skipped": skipped,
             "residues": len(table),
@@ -2860,21 +3020,28 @@ class PickControlsTool(Tool):
     spec = ToolSpec(
         name="pick_controls",
         description=(
-            "从候选表里挑出**对照分子**，并写明每一条为什么算对照。"
-            "只读产物，不写盘。\n"
+            "挑出**对照分子**，并写明每一条为什么算对照。只读产物，不写盘。\n"
             "三类各挑一到几个：\n"
             "- 正向对照：排名最高、门禁全过。它测不出活性时，问题在实验或假设，不在排序。\n"
             "- 阴性对照：排名最低、门禁全过。预期不结合；它要也活，说明这个位点的排序没意义。\n"
             "- 背离对照：门禁没过却排在前半。分数好看而性质不过关，用来检验「只看分数」会不会踩坑。\n"
+            "`source` 收候选表（rank_candidates、相似度、形状的产物）与配体集。配体集没有"
+            "门禁与分数，只能按顺序取正向与阴性，背离那一类挑不出来——会如实说明。\n"
+            "`pocket` 可选：写明这批对照是为哪一处口袋准备的，输出里带上它的残基数。\n"
             "给了 `hypothesis` 会说明这批对照用来检验哪一条假设。"
             "**每批候选都该带对照**：没有对照的活性数据说明不了任何事。"
+            "**在对接之前挑**：对照要跟着候选一起下单，事后再挑只能从已经测过的那批里凑。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "候选表 handle（rank_candidates 的产物），例如 artifact#5",
+                    "description": "候选表或配体集的 handle，例如 artifact#5",
+                },
+                "pocket": {
+                    "type": "string",
+                    "description": "这批对照对应的口袋（口袋集或 define_pocket 的产物）；可选",
                 },
                 "hypothesis": {
                     "type": "string",
@@ -2903,27 +3070,61 @@ class PickControlsTool(Tool):
             )
         raw = str(arguments.get("source") or "").strip()
         if not raw:
-            return ToolResult(output="缺少参数 source：候选表的 handle。", failed=True)
+            return ToolResult(output="缺少参数 source：候选表或配体集的 handle。", failed=True)
         try:
             entry = ledger.get(raw)
-            expect_handle(entry, ArtifactHandle, "候选表")
         except Exception as error:
             return ToolResult(output=str(error), failed=True)
-        if str((entry.meta or {}).get("kind") or "") != "candidates":
+
+        kind = str(getattr(entry.handle, "kind", ""))
+        rows: list[CandidateRow] = []
+        if kind == "artifact":
+            if str((entry.meta or {}).get("kind") or "") != "candidates":
+                return ToolResult(
+                    output=(
+                        f"{entry.handle} 不是候选表（kind={(entry.meta or {}).get('kind')!r}）。"
+                        "先用 rank_candidates 生成一张候选表，或把配体集的 handle 传进来。"
+                    ),
+                    failed=True,
+                )
+            try:
+                payload = read_candidates(Path(str(entry.path)))
+            except (ToolError, OSError) as error:
+                return ToolResult(output=f"读候选表失败：{error}", failed=True)
+            rows = _rows_from_payload(payload)
+        elif kind == "ligandset":
+            from . import sar
+
+            try:
+                table = sar._ligandset_rows(entry)
+            except ToolError as error:
+                return ToolResult(output=str(error), failed=True)
+            rows = [
+                CandidateRow(
+                    id=row["id"],
+                    name=row["name"],
+                    smiles=row["smiles"],
+                    scores={"ligandset": float(row["score"])},
+                    consensus=float(index),
+                    tier=TIER_LOW,
+                )
+                for index, row in enumerate(table, start=1)
+            ]
+        else:
             return ToolResult(
-                output=(
-                    f"{entry.handle} 不是候选表（kind={(entry.meta or {}).get('kind')!r}）。"
-                    "先用 rank_candidates 生成一张候选表。"
-                ),
+                output=f"{entry.handle} 既不是候选表也不是配体集（{kind or '未知'}）。",
                 failed=True,
             )
-        try:
-            payload = read_candidates(Path(str(entry.path)))
-        except (ToolError, OSError) as error:
-            return ToolResult(output=f"读候选表失败：{error}", failed=True)
-        rows = _rows_from_payload(payload)
         if not rows:
             return ToolResult(output=f"{entry.handle} 里没有任何候选行。", failed=True)
+
+        pocket = None
+        raw_pocket = str(arguments.get("pocket") or "").strip()
+        if raw_pocket:
+            try:
+                pocket = ledger.get(raw_pocket)
+            except Exception as error:
+                return ToolResult(output=str(error), failed=True)
 
         limit = _int_argument(arguments, "limit", 1, 1, 3)
         picks = _pick_controls(rows, limit)
@@ -2940,6 +3141,12 @@ class PickControlsTool(Tool):
                 )
 
         lines = [f"对照分子（来源 {entry.handle}，候选 {len(rows)} 条）："]
+        if pocket is not None:
+            lines.append(f"对应口袋：{pocket.handle} {getattr(pocket, 'summary', '') or ''}".rstrip())
+        if kind == "ligandset":
+            lines.append(
+                "这一份是配体集：没有分数与门禁，背离对照挑不出来，只按顺序取正向与阴性。"
+            )
         missing: list[str] = []
         for role, why, chosen in picks:
             if not chosen:
@@ -2964,7 +3171,8 @@ class PickControlsTool(Tool):
         return ToolResult(
             output="\n".join(lines),
             meta={
-                "handle": entry.handle,
+                "handle": str(entry.handle),
+                "pocket": str(pocket.handle) if pocket is not None else "",
                 "hypothesis": hypothesis.id if hypothesis is not None else "",
                 "controls": {role: [row.id for row in chosen] for role, _why, chosen in picks},
                 "missing": missing,
@@ -3027,4 +3235,4 @@ def domain_tools() -> list[Tool]:
 if __name__ == "__main__":  # pragma: no cover
     from debug_tools import main
 
-    main()
+    raise SystemExit(main(__name__, domain_tools()))

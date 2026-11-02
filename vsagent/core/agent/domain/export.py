@@ -33,6 +33,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from ...paths import project_root
 from ...models import Hypothesis
@@ -765,6 +766,10 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     products.write_json_atomic(path, payload)
 
 
+INTERACTION_MODES = ("none", "top", "all")
+INTERACTION_TOP = 8
+
+
 class WriteRunTool(Tool):
     """把「受体 + 口袋」写成一个运行目录，交给网页看。"""
 
@@ -775,10 +780,14 @@ class WriteRunTool(Tool):
             "登记成 artifact，网页端据此渲染结构页。\n"
             "`view=pockets`（默认）算口袋；`view=structure` 只展示结构、不联网。"
             "两者都先做同一套预处理（选链与构象、去水去溶剂去氢）。\n"
-            "给了 `docking` 就写对接结果（位姿、分数、`provenance.poses`），不要再传 `ligands`。\n"
-            "口袋来源二选一：给了 `candidates` 就走先验（核对编号与链序列，按 CA 叠合后用共晶配体"
-            "圈口袋，`source=ligand`）；没给就搜该蛋白的带配体复合物，一个都没有才转 p2rank。"
-            "两路都拿不到就写空口袋并说明原因。\n"
+            "给了 `docking` 就写对接结果（位姿、分数、`provenance.poses`），不要再传 `ligands`。"
+            "给了 `affinity` 会按分子 id 贴 `affinity_pk`；`affinity` 要与 `docking` 一起给。\n"
+            "`interactions` 控制每分子的接触、几何氢键与 PLIP 指纹：`top`（默认）给所有位姿"
+            "算几何接触与几何氢键、前 8 个再算 PLIP；`all` 给全部加 PLIP；`none` 不算。\n"
+            "口袋来源三选一：给了 `pockets` 就直接用那份口袋集（`detect_pockets` 的产物，"
+            "四路叠合的结果都能上网页）；给了 `candidates` 就走先验（核对编号与链序列，"
+            "按 CA 叠合后用共晶配体圈口袋，`source=ligand`）；都没给就搜该蛋白的带配体复合物，"
+            "一个都没有才转 p2rank。三路都拿不到就写空口袋并说明原因。\n"
             "`uniprot` 是蛋白编号（如 P00519），**不是** PDB 编号；只给 `pdb_id` 会让主来源"
             "只剩手上这一份结构。center / score / min_distance 一律现算，不要自己编。"
         ),
@@ -815,6 +824,28 @@ class WriteRunTool(Tool):
                     "description": (
                         "先验清单：PDB 编号，逗号或空格分隔（如 \"1M17,2ITY,4HJO\"）。"
                         "给了它就不再按 UniProt 检索复合物"
+                    ),
+                },
+                "pockets": {
+                    "type": "string",
+                    "description": (
+                        "口袋集 handle（detect_pockets 的产物）。给了就直接用它，"
+                        "不再自己算口袋——四路叠合的结果原样上网页"
+                    ),
+                },
+                "affinity": {
+                    "type": "string",
+                    "description": (
+                        "亲和力产物 handle（kind=affinity，score_affinity 的产物）。"
+                        "与 docking 一起给；按分子 id 把 pK 写进 molecules[].affinity_pk"
+                    ),
+                },
+                "interactions": {
+                    "type": "string",
+                    "enum": list(INTERACTION_MODES),
+                    "description": (
+                        "接触与作用：top（默认）所有位姿算几何接触与几何氢键、前 8 个再算 PLIP；"
+                        "all 给全部位姿加 PLIP；none 不算"
                     ),
                 },
                 "view": {
@@ -899,6 +930,15 @@ class WriteRunTool(Tool):
                 output=f"view 只能是 pockets 或 structure，收到 {view!r}。",
                 failed=True,
             )
+        interactions_mode = str(arguments.get("interactions") or "top").strip().lower()
+        if interactions_mode not in INTERACTION_MODES:
+            return ToolResult(
+                output=(
+                    f"interactions 只能是 {'、'.join(INTERACTION_MODES)}，"
+                    f"收到 {interactions_mode!r}。"
+                ),
+                failed=True,
+            )
 
         # ---- 对接产物：在写任何文件之前校验完 ----
         docking_manifest: dict[str, Any] | None = None
@@ -911,6 +951,28 @@ class WriteRunTool(Tool):
                 )
             except ValueError as error:
                 return ToolResult(output=str(error), failed=True)
+
+        # ---- 亲和力产物：同样在写盘之前校验 ----
+        affinity_entry = None
+        affinity_scores: dict[str, float] = {}
+        affinity_provenance: dict[str, Any] | None = None
+        raw_affinity = str(arguments.get("affinity") or "").strip()
+        if raw_affinity:
+            if docking_entry is None:
+                return ToolResult(
+                    output="affinity 要与 docking 一起给：没有位姿就没有可贴 pK 的分子。",
+                    failed=True,
+                )
+            try:
+                affinity_entry = ledger.get(raw_affinity)
+                expect_handle(affinity_entry, ArtifactHandle, "affinity")
+                affinity_scores, affinity_provenance = _read_affinity(
+                    affinity_entry, entry
+                )
+            except Exception as error:  # LedgerError / ValueError
+                return ToolResult(output=str(error), failed=True)
+        if docking_entry is None:
+            interactions_mode = "none"
 
         # ---- 取出受体文本，解析事实 ----
         try:
@@ -949,6 +1011,23 @@ class WriteRunTool(Tool):
         verdicts: tuple = ()
 
         candidates = _candidates_of(arguments.get("candidates"))
+        raw_pockets = str(arguments.get("pockets") or "").strip()
+        pocket_set: Any = None
+        if raw_pockets:
+            try:
+                pocket_set = ledger.get(raw_pockets)
+                expect_handle(pocket_set, ArtifactHandle, "pockets")
+            except Exception as error:
+                return ToolResult(output=str(error), failed=True)
+            if str((pocket_set.meta or {}).get("kind") or "") != "pockets":
+                return ToolResult(
+                    output=(
+                        f"{pocket_set.handle} 不是口袋集（kind="
+                        f"{(pocket_set.meta or {}).get('kind')!r}）。"
+                        "先用 detect_pockets 算出口袋，再把它的 handle 传进来。"
+                    ),
+                    failed=True,
+                )
         if view == "structure":
             # 结构展示**不碰口袋来源**：不算、不联网。用户要的是「看结构」，
             # 这时去检索几十个复合物会让一个本该秒开的动作变成几分钟的等待。
@@ -957,6 +1036,15 @@ class WriteRunTool(Tool):
                 note="view=structure：只展示结构，未计算口袋",
             )
             note_parts.append(bundle.note)
+        elif pocket_set is not None:
+            # 已经算过的口袋集优先：模型通常先 detect_pockets 叠四路、挑完再写运行目录。
+            # 再算一遍不只是浪费，还会让网页上那份与聊天里说的那份不是同一份。
+            try:
+                bundle = pockets_module.bundle_from_set(pocket_set)
+            except pockets_module.ToolError as error:
+                return ToolResult(output=str(error), failed=True)
+            note_parts.append(bundle.note)
+            p0_total, p0_used = bundle.total, bundle.used
         elif candidates:
             # 给了先验清单就走这一侧，**不再按 UniProt 检索复合物**：那种检索只返回
             # 「带配体的已发布复合物」，覆盖到的口袋窄。清单覆盖面宽，代价是清单本身
@@ -1032,6 +1120,35 @@ class WriteRunTool(Tool):
                 # 否则目录里留着新 meta 不认识的位姿文件。
                 for old in (target / RUN_LIGANDS).glob("pose-*.pdb"):
                     old.unlink()
+            # 亲和力与相互作用都在写盘之前算：算不成时旧 meta 与旧 pose 都没动。
+            if affinity_provenance is not None:
+                try:
+                    affinity_provenance = _apply_affinity(
+                        molecules, affinity_scores, affinity_provenance
+                    )
+                except ValueError as error:
+                    if staging is not None:
+                        shutil.rmtree(staging, ignore_errors=True)
+                    return ToolResult(
+                        output=f"{error}；旧的 meta.json 没有被改动", failed=True
+                    )
+            interaction_report: dict[str, Any] | None = None
+            if docking_manifest is not None and interactions_mode != "none":
+                source_dir = staging if staging is not None else target
+                try:
+                    interaction_report = _apply_interactions(
+                        molecules, display.text, source_dir, interactions_mode
+                    )
+                except Exception as error:  # 坐标解析、PLIP、文件读取
+                    if staging is not None:
+                        shutil.rmtree(staging, ignore_errors=True)
+                    return ToolResult(
+                        output=(
+                            f"算相互作用失败（{type(error).__name__}：{error}）；"
+                            "旧的 meta.json 没有被改动"
+                        ),
+                        failed=True,
+                    )
             (target / RUN_RECEPTOR).write_text(
                 display.text, encoding="utf-8", newline=""
             )
@@ -1057,6 +1174,9 @@ class WriteRunTool(Tool):
                 view=view,
                 preprocess_report=display.report,
                 hypotheses=hypotheses,
+                pocket_set=str(pocket_set.handle) if pocket_set is not None else "",
+                affinity=affinity_provenance,
+                interaction_report=interaction_report,
             )
             _write_json(target / RUN_META, payload)
         except OSError as error:
@@ -1078,7 +1198,8 @@ class WriteRunTool(Tool):
             path=target,
             summary=_run_summary(name, pdb_id, chains, reference),
             fingerprint=fingerprint_path(target),
-            parents=[entry.handle],
+            parents=[entry.handle]
+            + ([pocket_set.handle] if pocket_set is not None else []),
             meta={"kind": "run", "run_id": run_id, "origin": bundle.origin, "view": view},
         )
 
@@ -1089,23 +1210,41 @@ class WriteRunTool(Tool):
         )
         docking_handle = str(docking_entry.handle) if docking_entry is not None else ""
 
+        report = _run_report(
+            artifact=artifact,
+            target=target,
+            bundle=bundle,
+            p0_total=p0_total,
+            p0_used=p0_used,
+            p1_state=p1_state,
+            uniprot=uniprot,
+            pdb_id=pdb_id,
+            reference=reference,
+            note_parts=note_parts,
+            prior=verdicts,
+            docking=docking_report,
+            view=view,
+            preprocess_report=display.report,
+        )
+        if affinity_provenance is not None:
+            report += (
+                f"\n  亲和力：{affinity_provenance.get('matched', 0)} 个分子有 pK"
+                f"（来源 {affinity_provenance.get('handle', '')}，"
+                f"模型 {affinity_provenance.get('model') or '—'}）。"
+            )
+        if interaction_report is not None and interaction_report.get("mode") != "none":
+            if interaction_report.get("plip_failed"):
+                report += (
+                    f"\n  相互作用：PLIP 没算成（{interaction_report.get('reason') or '原因见产物'}）；"
+                    "几何接触与几何氢键仍然写进了页面。"
+                )
+            else:
+                report += (
+                    f"\n  相互作用：PLIP 算了 {interaction_report.get('plip_ok', 0)} 个位姿；"
+                    "接触与作用已写进页面。"
+                )
         return ToolResult(
-            output=_run_report(
-                artifact=artifact,
-                target=target,
-                bundle=bundle,
-                p0_total=p0_total,
-                p0_used=p0_used,
-                p1_state=p1_state,
-                uniprot=uniprot,
-                pdb_id=pdb_id,
-                reference=reference,
-                note_parts=note_parts,
-                prior=verdicts,
-                docking=docking_report,
-                view=view,
-                preprocess_report=display.report,
-            ),
+            output=report,
             meta={
                 "handle": str(artifact.handle),
                 "run_id": run_id,
@@ -1119,6 +1258,16 @@ class WriteRunTool(Tool):
                 "molecules": len(molecules),
                 "best_score": (
                     docking_report["best_score"] if docking_report else None
+                ),
+                "affinity": (
+                    str(affinity_provenance.get("handle") or "")
+                    if affinity_provenance is not None
+                    else ""
+                ),
+                "interactions": (
+                    str(interaction_report.get("mode") or "")
+                    if interaction_report is not None
+                    else "none"
                 ),
             },
         )
@@ -1358,6 +1507,136 @@ def _read_docking(
     return manifest, root, usable, skipped
 
 
+def _read_affinity(
+    entry: Any, receptor_entry: Any
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """校验 affinity artifact，返回 `(id -> pK, provenance)`。"""
+    if str(getattr(entry, "meta", {}).get("kind") or "") != "affinity":
+        raise ValueError(
+            "affinity 参数要的是 kind=affinity 的产物；先跑 score_affinity"
+        )
+    root = getattr(entry, "path", None)
+    if root is None or not Path(root).is_dir():
+        raise ValueError("亲和力产物的目录不在了；重新跑 score_affinity")
+    root = Path(root).resolve()
+    try:
+        manifest = products.read_json(root / "manifest.json")
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"读亲和力 manifest 失败（{type(error).__name__}：{error}）"
+        ) from error
+    if str(manifest.get("kind") or "") != "affinity":
+        raise ValueError("亲和力 manifest 不是 affinity 状态；重新跑 score_affinity")
+
+    expected = str(getattr(receptor_entry, "fingerprint", "") or "")
+    actual = str((manifest.get("receptor") or {}).get("fingerprint") or "")
+    if expected and actual and expected != actual:
+        raise ValueError(
+            "亲和力产物属于另一份受体（指纹不一致）；对当前受体重新打分"
+        )
+
+    scores: dict[str, float] = {}
+    for result in manifest.get("results") or []:
+        identifier = str(result.get("id") or "")
+        try:
+            pk = float(result.get("pk"))
+        except (TypeError, ValueError):
+            continue
+        if identifier and math.isfinite(pk):
+            scores[identifier] = pk
+    if not scores:
+        raise ValueError("亲和力产物里没有可用的 pK 记录")
+
+    params = manifest.get("params") or {}
+    model = manifest.get("model") or {}
+    pocket = manifest.get("pocket") or {}
+    return scores, {
+        "handle": str(entry.handle),
+        "source": str((manifest.get("ligands") or {}).get("handle") or ""),
+        "model": str(model.get("handle") or ""),
+        "aff_unit": str(params.get("aff_unit") or ""),
+        "pocket_radius": params.get("pocket_radius"),
+        "pocket_center": list(pocket.get("center") or []),
+        "score_direction": "higher_is_better",
+        "score_unit": "pK",
+        "counts": dict(manifest.get("counts") or {}),
+    }
+
+
+def _apply_affinity(
+    molecules: Sequence[dict[str, Any]],
+    scores: dict[str, float],
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    """把 pK 贴到分子上。返回补了覆盖率的 provenance。"""
+    matched = 0
+    for molecule in molecules:
+        identifier = str(molecule.get("id") or "")
+        pk = scores.get(identifier)
+        if pk is None:
+            continue
+        molecule["affinity_pk"] = float(pk)
+        matched += 1
+    if not matched:
+        sample = "、".join(list(scores)[:3])
+        raise ValueError(
+            "亲和力产物与这份对接产物没有共同的分子 id"
+            f"（亲和力里有 {sample} 等）；确认两次用的是同一批配体"
+        )
+    report = dict(provenance)
+    report["matched"] = matched
+    report["written"] = len(molecules)
+    return report
+
+
+def _apply_interactions(
+    molecules: Sequence[dict[str, Any]],
+    receptor_text: str,
+    pose_dir: Path,
+    mode: str,
+) -> dict[str, Any]:
+    """给每个位姿算接触与几何氢键，按 mode 决定哪几个再算 PLIP。
+
+    这一步在 pose 换进运行目录**之前**跑：算不成时旧目录仍然是上一次那份完整结果。
+    """
+    from .interactions import compute
+
+    top_ids = {str(item.get("id") or "") for item in list(molecules)[:INTERACTION_TOP]}
+    requested = 0
+    ok = 0
+    failed = 0
+    reason = ""
+    for molecule in molecules:
+        pose_name = Path(str(molecule.get("pose") or "")).name
+        pose_path = pose_dir / pose_name
+        want_plip = mode == "all" or (
+            mode == "top" and str(molecule.get("id") or "") in top_ids
+        )
+        if want_plip:
+            requested += 1
+        result = compute(
+            receptor_text,
+            pose_path.read_text(encoding="utf-8", errors="replace"),
+            want_plip=want_plip,
+        )
+        molecule["contacts"] = list(result.contacts)
+        molecule["interactions"] = list(result.interactions)
+        molecule["clashes"] = result.clashes
+        if want_plip:
+            if result.plip_ok:
+                ok += 1
+            else:
+                failed += 1
+                reason = reason or result.plip_reason
+    return {
+        "mode": mode,
+        "plip_requested": requested,
+        "plip_ok": ok,
+        "plip_failed": failed,
+        "reason": reason,
+    }
+
+
 def _stage_docking_poses(
     target: Path, results: Sequence[dict[str, Any]], chains: Sequence[str]
 ) -> tuple[list[dict[str, Any]], Path]:
@@ -1473,6 +1752,9 @@ def _build_meta(
     view: str = "pockets",
     preprocess_report: Any = None,
     hypotheses: Sequence[Hypothesis] = (),
+    pocket_set: str = "",
+    affinity: dict[str, Any] | None = None,
+    interaction_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """装配 `meta.json`。
 
@@ -1509,6 +1791,8 @@ def _build_meta(
                 "sources": list(bundle.sources or []),
                 "pdb_id": pdb_id,
                 "uniprot": uniprot,
+                # 口袋集直接搬过来时，网页上那份口袋与聊天里说的是同一份：记下它从哪来。
+                **({"from": pocket_set} if pocket_set else {}),
             },
         },
     }
@@ -1533,7 +1817,11 @@ def _build_meta(
             for item in prior
         ]
     if poses is not None:
+        if interaction_report is not None:
+            poses = {**poses, "interactions": interaction_report}
         payload["provenance"]["poses"] = poses
+    if affinity is not None:
+        payload["provenance"]["affinity"] = affinity
     return payload
 
 
@@ -1760,22 +2048,42 @@ class OpenViewerTool(Tool):
     spec = ToolSpec(
         name="open_viewer",
         description=(
-            "给一个已写出的运行目录（artifact）返回它在**本地结构页**上的地址，"
-            "形如 `http://127.0.0.1:<port>/#/structure/<run_id>`。\n\n"
+            "给一个已写出的产物返回它在**本地网页**上的地址。运行目录形如 "
+            "`http://127.0.0.1:<port>/#/structure/<run_id>`；`survey_structures` 写的"
+            "结构全景形如 `#/survey/<survey_id>`。"
+            "给 `pocket` 会打开该口袋的局部视图，`molecule` 会打开该分子的详情与作用线。\n"
+            "消息里出现具体的结构、口袋、位姿或相互作用时，必须用这个工具取地址；"
+            "不要自己拼接。\n"
             "默认只返回地址、**不擅自打开浏览器**（无头环境会静默失败，"
-            "在 TUI 里 suspend 去拉浏览器会把界面顶掉）——需要时再传 open_browser=true。\n\n"
-            "服务没起来时返回一条可操作的说明，不是抛异常。"
+            "在 TUI 里 suspend 去拉浏览器会把界面顶掉）——需要时再传 open_browser=true。\n"
+            "服务没起来时返回一条可操作的说明，不抛异常。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "run": {
                     "type": "string",
-                    "description": "运行目录条目引用，例如 artifact#3。留空则指向首页",
+                    "description": (
+                        "产物条目引用，例如 artifact#3（运行目录或结构全景）。"
+                        "留空则指向首页"
+                    ),
                 },
                 "open_browser": {
                     "type": "boolean",
                     "description": "是否顺手用系统默认浏览器打开。默认不开",
+                },
+                "pocket": {
+                    "type": "string",
+                    "description": "口袋编号，例如 P2；给了就打开该口袋的视图",
+                },
+                "molecule": {
+                    "type": "string",
+                    "description": "分子 id，例如 mol-7；给了就打开该分子的详情与作用线",
+                },
+                "view": {
+                    "type": "string",
+                    "enum": ["local", "whole"],
+                    "description": "pocket 的取景，默认 local（局部）；whole 是整份结构",
                 },
             },
         },
@@ -1794,6 +2102,7 @@ class OpenViewerTool(Tool):
             )
 
         run_id = ""
+        survey_id = ""
         raw = arguments.get("run")
         if raw is not None and str(raw).strip() != "":
             try:
@@ -1801,7 +2110,11 @@ class OpenViewerTool(Tool):
                 expect_handle(entry, ArtifactHandle, "run")
             except Exception as error:
                 return ToolResult(output=str(error), failed=True)
-            run_id = str((entry.meta or {}).get("run_id") or entry.path.name if entry.path else "")
+            meta = entry.meta or {}
+            run_id = str(meta.get("run_id") or entry.path.name if entry.path else "")
+            # 结构全景是另一种产物（`survey_structures` 写的），页面地址也不同：
+            # 它没有运行目录，只有一份 survey.json 与它的目录名。
+            survey_id = str(meta.get("survey_id") or "")
 
         port = _resolve_port(viewer)
         if not port:
@@ -1814,9 +2127,33 @@ class OpenViewerTool(Tool):
                 failed=True,
             )
 
+        pocket = str(arguments.get("pocket") or "").strip()
+        molecule = str(arguments.get("molecule") or "").strip()
+        view = str(arguments.get("view") or "local").strip().lower()
+        if view not in ("local", "whole"):
+            view = "local"
+        if (pocket or molecule) and not run_id:
+            return ToolResult(
+                output="给 pocket 或 molecule 时要同时给 run：地址要指向某一份运行目录。",
+                failed=True,
+            )
+
         url = f"http://127.0.0.1:{port}/"
-        if run_id:
-            url += f"#/structure/{run_id}"
+        if survey_id:
+            url += f"#/survey/{quote(survey_id, safe='')}"
+        elif run_id:
+            if molecule:
+                url += (
+                    f"#/structure/{quote(run_id, safe='')}"
+                    f"?molecule={quote(molecule, safe='')}"
+                )
+            elif pocket:
+                url += (
+                    f"#/structure/{quote(run_id, safe='')}"
+                    f"?pocket={quote(pocket, safe='')}&view={view}"
+                )
+            else:
+                url += f"#/structure/{quote(run_id, safe='')}"
 
         opened = False
         if arguments.get("open_browser"):
@@ -1830,9 +2167,23 @@ class OpenViewerTool(Tool):
         suffix = "（已尝试打开浏览器）" if arguments.get("open_browser") else "（未打开浏览器，请自行点开）"
         if arguments.get("open_browser") and not opened:
             suffix = "（尝试打开浏览器没成功——环境可能没有默认浏览器，请手动复制地址）"
+        target_text = ""
+        if survey_id:
+            target_text = "（结构全景）"
+        elif molecule:
+            target_text = f"（分子 {molecule}）"
+        elif pocket:
+            target_text = f"（口袋 {pocket}，{'局部' if view == 'local' else '全景'}视图）"
         return ToolResult(
-            output=f"结构页地址：{url}{suffix}",
-            meta={"url": url, "port": port, "run_id": run_id},
+            output=f"结构页地址：{url}{target_text}{suffix}",
+            meta={
+                "url": url,
+                "port": port,
+                "run_id": run_id,
+                "pocket": pocket,
+                "molecule": molecule,
+                "view": view,
+            },
         )
 
 

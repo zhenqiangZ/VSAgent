@@ -31,10 +31,12 @@ from . import ligand, products
 from .chemistry import CHEM_TOOL_DESCRIPTION_NOTE, require_chem
 
 __all__ = [
+    "PickDiverseTool",
     "ScreenShapeTool",
     "ScreenSimilarityTool",
     "candidates_dir",
     "domain_tools",
+    "selected_dir",
     "usr_descriptor",
 ]
 
@@ -59,6 +61,11 @@ SCORE_COLUMN = "similarity"
 def candidates_dir() -> Path:
     """相似度产物的根。测试替换它，避免写用户家目录。"""
     return Path.home() / ".vsagent" / "screens"
+
+
+def selected_dir() -> Path:
+    """挑选结果（配体集）的根。测试替换它，避免写用户家目录。"""
+    return Path.home() / ".vsagent" / "selected"
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +219,20 @@ def _int_argument(arguments: dict[str, Any], name: str, default: int, low: int, 
     if not low <= value <= high:
         raise ToolError(f"参数 {name} 要在 {low} 到 {high} 之间（现在是 {value}）")
     return value
+
+
+def _number_argument(
+    arguments: dict[str, Any], name: str, default: float, low: float, high: float
+) -> float:
+    value = arguments.get(name)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ToolError(f"参数 {name} 应当是数")
+    number = float(value)
+    if not math.isfinite(number) or not low <= number <= high:
+        raise ToolError(f"参数 {name} 要在 {low:g} 到 {high:g} 之间（现在是 {number:g}）")
+    return number
 
 
 def _cutoff_argument(arguments: dict[str, Any]) -> float:
@@ -862,11 +883,630 @@ class ScreenShapeTool(Tool):
         )
 
 
+# ---------------------------------------------------------------------------
+# 挑选：从一批候选里挑出彼此不像的那些
+#
+# 相似度与形状两路都是「按分数排序再截断」，而截断留下的是近邻：一个库里同一骨架
+# 换基团的几十个分子会把名额占满。这里补的是截断之前的那一步——先去重，再按
+# 两两不相似度取，最后按骨架配额兜底。**三步都不看分数**，分数只决定从哪里开始。
+# ---------------------------------------------------------------------------
+SELECTED_STAGE = "selected"
+SELECTED_MANIFEST = "manifest.json"
+SELECTED_COLUMNS: tuple[str, ...] = (
+    "id",
+    "name",
+    "smiles",
+    "input_smiles",
+    "heavy_atoms",
+    "pchembl_value",
+    "source_index",
+    "scaffold",
+    "cluster",
+    "max_similarity",
+    "rank",
+)
+
+DEFAULT_LIMIT = 20
+MAX_LIMIT = 200
+DEFAULT_MAX_SIMILARITY = 0.6
+DEFAULT_PER_SCAFFOLD = 3
+# 位姿去重的体积口径：重原子为中心、半径 1.8 埃的球并起来，1.0 埃一格。
+# 判据取体积而不是中心距：两个分子可以中心差 3 埃而形状完全错开。
+POSE_SPHERE_RADIUS = 1.8
+POSE_VOXEL = 1.0
+POSE_JACCARD = 0.5
+
+# 组外探索的停止阈值。由论文的三轮经验换算，尚未在真实库上实测。
+STOP_OVERLAP = 0.6
+STOP_NEW_SCAFFOLDS = 2
+
+
+def _ranked_rows(entry: Any) -> tuple[list[dict[str, Any]], str]:
+    """候选表或配体集 → 按名次排好的 `[{id,name,smiles}]`。
+
+    **行序就是名次**：`write_candidates` 与 `rank_candidates` 写盘时都按分数或共识
+    名次排好了，这里再排一次只会与表里那一列对不上。配体集没有名次，按导入顺序。
+    """
+    path = Path(str(getattr(entry, "path", "") or ""))
+    if path.is_dir() and (path / CANDIDATES_FILE).is_file():
+        payload = products.read_json(path / CANDIDATES_FILE)
+        rows = [
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "smiles": str(item.get("smiles") or ""),
+            }
+            for item in (payload.get("rows") or [])
+            if isinstance(item, dict)
+        ]
+        return [row for row in rows if row["id"] and row["smiles"]], "candidates"
+    # 准备后的配体集只有 manifest.json 与 ligands/ 子目录，没有 ligands.csv：
+    # 那一份的行在 `records` 里（id / name / smiles / pdbqt）。不认这一路的话，
+    # 「筛完直接挑」这条最常见的顺序会在挑选这一步失败，而前面每一步都是好的。
+    manifest = path / ligand.MANIFEST_FILE
+    if path.is_dir() and manifest.is_file() and not (path / ligand.CSV_FILE).is_file():
+        payload = products.read_json(manifest)
+        rows = [
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "smiles": str(item.get("smiles") or ""),
+            }
+            for item in (payload.get("records") or [])
+            if isinstance(item, dict) and str(item.get("status") or "ok") == "ok"
+        ]
+        return [row for row in rows if row["id"] and row["smiles"]], "prepared"
+    return _smiles_of(entry), "ligandset"
+
+
+def _pose_voxels(entry: Any, wanted: set[str]) -> tuple[dict[str, set[tuple[int, int, int]]], str]:
+    """每个分子最佳位姿占的体积格。返回 `(分子 → 格集合, 错误说明)`。
+
+    `dock` 的产物里每个分子只存了一条最佳位姿，所以这里不需要再挑一次。
+    """
+    from . import docking
+
+    manifest_path = Path(str(entry.path)) / docking.MANIFEST_FILE
+    try:
+        manifest = products.read_json(manifest_path)
+    except (OSError, ValueError) as error:
+        return {}, f"{entry.handle} 的 {docking.MANIFEST_FILE} 读不出来（{error}）"
+    voxels: dict[str, set[tuple[int, int, int]]] = {}
+    for item in manifest.get("results") or []:
+        identifier = str(item.get("id") or "")
+        if identifier not in wanted:
+            continue
+        relative = str(item.get("pose_pdb") or "").strip()
+        if not relative:
+            continue
+        points = _pdb_points(Path(str(entry.path)) / relative)
+        cells = _volume_cells(points)
+        if cells:
+            voxels[identifier] = cells
+    return voxels, ""
+
+
+def _volume_cells(points: Sequence[Sequence[float]]) -> set[tuple[int, int, int]]:
+    """一组原子坐标占的 1.0 埃格子。半径 1.8 埃的球并起来。"""
+    cells: set[tuple[int, int, int]] = set()
+    reach = int(POSE_SPHERE_RADIUS / POSE_VOXEL) + 1
+    for point in points:
+        base = tuple(int(round(value / POSE_VOXEL)) for value in point[:3])
+        for dx in range(-reach, reach + 1):
+            for dy in range(-reach, reach + 1):
+                for dz in range(-reach, reach + 1):
+                    offset = (dx * POSE_VOXEL, dy * POSE_VOXEL, dz * POSE_VOXEL)
+                    if math.sqrt(dx * dx + dy * dy + dz * dz) * POSE_VOXEL > POSE_SPHERE_RADIUS:
+                        continue
+                    cells.add((base[0] + dx, base[1] + dy, base[2] + dz))
+    return cells
+
+
+def _jaccard(left: set, right: set) -> float:
+    if not left or not right:
+        return 0.0
+    union = len(left | right)
+    return len(left & right) / union if union else 0.0
+
+
+def _pose_clusters(
+    rows: Sequence[dict[str, Any]], voxels: dict[str, set[tuple[int, int, int]]]
+) -> dict[str, int]:
+    """位姿体积重叠聚簇：Jaccard ≥ 0.5 的并成一簇。返回 `分子 → 簇号`。
+
+    单链接：A 像 B、B 像 C 就算同一簇。链式相连会把一长串略有重叠的位姿并成
+    一大簇，所以簇号只用来「每簇留名次最高的一个」，不参与别的判断。
+    """
+    ids = [row["id"] for row in rows if row["id"] in voxels]
+    parent = {identifier: identifier for identifier in ids}
+
+    def find(key: str) -> str:
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    for index, left in enumerate(ids):
+        for right in ids[index + 1 :]:
+            if _jaccard(voxels[left], voxels[right]) >= POSE_JACCARD:
+                a, b = find(left), find(right)
+                if a != b:
+                    parent[b] = a
+    roots: dict[str, int] = {}
+    out: dict[str, int] = {}
+    for identifier in ids:
+        root = find(identifier)
+        if root not in roots:
+            roots[root] = len(roots) + 1
+        out[identifier] = roots[root]
+    return out
+
+
+def _batch_summary(rows: Sequence[dict[str, Any]], voxels: dict[str, set]) -> str:
+    """位姿去重那一段：并成几簇、最大一簇几个。"""
+    if not voxels:
+        return ""
+    clusters: dict[int, int] = {}
+    for identifier, cluster in _pose_clusters(rows, voxels).items():
+        clusters[cluster] = clusters.get(cluster, 0) + 1
+    largest = max(clusters.values(), default=0)
+    return (
+        f"位姿去重：{len(voxels)} 个位姿并成 {len(clusters)} 簇，最大一簇 {largest} 个"
+    )
+
+
+class PickDiverseTool(Tool):
+    """从候选表或配体集里挑出一批彼此不像的分子。"""
+
+    spec = ToolSpec(
+        name="pick_diverse",
+        description=(
+            "从一批候选里挑出**彼此不像**的那些，交给实验或对接。产出是一个配体集"
+            "（`stage=selected`），列里有骨架、簇号、与已选集合的最大相似度、名次。\n"
+            "四步，**都不看分数**：① 位姿去重（给了 `poses` 才做）：按对接位姿的重原子"
+            "体积，Jaccard ≥0.5 判同簇，每簇只留名次最高的一个；② MaxMin：从名次最高的"
+            "开始，每步取「与已选集合最大相似度最小」的那个；③ 骨架配额：同一骨架最多"
+            "`per_scaffold` 个；④ 给了 `previous` 就报与上一轮前 N 个的重合、新增骨架数。\n"
+            "选不满 `limit` 时如实报数，不降低门槛凑数。`source` 收候选表（相似度、形状、"
+            "共识表）与配体集；`poses` 收 dock 的产物。\n"
+            "**为什么需要它**：按分数截断留下的是近邻，一个骨架换几个基团就能占满名额。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "候选表或配体集的 handle（名次取表里的行序）",
+                },
+                "poses": {
+                    "type": "string",
+                    "description": "对接产物 handle；给了才按位姿体积去重",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": f"挑几个，默认 {DEFAULT_LIMIT}，上限 {MAX_LIMIT}",
+                },
+                "max_similarity": {
+                    "type": "number",
+                    "description": (
+                        f"两两 ECFP4 Tanimoto 的上限，默认 {DEFAULT_MAX_SIMILARITY:g}；"
+                        "越小越严"
+                    ),
+                },
+                "per_scaffold": {
+                    "type": "integer",
+                    "description": f"同一骨架最多几个，默认 {DEFAULT_PER_SCAFFOLD}",
+                },
+                "previous": {
+                    "type": "string",
+                    "description": "上一轮的候选表或挑选结果；给了才算重合与新增骨架",
+                },
+                "name": {"type": "string", "description": "显示名，只影响产物目录名"},
+            },
+            "required": ["source"],
+            "additionalProperties": False,
+        },
+    )
+    primary_argument = "source"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：pick_diverse 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+        raw = str(arguments.get("source") or "").strip()
+        if not raw:
+            return ToolResult(
+                output="缺少参数 source。先 list_workspace 看清有哪些候选表或配体集。",
+                failed=True,
+            )
+        try:
+            limit = _int_argument(arguments, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
+            per_scaffold = _int_argument(
+                arguments, "per_scaffold", DEFAULT_PER_SCAFFOLD, 1, MAX_LIMIT
+            )
+            max_similarity = _number_argument(
+                arguments, "max_similarity", DEFAULT_MAX_SIMILARITY, 0.0, 1.0
+            )
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+
+        try:
+            source_entry = ledger.get(raw)
+        except Exception as error:
+            return ToolResult(output=str(error), failed=True)
+
+        try:
+            require_chem()
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+
+        try:
+            rows, source_kind = _ranked_rows(source_entry)
+        except (ToolError, ligand.LigandError) as error:
+            return ToolResult(output=str(error), failed=True)
+        if not rows:
+            return ToolResult(
+                output=f"{source_entry.handle} 里没有带结构的分子，挑不出东西。", failed=True
+            )
+
+        pose_entry = None
+        voxels: dict[str, set[tuple[int, int, int]]] = {}
+        raw_poses = str(arguments.get("poses") or "").strip()
+        if raw_poses:
+            try:
+                pose_entry = ledger.get(raw_poses)
+            except Exception as error:
+                return ToolResult(output=str(error), failed=True)
+            voxels, reason = _pose_voxels(pose_entry, {row["id"] for row in rows})
+            if reason:
+                return ToolResult(output=reason, failed=True)
+            if not voxels:
+                return ToolResult(
+                    output=(
+                        f"{pose_entry.handle} 里没有这些分子的位姿文件（`pose_pdb` 为空或"
+                        "文件不在了）。去掉 poses 只做 MaxMin，或先确认对接产物还在。"
+                    ),
+                    failed=True,
+                )
+
+        from rdkit import Chem, DataStructs, rdBase
+        from rdkit.Chem.Scaffolds import MurckoScaffold
+
+        from . import sar
+
+        with rdBase.BlockLogs():
+            molecules = {}
+            for row in rows:
+                mol = Chem.MolFromSmiles(row["smiles"])
+                if mol is not None:
+                    molecules[row["id"]] = mol
+            pool = [row for row in rows if row["id"] in molecules]
+            if not pool:
+                return ToolResult(
+                    output=f"{source_entry.handle} 里的 SMILES 一条都解析不了。", failed=True
+                )
+            fingerprints = {
+                row["id"]: fingerprint_for(molecules[row["id"]], "ecfp4") for row in pool
+            }
+            scaffolds = {
+                row["id"]: sar.scaffold_of(molecules[row["id"]], "murcko") or sar.ACYCLIC
+                for row in pool
+            }
+
+        # ---- ① 位姿去重：每簇留名次最高的一个 ----
+        clusters = _pose_clusters(pool, voxels)
+        kept_clusters: set[int] = set()
+        deduped: list[dict[str, Any]] = []
+        for row in pool:
+            cluster = clusters.get(row["id"])
+            if cluster is not None:
+                if cluster in kept_clusters:
+                    continue
+                kept_clusters.add(cluster)
+            deduped.append({**row, "cluster": cluster})
+
+        # ---- ② MaxMin + ③ 骨架配额 ----
+        selected: list[dict[str, Any]] = []
+        scaffold_counts: dict[str, int] = {}
+        remaining = list(deduped)
+        while remaining and len(selected) < limit:
+            if not selected:
+                choice, best_similarity = remaining[0], 0.0
+            else:
+                best: dict[str, Any] | None = None
+                best_similarity = 1.0
+                for candidate in remaining:
+                    if scaffold_counts.get(scaffolds[candidate["id"]], 0) >= per_scaffold:
+                        continue
+                    similarity = max(
+                        DataStructs.TanimotoSimilarity(
+                            fingerprints[candidate["id"]], fingerprints[chosen["id"]]
+                        )
+                        for chosen in selected
+                    )
+                    if similarity > max_similarity:
+                        continue
+                    if best is None or similarity < best_similarity:
+                        best, best_similarity = candidate, similarity
+                if best is None:
+                    break
+                choice = best
+            selected.append({**choice, "max_similarity": round(float(best_similarity), 3)})
+            scaffold_counts[scaffolds[choice["id"]]] = (
+                scaffold_counts.get(scaffolds[choice["id"]], 0) + 1
+            )
+            remaining = [row for row in remaining if row["id"] != choice["id"]]
+
+        # ---- ④ 与上一轮的重合 ----
+        previous_ids: list[str] = []
+        previous_scaffolds: set[str] = set()
+        previous_entry = None
+        raw_previous = str(arguments.get("previous") or "").strip()
+        if raw_previous:
+            try:
+                previous_entry = ledger.get(raw_previous)
+                previous_rows, _kind = _ranked_rows(previous_entry)
+            except (ToolError, ligand.LigandError) as error:
+                return ToolResult(output=str(error), failed=True)
+            previous_ids = [row["id"] for row in previous_rows][:limit]
+            with rdBase.BlockLogs():
+                for row in previous_rows:
+                    mol = Chem.MolFromSmiles(row["smiles"])
+                    if mol is not None:
+                        previous_scaffolds.add(
+                            sar.scaffold_of(mol, "murcko") or sar.ACYCLIC
+                        )
+        overlap = len({row["id"] for row in selected} & set(previous_ids))
+        new_scaffolds = {
+            scaffolds[row["id"]] for row in selected
+        } - previous_scaffolds
+
+        if not selected:
+            return ToolResult(
+                output=(
+                    f"一个都没挑出来（{source_entry.handle} 里 {len(pool)} 个分子，"
+                    f"max_similarity={max_similarity:g}、每骨架 {per_scaffold} 个）。"
+                    "放宽门槛再试；这一批不要直接拿去测。"
+                ),
+                failed=True,
+            )
+
+        params = {
+            "source": str(source_entry.handle),
+            "poses": str(pose_entry.handle) if pose_entry is not None else "",
+            "limit": limit,
+            "max_similarity": max_similarity,
+            "per_scaffold": per_scaffold,
+            "previous": str(previous_entry.handle) if previous_entry is not None else "",
+            "metric": "ecfp4",
+            "pose_jaccard": POSE_JACCARD,
+            "pose_radius": POSE_SPHERE_RADIUS,
+        }
+        stem = str(arguments.get("name") or "selected")
+        try:
+            target, reused = products.content_dir(
+                selected_dir(),
+                stem,
+                params,
+                (SELECTED_MANIFEST, ligand.CSV_FILE, products.PARAMS_FILE),
+            )
+        except OSError as error:
+            return ToolResult(output=f"建产物目录失败：{error}", failed=True)
+
+        if reused:
+            existing = ledger.find(
+                kind="ligandset", fingerprint=fingerprint_path(target), include_archived=True
+            )
+            for candidate in existing:
+                if str((candidate.meta or {}).get("stage") or "") == SELECTED_STAGE:
+                    cached = list((candidate.meta or {}).get("rows") or [])
+                    return ToolResult(
+                        output=self._render(
+                            handle=str(candidate.handle),
+                            rows=cached,
+                            total=len(pool),
+                            limit=limit,
+                            max_similarity=max_similarity,
+                            per_scaffold=per_scaffold,
+                            dedupe=_batch_summary(pool, voxels),
+                            overlap=None if previous_entry is None else overlap,
+                            new_scaffolds=None if previous_entry is None else len(new_scaffolds),
+                            target=target,
+                            reused=True,
+                        ),
+                        meta={"handle": str(candidate.handle), "count": len(cached),
+                              "reused": True},
+                    )
+
+        record: list[dict[str, Any]] = []
+        for rank, row in enumerate(selected, start=1):
+            record.append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "smiles": row["smiles"],
+                    "scaffold": scaffolds[row["id"]],
+                    "cluster": row.get("cluster") or 0,
+                    "max_similarity": row["max_similarity"],
+                    "rank": rank,
+                }
+            )
+        manifest = {
+            "kind": "ligandset",
+            "stage": SELECTED_STAGE,
+            "tool": "pick_diverse",
+            "source": {"handle": str(source_entry.handle), "kind": source_kind},
+            "poses": str(pose_entry.handle) if pose_entry is not None else "",
+            "params": params,
+            "counts": {
+                "pool": len(pool),
+                "selected": len(record),
+                "clusters": len(kept_clusters),
+                "scaffolds": len({item["scaffold"] for item in record}),
+                "overlap": None if previous_entry is None else overlap,
+                "new_scaffolds": None if previous_entry is None else len(new_scaffolds),
+            },
+            "rows": record,
+            "columns": list(SELECTED_COLUMNS),
+        }
+        try:
+            products.write_text_atomic(target / ligand.CSV_FILE, _selected_csv(record))
+            products.write_json_atomic(target / SELECTED_MANIFEST, manifest)
+            # 最后写：缺它说明上一次写在中间崩了，不能当完整产物复用。
+            products.write_json_atomic(target / products.PARAMS_FILE, params)
+        except OSError as error:
+            return ToolResult(output=f"写挑选结果失败：{error}", failed=True)
+
+        fingerprint = fingerprint_path(target)
+        handle = ""
+        existing = ledger.find(kind="ligandset", fingerprint=fingerprint, include_archived=True)
+        for candidate in existing:
+            if str((candidate.meta or {}).get("stage") or "") == SELECTED_STAGE:
+                handle = str(candidate.handle)
+                break
+        if not handle:
+            registered = ledger.add(
+                "ligandset",
+                path=target,
+                summary=f"待测批次 · {len(record)} 个 · {len({item['scaffold'] for item in record})} 个骨架",
+                fingerprint=fingerprint,
+                parents=[source_entry.handle],
+                meta={
+                    "kind": "ligandset",
+                    "stage": SELECTED_STAGE,
+                    "tool": "pick_diverse",
+                    "source": {"handle": str(source_entry.handle), "kind": source_kind},
+                    "params": params,
+                    "counts": dict(manifest["counts"]),
+                    "rows": record,
+                    "file": ligand.CSV_FILE,
+                    "manifest": SELECTED_MANIFEST,
+                },
+                link_current_receptor=False,
+            )
+            handle = str(registered.handle)
+
+        return ToolResult(
+            output=self._render(
+                handle=handle,
+                rows=record,
+                total=len(pool),
+                limit=limit,
+                max_similarity=max_similarity,
+                per_scaffold=per_scaffold,
+                dedupe=_batch_summary(pool, voxels),
+                overlap=None if previous_entry is None else overlap,
+                new_scaffolds=None if previous_entry is None else len(new_scaffolds),
+                target=target,
+                reused=False,
+            ),
+            meta={
+                "handle": handle,
+                "count": len(record),
+                "pool": len(pool),
+                "clusters": len(kept_clusters),
+                "scaffolds": manifest["counts"]["scaffolds"],
+                "overlap": manifest["counts"]["overlap"],
+                "new_scaffolds": manifest["counts"]["new_scaffolds"],
+                "reused": False,
+            },
+        )
+
+    def _render(
+        self,
+        *,
+        handle: str,
+        rows: Sequence[dict[str, Any]],
+        total: int,
+        limit: int,
+        max_similarity: float,
+        per_scaffold: int,
+        dedupe: str,
+        overlap: int | None,
+        new_scaffolds: int | None,
+        target: Path,
+        reused: bool,
+    ) -> str:
+        lines = [
+            f"登记表里已有同一份：{handle}（未重算）。"
+            if reused
+            else f"挑出 {len(rows)} 个，登记为 {handle}。"
+        ]
+        lines.append(
+            f"候选 {total} 个，门槛：两两相似度 ≤{max_similarity:g}、每骨架 ≤{per_scaffold} 个、"
+            f"目标 {limit} 个。"
+        )
+        if dedupe:
+            lines.append(dedupe)
+        if len(rows) < limit:
+            lines.append(
+                f"只挑出 {len(rows)} 个（目标 {limit}）：剩下的都超过了相似度上限，"
+                "没有降低门槛凑数。"
+            )
+        lines.append(f"{'#':>3}  {'分子':<16}{'骨架':<24}{'簇':>3}{'最大相似':>9}")
+        for item in rows[:limit]:
+            lines.append(
+                f"{item['rank']:>3}  {item['id'][:16]:<16}{item['scaffold'][:24]:<24}"
+                f"{item.get('cluster') or 0:>3}{item['max_similarity']:>9.2f}"
+            )
+        if overlap is not None and new_scaffolds is not None:
+            ratio = overlap / len(rows) if rows else 0.0
+            lines.append(
+                f"与上一轮前 {limit} 重合 {overlap} 个（{ratio:.0%}），新增骨架 {new_scaffolds} 组"
+            )
+            stop = ratio >= STOP_OVERLAP and new_scaffolds <= STOP_NEW_SCAFFOLDS
+            if stop:
+                lines.append(
+                    f"判定：重合 ≥{STOP_OVERLAP:.0%} 且新增骨架 ≤{STOP_NEW_SCAFFOLDS}，"
+                    "停止组外探索，转入实测与结案。"
+                )
+            elif ratio >= STOP_OVERLAP:
+                lines.append(
+                    "判定：重合高但新增骨架不少——上一轮的挑选没把新化学型选进来，"
+                    "该改的是挑选规则，不是再加一轮。"
+                )
+            else:
+                lines.append("判定：重合不高，这一轮还在找到新分子，可以再扩一轮。")
+        lines.append(f"产物目录：{target}")
+        lines.append(
+            f"下一步：拿这 {len(rows)} 个去 dock 或直接做实测建议；"
+            f"数据回来用 record_assay(batch={handle}) 记这一批的账。"
+        )
+        return "\n".join(lines)
+
+
+def _selected_csv(rows: Sequence[dict[str, Any]]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(SELECTED_COLUMNS)
+    for item in rows:
+        writer.writerow(
+            [
+                item["id"],
+                item["name"],
+                item["smiles"],
+                item["smiles"],
+                "",
+                "",
+                item["rank"],
+                item["scaffold"],
+                item.get("cluster") or 0,
+                f"{item['max_similarity']:.4f}",
+                item["rank"],
+            ]
+        )
+    return buffer.getvalue()
+
+
 def domain_tools() -> list[Tool]:
-    return [ScreenSimilarityTool(), ScreenShapeTool()]
+    return [ScreenSimilarityTool(), ScreenShapeTool(), PickDiverseTool()]
 
 
 if __name__ == "__main__":  # pragma: no cover
     from debug_tools import main
 
-    main()
+    raise SystemExit(main(__name__, domain_tools()))

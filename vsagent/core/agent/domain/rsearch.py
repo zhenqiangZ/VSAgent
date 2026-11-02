@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,18 +32,25 @@ from ..tools import RetryableToolError, Tool, ToolError, ToolResult, ToolSpec
 from . import http
 
 __all__ = [
+    "ChemComp",
     "DEFAULT_LIMIT",
     "GRAPHQL_BATCH",
     "MAX_LIMIT",
     "PdbHit",
+    "PolymerChain",
+    "RCSB_CHEMCOMP_URL",
     "RCSB_GRAPHQL_URL",
     "RCSB_SEARCH_URL",
     "SearchError",
     "SearchPdbTool",
     "attribute_query",
     "cache_path",
+    "chemcomp_record",
     "domain_tools",
     "fetch_ligands",
+    "ligand_display_names",
+    "ligand_synonym_map",
+    "ligand_synonyms",
     "read_cache",
     "search_dir",
     "search_entries",
@@ -52,6 +60,7 @@ __all__ = [
 
 RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 RCSB_GRAPHQL_URL = "https://data.rcsb.org/graphql"
+RCSB_CHEMCOMP_URL = "https://data.rcsb.org/rest/v1/core/chemcomp/{code}"
 
 SEARCH_CACHE_TTL = 24 * 3600
 """搜索结果缓存时效（秒）。一天——新结构发布是低频事件，一天足够新鲜。
@@ -76,6 +85,32 @@ class SearchError(ToolError):
 # 条目
 # ---------------------------------------------------------------------------
 @dataclass
+class ChemComp:
+    """一个非聚合物组分（`chem_comp`）。
+
+    **`name` 是首选名，实测常常是一长串系统命名**：`9SR` 的 `name` 是
+    「(1R,5R,6R,7R,9S,11S,12S,13S,14S)-3-amino-14-(hydroxymethyl)-…-pentol」，
+    「Tetrodotoxin」在另一处（`ligand_synonyms`）。只显示首选名，读的人认不出
+    这是河豚毒素——`ses_0014` 就是把 9SR 当成一个陌生代号放过去的。
+    """
+
+    code: str
+    name: str = ""
+    kind: str = ""
+    """`chem_comp.type`：`non-polymer` / `D-saccharide, beta linking` / …"""
+    weight: float | None = None
+
+
+@dataclass
+class PolymerChain:
+    """一条聚合物实体。`uniprot_ids` 为空时是合成肽或没有映射到 UniProt 的链。"""
+
+    entity_id: str
+    description: str = ""
+    uniprot_ids: tuple[str, ...] = ()
+
+
+@dataclass
 class PdbHit:
     """一条命中的结构。字段全部来自 RCSB，**没有一处是我们猜的**。"""
 
@@ -90,6 +125,13 @@ class PdbHit:
     """`(代号, 名称)`，同样原样。"""
 
     nonpolymer_count: int = 0
+
+    comps: tuple[ChemComp, ...] = ()
+    """非聚合物组分的完整几项（代号、名称、类型、分子量）。"""
+
+    polymers: tuple[PolymerChain, ...] = ()
+    """聚合物实体。有了它才能把「只有本靶点」与「还带一条别的链」分开——
+    肽类毒素、抗体片段、辅助亚基都是聚合物实体，不会出现在 `nonpolymer_entities` 里。"""
 
     def as_dict(self) -> dict[str, Any]:
         """给 `ToolResult.meta` 用的结构。**不含任何归类字段**。"""
@@ -316,9 +358,15 @@ _GRAPHQL_QUERY = (
     "rcsb_id "
     "struct{title} "
     "rcsb_entry_info{nonpolymer_entity_count experimental_method resolution_combined} "
-    "nonpolymer_entities{nonpolymer_comp{chem_comp{id name}}}"
+    "polymer_entities{rcsb_id rcsb_polymer_entity{pdbx_description} "
+    "rcsb_polymer_entity_container_identifiers{uniprot_ids}} "
+    "nonpolymer_entities{nonpolymer_comp{chem_comp{id name type formula_weight}}}"
     "}}"
 )
+
+_GRAPHQL_CACHE_VERSION = 2
+"""缓存键里的版本号。**改了 `_GRAPHQL_QUERY` 就要加一**：缓存键只认条目 id，
+不认查询体，旧响应里没有新字段，读回来会是「这一条没有聚合物实体」而不是报错。"""
 
 
 def fetch_ligands(
@@ -340,7 +388,7 @@ def fetch_ligands(
     for start in range(0, len(wanted), GRAPHQL_BATCH):
         chunk = wanted[start : start + GRAPHQL_BATCH]
         payload = {"query": _GRAPHQL_QUERY, "variables": {"ids": chunk}}
-        path = cache_path("ligands", {"ids": chunk})
+        path = cache_path("ligands", {"ids": chunk, "v": _GRAPHQL_CACHE_VERSION})
         body = read_cache(path) if use_cache else None
         if body is None:
             try:
@@ -382,6 +430,7 @@ def _hits_from(body: Any) -> list[PdbHit]:
 
         codes: list[str] = []
         names: list[tuple[str, str]] = []
+        comps: list[ChemComp] = []
         seen: set[str] = set()
         entities = item.get("nonpolymer_entities")
         if isinstance(entities, list):
@@ -391,8 +440,17 @@ def _hits_from(body: Any) -> list[PdbHit]:
                 if not code or code in seen:
                     continue
                 seen.add(code)
+                name = str(comp.get("name") or "").strip()
                 codes.append(code)
-                names.append((code, str(comp.get("name") or "").strip()))
+                names.append((code, name))
+                comps.append(
+                    ChemComp(
+                        code=code,
+                        name=name,
+                        kind=str(comp.get("type") or "").strip(),
+                        weight=_as_float(comp.get("formula_weight")),
+                    )
+                )
 
         hits.append(
             PdbHit(
@@ -403,9 +461,39 @@ def _hits_from(body: Any) -> list[PdbHit]:
                 ligands=tuple(codes),
                 ligand_names=tuple(names),
                 nonpolymer_count=int(info.get("nonpolymer_entity_count") or 0),
+                comps=tuple(comps),
+                polymers=_polymers_of(item),
             )
         )
     return hits
+
+
+def _polymers_of(item: dict[str, Any]) -> tuple[PolymerChain, ...]:
+    """解出聚合物实体。**缺字段就当没有**：老缓存与打桩响应里都没有这一段。"""
+    entities = item.get("polymer_entities")
+    if not isinstance(entities, list):
+        return ()
+    chains: list[PolymerChain] = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        poly = entity.get("rcsb_polymer_entity")
+        poly = poly if isinstance(poly, dict) else {}
+        ident = entity.get("rcsb_polymer_entity_container_identifiers")
+        ident = ident if isinstance(ident, dict) else {}
+        raw_ids = ident.get("uniprot_ids")
+        chains.append(
+            PolymerChain(
+                entity_id=str(entity.get("rcsb_id") or ""),
+                description=str(poly.get("pdbx_description") or "").strip(),
+                uniprot_ids=(
+                    tuple(str(value) for value in raw_ids)
+                    if isinstance(raw_ids, list)
+                    else ()
+                ),
+            )
+        )
+    return tuple(chains)
 
 
 def _comp_of(entity: Any) -> dict[str, Any]:
@@ -431,6 +519,136 @@ def _as_float(value: Any) -> float | None:
         except ValueError:
             return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# 三、配体代号的常用名
+# ---------------------------------------------------------------------------
+_CHEMCOMP_CACHE_VERSION = 1
+
+_PREFERRED_NAME_SUFFIX = " (non-preferred name)"
+
+_SYSTEMATIC_MARKS = ("(", ")", "[", "]", "~")
+
+
+def _looks_systematic(name: str) -> bool:
+    """名字像不像系统命名。**只用于排序，不用于判断对错**。
+
+    实测 RCSB 的 `type` 字段不可靠：`TB4` 的第一条 `Synonym` 就是
+    「(2~{S},5~{R})-5-[4-[(2-fluorophenyl)methoxy]phenyl]pyrrolidine-2-carboxamide」，
+    而「Vixotrigine」排在后面。只按 type 排序，显示出来的仍然是一串系统命名。
+    """
+    return len(name) > 40 or any(mark in name for mark in _SYSTEMATIC_MARKS)
+
+
+def chemcomp_record(
+    code: str,
+    *,
+    use_cache: bool = True,
+    timeout: float = http.DEFAULT_TIMEOUT,
+) -> dict[str, Any] | None:
+    """化学组分字典里的一条。**不存在时抛 `http.NotFound`，其余错误照常抛**。
+
+    三态是必要的：`None` 表示「取到了但形状不对」，`http.NotFound` 表示
+    「这个代号确实没有登记」，其他异常表示「这次没查成」。零命中时要把
+    「TTX 不是代号」与「这次没连上」分开写，混成一句就会让模型继续换说法重试。
+    """
+    cleaned = str(code or "").strip().upper()
+    if not cleaned:
+        return None
+    path = cache_path("chemcomp", {"code": cleaned, "v": _CHEMCOMP_CACHE_VERSION})
+    body = read_cache(path) if use_cache else None
+    if body is None:
+        body = http.get_json(RCSB_CHEMCOMP_URL.format(code=cleaned), timeout=timeout)
+        if use_cache:
+            write_cache(path, body)
+    return body if isinstance(body, dict) else None
+
+
+def ligand_synonyms(
+    code: str,
+    *,
+    use_cache: bool = True,
+    timeout: float = http.DEFAULT_TIMEOUT,
+) -> list[str]:
+    """一个配体代号的常用名清单，**短名在前、系统命名在后**。
+
+    `chem_comp.name` 给的是首选名，实测常常是一长串系统命名（`9SR` 就是
+    「(1R,5R,…)-3-amino-…-pentol」）。「Tetrodotoxin」这一档在
+    `rcsb_chem_comp_synonyms` 里，只有 REST 接口给，GraphQL 的 `ChemComp`
+    类型没有这个字段（字段清单实测过）。
+
+    **取不到时返回空表**：这是显示用的补充，不是判据。调用方拿不到就退回首选名，
+    并把「有几个代号没有短名」写进返回——悄悄退回的话，读的人会把系统命名
+    当成这个配体只有这一个名字。
+    """
+    try:
+        body = chemcomp_record(code, use_cache=use_cache, timeout=timeout)
+    except Exception:
+        return []
+
+    rows = body.get("rcsb_chem_comp_synonyms") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        return []
+    candidates: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("type") or "") not in ("Synonym", "Preferred Name"):
+            continue
+        name = str(row.get("name") or "").strip()
+        if name.endswith(_PREFERRED_NAME_SUFFIX):
+            name = name[: -len(_PREFERRED_NAME_SUFFIX)].strip()
+        if name and name not in candidates:
+            candidates.append(name)
+    # 稳定排序：同类里保持 RCSB 给的先后。
+    candidates.sort(key=lambda name: (_looks_systematic(name), len(name)))
+    return candidates
+
+
+def ligand_synonym_map(
+    codes: list[str] | tuple[str, ...],
+    *,
+    use_cache: bool = True,
+) -> tuple[dict[str, list[str]], list[str]]:
+    """一批代号的全部常用名。返回 `(代号 → 名字清单, 没取到的代号)`。
+
+    顺序按传入的先后（去重后），这样同一份输入两次调用得到同一份清单。
+    **并发查**：EGFR 一个靶点就有上百个不同代号，一个个问要十几秒；
+    每个代号一个缓存文件，互不相干，八个一起发不会互相踩。
+    """
+    unique = [
+        code
+        for code in dict.fromkeys(str(item or "").strip().upper() for item in codes)
+        if code
+    ]
+    if not unique:
+        return {}, []
+
+    def lookup(code: str) -> list[str]:
+        return ligand_synonyms(code, use_cache=use_cache)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        found = list(pool.map(lookup, unique))
+
+    names: dict[str, list[str]] = {}
+    missed: list[str] = []
+    for code, items in zip(unique, found):
+        if items:
+            names[code] = items
+        else:
+            missed.append(code)
+    return names, missed
+
+
+def ligand_display_names(
+    codes: list[str] | tuple[str, ...],
+    *,
+    use_cache: bool = True,
+) -> tuple[dict[str, str], list[str]]:
+    """一批代号的显示名（每组取第一个常用名）。"""
+    names, missed = ligand_synonym_map(codes, use_cache=use_cache)
+    return {code: found[0] for code, found in names.items()}, missed
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +685,11 @@ class SearchPdbTool(Tool):
                 },
                 "ligand": {
                     "type": "string",
-                    "description": "配体代号（chem_comp id，如 STI）。给出它则按「含该配体」筛",
+                    "description": (
+                        "配体**代号**（chem_comp id，三位字母数字，如 STI、9SR）。给出它则按"
+                        "「含该配体」筛。名称（如 tetrodotoxin）要先换成代号，"
+                        "`survey_structures` 会给出这个靶点的代号与常用名"
+                    ),
                 },
                 "method": {
                     "type": "string",
@@ -533,11 +755,57 @@ class SearchPdbTool(Tool):
             # 出了问题，换条件反复重试——现场 `ses_0037` 第 5~9 步连着试了四种说法，
             # 步数就是这么烧掉的。它与「没查成」对用户的含义相反：
             # 一个是「这个条件下确实没有」，一个是「这次没拿到答案」。
+            #
+            # **按配体查时补一句口径。** `ses_0014` 拿 `ligand=TTX` 查了一次 0 条，
+            # 就把「TTX 与 STX 共晶各 0 条」写进结论，整条路线建在「没有参考构象」上；
+            # 而 TTX 的代号是 9SR，同一个靶点下有 6 套。零命中在按代号查时几乎总是
+            # 「这个字符串不是代号」，不写清楚就会被读成「这个复合物不存在」。
+            hint = ""
+            if ligand:
+                hint = (
+                    "\n`ligand` 只认配体代号（`chem_comp` id，三位字母数字，例如 9SR）。"
+                    "名称要先换成代号：`survey_structures` 会列出这个靶点出现过的"
+                    "代号与常用名。"
+                )
+                if len(ligand) != 3:
+                    hint += (
+                        f"\n「{ligand}」有 {len(ligand)} 个字符，形状上就不是配体代号——"
+                        "这个 0 条说明的是「没有这个代号」，不是「没有这个复合物」。"
+                    )
+                else:
+                    # 三位字符也可能是名字：`TTX` 是河豚毒素的通用缩写，代号是 `9SR`；
+                    # 而 `TTX` 本身是登记过的——那是 TENTOXIN，另一种化合物。查一次
+                    # 化学组分字典，把「不是代号」「是代号但指别的东西」「这个靶点里没有」
+                    # 三种情况分开写，否则「TTX 0 条」会被读成「没有河豚毒素复合物」。
+                    try:
+                        record = chemcomp_record(ligand)
+                    except http.NotFound:
+                        record = None
+                    except Exception:
+                        record = {}
+                    comp = record.get("chem_comp") if isinstance(record, dict) else None
+                    comp = comp if isinstance(comp, dict) else {}
+                    if record is not None and not comp:
+                        hint += (
+                            f"\n「{ligand}」在 RCSB 化学组分字典里没有登记，它不是配体代号。"
+                            "这个 0 条说明的是「没有这个代号」，不是「没有这个复合物」。"
+                        )
+                    elif comp:
+                        name = str(comp.get("name") or "").strip()
+                        weight = comp.get("formula_weight")
+                        detail = f"：{name}" if name else ""
+                        if isinstance(weight, (int, float)):
+                            detail += f"（{float(weight):.1f} Da）"
+                        hint += (
+                            f"\n{ligand} 是登记过的代号{detail}，这个靶点里没有它。"
+                            "如果刚才那个是化合物的名称，代号要去 `survey_structures` "
+                            "的结果里找——缩写常常对不上。"
+                        )
             return ToolResult(
                 output=(
-                    f"{how} {condition}：查了，确实没有（命中 0 条）。\n"
+                    f"{how} {condition}：查了，确实没有（命中 0 条）。"
                     "（这是「查了没有」，不是「没查成」——换个条件或换个说法可以再试，"
-                    "但不必当成工具出错。）"
+                    "但不必当成工具出错。）" + hint
                 ),
                 meta=_empty_meta("checked", total=total),
             )

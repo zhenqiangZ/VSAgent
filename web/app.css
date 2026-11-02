@@ -584,6 +584,31 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 .chain-name { font-weight: 600; }
 .chain-count { margin-left: auto; font-size: 11.5px; color: var(--muted); }
 
+#pocket-scope { display: flex; gap: 6px; margin: 6px 0 10px; }
+#pocket-scope button {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+#pocket-scope button.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+.interaction-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 5px;
+}
+#interaction-table tbody tr { cursor: pointer; }
+#interaction-table tbody tr:hover { background: var(--accent-soft); }
+
 #pocket-list { list-style: none; margin: 0; padding: 0; }
 
 #pocket-list li {
@@ -949,3 +974,20 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
   word-break: break-word;
 }
 .lib-chunks-empty { padding: 18px 0; color: var(--faint); font-size: 12.5px; text-align: center; }
+
+/* 结构全景页（#/survey/<id>）。表格复用 .lib-table，这里只补它自己的几处。 */
+.survey-section { margin-top: 22px; }
+.survey-section h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+.survey-note { margin: 0 0 10px; color: var(--faint); font-size: 12px; line-height: 1.6; }
+.survey-code { font-family: var(--mono); font-weight: 600; white-space: nowrap; }
+.survey-star { color: var(--hot); }
+.survey-name { max-width: 360px; line-height: 1.55; }
+.survey-title { max-width: 460px; line-height: 1.55; }
+.survey-ids {
+  max-width: 320px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.9;
+}
+.survey-pdb { color: var(--accent-strong); text-decoration: none; }
+.survey-pdb:hover { text-decoration: underline; }

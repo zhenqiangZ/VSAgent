@@ -40,6 +40,12 @@ def main() -> None:
         help="单次上传上限（字节，默认 50MB）。判据用它把「超限」测成几百字节",
     )
     parser.add_argument(
+        "--surveys",
+        type=Path,
+        default=None,
+        help="结构全景根目录（默认 ~/.vsagent/surveys）",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
@@ -63,12 +69,14 @@ def main() -> None:
         args.runs.resolve(),
         args.web.resolve(),
         corpus_root=args.corpus.resolve() if args.corpus else None,
+        surveys_root=args.surveys.resolve() if args.surveys else None,
         **extra,
     )
     print(f"状态文件 {server.state_path}")
     print(f"运行目录 {server.runs_dir}")
     print(f"网页目录 {server.web_root}")
     print(f"语料目录 {server.corpus_root}")
+    print(f"全景目录 {server.surveys_root}")
     print(f"http://{HOST}:{port}/")
     server.serve_forever()
 

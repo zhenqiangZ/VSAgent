@@ -38,7 +38,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlparse
 
 from .. import corpus, corpus_config, index
-from ..paths import config_home
+from ..paths import SURVEY_DIRECTORY, config_home
 from ..session_manager import SessionManager
 
 # 状态文件是原子换名写出的（`SessionManager.save_to_toml`）。但读的人仍可能
@@ -889,6 +889,31 @@ def _run_list(request: "WebHandler", _rest: str) -> dict:
     return {"runs": scan_runs(request.server.runs_dir)}
 
 
+SURVEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
+
+
+def _survey(request: "WebHandler", rest: str) -> dict:
+    """`/api/survey/<id>`：一份结构全景的完整产物。
+
+    只读。id 是 `survey_structures` 写产物时的目录名（安全 stem + 参数指纹），
+    这里只认这个形状——**只认 id，不认路径**，于是没有逃逸的可能。
+    产物不存在时回 404，不返回空表：空表会被读成「这个靶点没有结构」。
+    """
+    survey_id = unquote(rest).strip("/")
+    if not SURVEY_ID.match(survey_id):
+        raise HttpError(400, "全景标识不合法")
+    path = request.server.surveys_root / survey_id / "survey.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise HttpError(404, f"没有这份结构全景：{survey_id}") from None
+    except (OSError, ValueError) as error:
+        raise HttpError(500, f"全景产物读不出来：{error}") from error
+    if not isinstance(payload, dict):
+        raise HttpError(500, "全景产物不是一份对象")
+    return payload
+
+
 def _library(request: "WebHandler", _rest: str) -> dict:
     """语料库列表。只读：列表、待入库数、占用、开关现状与入库进度。
 
@@ -957,6 +982,7 @@ SPEC = RouteSpec(
         JsonRoute("/api/sessions/", _session_detail, prefix=True),
         JsonRoute("/api/sessions", _session_list),
         JsonRoute("/api/runs", _run_list),
+        JsonRoute("/api/survey/", _survey, prefix=True),
         JsonRoute("/api/library", _library),
         JsonRoute("/api/library/upload", _library_upload, method="POST"),
         # 放在前缀路由之前：`/api/library/ingest` 也会被 `/api/library/` 前缀匹配到，
@@ -989,6 +1015,7 @@ class WebServer(ThreadingHTTPServer):
         corpus_root: Path | None = None,
         max_upload: int = MAX_UPLOAD_BYTES,
         ingest: Callable[[list[Path], Path], list[dict[str, Any]]] | None = None,
+        surveys_root: Path | None = None,
     ) -> None:
         super().__init__(address, WebHandler)
         self.state_path = state_path
@@ -996,6 +1023,12 @@ class WebServer(ThreadingHTTPServer):
         self.web_root = web_root
         self.spec = spec
         self.corpus_root = Path(corpus_root) if corpus_root is not None else corpus.corpus_root()
+        # 结构全景的根与语料根同一个道理：判据要在一个临时目录上跑，
+        # 否则会读到、也可能动到用户家目录里那一份。
+        self.surveys_root = (
+            Path(surveys_root) if surveys_root is not None
+            else config_home() / SURVEY_DIRECTORY
+        )
         self.max_upload = max_upload
         # 入库的**唯一写者**就在这个进程里：应用装配时把它传进来。独立运行的
         # 服务没有这一项（None），`/api/library/ingest` 会明确回 503，而不是

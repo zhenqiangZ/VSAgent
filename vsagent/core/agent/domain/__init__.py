@@ -51,8 +51,12 @@
 | `prankweb.py` | P1 副选：prankweb.cz 的 p2rank 预测（状态轮询 + 缓存，不登记工具） |
 | `products.py` | 内容寻址产物目录、`params.json` 提交标记、原子写盘（不登记工具） |
 | `pockets.py` | 四层口袋来源的装配点 + `detect_pockets` / `define_pocket` 两个工具（第 2 步） |
-| `analysis.py` | 把多路分数合成候选表（对齐、平均秩、分档）、看位姿的接触与 PLIP 指纹、拆疏水（HP/HM/脱水账）、效率体检（LE/LELP/LLE）、重对接验证；5 个工具 |
-| `screen.py` | 不看靶点的通道：2D 指纹相似度 + 3D 形状（USR），两个工具 |
+| `pocketcmp.py` | 口袋之间的比较：`compare_pockets`（同家族两个受体逐残基比差异）、`similar_pockets`（按口袋窗口的局部序列相似性找可借配体的邻近受体） |
+| `campaign.py` | 开工前的盘点 `assess_campaign`：两侧各看几个数，判定四类起点之一。**常驻，不登记族** |
+| `survey.py` | 全部实验结构的全景 `survey_structures`：按配体分组、每组套数与最佳分辨率，产物进页面。**常驻，不登记族** |
+| `analysis.py` | 把多路分数合成候选表（对齐、平均秩、分档与并列组）、看位姿的接触与 PLIP 指纹、接触频次、拆疏水（HP/HM/脱水账）、效率体检（LE/LELP/LLE）、重对接验证、挑对照；7 个工具 |
+| `interactions.py` | 位姿的相互作用：接触 / 几何氢键 / 冲突 + PLIP 指纹，整理成 Mol* 能画的三维端点（不登记工具，`analyze_pose` 与 `write_run` 共用） |
+| `screen.py` | 不看靶点的通道：2D 指纹相似度、3D 形状（USR）、按位姿去重与骨架配额挑一批交给实验；3 个工具 |
 | `admet.py` | 类药性规则层：ESOL / Veber / BBB / CYP 警示（1 个工具） |
 | `sar.py` | 构效关系：骨架分组、匹配分子对、类似物枚举、实验回填（4 个工具） |
 | `pharmacophore.py` | 共识药效团：从活性里提炼特征点 + 按距离指纹筛库（2 个工具） |
@@ -62,6 +66,7 @@
 | `websearch.py` | 搜索工具（三）：联网搜索与单页抓取（2 个工具，结果落进本地语料） |
 | `corpus.py` | 本地语料：入库 / 检索 / 按页读原文（3 个工具，免费离线；检索是三路 RRF） |
 | `finetune.py` | 用已测活性微调 VCrossFormer（1 个工具） |
+| `affinity.py` | 用微调后的权重给位姿打 pK（1 个工具；分数方向与 dock 相反，两者不可比较） |
 | `fit_train.py` | 训练脚本本体（不登记工具，交给 DTA 环境跑） |
 | `receptor.py` | 准备受体（1 个工具） |
 | `ligand.py` | 导入 / 准备 / 筛库 / 参考集 / 叠合（5 个工具） |
@@ -79,6 +84,7 @@ __all__ = [
     "affinity",
     "align",
     "analysis",
+    "campaign",
     "chembl",
     "chemistry",
     "complexes",
@@ -87,12 +93,14 @@ __all__ = [
     "export",
     "finetune",
     "http",
+    "interactions",
     "ligand",
     "listing",
     "literature",
     "opentargets",
     "pdbtext",
     "pharmacophore",
+    "pocketcmp",
     "pockets",
     "prankweb",
     "preprocess",
@@ -103,6 +111,7 @@ __all__ = [
     "sar",
     "screen",
     "structure",
+    "survey",
     "uniprot",
     "websearch",
 ]

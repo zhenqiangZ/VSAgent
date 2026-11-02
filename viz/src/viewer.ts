@@ -11,10 +11,15 @@ import { PluginContext } from "molstar/lib/mol-plugin/context";
 import { PluginConfig } from "molstar/lib/mol-plugin/config";
 import { MolScriptBuilder as MS } from "molstar/lib/mol-script/language/builder";
 import { StructureSelectionQuery } from "molstar/lib/mol-plugin-state/helpers/structure-selection-query";
-import { StructureElement, StructureProperties } from "molstar/lib/mol-model/structure";
+import { StructureElement, StructureProperties, StructureSelection } from "molstar/lib/mol-model/structure";
 const Loci = StructureElement.Loci;
 import { RuntimeContext } from "molstar/lib/mol-task";
 import { StateTransforms } from "molstar/lib/mol-plugin-state/transforms";
+import {
+  CustomInteractions,
+  InteractionsShape,
+} from "molstar/lib/extensions/interactions/transforms";
+import { ShapeRepresentation3D } from "molstar/lib/mol-plugin-state/transforms/representation";
 
 // StructureSelectionQuery.getSelection 的第二个参数是 RuntimeContext，
 // 只在查询自带 ensureCustomProperties 时才真正用到（本项目的表达式不带），
@@ -353,11 +358,12 @@ export async function showOnlyChains(
     SYNC_RUNTIME,
     structure
   );
-  if (selection.kind === "empty-loci") return;
+  if (StructureSelection.isEmpty(selection)) return;
+  const loci = StructureSelection.toLociWithCurrentUnits(selection);
   await current.builders.structure.representation.addRepresentation(
     structureRef(ref),
     { type, ...params } as any,
-    { initialState: { loci: selection as any } }
+    { initialState: { loci: loci as any } }
   );
 }
 
@@ -434,7 +440,9 @@ export async function selectResidues(
 // 一调用就抛 ReferenceError；页面没有用到这个导出，所以一直没露出来。
 export async function focusResidues(
   label: string,
-  residues: ResidueRef[]
+  residues: ResidueRef[],
+  extraRadius = 6,
+  minRadius = 12
 ): Promise<void> {
   const current = requirePlugin();
   const structure = structureByRef();
@@ -444,8 +452,13 @@ export async function focusResidues(
     SYNC_RUNTIME,
     structure
   );
-  if (selection.kind === "empty-loci") return;
-  current.managers.camera.focusLoci(selection as any);
+  if (StructureSelection.isEmpty(selection)) return;
+  const loci = StructureSelection.toLociWithCurrentUnits(selection);
+  current.managers.camera.focusLoci(loci, {
+    extraRadius,
+    minRadius,
+    zoomOut: true,
+  });
 }
 
 // 相机对准整个结构。这是「相机别贴进结构内部」的正确做法。
@@ -530,9 +543,9 @@ export async function focusChainsOnly(chains: string[], ref?: string): Promise<v
     SYNC_RUNTIME,
     structure
   );
-  const loci = selection.kind === "empty-loci"
+  const loci = StructureSelection.isEmpty(selection)
     ? StructureElement.Loci.all(structure)
-    : (selection as any);
+    : StructureSelection.toLociWithCurrentUnits(selection);
   current.managers.camera.focusLoci(loci);
 }
 
@@ -545,6 +558,64 @@ export function resetCamera(): void {
   } else {
     current.managers.camera.reset();
   }
+}
+
+// 相互作用线的状态引用与条数。切分子时先清掉上一条，再画新的。
+let interactionRef: string | null = null;
+let interactionCount = 0;
+
+export async function clearInteractions(): Promise<void> {
+  const current = requirePlugin();
+  interactionCount = 0;
+  if (!interactionRef) return;
+  try {
+    await current.state.data.build().delete(interactionRef).commit();
+  } catch {
+    // 状态已经被整份清掉时删除会失败，下一次画线会重新建。
+  }
+  interactionRef = null;
+}
+
+// 画一组相互作用线。`items` 来自 `meta.molecules[i].interactions`，
+// 每条带 Mol* 的 `a` / `b` 原子定位与作用类型。
+export async function showInteractions(
+  items: Array<{
+    kind: string;
+    a: Record<string, unknown>;
+    b: Record<string, unknown>;
+    detail?: string;
+  }>,
+  ligandRef: string
+): Promise<number> {
+  const current = requirePlugin();
+  await clearInteractions();
+  if (!items.length) return 0;
+  const receptorRef = structureRef();
+  const interactions = items.map((item) => ({
+    kind: item.kind,
+    aStructureRef: receptorRef,
+    bStructureRef: ligandRef,
+    a: item.a,
+    b: item.b,
+    description: item.detail,
+  }));
+  const update = current.build();
+  const builder = update
+    .toRoot()
+    .apply(
+      CustomInteractions,
+      { interactions } as any,
+      { dependsOn: [receptorRef, ligandRef] }
+    )
+    .apply(InteractionsShape)
+    .apply(ShapeRepresentation3D, {});
+  await update.commit();
+  interactionRef = builder.ref;
+  const data = builder.selector?.data as
+    | { interactions?: { elements?: unknown[] } }
+    | undefined;
+  interactionCount = data?.interactions?.elements?.length ?? items.length;
+  return interactionCount;
 }
 
 // 判据读的数：结构加载了没有、有几个单元、相机在哪。
@@ -583,6 +654,7 @@ export function getSnapshot(ref?: string) {
     representationTotal: countRepresentations(),
     // 选区数量：面板高亮有没有真的落到渲染状态上，看这个
     selectionCount: current.managers.structure.selection.elementCount(),
+    interactionCount,
     cameraTarget: camera ? [camera.target[0], camera.target[1], camera.target[2]] : null,
     cameraPosition: camera
       ? [camera.position[0], camera.position[1], camera.position[2]]

@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Callable, cast
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container, ScrollableContainer, Vertical
-from textual.scrollbar import ScrollTo
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Markdown, Static
@@ -16,60 +15,15 @@ from ..core.models import Message, Part, PartType, ToolStatus
 if TYPE_CHECKING:
     from ..app import VSAgentApp
 
+# 每一档状态只有一个字形，没有对应的汉字标签：卡片头上一行里既有图标又写「执行中」，
+# 是把同一件事说两遍。空心的圆表示还没开始，实心表示在做，勾与叉是两种结局。
 STATUS_ICON = {
     ToolStatus.PENDING: "○",
     ToolStatus.AWAITING: "◐",
     ToolStatus.RUNNING: "●",
-    ToolStatus.COMPLETED: "◆",
+    ToolStatus.COMPLETED: "✓",
     ToolStatus.FAILED: "✕",
 }
-
-STATUS_TEXT = {
-    ToolStatus.PENDING: "等待",
-    ToolStatus.AWAITING: "询问",
-    ToolStatus.RUNNING: "执行中",
-    ToolStatus.COMPLETED: "完成",
-    ToolStatus.FAILED: "失败",
-}
-
-# 卡片头上的工具图标。全是单格宽的字形（`☰` 是两格，没用它）：卡片头是一行文字，
-# 混进一个双宽字形会让后面整段右移一格，几张卡叠在一起就看得出参差。
-# 同一类工具给同一个图标——一眼分得出「这是检索」还是「这是算」比分清具体是哪个更重要。
-TOOL_ICON = {
-    "bash": "$",
-    "read": "▤",
-    "write": "✎",
-    "patch": "◇",
-    "grep": "⌕",
-    "list_workspace": "≡",
-    "describe_entry": "?",
-    "switch_receptor": "⇄",
-    "search_targets": "⌕",
-    "fetch_target": "⇣",
-    "fetch_structure": "⇣",
-    "search_actives": "⌕",
-    "find_analogs": "≈",
-    "lookup_compound": "⬡",
-    "search_pdb": "⌕",
-    "search_literature": "⌕",
-    "search_web": "⌕",
-    "fetch_webpage": "⇣",
-    "import_documents": "⇥",
-    "search_corpus": "⌕",
-    "read_source": "▤",
-    "import_structure": "⇥",
-    "import_ligandset": "⇥",
-    "prepare_receptor": "⚙",
-    "prepare_ligands": "⚙",
-    "dock": "⊙",
-    "write_run": "▣",
-    "open_viewer": "◎",
-}
-
-
-def tool_icon(tool_name: str) -> str:
-    """工具在卡片头上的图标。没登记过的工具用一个中性符号。"""
-    return TOOL_ICON.get(tool_name, "◆")
 
 
 def format_seconds(seconds: float) -> str:
@@ -192,10 +146,10 @@ class FoldBlock(CoalescedText, Container):
     DEFAULT_CSS = """
     FoldBlock {
         height: auto;
-        border-left: thick #3A3A3A;
+        border-left: thick #2A2A2A;
         padding: 0 1;
     }
-    FoldBlock .fold-header { color: #6E7681; }
+    FoldBlock .fold-header { color: #5A5A5A; }
     FoldBlock .fold-body { color: #8B949E; }
     FoldBlock .fold-body.-hidden { display: none; }
     """
@@ -204,12 +158,13 @@ class FoldBlock(CoalescedText, Container):
         super().__init__(classes=classes)
         self._title = title
         self._expanded = False
-        self._header = Static(self._header_text(), classes="fold-header", markup=False)
         self._body = Static("", classes="fold-body -hidden", markup=False)
         self._start_window("")
 
     def compose(self) -> ComposeResult:
-        yield self._header
+        # 标题行直接交给 `compose` 建：在 `__init__` 里先建再 yield 的话，
+        # 组件会被挂载两次，测试里拿到的那一份是第一个、屏幕上的是第二个。
+        yield Static(self._header_text(), classes="fold-header", markup=False)
         yield self._body
 
     def _header_text(self) -> str:
@@ -222,10 +177,10 @@ class FoldBlock(CoalescedText, Container):
 
         只认标题行：正文展开之后点它多半是想读或选中，整段收起来是把人赶走。
         """
-        if event.widget is not self._header:
+        if not event.widget.has_class("fold-header"):
             return
         self._expanded = not self._expanded
-        self._header.update(self._header_text())
+        self.query_one(".fold-header", Static).update(self._header_text())
         self._body.set_class(not self._expanded, "-hidden")
 
     def set_body(self, text: str) -> None:
@@ -250,7 +205,11 @@ class ReasoningPartView(FoldBlock):
 
 
 class ToolCard(Container):
-    """工具调用卡片，左侧竖条按状态着色，输出截断且可收起。
+    """工具调用卡片，输出截断且可收起。
+
+    卡片头只有三样：状态字形、工具名、耗时（有的话）。原先还带一个按工具类别挑的图标，
+    二十多个工具里有五个共用同一个字形，「这是检索还是计算」这个问题它答不了，
+    答得了的是工具名本身。
 
     卡片上有两级折叠，各自管一段：
 
@@ -263,22 +222,18 @@ class ToolCard(Container):
     DEFAULT_CSS = """
     ToolCard {
         height: auto;
-        border-left: thick #555555;
         padding: 0 1;
         margin: 0 0 1 0;
     }
-    ToolCard.-running { border-left: thick #4A9EFF; }
-    ToolCard.-awaiting { border-left: thick #FFB300; }
-    ToolCard.-completed { border-left: thick #2E7D32; }
-    ToolCard.-failed { border-left: thick #C62828; }
-    ToolCard .tool-header { color: #9AA0A6; }
+    /* 状态只用字形与标题那一档颜色表达，不另加左侧竖线：
+       一条彩色的竖线在整屏里比卡片本身的正文还显眼。 */
+    ToolCard .tool-header { color: #8B949E; }
     ToolCard.-running .tool-header { color: #4A9EFF; }
     ToolCard.-awaiting .tool-header { color: #FFB300; }
-    ToolCard.-completed .tool-header { color: #66BB6A; }
-    ToolCard.-failed .tool-header { color: #EF5350; }
-    ToolCard .tool-output { color: #6E7681; }
-    ToolCard .tool-tail { color: #6E7681; }
-    ToolCard .tool-more { color: #4A9EFF; height: 1; }
+    ToolCard.-failed .tool-header { color: #C62828; }
+    ToolCard .tool-output { color: #5A5A5A; }
+    ToolCard .tool-tail { color: #5A5A5A; }
+    ToolCard .tool-more { color: #8B949E; height: 1; }
     ToolCard .tool-output.-hidden,
     ToolCard .tool-tail.-hidden,
     ToolCard .tool-more.-hidden { display: none; }
@@ -311,8 +266,8 @@ class ToolCard(Container):
         status = self._part.tool_status or ToolStatus.PENDING
         mark = "▾" if self._show_output else "▸"
         return (
-            f"{mark} {tool_icon(self._part.tool_name)} {self._part.tool_name or 'tool'}"
-            f" · {STATUS_TEXT[status]}{self._elapsed_text()}"
+            f"{mark} {STATUS_ICON[status]} {self._part.tool_name or 'tool'}"
+            f"{self._elapsed_text()}"
             f"{self._permission_text()}{self._detail_text()}"
         )
 
@@ -455,11 +410,17 @@ class SimplePartView(Static):
     """用一个 Static 渲染的简单 Part。"""
 
     # 与正文、思考块、工具卡的文字起始列取齐。正文那一类（Markdown）自带两列内边距，
-    # 这里不补的话，patch 摘要、引用文件、step 分隔线这类行会比同一条消息里别的行左移两列。
+    # 这里不补的话，patch 摘要、引用文件、步骤分隔线这类行会比同一条消息里别的行左移两列。
     DEFAULT_CSS = """
     SimplePartView {
         height: auto;
         padding: 0 2;
+    }
+    /* 步骤分隔不再是横线：一轮里的每一步本来就是一串工具卡，
+       卡片之间的留白已经把它们分开，再加一条「── step 1 ──」是把内部计数写给用户看。 */
+    SimplePartView.part-step_start,
+    SimplePartView.part-step_finish {
+        display: none;
     }
     """
 
@@ -493,32 +454,38 @@ class SimplePartView(Static):
 
     @staticmethod
     def render_part_text(part: Part) -> str:
+        """系统事件与普通 Part 的正文。
+
+        系统事件（重试、压缩、收尾总结、错误、子任务）统一成「· 一句话」：
+        圆点是这类行的唯一标记。原先各用 `⟳` `░` `■` `◇` 四种字形再加四种颜色，
+        读的人要先学会每个字形是什么意思。
+        """
         if part.type is PartType.FILE:
             preview = f"  {len(part.text.splitlines())} 行" if part.text else ""
-            return f"▤ {part.file_path or part.text}{preview}"
+            return f"{part.file_path or part.text}{preview}"
         if part.type is PartType.AGENT:
-            return f"◆ 已派发子 agent「{part.agent_name}」 · 点击进入"
+            return f"已派发子 agent「{part.agent_name}」 · 点击进入"
         if part.type is PartType.STEP_START:
-            return f"── step {part.text or 'start'} " + "─" * 20
+            return f"step {part.text or 'start'}"
         if part.type is PartType.STEP_FINISH:
-            return f"── step {part.text or 'finish'} " + "─" * 20
+            return f"step {part.text or 'finish'}"
         if part.type is PartType.PATCH:
             stat = (
                 f"  (+{part.patch_added} -{part.patch_removed})"
                 if part.patch_added or part.patch_removed
                 else ""
             )
-            return f"◇ patch  {part.text or part.file_path}{stat}"
+            return f"· patch  {part.text or part.file_path}{stat}"
         if part.type is PartType.SUBTASK:
-            return f"◇ 子任务 [{part.agent_name or 'subagent'}] {part.text}"
+            return f"· 子任务 [{part.agent_name or 'subagent'}] {part.text}"
         if part.type is PartType.RETRY:
-            return f"⟳ 重试 {part.text}"
+            return f"· 重试 {part.text}"
         if part.type is PartType.COMPACTION:
-            return f"░ 上下文已压缩 {part.text}"
+            return f"· 上下文已压缩 {part.text}"
         if part.type is PartType.ERROR:
-            return f"■ {part.text}"
+            return f"· {part.text}"
         if part.type is PartType.SUMMARY:
-            return f"◆ 收尾总结\n{part.text}"
+            return part.text
         return part.text
 
 
@@ -539,24 +506,26 @@ class PatchPartView(SimplePartView):
 class MessageView(Container):
     """一条消息的容器，内部按 Part 顺序堆叠子组件。
 
-    用户消息画成一条对话框：浅灰底、最左侧一条蓝线；回复不画边框也不画角色标签，
-    只靠左内边距与用户消息里的正文起始列保持一致。
+    用户消息与回复用同一条左边界，靠一小段浅底和留白分开：用户那一侧进消息区后
+    换一层底色，回复那侧沿用屏幕底。不给任何一方画竖线、写角色标签——
+    谁在说话，位置与底色已经说了。
     """
 
     DEFAULT_CSS = """
     MessageView { height: auto; margin-bottom: 1; }
     MessageView .message-parts { height: auto; }
+    /* 用户消息：与回复同左边界，整块换一层浅底，靠底色而不是竖线区分是谁在说话。
+       上下各留一行，底色于是把这段文字包成一个方块，而不是贴着上一段回复的末行。
+       回复那一侧的内边距在容器上，用户这一侧在容器上补同样多，正文（Markdown 自带
+       两列）于是落在同一列；右侧不留，底色右沿与回复正文右沿对齐。 */
     MessageView.message-user {
-        background: #1E1E1E;
-        border-left: thick #4A9EFF;
-        /* 顶部留一行：正文不贴着气泡顶边，左侧那条蓝线覆盖这一行，线上沿于是高过文字。
-           底部不再另加内边距：`.part-text` 的 margin-bottom 已经留出一行 */
-        padding: 1 1 0 1;
+        background: #1A1A1A;
+        padding: 1 0 1 2;
     }
     MessageView.message-assistant { padding-left: 2; }
     /* 派发标记不是用户说的话。它仍然是一条 user 消息（翻译层把它翻成空，
-       不进模型上下文），但视觉上必须去掉气泡底色与左侧蓝线，
-       否则看起来就像用户自己发了一句「◆ 已派发子 agent…」。 */
+       不进模型上下文），但视觉上必须去掉底色，
+       否则看起来就像用户自己发了一句「已派发子 agent…」。 */
     MessageView.message-notice {
         background: transparent;
         border: none;
@@ -568,7 +537,7 @@ class MessageView(Container):
 
     def __init__(self, message: Message, pane: MessagesPane) -> None:
         # 只有派发标记的消息不是「用户说了什么」：给它单独的样式类，
-        # 让气泡的底色与蓝边不套在它身上。
+        # 让底色不套在它身上。
         notice = bool(message.parts) and all(
             part.type is PartType.AGENT for part in message.parts
         )
@@ -603,8 +572,8 @@ class NewMessagesHint(Static):
         dock: bottom;
         height: 1;
         display: none;
-        background: #16212E;
-        color: #4A9EFF;
+        background: #1A1A1A;
+        color: #8B949E;
         content-align: center middle;
     }
     NewMessagesHint.-visible { display: block; }
@@ -800,12 +769,14 @@ class MessagesPane(ScrollableContainer):
         跟随状态按滚动量判，不只认键盘动作：鼠标滚轮与拖动滚动条都会改滚动量，
         它们不走 `action_scroll_up` 这几个动作。原先只认动作的写法下，用滚轮往上翻
         之后 `_follow` 还开着，下一条消息一到就把画面拽回底部，懒加载也不会被滚轮触发。
+        拖动滚动条发来的目标位置不参与判定：那是按发消息那一刻的最大滚动量算的，
+        消息排到队尾才被处理时视口可能已经变过，拿它比会把「拖到底」判成「没到底」。
 
-        例外是「减一行，但落点仍在底部」。滚动量有两个来源：用户输入与窗口维护，
-        而维护自己也要改滚动量——裁掉上端要把位置减回来，布局还会把超出的位置夹回
-        一行。按方向一律判成「用户往上翻」的话，滚到最底之后裁一次上端、位置被夹回
-        一行，跟随就永远关着了：用户没动过键盘，新消息却不再跟到底。落点仍在底部时
-        不动跟随，要关由用户动作去关（`action_scroll_up` 等自己会写 `_follow`）。
+        往上那一支的判读排在这次刷新之后：滚动量变小的原因不一定是用户往上翻，
+        视口变高（提示条占位、输入框收放）也会把超出上限的位置夹回。夹回的那一刻
+        `max_scroll_y` 还是布局之前的旧值，当场比会把「夹回两行」当成「用户往上翻
+        两行」；等布局稳定再看落点，不在底部才关掉跟随。滚轮那种明确的用户动作
+        由 `_on_mouse_scroll_up` 自己关。
 
         父类那条负责滚动条位置与重绘，少了它滚动条不跟着动，所以先调它。
         """
@@ -813,9 +784,7 @@ class MessagesPane(ScrollableContainer):
         if self._loading:
             return
         if new_value < old_value:
-            # 底部留一行容差：夹回之后还在底部，就不算用户往上翻。
-            if new_value < self.max_scroll_y - 1:
-                self._set_follow(False)
+            self.call_after_refresh(self._confirm_follow_after_scroll_up)
         elif new_value > old_value:
             # 竖向虚拟高度要等这次刷新之后才算得出来，紧接着读 max_scroll_y 读不准
             self.call_after_refresh(self._resume_follow_at_bottom)
@@ -826,6 +795,31 @@ class MessagesPane(ScrollableContainer):
         elif new_value > old_value:
             self._maintain_window_down()
 
+    def on_resize(self, event: events.Resize) -> None:
+        """视口高度变了：落点还在底部就保持跟随。
+
+        视口变高（提示条占位、输入框收放）会把最大滚动量压小，位置被一起夹回。
+        这一下不触发「往下滚」的判读，最后一次按键排的判读可能已经跑过，
+        跟随就停在关着——用户明明在底部，新消息却不再跟下来。
+        """
+        if self._loading:
+            return
+        self.call_after_refresh(self._confirm_follow_at_bottom)
+
+    def _confirm_follow_at_bottom(self) -> None:
+        """布局稳定之后再看一眼：还在底部就恢复跟随。"""
+        if self._at_bottom():
+            self._set_follow(True)
+
+    def _confirm_follow_after_scroll_up(self) -> None:
+        """往上滚动之后再看一眼：落点不在底部才关掉跟随。
+
+        位置变小的原因不一定是用户往上翻：视口变高（提示条占位、输入框收放）会把
+        超出上限的位置夹回来，那一下也得等布局算完再判。
+        """
+        if not self._at_bottom():
+            self._set_follow(False)
+
     def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         """滚轮往上：停止跟随。
 
@@ -834,16 +828,6 @@ class MessagesPane(ScrollableContainer):
         """
         self._set_follow(False)
         super()._on_mouse_scroll_up(event)
-
-    def _on_scroll_to(self, message: ScrollTo) -> None:
-        """拖动滚动条：按目标位置决定跟不跟。
-
-        滚动条只发一条 `ScrollTo`，不经过上面那些动作，同样得显式写 `_follow`。
-        目标正好到底才算跟：拖到差一行松手也当作用户要停在那一行。
-        """
-        if message.y is not None:
-            self._set_follow(message.y >= self.max_scroll_y)
-        super()._on_scroll_to(message)
 
     def _history_hint_text(self) -> str:
         """顶端那条提示的文字，写明还剩多少条没建出来。"""
@@ -1177,7 +1161,12 @@ class MessagesPane(ScrollableContainer):
         self.scroll_relative(y=-1, animate=False)
 
     def action_scroll_down(self) -> None:
-        """向下滚动，到底部后恢复跟随。"""
+        """向下滚动，到底部后恢复跟随。
+
+        先滚再排一次判读。滚动量没变的那一次也照排：贴底时最后一格往下滚不动，
+        而这一帧里视口可能正好变高一行、最大滚动量跟着变小，这一下就没走到底。
+        这一帧里滚动量没变，`watch_scroll_y` 不会被叫醒，排着的判读就是唯一的收尾。
+        """
         self.scroll_relative(y=1, animate=False)
         self.call_after_refresh(self._resume_follow_at_bottom)
 
@@ -1191,15 +1180,29 @@ class MessagesPane(ScrollableContainer):
         self.scroll_page_down(animate=False)
         self.call_after_refresh(self._resume_follow_at_bottom)
 
-    def _resume_follow_at_bottom(self) -> None:
+    def _resume_follow_at_bottom(self, retried: bool = False) -> None:
         """滚动完成之后，已经到底就恢复自动跟随。
 
         向下滚动与向下翻页的目标位置都排在下一次刷新之后才写到 scroll_y 上，
         动作里紧接着读到的还是滚动之前的位置，所以一路滚到最底也恢复不了跟随。
         跟着刷新之后再判一次，读到的才是新的位置。
+
+        差一行的位置要再看一帧：这次刷新可能把视口抬高一行（输入框失去焦点、
+        状态行收起），最大滚动量随之变小而滚动量还没夹回。这一帧判成没到底，
+        下一帧夹回之后就到底了；不再多看一帧的话跟随会一直关着。
+
+        看完这一帧还差一行，就按到底处理：视口反向变高一行时滚动量停在这一行上
+        不会再被夹回，一直重排只会永远差一行，跟随永远关着（实测滚到底之后
+        新消息不再跟下来）。`_at_bottom` 的容差本来就是一行，两处取同一个口径。
         """
-        if self._at_bottom():
+        if self.scroll_y >= self.max_scroll_y:
             self._set_follow(True)
+            return
+        if self.max_scroll_y > 0 and self.scroll_y >= self.max_scroll_y - 1:
+            if retried:
+                self._set_follow(True)
+                return
+            self.call_after_refresh(lambda: self._resume_follow_at_bottom(True))
 
     def action_scroll_home(self) -> None:
         """回到顶部并停止跟随。"""

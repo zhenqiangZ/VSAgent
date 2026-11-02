@@ -25,8 +25,10 @@ class AutocompletePopup(Widget):
         padding: 0 1;
     }
     AutocompletePopup.-visible { display: block; }
-    AutocompletePopup .ac-item { color: #999999; }
-    AutocompletePopup .ac-item.-active { color: #FFFFFF; background: #4A9EFF; }
+    AutocompletePopup .ac-item { color: #8B949E; }
+    /* 选中项是亮蓝底，文字取屏幕底那一档：白字压在 #4A9EFF 上对比不够，
+       而深字与询问弹窗里那三个按键色块是同一种做法 */
+    AutocompletePopup .ac-item.-active { color: #0A0A0A; background: #4A9EFF; }
     """
 
     def __init__(

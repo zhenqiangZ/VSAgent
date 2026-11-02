@@ -244,12 +244,12 @@ class HomeScreen(Screen):
         return AGENTS[(index + 1) % len(AGENTS)]
 
     def _info_text(self) -> Text:
-        """拼出状态行：Agent 用蓝色，模型与提供方用浅灰。"""
+        """拼出状态行：Agent 用蓝色，模型与提供方用次要文字那一档。"""
         app = self.app
         text = Text()
         text.append(app.session_manager.last_agent, style="#4A9EFF")
-        text.append(" · ", style="#666666")
-        text.append(f"{app.current_model_label} {app.current_model_provider}", style="#AAAAAA")
+        text.append(" · ", style="#4A4A4A")
+        text.append(f"{app.current_model_label} {app.current_model_provider}", style="#8B949E")
         return text
 
     def _refresh_info(self) -> None:

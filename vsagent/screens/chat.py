@@ -20,7 +20,13 @@ from ..core.models import Message, Part, PartType, Session, ToolStatus
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import EditorPane
 from ..widgets.messages_pane import STATUS_ICON, MessagesPane
-from ..widgets.status_bar import StatusBar, format_tokens
+from ..widgets.status_bar import (
+    ContextUsage,
+    SidebarToggle,
+    StatusBar,
+    format_tokens,
+)
+from .context_usage import ContextUsageScreen
 
 
 def _short(text: str, width: int) -> str:
@@ -48,7 +54,6 @@ def _status_text(status: str) -> str:
     }.get(status, status)
 
 
-
 class AgentOptionList(OptionList):
     """右栏的子 agent 列表。
 
@@ -66,35 +71,14 @@ class AgentOptionList(OptionList):
             editor.focus_input()
 
 
-class SidebarToggle(Static):
-    """标题栏右端的侧栏开关：点一下折叠、再点一下展开。
-
-    单独一个类而不是在 `ChatScreen.on_click` 里按坐标判断：认的是消息而不是位置，
-    侧栏宽度、标题长度怎么变都不会点到别的东西上。文字也由它自己换——
-    「◧ 侧栏」是关着时按下去会打开，「◨ 收起」是开着时按下去会收起。
-    """
-
-    class Toggled(TextualMessage):
-        """用户点了这个按钮。"""
-
-    def __init__(self) -> None:
-        super().__init__("", id="side-toggle", markup=False)
-
-    def render_state(self, visible: bool) -> None:
-        """按侧栏当前是否可见改写标签。"""
-        self.update("◨ 收起" if visible else "◧ 侧栏")
-        self.set_class(visible, "-open")
-
-    def on_click(self) -> None:
-        """点一下就把这一下交给聊天界面。"""
-        self.post_message(self.Toggled())
-
-
 class SidePanel(Vertical):
     """会话右栏：子 agent 列表在上，上下文信息在下。
 
     子 agent 段只在有子会话时出现；没有时不占任何高度，/sidebar 的行为与以前一致。
     列表用 `OptionList` 而不是 `Static`：它要能点。
+
+    这一段不写会话名与模型名：会话名在底部状态栏，模型名也在那里。
+    同一个名字在两处出现，读的人要自己判断哪一个才是真的。
     """
 
     class AgentPicked(TextualMessage):
@@ -111,8 +95,7 @@ class SidePanel(Vertical):
     def compose(self) -> ComposeResult:
         yield Static("子 AGENT", id="side-agents-title", classes="side-section")
         yield AgentOptionList(id="side-agents")
-        yield Static("上下文", id="side-context-title", classes="side-section")
-        yield Static("", id="side-session", classes="side-line", markup=False)
+        yield Static("用量", id="side-context-title", classes="side-section")
         yield Static("", id="side-stats", classes="side-line", markup=False)
         yield Static("引用文件", classes="side-section")
         yield Static("", id="side-files", classes="side-body", markup=False)
@@ -120,19 +103,22 @@ class SidePanel(Vertical):
         yield Static("", id="side-tools", classes="side-body", markup=False)
 
     def update_context(self, session: Session) -> None:
-        """按当前会话刷新标题、用量、引用文件与工具清单。
+        """按当前会话刷新用量、引用文件与工具清单。
 
         侧栏没打开时整个跳过：底下这两份清单要把会话里全部 Part 走一遍，
         而它们算出来只会写进一个不显示的组件。打开侧栏的那一处会重新调一次。
         """
         if not self.has_class("-visible"):
             return
-        self._write("#side-session", session.title)
-        stats = f"{len(session.messages)} 条消息 · {format_tokens(session.total_tokens())} tokens"
-        cached = session.total_cached()
-        uncached = session.total_uncached()
-        if cached and cached + uncached:
-            stats += f" · 缓存命中 {round(cached / (cached + uncached) * 100)}%"
+        stats = (
+            f"{len(session.messages)} 条消息"
+            f" · 总 {format_tokens(session.total_tokens())} tokens"
+        )
+        # 累计用量只写在这里：状态栏那个百分比回答「还能聊多久」，这三项回答「钱花在哪」。
+        # 输入分成命中与未命中，两者的单价差十倍，合成一个数就看不出省了多少。
+        stats += f"\n缓存命中 {format_tokens(session.total_cached())}"
+        stats += f"\n未命中 {format_tokens(session.total_uncached())}"
+        stats += f"\n输出 {format_tokens(session.total_output())} · ${session.total_cost():.2f}"
         self._write("#side-stats", stats)
         self._write("#side-files", self._files_text(session))
         self._write("#side-tools", self._tools_text(session))
@@ -141,7 +127,11 @@ class SidePanel(Vertical):
         """重画子 agent 列表。
 
         这一段**不走 `_write`**：既有判据断言侧栏打开后 `_written` 恰好是
-        上下文那四个键，子 agent 列表是一组可点条目，不是几段文字。
+        上下文那三个键，子 agent 列表是一组可点条目，不是几段文字。
+
+        每条两行：第一行状态、名字、时间，第二行一句说明（失败原因或消息条数）。
+        父会话取了哪一段历史、谁派发的，都不进这两行——那是打开之后才要读的细节，
+        常驻三行会把这个列表撑到十行以上，而多数时间里用户只需要认名字。
         """
         if not self.has_class("-visible"):
             return
@@ -171,19 +161,12 @@ class SidePanel(Vertical):
             # 以为它什么都不用做，说「待开始」才对应界面里那条开始条。
             detail = "待开始" if child.has_pending_prompt else _status_text(child.status)
             if note:
-                detail += f" · {_short(note, 8)}"
+                detail += f" · {_short(note, 10)}"
             else:
                 detail += f" · {len(child.messages)} 条"
-            if child.seed_end > child.seed_start:
-                span = f"第 {child.seed_start + 1}–{child.seed_end} 条"
-            else:
-                span = "无父会话历史"
-            origin = "用户派发" if child.origin == "user" else "模型派发"
             listing.add_option(
                 Option(
-                    f"{marker} {_short(child.title, 12)}{now}\n"
-                    f"  {detail} · {stamp}\n"
-                    f"  {span} · {origin}",
+                    f"{marker} {_short(child.title, 12)}{now} · {stamp}\n  {detail}",
                     id=child.id,
                 )
             )
@@ -234,7 +217,11 @@ class SidePanel(Vertical):
 
 
 class ChatScreen(Screen):
-    """聊天主界面，消息区在上、编辑器在下、状态栏在最底。"""
+    """聊天主界面，消息区在上、编辑器在下、状态栏在最底。
+
+    没有单独的标题栏：会话名、目录、分支、用量与侧栏开关全部放在底部那一行。
+    标题栏与状态栏各占一行时，两行画的都是低优先级信息，而消息区被挤短两行。
+    """
 
     # 鼠标在消息区按下时，`Screen.set_focus` 会给 `focused` 赋值，
     # `Screen._forward_event` 会给 `_select_state` 赋值。这两个响应式变量在 Textual 里
@@ -264,7 +251,7 @@ class ChatScreen(Screen):
     allowed_commands: frozenset[str] | None = None
     # 子 agent 界面设成 False：Build/Plan 跟着父会话走，不能在这里改。
     allow_agent_switch = True
-    # 子 agent 的返回栏里已经有会话名，标题栏就不必再写一遍。
+    # 子 agent 的返回栏里已经有会话名，底部状态栏就不必再写一遍。
     show_chat_title = True
 
     def __init__(
@@ -313,12 +300,6 @@ class ChatScreen(Screen):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            # 标题栏：左边是这一屏正在看的会话，右边是侧栏开关。
-            # 它只占一行，换来两件事——不用打开侧栏就知道自己在哪条会话里，
-            # 以及折叠侧栏不必先记住 /sidebar。
-            with Horizontal(id="chat-header"):
-                yield Static("", id="chat-title", markup=False)
-                yield SidebarToggle()
             with Horizontal(id="chat-body"):
                 yield MessagesPane(self._stop_consuming)
                 yield SidePanel(id="side-panel")
@@ -334,11 +315,12 @@ class ChatScreen(Screen):
             bus.subscribe("part.update", self._on_part_update),
             bus.subscribe("turn.done", self._on_turn_done),
             bus.subscribe("status.update", self._on_status_update),
+            bus.subscribe("context.metrics", self._on_context_metrics),
             bus.subscribe("agent.created", self._on_agent_changed),
             bus.subscribe("agent.status", self._on_agent_changed),
         ]
-        self.rebuild()
         self.side_toggle.render_state(self.side_panel.has_class("-visible"))
+        self.rebuild()
         self.editor.focus_input()
         self.refresh_status()
         # 后台可能已经跑完了一轮：进屏幕时按真实状态校准一次 busy，
@@ -403,7 +385,7 @@ class ChatScreen(Screen):
 
     @property
     def side_toggle(self) -> SidebarToggle:
-        """标题栏右端的侧栏开关。"""
+        """底部状态栏右端的侧栏开关。"""
         return self.query_one(SidebarToggle)
 
     def rebuild(self) -> None:
@@ -414,20 +396,27 @@ class ChatScreen(Screen):
         self.messages.set_thinking(self.app.session_manager.show_thinking)
         self.refresh_status()
 
+    def _context_metrics(self) -> dict[str, object] | None:
+        """最近一步的上下文度量；还没有发过请求时返回 None。
+
+        读的是循环层现场记下的那一份，不在界面里另存一遍：`/context`、trace 与
+        右端占比读的都是同一处，三处各存一份必然有一处会晚一步。
+        """
+        history = self.loop.context_history
+        return history[-1] if history else None
+
     def refresh_status(self) -> None:
-        """刷新状态栏、输入框状态行、标题栏与右栏的会话上下文。"""
+        """刷新状态栏、输入框状态行与右栏的会话上下文。"""
         session = self.session
-        self._refresh_title(session)
         self.status.update_status(
-            tokens=session.total_tokens(),
-            cost=session.total_cost(),
-            latency_ms=self.loop.last_latency_ms,
+            title=session.title if self.show_chat_title else "",
+            context_tokens=session.last_input_tokens(),
             context_window=self.loop.context_window,
             busy=self._busy,
         )
+        self.status.set_sidebar(self.side_panel.has_class("-visible"))
         self.editor.update_context(
             agent=session.agent_name,
-            model=self.app.current_model_label,
             effort=session.effort,
         )
         self.side_panel.update_context(session)
@@ -439,29 +428,15 @@ class ChatScreen(Screen):
             session.id,
         )
 
-    def _refresh_title(self, session: Session) -> None:
-        """把会话名写进标题栏。内容没变就不写。
-
-        `refresh_status` 在一轮生成里会被调到很多次，而标题几乎从不变化；
-        每次都 `update()` 会白走一遍整屏重新布局。
-        **子 agent 界面留空但不隐藏**：这一格是 1fr，隐藏了开关会滑到最左边。
-        """
-        if not self.show_chat_title:
-            return
-        if session.title == self._title_written:
-            return
-        self._title_written = session.title
-        self.query_one("#chat-title", Static).update(session.title)
-
     def set_sidebar(self, visible: bool) -> bool:
         """设定侧栏可见性，返回设定之后的状态。
 
-        三条路都走这里：`/sidebar` 命令、点标题栏那个开关、子 agent 刚建出来时自动打开。
+        三条路都走这里：`/sidebar` 命令、点状态栏那端的开关、子 agent 刚建出来时自动打开。
         各写一份的话，按钮上的字会跟实际状态对不上——「收起」两个字配着一条关着的侧栏。
         """
         panel = self.side_panel
         panel.set_class(visible, "-visible")
-        self.side_toggle.render_state(visible)
+        self.status.set_sidebar(visible)
         # 侧栏关着的时候内容是被跳过的，打开时必须在这里补一次刷新。
         self.refresh_status()
         return visible
@@ -471,7 +446,7 @@ class ChatScreen(Screen):
         return self.set_sidebar(not self.side_panel.has_class("-visible"))
 
     def on_sidebar_toggle_toggled(self, event: SidebarToggle.Toggled) -> None:
-        """点了标题栏右端的开关。"""
+        """点了状态栏右端的开关。"""
         event.stop()
         self.toggle_sidebar()
 
@@ -652,6 +627,30 @@ class ChatScreen(Screen):
         """事件总线：状态刷新。"""
         if self._belongs(data):
             self.refresh_status()
+
+    def _on_context_metrics(self, data: dict[str, object]) -> None:
+        """事件总线：这一步的装配度量到了。
+
+        只重画右端的百分比：这一步没换会话、没换模型，左端与侧栏都没有新东西，
+        为一行百分比把整块侧栏的清单重走一遍不值得。
+        """
+        if not self._belongs(data):
+            return
+        self.status.update_usage(
+            context_tokens=self.session.last_input_tokens(),
+            context_window=self.loop.context_window,
+        )
+
+    def on_context_usage_pressed(self, event: ContextUsage.Pressed) -> None:
+        """点了右端的占比数字：在状态栏上方展开柱状图，水平中心对准数字。"""
+        event.stop()
+        metrics = self._context_metrics()
+        if metrics is None:
+            self.app.show_toast("还没有上下文度量，发起一轮生成后就有了", "info")
+            return
+        widget = self.query_one(ContextUsage)
+        anchor = widget.region.x + widget.region.width // 2
+        self.app.push_screen(ContextUsageScreen(metrics, anchor))
 
     def _on_agent_changed(self, data: dict[str, object]) -> None:
         """事件总线：子 agent 建了或状态变了。

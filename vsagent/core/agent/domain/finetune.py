@@ -5,7 +5,7 @@
 
 ## 什么时候该用
 
-只有一种情形：**这个靶点上已经有几百个实测活性，而零样本 `score_affinity` 排不出序。**
+只有一种情形：**这个靶点上已经有几十到几百个实测活性，而便宜的 2D 模型给不出结构上的解释。**
 
 回顾性实验（`docs/retro-affinity-report.md` §九）在 PTP1B 上的读数：
 
@@ -15,6 +15,8 @@
 | 100 | +0.036 | 0.53 |
 | 300 | +0.178 | 0.49 |
 | 726 | **+0.385**（3 种子 0.384 ± 0.017） | 0.50 |
+
+表里的「零样本」一行是基线读数。当前流程固定走「微调 → 推理」，零样本不作为一条通道。
 
 三件事必须同时记住：
 
@@ -46,7 +48,7 @@ from ..ledger import (
     fingerprint_path,
 )
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
-from . import affinity, pdbtext, products
+from . import affinity, ligand, pdbtext, products
 from .docking import read_box
 
 CONFORMER_SEED = 42
@@ -167,13 +169,19 @@ def _safe_name(text: str) -> str:
 
 
 def read_actives(path: Path) -> list[dict[str, Any]]:
-    """从 `search_actives` 写下的活性表里取 (id, SMILES, pChEMBL)。
+    """从配体集里取 (id, SMILES, pChEMBL)。
 
-    只认有 `pchembl_value` 列的表。`find_analogs` 与 `import_ligandset` 的产物没有
-    实测活性，训不了——这里如实返回空表，由调用方给出一句能照着做的话。
+    两种布局都收：`search_actives` 写的是单个 CSV，`import_ligandset` 写的是产物
+    目录（表在目录里的 `ligands.csv`）。只认有 `pchembl_value` 列的表。
+    `find_analogs` 与 `import_ligandset` 的产物即使带这一列也是空的，训不了——
+    这里如实返回空表，由调用方给出一句能照着做的话。
     """
+    if path.is_dir():
+        path = path / ligand.CSV_FILE
+    if not path.is_file():
+        raise ToolError(f"配体表读不出来：{path} 不是文件")
     rows: list[dict[str, Any]] = []
-    with path.open(newline="", encoding="utf-8") as handle:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames or "pchembl_value" not in reader.fieldnames:
             return []
@@ -251,20 +259,15 @@ class FitAffinityTool(Tool):
     spec = ToolSpec(
         name="fit_affinity",
         description=(
-            "用**已测活性**把 VCrossFormer 微调到这个受体上，产出登记成 artifact"
-            "（kind=model），之后用 `score_affinity(model=…)` 打分。"
+            "DTA 通道的固定前置：用该靶点的**实测活性**把 VCrossFormer 微调到这个受体上，"
+            "产出登记成 artifact（kind=model），之后用 `score_affinity(model=…)` 推理。"
             "训练在 DTA 的独立环境里跑，CPU 上 5–10 分钟。默认只预演，confirm=true 才真跑。\n"
-            "**什么时候用**：零样本 `score_affinity` 在这个靶点上排不出序（分数挤成一团、"
-            "与实测对不上），且该靶点已有几百个精确测量的化合物。"
-            "回顾性实验的曲线是 100 个→ρ 0.04、300 个→0.18、726 个→0.39，单调，"
-            "所以少于 40 个直接拒绝。\n"
-            "**不要指望它超过便宜的方法**：实测微调后与「ECFP4 + LightGBM」打平"
-            "（Δρ −0.02，CI 含 0），而后者几秒训完。几百个化合物时先试 2D；"
-            "微调的独有价值是它给的是结构模型——可与口袋、对接坐标共用一套解释。\n"
-            "**只有全量微调能恢复排序**：只训最后一层（mode=head）会把 RMSE 从 1.66 压到 "
-            "1.16，但排序反而略降（ρ 0.077→0.045），因为它学的是「这个靶点大概在什么档位」。\n"
-            "**只对这个口袋有效**，换靶点必须重训。口袋从准备受体留下的共晶配体截出"
-            "（残基任一原子落在配体 10 Å 内即整条保留，与训练一致）。\n"
+            "**适用**：靶点有 ≥40 个带 pChEMBL 的化合物，受体保留了与选定口袋对应的共晶"
+            "配体；要用结构模型给出亲和力排序，并愿意等几分钟。\n"
+            "**局限**：只对训练时的口袋有效，换口袋或换受体要重训；40–100 个活性时排序力"
+            "有限（100 个→ρ 0.04、300 个→0.18、726 个→0.39）；与「ECFP4 + LightGBM」打平，"
+            "不超越；`mode=head` 只修绝对尺度，排序不变好；验证集小，RMSE 波动大，"
+            "RMSE 不代表排序力；训练数据来自 ChEMBL，测定条件混杂。\n"
             "需要 `search_actives` 产出的带 pchembl 的配体集；`find_analogs` / "
             "`import_ligandset` 的产物没有实测值，训不了。"
         ),
@@ -358,7 +361,8 @@ class FitAffinityTool(Tool):
         if not actives:
             return ToolResult(
                 output=(
-                    f"{ligands.handle} 里没有可用的实测活性（需要 pchembl 列）。"
+                    f"{ligands.handle} 里没有可用的实测活性"
+                    "（pchembl_value 列缺失，或整列为空）。"
                     "用 search_actives 取已知活性；find_analogs 与 import_ligandset "
                     "的产物只有结构、没有活性值，训不了。"
                 ),
@@ -550,10 +554,17 @@ class FitAffinityTool(Tool):
             )
 
         config = Path(result["config"]).parent / "config.infer.yaml"
+        # 排序力才是这条通道的产出；RMSE 只说明绝对尺度。取不到就只报 RMSE。
+        spearman = result.get("best_val_spearman")
         summary = (
             f"微调完成：{len(train_ids)} 训练 / {len(val_ids)} 验证，"
-            f"验证 RMSE {result['best_val_rmse']}，模式 {mode}，{epochs} 轮。"
+            f"验证 RMSE {result['best_val_rmse']}"
+            + (f"、Spearman ρ {spearman}" if spearman is not None else "")
+            + f"，模式 {mode}，{epochs} 轮。"
         )
+        metrics = {"val_rmse": result["best_val_rmse"]}
+        if spearman is not None:
+            metrics["val_spearman"] = spearman
         entry = ledger.add(
             "artifact",
             path=work,
@@ -571,7 +582,7 @@ class FitAffinityTool(Tool):
                 "pocket": str(pocket_path),
                 "counts": {"train": len(train_ids), "val": len(val_ids),
                            "skipped": len(failed)},
-                "metrics": {"val_rmse": result["best_val_rmse"]},
+                "metrics": metrics,
                 "pocket_atoms": atoms,
                 "pocket_residues": residues,
             },
@@ -582,11 +593,13 @@ class FitAffinityTool(Tool):
                 f"用法：score_affinity(receptor=…, ligands=…, model={entry.handle})。\n"
                 "提醒：这个模型只对本次的口袋有效；换受体或换靶点要重训。"
                 "另外，验证集是骨架互斥切出来的，但只有 "
-                f"{len(val_ids)} 个点，RMSE 的波动不小——别拿它当精确指标。"
+                f"{len(val_ids)} 个点，RMSE 的波动不小——别拿它当精确指标；"
+                "排序好坏看 Spearman，不看 RMSE。"
             ),
             meta={
                 "handle": str(entry.handle),
                 "val_rmse": result["best_val_rmse"],
+                "val_spearman": spearman,
                 "train": len(train_ids),
                 "val": len(val_ids),
                 "mode": mode,

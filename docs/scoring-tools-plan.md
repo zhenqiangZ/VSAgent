@@ -1,5 +1,8 @@
 # 打分与评价层（轮 1）：三个力场 + 两个分析工具
 
+> 后续的打分通道（DTA 微调后推理）与结构呈现方案见
+> [`docs/scoring-presentation-plan.md`](scoring-presentation-plan.md)。
+
 本文件记录「把打分函数从 Vina 一家扩开、并把打分结果怎么评价补上」这一轮：
 **做了哪些、为什么这么选、踩到的坑、明确不做的**。
 

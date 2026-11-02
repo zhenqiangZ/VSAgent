@@ -1,9 +1,9 @@
 """领域工具的调试入口：**直接跑，不用敲任何参数**。
 
 放在仓库根目录，不放在 `vsagent/core/agent/domain/` 里：它是开发期用的东西，
-不该和那 51 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
+不该和那 57 个工具挤在同一个目录里。两种跑法，工作目录都在仓库根：
 
-    # 一、全跑：22 个模块、54 次调用（51 个工具），按依赖顺序一个接一个（不需要任何参数）
+    # 一、全跑：24 个模块、61 次调用（57 个工具），按依赖顺序一个接一个（不需要任何参数）
     .venv/Scripts/python.exe debug_tools.py
 
     # 二、只跑一个模块（每个工具模块末尾的块就是这么用的）
@@ -85,6 +85,13 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     # 靶点：检索 → 取详情
     ("search_targets", {"query": "EGFR", "limit": 5}),
     ("fetch_target", {"accession": "P00533"}),
+    # 开工前的盘点：受体侧（结构数、最佳分辨率、AlphaFold）与配体侧（活性条数、
+    # 骨架分组、匹配对密度）一起看，判定四类起点之一。**不给 receptor**：这一步
+    # 还没有受体。它取 ChEMBL 时两端各拉一份（最强与最弱），所以要跑几十秒。
+    ("assess_campaign", {"accession": "P00533"}),
+    # 全部实验结构的全景：按配体分组，每组套数与最佳分辨率。用 Q15858（Nav1.7，
+    # 44 套）是因为它同时有小分子配体、肽类毒素与大量脂质——分组口径在这里最容易露馅。
+    ("survey_structures", {"accession": "Q15858"}),
     # 靶点值不值得做：可成药性 / 安全性 / 临床候选 / 疾病关联（纯查询，不登记产物）。
     # 用的是基因名而不是 Ensembl 编号——解析那一步本身也要跑通。
     ("check_druggability", {"target": "EGFR", "disease_limit": 3, "drug_limit": 3}),
@@ -185,6 +192,14 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "library": "{ligandset:prepared}",
         "top": 5,
     }),
+    # 从筛出来的里面挑一批交给实验：位姿去重（同一构象的近似重复只留名次最高的）、
+    # 相似度上限 0.6、同一骨架最多 3 个。这一步不看分数排序，所以排在两条筛法之后。
+    # 给了 poses 才做位姿去重；这次没给，走的是「只看 2D 相似度」那条路。
+    ("pick_diverse", {
+        "source": "{ligandset:prepared}",
+        "limit": 3,
+        "max_similarity": 0.8,
+    }),
     # 类药性：在同一份筛过的库上算规则层指标（不需要 3D、不需要引擎）
     ("predict_admet", {"ligands": "{ligandset:curated}", "endpoints": "solubility,veber,bbb,cyp"}),
     # 构效关系：先分组，再找匹配分子对，最后用第一组枚举一批类似物。
@@ -202,11 +217,15 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "library": "{ligandset:raw}",
         "top": 5,
     }),
-    # 实验回填（第四个收路径的动作）：夹具里 3 条可解析、1 条写成 n/a
+    # 实验回填（第四个收路径的动作）：夹具里 3 条可解析、1 条写成 n/a。
+    # `batch` 给的是这一批的配体集：给了就顺手报「本批几个、实测几个、未测清单」。
+    # 用筛过的那份库（erlotinib / imatinib / aspirin / caffeine），夹具里只有
+    # aspirin 与 caffeine 有数，所以未测清单会列出另外两个。
     ("record_assay", {
         "file": "tests/fixtures/assay.csv",
         "campaign": "debug",
         "assay": "IC50",
+        "batch": "{ligandset:curated}",
     }),
     # 两个搜索工具：只给候选、不给结论
     ("search_pdb", {"query": "EGFR kinase", "limit": 5}),
@@ -243,8 +262,9 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("search_web", {"query": "EGFR T790M resistance mechanism", "count": 3}),
     # 抓单页正文（同样计费）。用一个稳定的公开页面，**不依赖上一条的返回**——
     # 全跑时参数是静态的，占位只认登记表里的 handle，认不了「上一条结果里的某个 URL」。
+    # 取 UniProt 的靶点页：整页是服务端渲染的静态 HTML，抓取后端拿得到正文。
     ("fetch_webpage", {
-        "url": "https://en.wikipedia.org/wiki/Epidermal_growth_factor_receptor",
+        "url": "https://www.uniprot.org/uniprotkb/P00533/entry",
         "max_chars": 800,
     }),
     # 产物：受体 → 运行目录 → 网页地址
@@ -254,15 +274,33 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "uniprot": "P00533",
     }),
     ("open_viewer", {"run": "{artifact}"}),
+    # 口袋之间的比较（1）：同一蛋白的两份结构。先取一份 4HJO（也是 EGFR 激酶域），
+    # 与准备好的 1M17 逐残基比——两条序列几乎相同，差异应当接近 0。
+    ("fetch_structure", {"pdb_id": "4HJO"}),
+    ("compare_pockets", {
+        "target": "{receptor:prepared}",
+        "anti": "{receptor:raw}",
+        "residues": "A:745,A:788,A:790",
+    }),
+    # 口袋之间的比较（2）：按口袋窗口的局部序列相似性找可借配体的邻近受体。
+    # ERBB2（P04626）与 EGFR 同家族，窗口同一性应当很高；这一步会联网取 UniProt
+    # 条目与 ChEMBL 计数，两个候选约十几秒。
+    ("similar_pockets", {
+        "accession": "P00533",
+        "candidates": "P04626",
+        "residues": "745,788,790",
+    }),
     # 最后回来看准备后的受体那一条
     ("describe_entry", {"handle": "{receptor:prepared}"}),
     # 微调：**这里只跑预演**（confirm=false）。真训一次要 5–10 分钟、还要 DTA 的
     # 独立环境，把它塞进全跑会让这个脚本从「几分钟」变成「半小时」。
     # 预演仍然走完整的前置校验：受体必须是 prepared 且留了 ligand.pdb，
     # 配体集必须有 pchembl 列——这两条恰好是最容易配错的地方。
+    # 配体集取 `search_actives` 那一份（`stage=actives`）：导入的配体集也有这一列，
+    # 但整列是空的，只会走到「没有可用的实测活性」那条拒绝上。
     ("fit_affinity", {
         "receptor": "{receptor:prepared}",
-        "ligands": "{ligandset:raw}",
+        "ligands": "{ligandset:actives}",
         "confirm": False,
     }),
     # AlphaFold 预测模型（免费，无 key）。**排在最后是故意的**：它也会登记一条 raw
@@ -276,7 +314,8 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
 DEFAULTS: dict[str, dict[str, Any]] = {name: arguments for name, arguments in CALLS}
 
 # 参数里的占位：`{receptor}` = 最新的受体，`{receptor:raw}` = 最新的、阶段是 raw 的受体。
-# 阶段读条目的 `meta["stage"]`（`structure` 登记 raw、`prepare_receptor` 登记 prepared）。
+# 阶段读条目的 `meta["stage"]`（`structure` 登记 raw、`prepare_receptor` 登记 prepared、
+# `search_actives` 登记 actives）。
 # 占位可以整段是一个，也可以夹在一串里（`rank_candidates` 的 sources 要两三个 handle）。
 INLINE = re.compile(r"\{([a-z]+)(?::([a-z]+))?\}")
 

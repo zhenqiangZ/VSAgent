@@ -103,7 +103,7 @@ python tests/test_agent.py --only hooks-in-loop
 python tests/dump_layout.py       # 100x30 布局快照，写到 tests/output/
 
 # 领域工具调试：唯一需要真实网络的脚本（真的打 UniProt/ChEMBL/RCSB/PubMed）
-python debug_tools.py             # 全跑 22 模块 56 次调用（53 工具），顺序即依赖顺序，零参数
+python debug_tools.py             # 全跑 24 模块 61 次调用（57 工具），顺序即依赖顺序，零参数
 python debug_tools.py --clean     # 同上，跑完删掉本轮产物（只删 ~/.vsagent 下的）
 # dock 需要外部 vina：PATH 里有 vina，或设置 VSA_VINA_BIN；没有时这一步直接失败
 # score_affinity 需要 models/DTA/.venv：没有时同样直接失败并给安装指引
@@ -148,10 +148,8 @@ python -m vsagent.core.embed index          # 只补向量（换模型后跑这�
 
 # 前端（viz/ 是唯一装 npm 包的地方）
 cd viz && npm install && npm run build     # esbuild → viz/build/{viewer,markdown}-lib.js
-node tools/check_molstar_ui.js             # Playwright，需要先起服务（DEMO_URL，默认 :8851）
-node tools/check_web_ui.js                 # WEB_PORT，默认 8866；会自己 spawn serve_web.py
-node tools/check_demo_datadriven.js        # 反硬编码证明：改了数据，面板文字必须跟着变
-node tools/check_demo_ui.js                # 针对 3Dmol.js 演示页（DEMO_URL，默认 :8848）
+node tools/check_web_ui.js                 # WEB_PORT，默认 8866；自己造夹具、自己 spawn serve_web.py
+                                           # 含：数据驱动、口袋深链接、对接分数排序方向
 
 # 打包（Windows）
 pip install -r requirements-pack.txt
@@ -281,10 +279,11 @@ graph TD
   既不在事件里也不在 RECENT 里，不说就是无声消失。
   **摘要已退休**：它的三段分别由 TASK、Step 流水、Phase 结论覆盖；
   `_summarize` 只剩「首轮就溢出、连一段都封不出来」的兜底。
-- `toolset.py` — 按族加载领域工具。68 个工具里领域那 53 个的完整定义约 21K token
-  （42K 字符，按请求体里那份 JSON 量），每一步都要发；
-  核心 15 个（文件、登记表、任务、假设、事件、记忆、`load_tools`）常驻，53 个领域工具分成
-  21 族由 `load_tools` 现装现用，装过之后每步只发 3.5K。**族记在
+- `toolset.py` — 按族加载领域工具。73 个工具里领域那 54 个的完整定义约 23K token，
+  每一步都要发；核心 19 个（文件、登记表、任务、假设、事件、记忆、`load_tools`、
+  开工前的盘点、结构全景、`write_run` / `open_viewer`）常驻，54 个领域工具分成 18 族由
+  `load_tools` 现装现用，
+  装过之后每步只发 3.5K。**族记在
   `Session.tool_families` 上，不记在注册表上**（注册表按根 / 子 agent 共享两份，
   记在那里会让一个会话装过的工具漏到另一个）；子 agent 从父会话继承。
   **装载会随阶段结束而失效**：`prune_families()` 绑定在 Phase 封存上，把这个阶段没用过的族卸掉
@@ -294,7 +293,7 @@ graph TD
   `hidden_names(session)` 给的是**排除集**：没登记族的工具默认常驻，
   新工具忘了登记时坏处只是白占额度，不会「写了却没装、模型看不见」。
   模型看不见某个工具时最容易直接叫它的名字，所以 `loop.missing_tool_reason` 会认族：
-  回的是「属于 docking 族，先 `load_tools family=docking`」。
+  回的是「属于 scoring 族，先 `load_tools family=scoring`」。
   **`load_tools` 的说明里那张「族 → 工具」表由 `catalog_text()` 从模块现数**，
   不手写（手写的那份漂过三处）；结果也要减去 `registry.disabled`——对着被
   `tools.toml` 关掉的工具说「已装入」，模型下一步就会去调，撞墙之后转去 bash 自己实现。
@@ -303,12 +302,13 @@ graph TD
   `structure`。
 - `prompt.py` — `stable_prefix` 组装：身份 → **假设规则** → 工作方式 → shell → 登记表 →
   记忆 → 事件 →（派发）→ 项目规则。**前缀里不放时间不放进度**，否则每步都击穿 prompt cache。
-  排序是语义：假设规则紧跟身份（它定义「产出长什么样」，先于所有操作纪律），门禁放最后。
-  **整段预算 1900 token（实测 1838），由 `tools/check_prefix.py` 守着**：超预算、点名了
-  首步看不见的工具、出现「全库只有…」这类枚举，都会被检查出来。
-  `project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`，32KB 上限）；超限**不截一半**，
-  只注入一句「本次没有注入，用 read 分段读」，编码坏了返回空串——`stable_prefix`
-  在装配之前调，那里没有 try，一个异常会掀掉一整轮。
+  排序是语义：假设规则紧跟身份（它定义「产出长什么样」，先于所有操作纪律），确认点放最后。
+  **固定那几段预算 1900 token（实测 1472），由 `tools/check_prefix.py` 守着**：超预算、
+  点名了首步看不见的工具、出现「全库只有…」这类枚举，都会被检查出来。
+  `AGENTS.md` 那一块**不设上限**：它是许可与判据的来源，少一条就可能让模型做一个本来
+  被禁止的动作，判据只报它的体量（现 2818 token / 117 行）。
+  `project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`），整份注入、不截断；
+  编码坏了返回空串——`stable_prefix` 在装配之前调，那里没有 try，一个异常会掀掉一整轮。
   平台那句由 `platform_note()` 按 `sys.platform` 现取，**必须现取**：把「这套环境是
   Windows」固定写进代码的版本在 Linux 上跑就是在教模型写 `dir`，而且 `env-block` 判据盯着这一条。
   易变的环境信息（日期、工作目录、状态目录）走 `environment_block()`，由循环层塞进 user 头，
@@ -364,15 +364,19 @@ graph TD
 - 每个登记工具的模块暴露一个模块级 `domain_tools() -> list[Tool]`，文件末尾带
   `if __name__ == "__main__": from debug_tools import main` 块。
 - `all_tools.py:domain_tools()` 按**浏览 → 检索 → 改动**的顺序拼装
-  （listing, uniprot, structure, chembl, rsearch, literature, receptor, ligand, docking,
-  affinity, export）。这个顺序同时决定了工具在请求体里的先后，靠前的更容易被模型选中
+  （listing, uniprot, structure, pocket, chembl, pubchem, opentargets, literature,
+  corpus, websearch, receptor, ligand, screen, scoring, analysis, admet, sar,
+  pharmacophore）。这个顺序同时决定了工具在请求体里的先后，靠前的更容易被模型选中
   ——**顺序影响模型的选择**。同一个文件的 `FAMILIES` 是**按族加载的唯一真相**：
   族名、给人看的一句话、模块；`catalog()` 展开成「族 → 工具名」，`load_tools` 与
-  `hidden_names` 都从它取。
+  `hidden_names` 都从它取。`write_run` / `open_viewer` 不在任何族里，由 `app.py`
+  直接注册成核心工具。
 - 配体链路：`import_ligandset`（文件 → raw ligandset）→ `prepare_ligands`（ETKDGv3 +
-  MMFF/UFF + Meeko → prepared ligandset）→ `dock`（Vina → docking artifact）→
-  `score_affinity`（VCrossFormer → affinity artifact）→ `write_run(docking=...)`（pose 进运行目录）。
-  `ligand.py` 与 `docking.py` 是这条链，`products.py` 是共用的产物目录/原子写盘。
+  MMFF/UFF + Meeko → prepared ligandset）→ `dock`（Vina → docking artifact）。
+  DTA 通道是另一条：`fit_affinity`（实测活性 → model artifact）→
+  `score_affinity(model=…)`（同一批位姿 → affinity artifact）。
+  `write_run(docking=…, affinity=…)` 把两路分数写进运行目录。
+  `ligand.py` 与 `docking.py` 是配体这条链，`products.py` 是共用的产物目录/原子写盘。
 - `dock` 有三个力场（`scoring="vina"|"vinardo"|"ad4"`），**分数互不可比**。前两个只要
   受体 + 盒子；`ad4` 要先 `autogrid4` 算亲和力图（`--maps`，不能给 `--receptor`），
   图缓存在 `~/.vsagent/grids/`（键是受体指纹 + 盒子 + 配体原子类型），盒子限 40 Å
@@ -380,11 +384,11 @@ graph TD
   与批量筛选的形态冲突，而 AD4 力场已经通过 vina 拿到了。
 - `finetune.py` 是**唯一会训练模型的工具**：用某个靶点上已测的活性把预训练权重
   微调一遍（`fit_affinity`），产出登记成 artifact（`kind=model`），之后
-  `score_affinity(model=…)` 用这份权重与它训练时的口袋打分。训练本身交给
+  `score_affinity(model=…)` 用这份权重与它训练时的口袋推理。训练本身交给
   `domain/fit_train.py` 在 `models/DTA/.venv` 里跑（5–10 分钟，CPU），主仓一行
-  torch 都不 import。**它只对这个口袋有效，换靶点要重训**；而且实测只与
-  「ECFP4 + LightGBM」打平、不超越——所以描述里写的是「零样本排不出序时才用」。
-  依据见 [`docs/retro-affinity-report.md`](docs/retro-affinity-report.md) §九。
+  torch 都不 import。**它只对这个口袋有效，换受体或换口袋要重训**；而且实测只与
+  「ECFP4 + LightGBM」打平、不超越。DTA 通道固定走「微调 → 推理」，零样本不再是
+  流程的一部分。依据见 [`docs/retro-affinity-report.md`](docs/retro-affinity-report.md) §九。
 - `affinity.py` 是**第二个调外部进程的工具**，外面是一个 Python 解释器，
   所以它比 `docking.py` 多两件事：`dta_python()` / `dta_root()` 两个环境变量入口，
   以及**现截口袋**（受体的 `box.txt` 只给中心，模型要的是中心 10Å 内的残基）。
@@ -404,7 +408,24 @@ graph TD
   「handle → 产物 → 位姿 → 受体坐标」的校验必然复制错。
   `analyze_hydrophobic` 与 `efficiency_profile` 的口径里都写明「没有计算熵与脱水代价」：
   输出不能让读者以为算过。
-- 不登记工具的模块（`pockets` / `complexes` / `prankweb` / `align` / `chemistry` / `pdbtext` / `http` / `products`）
+- `pocketcmp.py` 是「口袋定下来之后」的两个问法：`compare_pockets`（同家族两个受体
+  逐残基比 8 Å 内的差异，先做全局序列对齐再按对齐结果配对）、`similar_pockets`
+  （按口袋窗口的局部序列同一性给候选受体排序，并给出各自的 ChEMBL 活性条数）。
+  两者共用同一套 Needleman–Wunsch；选链按「同一性 × 覆盖」，只看同一性时一条 30 个
+  残基的短链会以 70% 压过真同源链。窗口按 UniProt 编号取，给 `pocket` 时先对齐换算。
+- `campaign.py` 是开工前的盘点 `assess_campaign`（**常驻，不登记族**——它决定这一轮
+  装哪几族，自己先要装族就反了）。阈值表写死，四类起点各带一句引用哪几个数的理由，
+  另给一条假设草稿。配体侧的活性用 `chembl.activity_snapshot(spread=True)`：
+  默认只取最强的一段，P00533 的 325 个分子全在 pChEMBL 9.49–11.00，Δ≥2 的匹配对恒为 0。
+- `survey.py` 是结构全景 `survey_structures`（**同样常驻，不登记族**——宽泛问题发生在
+  第一轮，那时一族都还没装）。它把这个靶点的**全部**实验结构取回来，按 `chem_comp`
+  代号分组，每组给套数、最佳分辨率与代表条目；产物写 `~/.vsagent/surveys/`，
+  聊天里只给摘要，全表在 `#/survey/<id>`。**标题里点过名的配体排在最前**：膜蛋白
+  结构里胆固醇与磷脂按套数永远最多（Nav1.7 的 44 套里胆固醇 26 套），按套数排序
+  会把河豚毒素（9SR，3 套）挤到折叠行里。配体常用名来自 REST 的
+  `rcsb_chem_comp_synonyms`——`chem_comp.name` 常常是一长串系统命名，
+  「Tetrodotoxin」不在里面。它不下载坐标、不算口袋、不核对序列。
+- 不登记工具的模块（`complexes` / `prankweb` / `align` / `chemistry` / `pdbtext` / `http` / `products` / `preprocess`）
   是库层，被 `WriteRunTool` 之类调用。口袋来源因此是四层叠合：共晶配体 → 复合物 → p2rank 预测 → 先验叠合。
   四层在聚簇之前都先剔掉脂质与去垢剂（`preprocess.screen_lipids`）：碳数 ≥ 8、极性原子
   （N/O/S）≤ 2 或含磷、重原子 ≥ 16、包围盒最长边 ≥ 16 埃，四条全中才算；最后那条是
@@ -493,6 +514,8 @@ graph TD
 `core/web/routes.py` 的 `SPEC` 是路由的**唯一真相**，包内常驻服务和 `tools/serve_web.py`
 都从它拿，别在第二处写路由。会话与运行仍是纯 GET：`GET /api/sessions`、
 `GET /api/sessions/<id>`、`GET /api/runs`，外加 `/runs/...` 静态与 `web_root` 静态。
+结构全景另有一条 `GET /api/survey/<id>`（只认目录名，不认路径），
+根目录由 `--surveys` 注入，判据因此不必往家目录里写东西。
 路径逃逸用 `resolve_within` 拒绝（403）。
 
 **S2 起网页端多了一组语料入口**（`GET /api/library`、`GET /api/library/<kind>:<id>/chunks`、
@@ -543,6 +566,7 @@ import 任何 npm 包，换 3D 库只动 `viz/`。
 - **`.probe/` 是所有测试与脚本的临时产物目录**，已 gitignore，可以放心写。
 - `AGENTS.md` **已纳入版本控制**（`.gitignore` 里它是唯一例外），`prompt.py:rules_directory()`
   读的就是它，且按**代码位置**定位——源码运行时是仓库根，打包后是 exe 所在目录。
-  它在每个 step 注入系统提示的「项目规则」段，改完下一个 step 即生效；32KB 上限，超了**不注入**
-  （只留一句「用 read 分段读」）。它是**门禁与许可**（≤50 行），展开的操作细则在
-  `docs/screening-playbook.md`——改流程细节写 playbook，别往 `AGENTS.md` 里堆。
+  它在每个 step 注入系统提示的「项目规则」段，改完下一个 step 即生效；**不设大小上限**，
+  整份注入（编码坏了才返回空串）。它装着**确认点、许可与判据**，展开的操作细则在
+  `docs/screening-playbook.md`——改流程细节写 playbook，`AGENTS.md` 只放「什么算数、
+  什么不许做」。

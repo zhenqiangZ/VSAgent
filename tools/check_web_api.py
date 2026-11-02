@@ -42,6 +42,7 @@ FIXTURE_DIR = PROJECT_ROOT / ".probe" / "web-runs"
 STATE_COPY = PROJECT_ROOT / ".probe" / "web-state" / "state.toml"
 
 CORPUS_DIR = PROJECT_ROOT / ".probe" / "web-corpus"
+SURVEYS_DIR = PROJECT_ROOT / ".probe" / "web-surveys"
 UPLOAD_CAP = 4096
 """上传上限调到 4KB：这样「超限」只要发 5KB，不必真造一个 50MB 的请求。"""
 
@@ -228,6 +229,7 @@ def start_service(state_path, runs_dir, port):
                 "--state", str(state_path),
                 "--runs", str(runs_dir),
                 "--corpus", str(CORPUS_DIR),
+                "--surveys", str(SURVEYS_DIR),
                 "--max-upload", str(UPLOAD_CAP),
                 "--port", str(port),
             ],
@@ -435,6 +437,120 @@ def run_checks(base, state_path, runs_dir, link_session, other_session):
         status == 403,
         f"返回 {status}，内容 {traversal.get('error', '')}",
     )
+
+
+def prepare_surveys():
+    """造一份结构全景产物，够核对接口形状与页面取数即可。
+
+    **不放在 `~/.vsagent/surveys`**：判据不该往用户家目录里写东西，
+    服务用 `--surveys` 指到这里（与 `--corpus` 同一个理由）。
+    """
+    if SURVEYS_DIR.exists():
+        shutil.rmtree(SURVEYS_DIR)
+    target = SURVEYS_DIR / "Q15858-survey-test0001"
+    target.mkdir(parents=True)
+    payload = {
+        "format": 1,
+        "accession": "Q15858",
+        "query": {"method": "", "ligand_class": "any", "limit": 400},
+        "total": 3,
+        "fetched": 3,
+        "groups": [
+            {
+                "code": "9SR",
+                "name": "Tetrodotoxin",
+                "names": ["Tetrodotoxin"],
+                "kind": "non-polymer",
+                "weight": 319.268,
+                "count": 1,
+                "title_hits": 1,
+                "best": {"pdb_id": "6J8I", "resolution": 3.2, "method": "ELECTRON MICROSCOPY"},
+                "pdb_ids": ["6J8I"],
+            },
+            {
+                "code": "Y01",
+                "name": "CHOLESTEROL HEMISUCCINATE",
+                "names": [],
+                "kind": "non-polymer",
+                "weight": 486.726,
+                "count": 1,
+                "title_hits": 0,
+                "best": {"pdb_id": "7W9K", "resolution": 2.2, "method": "ELECTRON MICROSCOPY"},
+                "pdb_ids": ["7W9K"],
+            },
+        ],
+        "polymers": [
+            {
+                "description": "Sodium channel subunit beta-1",
+                "uniprot_ids": ["Q07699"],
+                "count": 2,
+                "pdb_ids": ["6J8I", "7W9K"],
+            }
+        ],
+        "additives": [{"code": "NAG", "name": "N-acetylglucosamine", "count": 2}],
+        "apo": [{"pdb_id": "2EB2", "resolution": 2.5, "method": "X-RAY DIFFRACTION"}],
+        "missing": [],
+        "entries": [
+            {
+                "pdb_id": "6J8I",
+                "title": "Nav1.7 with tetrodotoxin",
+                "resolution": 3.2,
+                "method": "ELECTRON MICROSCOPY",
+                "ligands": ["9SR"],
+                "additives": ["NAG"],
+                "other_polymers": ["Sodium channel subunit beta-1"],
+            },
+            {
+                "pdb_id": "7W9K",
+                "title": "Nav1.7-beta1-beta2 complex",
+                "resolution": 2.2,
+                "method": "ELECTRON MICROSCOPY",
+                "ligands": ["Y01"],
+                "additives": ["NAG"],
+                "other_polymers": ["Sodium channel subunit beta-1"],
+            },
+            {
+                "pdb_id": "2EB2",
+                "title": "EGFR kinase domain",
+                "resolution": 2.5,
+                "method": "X-RAY DIFFRACTION",
+                "ligands": [],
+                "additives": [],
+                "other_polymers": [],
+            },
+        ],
+        "names_unavailable": [],
+    }
+    (target / "survey.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    return SURVEYS_DIR
+
+
+def run_survey_checks(base):
+    """结构全景接口：读得到、形状对、不存在回 404、标识不合法回 400。"""
+    status, payload = request(f"{base}/api/survey/Q15858-survey-test0001")
+    check(
+        "结构全景读得到",
+        status == 200 and payload.get("accession") == "Q15858",
+        f"{status} / {payload.get('accession')}",
+    )
+    check(
+        "全景带着配体组与全部条目",
+        len(payload.get("groups") or []) == 2 and len(payload.get("entries") or []) == 3,
+        f"组 {len(payload.get('groups') or [])}，条目 {len(payload.get('entries') or [])}",
+    )
+    check(
+        "全景里的常用名原样转出",
+        (payload.get("groups") or [{}])[0].get("name") == "Tetrodotoxin",
+        str((payload.get("groups") or [{}])[0].get("name")),
+    )
+
+    status, _ = request(f"{base}/api/survey/not-a-survey")
+    check("不存在的全景回 404", status == 404, str(status))
+
+    status, _ = request(f"{base}/api/survey/..%2Fetc")
+    check("全景标识不合法回 400", status == 400, str(status))
 
 
 def prepare_corpus():
@@ -972,6 +1088,7 @@ def main():
     state_path = prepare_state_copy()
     runs_dir = prepare_runs()
     prepare_corpus()
+    prepare_surveys()
     # 用**副本里真实存在**的某个会话当关联目标，而不是取一个固定编号。
     # 状态文件是活的：把编号取成固定值，一旦那个会话不在里面，
     # 「只有对应会话拿到了运行」就不会报出关联断掉——它只查「恰好有一个
@@ -994,6 +1111,7 @@ def main():
 
     try:
         run_checks(base, state_path, runs_dir, link_session, other_session)
+        run_survey_checks(base)
         run_library_checks(base)
         run_chunk_checks(base)
         run_ingest_checks(base, CORPUS_DIR)

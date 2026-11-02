@@ -56,7 +56,7 @@ class HypothesisTool(Tool):
             "`test` 与 `expected` 是硬门槛：没有它们就不是假设，是印象。"
             "`expected` 里要有数、阈值或对照（例如「IC50 < 100 nM」「对照组无活性」）。\n"
             "两种粒度：`kind=strategy` 是这一轮该怎么筛（聚焦库还是多样性库），"
-            "必须给 `mode`（expand 找新骨架 / narrow 在已有骨架里优化）；"
+            "必须给 `mode`（expand 组外找新骨架 / narrow 组内做同系物优化）；"
             "`kind=mechanism` 是这批分子为什么活。两类都要提——只谈机制会在错的库上"
             "做精细分析，只谈策略则永远不知道为什么要这么筛。\n"
             "`action=close` 要说明依据；拿到实验数据后用 `record_assay(hypothesis=...)` "
@@ -79,7 +79,7 @@ class HypothesisTool(Tool):
                 "mode": {
                     "type": "string",
                     "enum": list(HYPOTHESIS_MODES),
-                    "description": "策略假设必填：expand 扩张找新骨架 / narrow 收窄",
+                    "description": "策略假设必填：expand 组外找新骨架 / narrow 组内优化",
                 },
                 "claim": {"type": "string", "description": "主张，一句话，必须可判真假"},
                 "mechanism": {"type": "string", "description": "机制：你认为它为什么成立"},
@@ -128,7 +128,8 @@ class HypothesisTool(Tool):
         if kind == "strategy":
             if mode not in HYPOTHESIS_MODES:
                 raise ToolError(
-                    "策略假设要说明方向：mode=expand（找新骨架）或 mode=narrow（收窄优化）。"
+                    "策略假设要说明方向：mode=expand（组外找新骨架）或 "
+                    "mode=narrow（组内做同系物优化）。"
                     "没有方向就没有筛选策略，只有一句愿望。"
                 )
         elif mode:

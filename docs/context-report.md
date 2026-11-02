@@ -20,7 +20,7 @@
 
 | 序 | 层 | 内容 | 来源（代码位置） | 淘汰策略 | 软配额 |
 | --- | --- | --- | --- | --- | --- |
-| L0 | `PREFIX` | 身份、工作纪律、shell/登记表/记忆纪律、`AGENTS.md` | `prompt.stable_prefix` | `pinned` 永不丢 | 不限（规则文件 32KB 截断） |
+| L0 | `PREFIX` | 身份、工作纪律、shell/登记表/记忆纪律、`AGENTS.md` | `prompt.stable_prefix` | `pinned` 永不丢 | 不限（规则文件整份放入） |
 | L1 | `MEMORY` | 常驻记忆（核心事实，跨会话） | `MemoryStore.resident_text(2000)` | `capped` 整块保留、超限砍旧条目 | `MEMORY_LIMIT=2000` |
 | L2 | `TASK` | 目标 / 用户约束 / 已完成 / 待办 / 阻塞 | `Session.task_state.render()` | `pinned` 永不丢 | 不限（通常 <2k） |
 | L3 | `RECENT` | 最近若干**完整交互组** | `split_turns(session.messages)` | `atomic` 整组进出 | 剩余 50% |

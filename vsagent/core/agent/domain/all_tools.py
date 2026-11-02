@@ -9,9 +9,9 @@
 应当是看清手上有哪些条目，而不是先动手。同一份清单也决定了工具在请求体里的
 先后，靠前的更容易被选中。
 
-**2026-10 起这份清单还兼一个用途：按族加载。** 27 个领域工具的定义合计约 10K token，
+**2026-10 起这份清单还兼一个用途：按族加载。** 领域工具的定义合计上万 token，
 每一步都要发；实际一轮任务通常只用到一两族。所以只把「核心工具」（文件、登记表、
-任务、事件、记忆、load_tools）常驻，其余按族由 `load_tools` 现装现用。
+任务、事件、记忆、load_tools、呈现）常驻，其余按族由 `load_tools` 现装现用。
 
 `FAMILIES` 是这套分组的唯一真相，但**只记「族名 → 模块」，不写「这一族里有什么」**：
 那句话原先手写，三处已经跟实际对不上（`structure` 里多写了 `search_pdb`、
@@ -36,12 +36,12 @@ from . import (
     chembl,
     corpus,
     docking,
-    export,
     ligand,
     listing,
     literature,
     opentargets,
     pharmacophore,
+    pocketcmp,
     pockets,
     pubchem,
     receptor,
@@ -65,7 +65,9 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     # 口袋跟着结构走：先看有哪些口袋、选一处，再准备受体（盒子来自口袋）。
     # 单独成族而不是塞进 structure，是因为它自己会联网（复合物检索 / 预测），
     # 与「查条目 → 取坐标」的代价不在一个量级。
-    ("pocket", (pockets,)),
+    # `pocketcmp` 放进来是「选哪一处」的延伸：口袋定下来之后，接着要问
+    # 「它和抗靶的口袋差在哪」「有没有同家族受体可以借配体」——同一件事的三个问法。
+    ("pocket", (pockets, pocketcmp)),
     ("chembl", (chembl,)),
     # 化合物身份与全库相似检索。**与 chembl 分成两族**，因为问题不同：
     # chembl 那条认 ChEMBL 编号、回答「有什么活性」；这条认任意标识（名称 / CID /
@@ -88,17 +90,15 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     # 相似度 / 形状是**不看靶点**的通道：只比分子之间像不像，不需要受体。
     # 放在 docking 之前，是因为它便宜（毫秒级/分子）、可以先缩小待对接的库。
     ("screen", (screen,)),
-    ("docking", (docking,)),
-    ("affinity", (affinity,)),
-    # 微调排在打分之后：它吃的是「这个靶点上的活性数据 + 打分结果」，不是原始结构。
-    # 单独成族是因为它训练一次 5–10 分钟、还要 DTA 环境，与只想打一批分的会话
-    # 完全不是一个量级。
-    ("finetune", (finetune,)),
+    # 结构打分是一个环节，三个工具一起可见：dock 给位姿与结构过滤，
+    # fit_affinity 用实测活性微调，score_affinity 用微调后的模型推理。
+    # 分成三族的话模型常常只装 docking，DTA 从不出现在清单里。
+    ("scoring", (docking, finetune, affinity)),
     # 分析排在打分之后：它吃的是 docking / affinity 的产物，不是原始结构。
     # 单独成族是因为「跑完一次」与「看完所有结果」是两件事——前者要引擎，
     # 后者只读产物，装在一起会让只想排序的会话连 vina 的说明一起背上。
     # 五个工具：合成候选表（rank_candidates）、看位姿（analyze_pose）、
-    # 拆疏水（analyze_hydrophobic）、效率体检（efficiency_profile）、重对接验证。
+    # 疏水账（analyze_hydrophobic）、效率体检（efficiency_profile）、重对接验证。
     ("analysis", (analysis,)),
     # 类药性与构效关系排在最后：它们吃的是已经排好序的候选表，而不是原始结构。
     # 两者分开成族，是因为「这批分子能不能成药」与「下一轮该改哪个基团」是
@@ -106,7 +106,6 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     ("admet", (admet,)),
     ("sar", (sar,)),
     ("pharmacophore", (pharmacophore,)),
-    ("export", (export,)),
 )
 
 # 族名 -> 该族的工具名。第一次用到时建一次，之后直接查。

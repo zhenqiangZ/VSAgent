@@ -62,6 +62,12 @@ def main() -> None:
         default=None,
         help="语料根目录（默认按代码位置定位到仓根下的 corpus/）",
     )
+    parser.add_argument(
+        "--surveys",
+        type=Path,
+        default=None,
+        help="结构全景根目录（默认 ~/.vsagent/surveys）",
+    )
     args = parser.parse_args()
 
     port = args.port if args.port is not None else default_port()
@@ -71,11 +77,13 @@ def main() -> None:
         args.runs.resolve(),
         args.web.resolve(),
         corpus_root=args.corpus.resolve() if args.corpus else None,
+        surveys_root=args.surveys.resolve() if args.surveys else None,
     )
     print(f"状态文件 {server.state_path}")
     print(f"运行目录 {server.runs_dir}")
     print(f"网页目录 {server.web_root}")
     print(f"语料目录 {server.corpus_root}")
+    print(f"全景目录 {server.surveys_root}")
     print(f"http://127.0.0.1:{port}/")
     server.serve_forever()
 

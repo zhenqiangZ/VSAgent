@@ -4,13 +4,16 @@ from collections import deque
 from pathlib import Path
 
 from textual.app import App
+from textual.screen import Screen
 
 from .core.agent.context import event_line
 from .core.agent.domain.all_tools import domain_tools
+from .core.agent.domain.campaign import AssessCampaignTool
+from .core.agent.domain.survey import SurveyStructuresTool
 from .core.agent.event_log import domain_tools as event_tools
 from .core.agent.event_log import render_event_detail
 from .core.agent.domain.corpus import ingest_files
-from .core.agent.domain.export import runs_dir
+from .core.agent.domain.export import OpenViewerTool, WriteRunTool, runs_dir
 from .core.web.service import WebService, web_root
 from .core.agent.hooks import HookRunner, default_hooks_paths, load_hooks
 from .core.agent.host import AgentHost
@@ -83,7 +86,7 @@ from .screens.subagent import SubagentChatScreen
 from .screens.theme_selector import ThemeSelectorScreen
 from .screens.tools_panel import ToolEntry, ToolsPanelScreen
 from .widgets.status_bar import format_tokens
-from .widgets.toast import ToastNotification
+from .widgets.toast import ToastNotification, ToastRack
 
 # 需要参数的命令：命令名之后那一段交给处理函数，其余命令不吃参数。
 ARGUMENT_COMMANDS = frozenset(
@@ -378,6 +381,12 @@ class VSAgentApp(App[None]):
         # 假设也挂在会话上（`task_state.hypotheses`），同样由内核注入。
         # 它是**产出单位**：没有它，模型交上来的是排名而不是可检验的判断。
         registry.register(HypothesisTool())
+        # 开工前的盘点。**常驻，不登记族**：它决定这一轮装哪几族，一个「决定装哪族」
+        # 的工具本身要先装族才看得见，顺序就反了。
+        registry.register(AssessCampaignTool())
+        # 全部实验结构的全景。同样**常驻，不登记族**：宽泛问题发生在第一轮，
+        # 那时一族都还没装；现装族会改动工具清单，把前缀缓存整段打掉。
+        registry.register(SurveyStructuresTool())
         # 取回被归档/被移出的原文。与任务状态同理：会话由内核注入。
         registry.register(ReadTurnTool())
         # 事件收口与召回：把做完的一段压成标题 + 摘要，需要细节再按编号取回。
@@ -385,6 +394,11 @@ class VSAgentApp(App[None]):
             registry.register(tool)
         # 按族加载领域工具：核心那一批常驻，其余由模型自己装。
         registry.register(LoadToolsTool())
+        # 呈现是交付通道，与 read / write 同一类。它们不登记族，所以每一步都可见：
+        # 放进 export 族时，口袋阶段装的是 pocket / structure，模型看不见它们，
+        # 规则点名 write_run 也调不到。
+        registry.register(WriteRunTool())
+        registry.register(OpenViewerTool())
         # 派发子 agent 是**根会话专属**的能力。子 agent 的注册表里没有它，
         # 请求体的 tools 数组里也就没有它，模型连这个名字都看不到。
         if allow_spawn:
@@ -556,15 +570,38 @@ class VSAgentApp(App[None]):
         toast = ToastNotification(text, kind)
         target = self.screen
         if target.is_mounted:
-            target.mount(toast)
+            self._mount_toast(target, toast)
         else:
-            self.call_after_refresh(lambda: target.mount(toast))
+            self.call_after_refresh(lambda: self._mount_toast(target, toast))
         self.set_timer(self.TOAST_SECONDS, lambda: self._remove_toast(toast))
 
+    def _mount_toast(self, target: Screen, toast: ToastNotification) -> None:
+        """把提示条挂进屏幕右下角的容器；容器不在就先建一个。"""
+        rack = next(iter(target.query(ToastRack)), None)
+        if rack is None:
+            rack = ToastRack()
+            target.mount(rack)
+        rack.mount(toast)
+
     def _remove_toast(self, toast: ToastNotification) -> None:
-        """移除已经挂载过的通知。"""
-        if toast.is_mounted:
-            toast.remove()
+        """移除已经挂载过的通知；最后一条走掉时连容器一起收掉，不留空行。
+
+        收容器排到下一次刷新：几条提示的计时器同时到点时，它们的移除挤在同一帧，
+        这一帧里 `children` 还是旧值，当场数会把容器留在屏幕上（空容器带一行外边距，
+        整块界面白丢一行）。
+        """
+        if not toast.is_mounted:
+            return
+        rack = toast.parent
+        toast.remove()
+        if isinstance(rack, ToastRack):
+            rack.forget(toast)
+            self.call_after_refresh(lambda: self._drop_rack_if_empty(rack))
+
+    def _drop_rack_if_empty(self, rack: ToastRack) -> None:
+        """容器里一条提示都不剩就收掉。"""
+        if rack.is_mounted and not rack.children:
+            rack.remove()
 
     def execute_command(self, name: str) -> None:
         """按名字执行斜杠命令。

@@ -25,6 +25,7 @@ __all__ = [
     "CONFIG_DIRECTORY",
     "LEGACY_CONFIG_DIRECTORY",
     "Migration",
+    "SURVEY_DIRECTORY",
     "config_home",
     "migrate_legacy_config",
     "project_root",
@@ -34,6 +35,13 @@ __all__ = [
 CONFIG_DIRECTORY = ".vsagent"
 # 改名之前用的名字。只在迁移时读，代码里不再往这里写任何东西。
 LEGACY_CONFIG_DIRECTORY = ".opencode_tui"
+
+SURVEY_DIRECTORY = "surveys"
+"""`~/.vsagent/surveys`：结构全景产物。
+
+写它的是 `domain/survey.py`，读它的是网页端的 `/api/survey/<id>`。两侧各写一份
+字面量的话，改名之后工具照样写、页面照样 404，而两边都不会报错。
+"""
 
 
 def project_root() -> Path:

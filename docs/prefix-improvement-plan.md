@@ -66,8 +66,8 @@
 | 项 | 文件 | 改法 |
 | --- | --- | --- |
 | 前缀结构 | `prompt.py` | 按第五节重排：身份 → `HYPOTHESIS_CONTRACT` → 工作方式 → shell → 登记表 → 记忆 → 事件 →（派发）→ 规则。删掉 `TOOL_DISCIPLINE`（并进工作方式）、`EVENT_DISCIPLINE` 的过程性说明、`MEMORY_DISCIPLINE` 的解释；`LEDGER_DISCIPLINE` 改指「任务状态的工作区索引」，不再点名 `list_workspace` / `describe_entry`（它们属于 `listing` 族，首步不可见） |
-| 规则拆分 | `AGENTS.md` + 新建 `docs/screening-playbook.md` | `AGENTS.md` 261 行 / 5036 token → 42 行 / 833 token：第 0 关、总原则、四道门禁、交互纪律、不要做的事。取证顺序、口袋核对、参数报法、结果读法全部进 playbook，每道门禁末尾留「细则 §N」指针 |
-| 读取健壮性 | `prompt.py:project_rules` | `read_text` 包 `UnicodeDecodeError` / `OSError`，失败返回空串并记日志；超限**不截一半**，只注入一句「本次没有注入，用 read 分段读」。**「启动时校验大小」没有单独做**：`project_rules` 每步都读、都记字节数，比启动时查一次更早发现问题，也少一条启动路径 |
+| 规则拆分 | `AGENTS.md` + 新建 `docs/screening-playbook.md` | `AGENTS.md` 261 行 / 5036 token → 42 行 / 833 token：第 0 关、总原则、四个确认点、交互纪律、不要做的事。取证顺序、口袋核对、参数报法、结果读法全部进 playbook，每个确认点末尾留「细则 §N」指针 |
+| 读取健壮性 | `prompt.py:project_rules` | `read_text` 包 `UnicodeDecodeError` / `OSError`，失败返回空串并记日志；超限**不截一半**，只注入一句「本次没有注入，用 read 分段读」（2026-10-31 取消大小上限，改成整份注入）。**「启动时校验大小」没有单独做**：`project_rules` 每步都读、都记字节数，比启动时查一次更早发现问题，也少一条启动路径 |
 | 单一路径 | `prompt.py` | 删除 `build_system_prompt`（只有测试在用）。测试改用 `stable_prefix`，断言从「规则排在工作目录之前」改成「规则排在前缀最后」 |
 | 判据 | 新建 `tools/check_prefix.py` | token 预算、规则行数、点名的领域工具是否配了 `load_tools`、首步不可见工具、枚举残留、前缀字节稳定、子 agent 与 Plan 的身份段 |
 
@@ -76,7 +76,7 @@
 
 两处与计划不同，都是量出来的：
 
-- **预算定 1900 而不是 1800。** 八行契约（250）+ 四十二行门禁（833）的真实体量比草案多 40 token。
+- **预算定 1900 而不是 1800。** 八行契约（250）+ 四十二行确认点（833）的真实体量比草案多 40 token。
   要压到 1800 只能删掉「取证顺序」或「工具报错即输入」这两条——它们各自对应一次实测失败，
   比一个整数目标重要。
 - **`COMPACT_WINDOW` 回到 18K。** 前缀省下 4800 token 之后，`loop` 组那条锯齿消失了
@@ -92,7 +92,7 @@
 | 假设对象 | `models.py`（`Hypothesis`）、新 `core/agent/hypothesis.py` | `Hypothesis(id, kind, mode, claim, mechanism, evidence, test, expected, status, result_ref)`；`TaskState.hypotheses`；`render()` 只铺**未结的前 3 条**，超出的写明「另有 N 条」并指向 `hypothesis(action="list")`；已结的只报一行计数。`kind=strategy` 必须带 `mode`（expand / narrow），这是 V4 的落点 |
 | 假设工具 | 常驻核心工具（第 15 个） | `hypothesis(action=propose\|update\|close\|list)`；`propose` 硬校验：`test` 非空、`expected` 含数值/阈值/对照、策略假设带 `mode`；同一主张重复提交返回已有编号而不是新建（换号会让旧实验数据的引用断掉） |
 | 实验闭环 | `sar.py` `record_assay` | 增 `hypothesis` 参数（**写盘前**校验编号存在）；按预期与这批实测逐条比，返回达标 / 不达标 / 判不了各几条，状态写回 `supported / refuted / inconclusive`，`result_ref` 记 assay 的 handle。限定符决定能不能下结论：`>1` 对「< 100」判不了，`>10000` 判死 |
-| 对照分子 | `analysis.py` `pick_controls`（analysis 族第 6 个） | 正向（最高分且门禁全过）/ 阴性（最低分且门禁全过）/ 背离（门禁没过却在前半）各挑 1–3 个，每条写明为什么算对照；可挂 `hypothesis`，说明这批对照为哪条假设服务。只读，不登记产物 |
+| 对照分子 | `analysis.py` `pick_controls`（analysis 族第 6 个） | 正向（最高分且确认点全过）/ 阴性（最低分且确认点全过）/ 背离（确认点没过却在前半）各挑 1–3 个，每条写明为什么算对照；可挂 `hypothesis`，说明这批对照为哪条假设服务。只读，不登记产物 |
 | 导出 | `export.py` `write_run` | 假设整份写进 `provenance.hypotheses`（**不新增顶层键**——判据按与演示数据同键核对） |
 | 升级门槛 | `domain/__init__.py` | 九条纪律：2D 能分辨就不上 3D；每升一级要能说出简单方法为什么不够 |
 
@@ -175,7 +175,7 @@
 | 风险 | 处理 |
 | --- | --- |
 | 改前缀会让所有会话的 prompt cache 失效一次 | 预期内，一次性成本；不要在会话中途灰度 |
-| 拆文档后模型不读 playbook | 契约里写清触发条件；`AGENTS.md` 的每个门禁留一行指针 |
+| 拆文档后模型不读 playbook | 契约里写清触发条件；`AGENTS.md` 的每个确认点留一行指针 |
 | 新工具占常驻定义（约 300 token） | 前缀省下的 ≥ 4000，净收益为正 |
 | 测试依赖前缀原文 | 先跑 `--only rules` / `--only env-block`，按失败逐条改断言 |
 | 假设状态与实验数据不同步 | `record_assay` 是唯一写入口；状态只由它和 `hypothesis(close)` 改 |

@@ -1212,6 +1212,20 @@ P2-4 加的三条规则（`prompt.py:424`）没有改变这个选择——派子
 应该改成「**十来个互不依赖的子任务**」或者「每个子任务都要读大量原文」，
 两个查询不该期待它派。
 
+**复验（2026-10-31）：封存的其余判据。** 两轮带工具、一轮纯聊天：
+
+```
+第 1 轮 3 步 → 「摸清 EGFR 两侧家底」 3 步 degraded=False 覆盖 0–2
+第 2 轮 3 步 → 「骨架分组与化学型分布」 3 步 degraded=False 覆盖 2–4
+第 3 轮纯聊天 → 没有新阶段
+```
+
+十条判据全过：两个阶段首尾相接（0–2、2–4）、第二个阶段收到第二轮结束时的消息末尾、
+阶段里的工具合计等于实际工具调用数（9 个）、封存没有另发摘要请求、第三轮装配时第一个
+阶段已收成事件块且标题就在块里、最近一个阶段仍留原文、纯聊天的一轮没有封出带步数的阶段。
+两轮都是模型命名的（`degraded=False`），说明 §4.14 的触发条件在规则文件涨到 2059 token
+之后仍然成立。探针 `.probe/verify_seal_phases.py`，记录 `.probe/verify-seal-phases.md`。
+
 ---
 
 ### 4.14 `close_phase` 改成「只命名」：三次真跑才走通
@@ -1252,6 +1266,24 @@ evt_0001 degraded=False 「查 .probe/live 目录 + P36544 蛋白名」 3 步 [b
 evt_0002 degraded=False 「数 state.toml 行数、消息段数与 .probe 下 .py 文件数」 3 步 [bash, bash, bash]
 close_phase 调用 2 次，两条阶段都是模型命名的
 ```
+
+**复验（2026-10-31，规则文件涨到 2059 token 之后）**：同一套判据再跑一轮，任务刻意
+要求三次分开的工具调用（并排除 `assess_campaign`，它一次就把三个数取完，走不到第 3 步）：
+
+```
+第 4 个请求：（本阶段已 3 步。收尾前调一次 close_phase 给这一大步起个名字、写一句结论…）
+工具调用：load_tools → load_tools → load_tools → fetch_target → search_actives → scaffold_analysis → close_phase
+evt 「查清 EGFR 两侧基础（结构/活性/骨架）」 4 步 degraded=False
+```
+
+九条判据全过：提示带具体步数、`close_phase` 排在三次工具调用之后、标题与结论都非空、
+封存取的是模型那一份（`degraded=False`）、阶段流水 4 步。结论里带了三个数与一句
+口径限制（「500 条截尾，不代表 9,894 条全集」）。探针 `.probe/verify_close_phase.py`，
+回答存在 `.probe/verify-close-phase.md`。
+
+写探针时踩到一个坑：第一版把「本阶段已」当命中，而系统提示的 `EVENT_DISCIPLINE`
+本身就写着「本阶段已 N 步」，那条检查恒为真、等于没验。改成只扫非 system 消息、
+且要求带数字之后才有意义。
 
 代价与副作用，都量了：
 

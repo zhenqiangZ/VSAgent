@@ -1,26 +1,36 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from itertools import count
 from typing import Any, Iterable, Literal
 
 # 一条 Part 的结构化读数最多占这么多字节。超了整份丢掉：
 # 它是提示不是账本，没必要为它把状态文件撑大。
 TOOL_META_LIMIT = 4096
 
-_SEQUENCES: dict[str, count] = {
-    "part": count(1),
-    "message": count(1),
-    "session": count(1),
+_SEQUENCES: dict[str, int] = {
+    "part": 1,
+    "message": 1,
+    "session": 1,
 }
+
+_SEQUENCE_LOCK = threading.Lock()
+"""护住取号与载入时的读改写。
+
+网页服务跑在应用进程的另一个线程里，它每次读盘都会走 `sync_sequences`，
+与事件循环线程的取号是并发的。两个线程各读一次再各写一次，就会发出同一个号。
+"""
 
 
 def _take(kind: str) -> int:
     """取某类 ID 的下一个序号。"""
-    return next(_SEQUENCES[kind])
+    with _SEQUENCE_LOCK:
+        value = _SEQUENCES[kind]
+        _SEQUENCES[kind] = value + 1
+        return value
 
 
 def _clean_meta(value: Any) -> Any:
@@ -73,7 +83,14 @@ def _event_serial(event_id: str) -> int:
 
 
 def sync_sequences(session_ids: Iterable[str], message_ids: Iterable[str], part_ids: Iterable[str]) -> None:
-    """载入历史数据后把 ID 序号推到已用最大值之后，避免 ID 撞车。"""
+    """载入历史数据后把 ID 序号推到已用最大值之后，避免 ID 撞车。
+
+    只往前推，不往回设。这份计数器是整个进程共用的一份，状态文件又只在一轮
+    结束时写盘：读盘那一刻磁盘上的编号常常低于手里已经发出去的编号。往回设
+    会让正在跑的这一轮把用过的编号再发一遍，界面按编号找组件，新内容被当成
+    旧组件的更新，屏幕上就不出新东西了。网页端每个 `/api/sessions` 请求都会
+    读一次盘（`web/routes.read_settled`），它走的就是这里。
+    """
     for kind, prefix, values in (
         ("session", "ses_", session_ids),
         ("message", "msg_", message_ids),
@@ -84,7 +101,8 @@ def sync_sequences(session_ids: Iterable[str], message_ids: Iterable[str], part_
             tail = value[len(prefix):] if value.startswith(prefix) else ""
             if tail.isdigit():
                 highest = max(highest, int(tail))
-        _SEQUENCES[kind] = count(highest + 1)
+        with _SEQUENCE_LOCK:
+            _SEQUENCES[kind] = max(_SEQUENCES[kind], highest + 1)
 
 
 class PartType(Enum):
@@ -311,11 +329,13 @@ TASK_RENDER_LIMITS: dict[str, int] = {
 # 十几条假设全铺开会把窗口吃满，而模型当下只需要看到「还有哪几条没验证」。
 HYPOTHESIS_RENDER_LIMIT = 3
 
-# 假设的两种粒度。**策略**是「这一轮该怎么筛」（聚焦库还是多样性库、先扩张还是先收窄），
+# 假设的两种粒度。**策略**是「这一轮该怎么筛」（聚焦库还是多样性库、先组外还是先组内），
 # **机制**是「这批分子为什么活」（结合哪个亚位点、靠什么相互作用）。两者都要能提，
 # 因为只谈机制会在错误的库上做精细分析，只谈策略则永远不知道为什么要这么筛。
 HYPOTHESIS_KINDS: tuple[str, ...] = ("strategy", "mechanism")
-# 策略假设必须带方向：扩张（找新骨架）还是收窄（在已有骨架里优化）。
+# 策略假设必须带方向：组外（去已知骨架之外找新的）还是组内（在已有骨架组里优化）。
+# 存的值仍是 `expand` / `narrow`——它们已经写进了 `state.toml` 与运行目录的
+# `provenance.hypotheses`，改名要连带迁移旧会话；显示层用组内/组外。
 HYPOTHESIS_MODES: tuple[str, ...] = ("expand", "narrow")
 # 状态只由「实验数据回填」与「显式关闭」两条路改，不由 `update` 改——
 # 否则模型可以绕过证据把一条假设标成 supported。
@@ -356,12 +376,12 @@ class Hypothesis:
         return self.status == "open"
 
     def label(self) -> str:
-        """给人看的一小段标签：`策略·扩张` / `机制`。"""
+        """给人看的一小段标签：`策略·组外` / `机制`。"""
         kind = "策略" if self.kind == "strategy" else "机制"
         if self.mode == "expand":
-            kind += "·扩张"
+            kind += "·组外"
         elif self.mode == "narrow":
-            kind += "·收窄"
+            kind += "·组内"
         return kind
 
     def render(self) -> str:
@@ -950,6 +970,19 @@ class Session:
         """返回会话内累计 token 数。"""
         return sum(message.total_tokens() for message in self.messages)
 
+    def last_input_tokens(self) -> int:
+        """返回最近一次请求实际带上的输入 token 数；还没发过请求时为 0。
+
+        取最后一条有用量的消息：`tokens["input"]` 是服务端记账的 prompt token，
+        也就是那一次请求发出去的整份上下文（含工具定义与缓存命中的部分）。
+        累计值回答不了「窗口还剩多少」，这一份能。
+        """
+        for message in reversed(self.messages):
+            sent = int(message.tokens.get("input", 0))
+            if sent:
+                return sent
+        return 0
+
     def total_cached(self) -> int:
         """返回会话内累计的缓存命中输入 token 数。"""
         return sum(int(message.tokens.get("cached", 0)) for message in self.messages)
@@ -957,6 +990,10 @@ class Session:
     def total_uncached(self) -> int:
         """返回会话内累计的缓存未命中输入 token 数。"""
         return sum(int(message.tokens.get("uncached", 0)) for message in self.messages)
+
+    def total_output(self) -> int:
+        """返回会话内累计的输出 token 数。"""
+        return sum(int(message.tokens.get("output", 0)) for message in self.messages)
 
     def total_cost(self) -> float:
         """返回会话内累计成本。"""

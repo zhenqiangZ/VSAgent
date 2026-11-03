@@ -336,7 +336,7 @@ graph TD
   字段权重 × 90 天衰减打分。详见 [`docs/memory-design.md`](docs/memory-design.md) §13。
 - `hypothesis.py` — **产出单位**：这个 agent 交出的是一组可检验的判断。
   `Hypothesis` 对象存在 `TaskState.hypotheses` 里（数据在 `models.py`，工具在 `core/agent/`，
-  分层理由与 `task.py` 相同），只渲染未结的前 3 条进 `TASK` 层。
+  分层理由与 `task.py` 相同），未结的按粒度分组渲染（策略 2 条、机制 3 条）进 `TASK` 层。
   六要素里 `test` 与 `expected` 是必须满足的条件，`expected` 还必须含数值、阈值或对照——
   没有可以判断真假的预期，实验数据回来也没法结案。**状态只由 `close` 与
   `record_assay(hypothesis=...)` 改**，`update` 改不了：否则模型能绕过证据把它标成 supported。

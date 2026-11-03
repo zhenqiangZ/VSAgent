@@ -52,7 +52,7 @@
 | `products.py` | 内容寻址产物目录、`params.json` 提交标记、原子写盘（不登记工具） |
 | `pockets.py` | 四层口袋来源的装配点 + `detect_pockets` / `define_pocket` 两个工具（第 2 步） |
 | `pocketcmp.py` | 口袋之间的比较：`compare_pockets`（同家族两个受体逐残基比差异）、`similar_pockets`（按口袋窗口的局部序列相似性找可借配体的邻近受体） |
-| `campaign.py` | 开工前的盘点 `assess_campaign`：两侧各看几个数，判定四类起点之一。**常驻，不登记族** |
+| `campaign.py` | 开工前的盘点 `assess_campaign`：两侧各看几个数，给一条推荐与 2–4 条并列候选策略（各带成本档与能区分什么）。**常驻，不登记族** |
 | `survey.py` | 全部实验结构的全景 `survey_structures`：按配体分组、每组套数与最佳分辨率，产物进页面。**常驻，不登记族** |
 | `analysis.py` | 把多路分数合成候选表（对齐、平均秩、分档与并列组）、看位姿的接触与 PLIP 指纹、接触频次、拆疏水（HP/HM/脱水账）、效率体检（LE/LELP/LLE）、重对接验证、挑对照；7 个工具 |
 | `interactions.py` | 位姿的相互作用：接触 / 几何氢键 / 冲突 + PLIP 指纹，整理成 Mol* 能画的三维端点（不登记工具，`analyze_pose` 与 `write_run` 共用） |

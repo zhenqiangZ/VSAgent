@@ -11423,6 +11423,139 @@ async def check_sar() -> None:
         export_module.runs_dir = original_runs
 
 
+def check_strategy_compare() -> None:
+    """盘点给候选策略，不是一条路线。
+
+    四条策略各自判适用条件：结构可用时同系物优化与换骨架并列，结构不可用时
+    配体侧建模与借邻近受体并列。推荐仍按固定优先级取第一条适用的，与原来那条
+    if 链的结果一致。
+    """
+    from vsagent.core.agent.domain.campaign import (
+        START_BORROW,
+        START_EXPAND,
+        START_LIGAND,
+        START_NARROW,
+        AssessCampaignTool,
+        _pick_strategies,
+    )
+
+    def split(**facts: Any) -> tuple[str, list[str], list[str]]:
+        start, items = _pick_strategies(**facts)
+        return (
+            start,
+            [item.start for item in items if item.applies],
+            [item.start for item in items if not item.applies],
+        )
+
+    start, ok, blocked = split(
+        structure_ok=True, actives=30, largest_scaffold=8, pair_count=13
+    )
+    check(start == START_NARROW, f"结构可用、活性多时推荐同系物优化：{start}")
+    check(
+        ok == [START_NARROW, START_EXPAND],
+        f"同系物优化与换骨架同时进候选，按成本排序：{ok}",
+    )
+    check(
+        set(blocked) == {START_LIGAND, START_BORROW},
+        f"有结构、活性多时另外两条不可行：{blocked}",
+    )
+
+    start, ok, _blocked = split(
+        structure_ok=True, actives=8, largest_scaffold=2, pair_count=0
+    )
+    check(start == START_EXPAND, f"结构可用、活性少时推荐换骨架：{start}")
+    check(ok == [START_BORROW, START_EXPAND], f"换骨架与借邻近受体并列：{ok}")
+
+    start, ok, _blocked = split(
+        structure_ok=False, actives=15, largest_scaffold=3, pair_count=0
+    )
+    check(start == START_LIGAND, f"无结构、活性够时推荐配体侧建模：{start}")
+    check(ok == [START_LIGAND, START_BORROW], f"配体侧建模与借邻近受体并列：{ok}")
+
+    start, ok, _blocked = split(
+        structure_ok=False, actives=5, largest_scaffold=1, pair_count=0
+    )
+    check(start == START_BORROW, f"无结构、活性少时只能借邻近受体：{start}")
+    check(ok == [START_BORROW], f"这一档只有一条可行：{ok}")
+
+    start, ok, _blocked = split(
+        structure_ok=True, actives=30, largest_scaffold=3, pair_count=13
+    )
+    check(
+        start == START_EXPAND,
+        f"骨架组不够大时同系物优化退出候选，推荐换骨架：{start}",
+    )
+    check(ok == [START_EXPAND], f"只剩换骨架一条：{ok}")
+
+    tool = AssessCampaignTool()
+    _start, items = _pick_strategies(
+        structure_ok=True, actives=30, largest_scaffold=8, pair_count=13
+    )
+    viable = [item for item in items if item.applies]
+    drafts = tool._strategy_drafts(
+        viable=viable, code="P00533", pair_count=13, selectivity={}
+    )
+    check(
+        [item["start"] for item in drafts] == [item.start for item in viable],
+        f"草稿与可行策略一一对应：{[item['start'] for item in drafts]}",
+    )
+    check(
+        all(item["kind"] == "strategy" and item["expected"] for item in drafts),
+        "每份草稿都是策略假设、都带可判真假的预期",
+    )
+
+    # 渲染配额按粒度分开：三条策略不能把机制假设挤出窗口。
+    from vsagent.core.models import Hypothesis
+
+    def one(kind: str, index: int) -> Hypothesis:
+        return Hypothesis(
+            id=f"hyp#{index}",
+            kind=kind,
+            mode="narrow" if kind == "strategy" else "",
+            claim=f"{kind} 第 {index} 条",
+            test="测一批",
+            expected="IC50 < 100 nM",
+        )
+
+    state = TaskState()
+    state.hypotheses = [
+        one("strategy", 1),
+        one("strategy", 2),
+        one("strategy", 3),
+        one("mechanism", 4),
+        one("mechanism", 5),
+    ]
+    rendered = state.render()
+    check(
+        "strategy 第 1 条" in rendered and "strategy 第 2 条" in rendered,
+        "两条策略都渲染出来",
+    )
+    check("strategy 第 3 条" not in rendered, "第三条策略被策略配额挡住")
+    check(
+        "mechanism 第 4 条" in rendered and "mechanism 第 5 条" in rendered,
+        f"机制假设没有被策略挤掉：{rendered}",
+    )
+    check(
+        "另有 1 条未列出：策略 1 条" in rendered,
+        f"截断说明写清是哪一类：{rendered}",
+    )
+
+    ordered = TaskState()
+    ordered.hypotheses = [one("mechanism", 1), one("strategy", 2)]
+    text = ordered.render()
+    check(
+        text.index("mechanism 第 1 条") < text.index("strategy 第 2 条"),
+        "按粒度挑完之后仍按提出顺序排列",
+    )
+
+    only_strategy = TaskState()
+    only_strategy.hypotheses = [one("strategy", index) for index in (1, 2, 3)]
+    check(
+        "另有 1 条未列出：策略 1 条" in only_strategy.render(),
+        "只有策略时仍按策略配额截断",
+    )
+
+
 async def check_hypothesis() -> None:
     """假设：六要素硬门槛、只渲染未结的、实验回填结案、对照挑选、导出。"""
     work = PROBE / "hypothesis"
@@ -11490,10 +11623,29 @@ async def check_hypothesis() -> None:
              "claim": f"机制假设 {index}", "test": "做一次突变", "expected": "活性下降 10 倍"}
         )
     rendered = state.render()
-    check(rendered.count("- hyp#") == 3, f"只渲染前 3 条未结的：{rendered}")
-    check("另有 1 条未列出" in rendered, f"超出的要说明还有几条：{rendered}")
+    check(
+        rendered.count("- hyp#") == 4,
+        f"一条策略与三条机制都在（策略 2 条、机制 3 条的配额）：{rendered}",
+    )
+    check("另有" not in rendered, f"没超出配额时不写截断说明：{rendered}")
+
+    # 机制再多两条：机制配额已经用满，多出来的不进上下文。
+    for index in range(3, 5):
+        await call(
+            {"action": "propose", "kind": "mechanism",
+             "claim": f"机制假设 {index}", "test": "做一次突变", "expected": "活性下降 10 倍"}
+        )
+    rendered = state.render()
+    check(
+        rendered.count("- hyp#") == 4 and "hyp#5" not in rendered,
+        f"机制配额 3 条，多出来的不进 TASK 层：{rendered}",
+    )
+    check(
+        "另有 2 条未列出：机制 2 条" in rendered,
+        f"截断说明写清是哪一类：{rendered}",
+    )
     listed = await call({"action": "list"})
-    check("共 4 条假设" in listed.output, f"list 能看到全部：{listed.output}")
+    check("共 6 条假设" in listed.output, f"list 能看到全部：{listed.output}")
 
     # ---- 三、update / close 的边界 ----
     updated = await call({"action": "update", "id": "hyp#2", "expected": "IC50 > 500 nM"})
@@ -21178,6 +21330,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("admet", check_admet),
     ("sar", check_sar),
     ("hypothesis", check_hypothesis),
+    ("strategy", check_strategy_compare),
     ("pharmacophore", check_pharmacophore),
     ("identity", check_identity_floor),
     ("align-prior", check_align_and_prior),

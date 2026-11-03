@@ -325,9 +325,13 @@ TASK_RENDER_LIMITS: dict[str, int] = {
     "blockers": 10,
 }
 
-# 假设只渲染未结的、最多这么多条。与任务状态同理：这一段每一步都进上下文，
-# 十几条假设全铺开会把窗口吃满，而模型当下只需要看到「还有哪几条没验证」。
-HYPOTHESIS_RENDER_LIMIT = 3
+# 假设只渲染未结的，按粒度分组给配额。**两类都要留位置**：只按提出顺序取前三条，
+# 先提的三条策略假设会把机制假设整段挤出去，而「这一轮怎么筛」与「这批为什么活」
+# 是两份要同时看见的判断。这一段每一步都进上下文，十几条全铺开会把窗口吃满。
+HYPOTHESIS_RENDER_LIMITS: dict[str, int] = {
+    "strategy": 2,
+    "mechanism": 3,
+}
 
 # 假设的两种粒度。**策略**是「这一轮该怎么筛」（聚焦库还是多样性库、先组外还是先组内），
 # **机制**是「这批分子为什么活」（结合哪个亚位点、靠什么相互作用）。两者都要能提，
@@ -501,13 +505,33 @@ class TaskState:
                 block += f"\n- （另有 {len(items) - len(shown)} 条未列出）"
             blocks.append(block)
         # 假设只铺未结的：已结的留着是给导出与复盘用的，每一步都看一遍没有意义。
+        # 配额按粒度分开，合并后仍按提出顺序——先给每一类各留位置，再还原顺序，
+        # 读起来不会突然按类型跳。
         opened = [item for item in self.hypotheses if item.is_open()]
         if opened:
-            shown = opened[:HYPOTHESIS_RENDER_LIMIT]
+            budget = dict(HYPOTHESIS_RENDER_LIMITS)
+            picked: list[int] = []
+            for index, item in enumerate(opened):
+                room = budget.get(item.kind, HYPOTHESIS_RENDER_LIMITS["mechanism"])
+                if room > 0:
+                    picked.append(index)
+                    budget[item.kind] = room - 1
+            shown = [opened[index] for index in picked]
             block = "假设（未结）：\n" + "\n".join(f"- {item.render()}" for item in shown)
-            if len(opened) > len(shown):
+            hidden = len(opened) - len(shown)
+            if hidden:
+                counts: dict[str, int] = {}
+                for item in opened:
+                    counts[item.kind] = counts.get(item.kind, 0) + 1
+                for item in shown:
+                    counts[item.kind] -= 1
+                detail = "、".join(
+                    f"{'策略' if kind == 'strategy' else '机制'} {count} 条"
+                    for kind, count in counts.items()
+                    if count > 0
+                )
                 block += (
-                    f"\n- （另有 {len(opened) - len(shown)} 条未列出，"
+                    f"\n- （另有 {hidden} 条未列出：{detail}；"
                     'hypothesis(action="list") 看全部）'
                 )
             blocks.append(block)

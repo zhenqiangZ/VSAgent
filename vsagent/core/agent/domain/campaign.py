@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -96,6 +97,39 @@ START_FAMILIES = {
     START_EXPAND: "pocket、receptor、ligand、screen、pharmacophore、scoring、analysis",
     START_LIGAND: "sar、structure、pocket、receptor、scoring、analysis",
     START_BORROW: "pocket、chembl、ligand、screen",
+}
+
+
+@dataclass(frozen=True)
+class Strategy:
+    """一条候选策略：能不能走、为什么、走不通时卡在哪。
+
+    四条策略各自判一次适用条件，不用 if 链短路。短路只够挑一条推荐，
+    挑不出「另外一条也可行」——而策略比较要的正是那几条并列的。
+    """
+
+    start: str
+    applies: bool
+    reason: str
+    blocked: str = ""
+
+
+# 成本档是人工给定的先验：系统里没有任何关于合成与实验规模的数据。
+# 排序值只决定候选的先后，不参与推荐——推荐按四类起点的固定优先级取。
+STRATEGY_COSTS: dict[str, tuple[str, int]] = {
+    START_LIGAND: ("纯计算，0 个合成", 0),
+    START_BORROW: ("借邻近受体的已知配体，1 轮 IC50", 1),
+    START_NARROW: ("合成 5–10 个同系物，1 轮 IC50", 2),
+    START_EXPAND: ("筛一个库，命中后合成，1 轮 IC50", 3),
+}
+
+# 每条策略的产出能区分哪两条互相竞争的机制解释。写死在这里，因为
+# 「这条策略回答什么问题」不随靶点变化，随靶点变的是它适不适用。
+STRATEGY_DISCRIMINATES: dict[str, str] = {
+    START_NARROW: "活性集中在一个骨架内 / 骨架外也有可结合型",
+    START_EXPAND: "已知骨架覆盖足够 / 覆盖不足",
+    START_LIGAND: "活性由某个锚定基团决定 / 由整体形状决定",
+    START_BORROW: "局部口袋相似带来可迁移的配体 / 相似性不足以迁移",
 }
 
 
@@ -231,35 +265,100 @@ def _receptor_facts(path: Path) -> dict[str, Any]:
     }
 
 
-def _pick_start(
+def _pick_strategies(
     *,
     structure_ok: bool,
     actives: int,
     largest_scaffold: int,
-) -> tuple[str, str]:
-    """四类起点。返回 `(起点, 理由)`，理由是「哪几个数决定了它」。"""
+    pair_count: int,
+) -> tuple[str, list[Strategy]]:
+    """四条候选策略与一条推荐。
+
+    推荐按「同系物优化 → 换骨架 → 配体侧建模 → 借邻近受体」的固定优先级
+    取第一条适用的，与原来那条 if 链的结果一致。返回全部四条、按成本从低到高，
+    不可行的也在里面：渲染时要说明它们为什么走不通，只返回可行的那几条会丢掉这句。
+
+    适用条件按「这一轮还有没有别的做法」写，不按互斥写：结构可用时，
+    系列内优化与骨架外探索都能走；结构不可用时，配体侧建模与借邻近受体
+    都能走。互斥的写法只够给一条路线，给不出候选。
+    """
     many = THRESHOLDS["actives_many"]
     few = THRESHOLDS["actives_few"]
     series = THRESHOLDS["largest_scaffold"]
-    if structure_ok and actives >= many and largest_scaffold >= series:
-        return START_NARROW, (
-            f"结构可用、活性 {actives} 条（≥{many:g}）、最大骨架组 {largest_scaffold} 个"
-            f"（≥{series:g}）：已知化学型够多，值得在这个系列里做同系物优化。"
+
+    narrow_ok = structure_ok and actives >= many and largest_scaffold >= series
+    expand_ok = structure_ok
+    ligand_ok = not structure_ok and actives >= few
+    # 活性不足 20 条时，系列内优化无从下手；借邻近受体不依赖本靶点的系列。
+    borrow_ok = (not structure_ok) or actives < many
+
+    if narrow_ok:
+        narrow = Strategy(
+            START_NARROW,
+            True,
+            f"结构可用、活性 {actives} 条（≥{many:g}）、最大骨架组 "
+            f"{largest_scaffold} 个（≥{series:g}）、匹配对 {pair_count} 对："
+            "已知化学型够多，可以在系列内做同系物优化。",
         )
-    if structure_ok:
-        return START_EXPAND, (
-            f"结构可用，但活性 {actives} 条、最大骨架组 {largest_scaffold} 个，"
-            f"还不到同系物优化的线（{many:g} 条 / {series:g} 个）：要在已知化学型之外找。"
+    elif not structure_ok:
+        narrow = Strategy(START_NARROW, False, "", "没有可用结构")
+    else:
+        narrow = Strategy(
+            START_NARROW,
+            False,
+            "",
+            f"活性 {actives} 条（<{many:g}）或最大骨架组 {largest_scaffold} 个"
+            f"（<{series:g}），没有成型系列",
         )
-    if actives >= few:
-        return START_LIGAND, (
+
+    if expand_ok:
+        expand = Strategy(
+            START_EXPAND,
+            True,
+            "结构可用：可以在已知骨架之外用形状与药效团筛一个库。"
+            if not narrow_ok
+            else "结构可用：已知骨架够多，仍可在骨架之外探索新化学型。",
+        )
+    else:
+        expand = Strategy(START_EXPAND, False, "", "没有可用结构，换骨架没有受体可筛")
+
+    if ligand_ok:
+        ligand = Strategy(
+            START_LIGAND,
+            True,
             f"没有可用实验结构，但活性 {actives} 条（≥{few:g}）：先从配体侧建模型，"
-            "对接只当过滤器。"
+            "对接只当过滤器。",
         )
-    return START_BORROW, (
-        f"没有可用实验结构，活性 {actives} 条（<{few:g}）：本靶点没有可用的起点，"
-        "先回答值不值得做——去邻近受体的配体库里借。"
-    )
+    elif not structure_ok:
+        ligand = Strategy(
+            START_LIGAND,
+            False,
+            "",
+            f"活性 {actives} 条（<{few:g}），建不起参考分布",
+        )
+    else:
+        ligand = Strategy(START_LIGAND, False, "", "有可用结构，走结构侧")
+
+    if borrow_ok:
+        borrow = Strategy(
+            START_BORROW,
+            True,
+            f"结构{'可用' if structure_ok else '不可用'}、活性 {actives} 条："
+            "本靶点缺少成型的系列，按口袋局部序列相似性去邻近受体借配体，"
+            "先回答值不值得做。",
+        )
+    else:
+        borrow = Strategy(
+            START_BORROW,
+            False,
+            "",
+            f"活性 {actives} 条（≥{many:g}），本靶点自己有起点",
+        )
+
+    candidates = [narrow, expand, ligand, borrow]
+    recommended = next(item.start for item in candidates if item.applies)
+    ordered = sorted(candidates, key=lambda item: STRATEGY_COSTS[item.start][1])
+    return recommended, ordered
 
 
 class AssessCampaignTool(Tool):
@@ -271,8 +370,9 @@ class AssessCampaignTool(Tool):
             "开工前的**盘点**：一次调用看两侧的数，给出这一轮该走哪条路。"
             "受体侧看实验结构数、最佳分辨率、共晶配体、缺口；配体侧看 pChEMBL ≥7 的"
             "条数、骨架分组、最大一组、匹配对密度；给了抗靶就算两靶交集与选择性比。\n"
-            "判定是四类起点之一：同系物优化 / 换骨架 / 配体侧建模 / 借邻近受体，另附一句理由"
-            "（引用哪几个数）与一条假设草稿。**阈值写死在返回的第一行**，复核不用翻代码。\n"
+            "判定给一条**推荐**与 2–4 条**并列候选**：每条候选带成本档、能区分哪两条"
+            "互相竞争的解释，以及一句理由（引用哪几个数）。走不通的策略也列出来并写明"
+            "卡在哪。推荐的策略附一条假设草稿。**阈值写死在返回的第一行**，复核不用翻代码。\n"
             "`actives` 不给时自己去 ChEMBL 取一份摘要，**不登记任何产物**——盘点不该在"
             "登记表里留下模型没打算用的东西。`receptor` 给了才看缺口与共晶配体。\n"
             "查不到的数写「没有记录」，不写 0；抗靶没给时选择性整段不出现。"
@@ -398,9 +498,13 @@ class AssessCampaignTool(Tool):
                 "selective": len(better),
             }
 
-        start, reason = _pick_start(
-            structure_ok=structure_ok, actives=len(rows), largest_scaffold=largest
+        start, strategies = _pick_strategies(
+            structure_ok=structure_ok,
+            actives=len(rows),
+            largest_scaffold=largest,
+            pair_count=pair_count,
         )
+        reason = next(item.reason for item in strategies if item.start == start)
 
         lines = [
             "阈值：结构 ≤{resolution:g} Å、活性 ≥{actives_many:g} 条、"
@@ -500,20 +604,43 @@ class AssessCampaignTool(Tool):
         lines.append(f"建议装族：{START_FAMILIES[start]}")
         lines.append(f"下一步：{START_STEPS[start]}")
 
-        draft = self._hypothesis_draft(
-            start=start,
+        viable = [item for item in strategies if item.applies]
+        blocked = [item for item in strategies if not item.applies]
+        lines.append("")
+        if len(viable) > 1:
+            lines.append("候选策略（按成本从低到高；都可行，选哪条是这一轮的决策）")
+        else:
+            lines.append("候选策略（只有这一条可行）")
+        for item in viable:
+            cost, _rank = STRATEGY_COSTS[item.start]
+            mark = " ← 推荐" if item.start == start else ""
+            lines.append(
+                f"- {START_LABELS[item.start]}（{item.start}）· 成本 {cost}"
+                f" · 能区分 {STRATEGY_DISCRIMINATES[item.start]}{mark}"
+            )
+            if item.start != start:
+                lines.append(f"  下一步：{START_STEPS[item.start]}")
+        if blocked:
+            lines.append(
+                "不可行："
+                + "；".join(
+                    f"{START_LABELS[item.start]}（{item.blocked}）" for item in blocked
+                )
+            )
+
+        drafts = self._strategy_drafts(
+            viable=viable,
             code=code,
-            actives=len(rows),
-            largest=largest,
             pair_count=pair_count,
             selectivity=selectivity,
         )
+        chosen = next(item for item in drafts if item["start"] == start)
         lines.append("")
         lines.append(
-            f"假设草稿（{draft['kind']} / {draft['mode']}）：{draft['claim']}"
+            f"假设草稿（{chosen['kind']} / {chosen['mode']}）：{chosen['claim']}"
         )
-        lines.append(f"  检验：{draft['test']}")
-        lines.append(f"  预期：{draft['expected']}")
+        lines.append(f"  检验：{chosen['test']}")
+        lines.append(f"  预期：{chosen['expected']}")
 
         return ToolResult(
             output="\n".join(lines),
@@ -532,7 +659,8 @@ class AssessCampaignTool(Tool):
                 "selectivity": selectivity,
                 "pockets": pocket_count,
                 "receptor": receptor,
-                "hypothesis": draft,
+                "hypothesis": chosen,
+                "strategies": drafts,
             },
         )
 
@@ -621,57 +749,77 @@ class AssessCampaignTool(Tool):
             return [], code
         return _snapshot_rows(snapshot.molecules), code
 
-    def _hypothesis_draft(
+    def _strategy_drafts(
         self,
         *,
-        start: str,
+        viable: Sequence[Strategy],
         code: str,
-        actives: int,
-        largest: int,
         pair_count: int,
         selectivity: dict[str, Any],
-    ) -> dict[str, str]:
-        """一条填好的假设草稿。模型可以改，但不必从零想。"""
-        if start == START_NARROW:
-            return {
-                "kind": "strategy",
-                "mode": "narrow",
-                "claim": f"{code} 的已知活性集中在一个骨架系列里，优化空间就在这个系列内。",
-                "test": "在最大骨架组内算匹配分子对，看这些对子改的是不是同一处基团。",
-                "expected": (
-                    f"ΔpChEMBL ≥2 的对子 ≥{THRESHOLDS['cliff_pairs']:g} 对"
-                    f"（现在 {pair_count} 对），且这些对子改的是同一处基团。"
-                ),
-            }
-        if start == START_EXPAND:
-            return {
-                "kind": "strategy",
-                "mode": "expand",
-                "claim": "存在已知骨架之外的可结合化学型。",
-                "test": "用形状与药效团筛一个库，看命中落在哪些骨架上。",
-                "expected": "前 100 个里 ≥20 个不在已知骨架上。",
-            }
-        if start == START_LIGAND:
-            return {
-                "kind": "strategy",
-                "mode": "narrow",
-                "claim": "活性由某个骨架锚在特定残基上决定，结构不是必需的。",
-                "test": "去掉该锚定基团的类似物测一批，看活性掉多少。",
-                "expected": "活性下降 ≥10 倍，且对映体里只有一个有活性。",
-            }
-        expected = "≥1 个实测 <10 μM"
-        if selectivity.get("selective"):
-            expected = (
-                f"借来的配体里 ≥1 个实测 <10 μM；抗靶 Ki 上升 "
-                f"≥{THRESHOLDS['selectivity']:g} 倍、本靶活性不降"
-            )
-        return {
-            "kind": "strategy",
-            "mode": "expand",
-            "claim": "邻近受体的配体库里有本靶点的起点。",
-            "test": "按口袋窗口的局部序列相似性借一批配体，测一批。",
-            "expected": expected,
-        }
+    ) -> list[dict[str, str]]:
+        """每条可行策略一份填好的假设草稿。模型可以改，但不必从零想。
+
+        只给可行的那几条：给走不通的策略写草稿，等于建议模型去走一条它走不通的路。
+        """
+        drafts: list[dict[str, str]] = []
+        for item in viable:
+            if item.start == START_NARROW:
+                drafts.append(
+                    {
+                        "start": START_NARROW,
+                        "kind": "strategy",
+                        "mode": "narrow",
+                        "claim": (
+                            f"{code} 的已知活性集中在一个骨架系列里，"
+                            "优化空间就在这个系列内。"
+                        ),
+                        "test": "在最大骨架组内算匹配分子对，看这些对子改的是不是同一处基团。",
+                        "expected": (
+                            f"ΔpChEMBL ≥2 的对子 ≥{THRESHOLDS['cliff_pairs']:g} 对"
+                            f"（现在 {pair_count} 对），且这些对子改的是同一处基团。"
+                        ),
+                    }
+                )
+            elif item.start == START_EXPAND:
+                drafts.append(
+                    {
+                        "start": START_EXPAND,
+                        "kind": "strategy",
+                        "mode": "expand",
+                        "claim": "存在已知骨架之外的可结合化学型。",
+                        "test": "用形状与药效团筛一个库，看命中落在哪些骨架上。",
+                        "expected": "前 100 个里 ≥20 个不在已知骨架上。",
+                    }
+                )
+            elif item.start == START_LIGAND:
+                drafts.append(
+                    {
+                        "start": START_LIGAND,
+                        "kind": "strategy",
+                        "mode": "narrow",
+                        "claim": "活性由某个骨架锚在特定残基上决定，结构不是必需的。",
+                        "test": "去掉该锚定基团的类似物测一批，看活性掉多少。",
+                        "expected": "活性下降 ≥10 倍，且对映体里只有一个有活性。",
+                    }
+                )
+            else:
+                expected = "≥1 个实测 <10 μM"
+                if selectivity.get("selective"):
+                    expected = (
+                        f"借来的配体里 ≥1 个实测 <10 μM；抗靶 Ki 上升 "
+                        f"≥{THRESHOLDS['selectivity']:g} 倍、本靶活性不降"
+                    )
+                drafts.append(
+                    {
+                        "start": START_BORROW,
+                        "kind": "strategy",
+                        "mode": "expand",
+                        "claim": "邻近受体的配体库里有本靶点的起点。",
+                        "test": "按口袋窗口的局部序列相似性借一批配体，测一批。",
+                        "expected": expected,
+                    }
+                )
+        return drafts
 
 
 def domain_tools() -> list[Tool]:

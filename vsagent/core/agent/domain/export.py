@@ -1177,6 +1177,7 @@ class WriteRunTool(Tool):
                 pocket_set=str(pocket_set.handle) if pocket_set is not None else "",
                 affinity=affinity_provenance,
                 interaction_report=interaction_report,
+                session_id=ledger.session_id,
             )
             _write_json(target / RUN_META, payload)
         except OSError as error:
@@ -1755,6 +1756,7 @@ def _build_meta(
     pocket_set: str = "",
     affinity: dict[str, Any] | None = None,
     interaction_report: dict[str, Any] | None = None,
+    session_id: str = "",
 ) -> dict[str, Any]:
     """装配 `meta.json`。
 
@@ -1781,6 +1783,9 @@ def _build_meta(
         "molecules": ligands,
         "provenance": {
             "view": view,
+            # 产出它的会话。历史页靠这一项把运行目录挂回会话，结构页靠它写
+            # 「这次结构是哪次任务做出来的」——没有这一项，两边都只能靠猜。
+            **({"session_id": session_id} if session_id else {}),
             "pockets": {
                 "method": _origin_method(bundle.origin),
                 "origin": bundle.origin,

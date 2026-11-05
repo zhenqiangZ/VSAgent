@@ -1,6 +1,10 @@
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    get_package_paths,
+)
 
 root = Path(SPECPATH)
 
@@ -14,6 +18,18 @@ datas = [
     (str(root / "web"), "web"),
 ]
 
+# `fit_affinity` 把 `fit_train.py` 当脚本交给 DTA 环境的解释器跑，路径是
+# `Path(__file__).with_name("fit_train.py")`。冻结后 `__file__` 指向解包目录，
+# 而脚本本身不会被 import、因此不在 PYZ 里，于是子进程报
+# `can't open file '/tmp/_MEI.../vsagent/core/agent/domain/fit_train.py'`。
+# 它一行都不 import torch/rdkit，整份放进 datas 即可。
+datas.append(
+    (
+        str(root / "vsagent" / "core" / "agent" / "domain" / "fit_train.py"),
+        "vsagent/core/agent/domain",
+    )
+)
+
 # 第三方包**自己带的**数据文件不会自动进包：`_pyinstaller_hooks_contrib` 里没有 meeko 钩子，
 # 而 meeko 是按 `Path(__file__).parents[0] / "data" / "params"` 与 `files("meeko") / "data"`
 # 找那些 json / toml 的。冻结后这两个路径都指到 `_MEIPASS/meeko/...` 底下，不把文件带进去
@@ -26,12 +42,33 @@ datas = [
 datas += collect_data_files("meeko", subdir="data")
 
 # PLIP 与 openbabel 的数据、动态库。冻结版里 `from plip.structure.preparation import
-# PDBComplex` 会抛 `ValueError: not enough values to unpack`，源码环境同一次导入正常；
-# 原因是 openbabel 的 data 文件与动态库没跟着进包。相互作用指纹要用的正是这一条，
-# 漏了它，页面上只剩几何接触与几何氢键。
+# PDBComplex` 会抛 `ValueError: not enough values to unpack (expected 2, got 1)`，
+# 源码环境同一次导入正常。那一行来自 `pybel._formatstodict`：它把每个格式拆成
+# 「名字 -- 说明」，拆不出两个值时当场抛出。格式表由插件提供，而插件
+# （`openbabel/lib/openbabel/<版本>/*.so`）既不在 `collect_data_files` 的结果里
+# （它跳过 .so），也不在 `collect_dynamic_libs` 的结果里（只扫 `lib/` 第一层）。
+# 少了它们，openbabel 加载不到任何格式，导入期就崩在这一行。
 datas += collect_data_files("plip")
 datas += collect_data_files("openbabel")
 binaries = collect_dynamic_libs("openbabel")
+
+_, _openbabel_dir = get_package_paths("openbabel")
+_plugin_root = Path(_openbabel_dir) / "lib" / "openbabel"
+datas += [
+    (str(item), str(Path("openbabel/lib/openbabel") / item.parent.name))
+    for item in sorted(_plugin_root.glob("*/*.so"))
+]
+
+# RDKit 的 `Data/` 目录。PyInstaller 自带与 `_pyinstaller_hooks_contrib` 里都没有 rdkit 钩子，
+# 冻结后 `_MEIPASS/rdkit/` 底下只有 `Chem` / `DataStructs` / `ForceField` / `Geometry` /
+# `ML` 与 `rdBase.so`，没有 `Data`。`RDConfig.RDDataDir` 由 `rdkit.__file__` 推出来，
+# 指到 `_MEIPASS/rdkit/Data`，于是 `pharmacophore._factory()` 抛
+# `OSError: File: /tmp/_MEI.../rdkit/Data/BaseFeatures.fdef could not be opened.`
+# 药效团构建与筛选都走这一处（`pharmacophore.py` 的 `feature_points`），
+# `build_pharmacophore` 要先生成完全部构象、再逐个叠合，到提特征这一步才抛出——
+# 前面几分钟的计算全部白做，界面上还停在「执行中」。整个 `Data` 只有 38 个文件、
+# 2 MB，一次收齐，省得以后哪个 RDKit 功能又要读里面的 `Crippen.txt` 或 `Pains`。
+datas += collect_data_files("rdkit", subdir="Data")
 
 a = Analysis(
     [str(root / "vsagent" / "__main__.py")],

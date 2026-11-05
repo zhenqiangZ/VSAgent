@@ -375,6 +375,9 @@ class Hypothesis:
     expected: str = ""
     status: str = "open"
     result_ref: str = ""
+    # 与哪几条假设在竞争。**两条假设给出不同预期时才填**：没有竞争关系的假设
+    # 各自检验，填进来只会让「谁被实验排除」这件事读不清。
+    rivals: list[str] = field(default_factory=list)
 
     def is_open(self) -> bool:
         return self.status == "open"
@@ -395,6 +398,8 @@ class Hypothesis:
             parts.append(f"检验：{_clip(self.test, 40)}")
         if self.expected:
             parts.append(f"预期：{_clip(self.expected, 30)}")
+        if self.rivals:
+            parts.append("竞争：" + "、".join(self.rivals))
         if not self.is_open():
             tail = f"状态：{self.status}"
             if self.result_ref:
@@ -414,6 +419,7 @@ class Hypothesis:
             "expected": self.expected,
             "status": self.status,
             "result_ref": self.result_ref,
+            "rivals": list(self.rivals),
         }
 
     @classmethod
@@ -432,6 +438,12 @@ class Hypothesis:
             expected=str(data.get("expected") or ""),
             status=status if status in HYPOTHESIS_STATUSES else "open",
             result_ref=str(data.get("result_ref") or ""),
+            # 旧会话没有这个键：空表就是「没有登记竞争关系」，不需要迁移。
+            rivals=[
+                str(item).strip()
+                for item in (data.get("rivals") or [])
+                if str(item).strip()
+            ],
         )
 
 
@@ -659,7 +671,7 @@ class TaskState:
 
 
 # 事件怎么来的。三种都要能读回来，区别只在「谁写的」：
-# manual 是模型主动封存（close_phase），auto 是轮末由内核自动封存，
+# manual 是模型主动封存（close_topic），auto 是轮末由内核自动封存，
 # local 是用户 /compact 或装不下时强推的。
 EVENT_KINDS: tuple[str, ...] = ("manual", "auto", "local")
 
@@ -671,7 +683,7 @@ STEP_RESULT_MAX = 120
 
 @dataclass
 class Step:
-    """一个 Phase 里的一小步：一次模型往返加它调用的那些工具。
+    """一个主题里的一小步：一次模型往返加它调用的那些工具。
 
     只记**已经算好的事实**——工具名、参数、状态、产物 handle。不记 reasoning，
     也不让模型写自述：记录必须零请求，而自述会美化过程（「验证受体质量」比
@@ -681,7 +693,7 @@ class Step:
     Step 级召回（`recall_event evt_0003 7`）靠它切原文。
     """
 
-    seq: int = 0                 # Phase 内连号，1 起
+    seq: int = 0                 # 主题内连号，1 起
     intent: str = ""             # 这一步干了什么，本地从工具名 + 关键参数拼
     tools: list[str] = field(default_factory=list)
     args: list[str] = field(default_factory=list)
@@ -733,35 +745,54 @@ class Step:
 
 @dataclass
 class Event:
-    """一个 Phase 的过程记录：一串 Step，加一句结论。
+    """一个主题的过程记录：一串 Step，加一句结论、一句交接。
 
-    语义与旧版不同：旧版是「一段工作的摘要」，模型觉得话题变了才写；新版是
-    「一个 Phase 的流水」，**内核每步都记，Phase 结束自动封存**。记录因此
-    不依赖任何模型判断，也就不可能一次都不触发。
+    边界用**位置**表示：`cut_message` / `cut_part` 是本主题之后的第一个位置
+    （左闭右开）。封存之后 RECENT 就从这里开始，它前面的原文不再发给模型。
+    用位置而不用消息下标，是因为一条 assistant 消息装着一整轮的所有步，
+    按消息切不出轮中途的主题边界；`Step.part_start` 与它同一套口径。
+
+    事件**连续覆盖**：后一条的切点接着前一条的切点，中间没有缝。起点不用另存，
+    它就是前一条的切点（首条从 `(0, 0)` 起）。断点由 `Session.sanitize_events`
+    裁掉，保留前面能用的那一段。
 
     `actions` / `artifacts` / `issues` 不再单独存，从 `steps` 聚合出来——
     存两份必然漂移（这次会话里已经出现过同一件事两个数字对不上）。
 
-    `start` / `end` 是消息下标（闭开区间），与 `compact_upto` 同一套口径。
-    事件**连续覆盖**一段：首条从 `summary_upto` 开始，后一条接着前一条的 `end`，
-    RECENT 从最后一条的 `end` 开始。这条不变式由 `Session.sanitize_events` 保证。
+    `step_start` / `step_end` 是会话内连号的步区间（1 起，左闭右开），
+    只用于显示与召回时的指路；没有步的强制封存两者相等。
     """
 
     id: str = ""
     title: str = ""
     summary: str = ""
-    phase_index: int = 0
+    handoff: str = ""        # 后续主题依赖什么，模型写；空串表示没写
+    topic_index: int = 0
     steps: list[Step] = field(default_factory=list)
-    start: int = 0
-    end: int = 0
-    tokens: int = 0          # 这一段原文的估算 token，软预算用
+    cut_message: int = 0
+    cut_part: int = 0
+    step_start: int = 0
+    step_end: int = 0
+    tokens: int = 0          # 这一段原文的估算 token，预算用
     kind: str = "manual"     # manual / auto / local，见 EVENT_KINDS
     degraded: bool = False   # 标题与结论是本地拼的
     created_at: float = field(default_factory=time.time)
 
     @property
+    def cut(self) -> tuple[int, int]:
+        """本主题之后的第一段原文在哪。"""
+        return (self.cut_message, self.cut_part)
+
+    @property
+    def span(self) -> str:
+        """步号区间的显示形式；没有步时是空串。"""
+        if self.step_end <= self.step_start:
+            return ""
+        return f"第 {self.step_start}–{self.step_end - 1} 步"
+
+    @property
     def actions(self) -> list[str]:
-        """本阶段用过的工具名，按首次出现的顺序去重。"""
+        """本主题用过的工具名，按首次出现的顺序去重。"""
         names: list[str] = []
         for step in self.steps:
             for name in step.tools:
@@ -771,7 +802,7 @@ class Event:
 
     @property
     def artifacts(self) -> list[str]:
-        """本阶段产出的 handle / 文件，按首次出现的顺序去重。"""
+        """本主题产出的 handle / 文件，按首次出现的顺序去重。"""
         found: list[str] = []
         for step in self.steps:
             for item in step.artifacts:
@@ -781,7 +812,7 @@ class Event:
 
     @property
     def issues(self) -> list[str]:
-        """本阶段失败项的首行，按首次出现的顺序去重。"""
+        """本主题失败项的首行，按首次出现的顺序去重。"""
         found: list[str] = []
         for step in self.steps:
             for item in step.issues:
@@ -798,10 +829,13 @@ class Event:
             "id": self.id,
             "title": self.title,
             "summary": self.summary,
-            "phase_index": self.phase_index,
+            "handoff": self.handoff,
+            "topic_index": self.topic_index,
             "steps": [step.to_dict() for step in self.steps],
-            "start": self.start,
-            "end": self.end,
+            "cut_message": self.cut_message,
+            "cut_part": self.cut_part,
+            "step_start": self.step_start,
+            "step_end": self.step_end,
             "tokens": self.tokens,
             "kind": self.kind,
             "degraded": self.degraded,
@@ -812,9 +846,12 @@ class Event:
     def from_dict(cls, data: dict[str, Any]) -> Event:
         """从字典还原事件。
 
-        **旧的形状也要读得回来**：旧版把 `actions` / `artifacts` / `issues` 平铺在
-        事件上，没有 `steps`。那种事件被折成「只有一步的流水」——内容一个字不丢，
-        只是粒度和新记录不同。`state.toml` 里已经存在的会话不会因为升级而丢掉历史。
+        **两种旧形状也要读得回来**：
+
+        - 旧版把 `actions` / `artifacts` / `issues` 平铺在事件上，没有 `steps`。
+          那种事件被折成「只有一步的流水」——内容一个字不丢，只是粒度和新记录不同。
+        - 更早的版本用 `start` / `end` 表示消息区间。折算成切点 `(end, 0)`：
+          那条消息之后的位置，与新口径一致。
         """
 
         def strings(key: str) -> list[str]:
@@ -847,14 +884,23 @@ class Event:
             )
 
         kind = str(data.get("kind") or "manual")
+        if "cut_message" in data:
+            cut_message = int(data.get("cut_message") or 0)
+            cut_part = int(data.get("cut_part") or 0)
+        else:
+            cut_message = int(data.get("end") or 0)
+            cut_part = 0
         return cls(
             id=str(data.get("id") or ""),
             title=str(data.get("title") or ""),
             summary=str(data.get("summary") or ""),
-            phase_index=int(data.get("phase_index") or 0),
+            handoff=str(data.get("handoff") or ""),
+            topic_index=int(data.get("topic_index") or data.get("phase_index") or 0),
             steps=steps,
-            start=int(data.get("start") or 0),
-            end=int(data.get("end") or 0),
+            cut_message=cut_message,
+            cut_part=cut_part,
+            step_start=int(data.get("step_start") or 0),
+            step_end=int(data.get("step_end") or 0),
             tokens=int(data.get("tokens") or 0),
             kind=kind if kind in EVENT_KINDS else "manual",
             degraded=bool(data.get("degraded")),
@@ -879,26 +925,27 @@ class Session:
     # 摘要正文，以及它覆盖到第几条消息。两者随会话写进状态文件
     summary: str = ""
     summary_upto: int = 0
-    # 事件列表：已经收口的一段消息被压成标题 + 摘要，原文不再进上下文。
-    # 连续覆盖 `[summary_upto, events[-1].end)`，RECENT 从那里往后接。
+    # 事件列表：已经封存的主题。每条记着切点，RECENT 从最后一条的切点往后接。
     events: list[Event] = field(default_factory=list)
     event_seq: int = 0
-    # 当前这个 Phase 已经走完、还没封存的步。**只在内存里**：每步落盘要重写整份
-    # 状态文件，而丢几步是可以接受的（原文还在 RECENT 里，最坏是这一阶段少几行流水）。
+    # 会话内连号的步计数器：事件上的 `step_start` / `step_end` 读它。
+    # 落盘，重启之后新步不会重复用旧号。
+    step_seq: int = 0
+    # 当前这个主题已经走完、还没封存的步。**只在内存里**：每步落盘要重写整份
+    # 状态文件，而丢几步是可以接受的（原文还在 RECENT 里，最坏是这一主题少几行流水）。
     pending_steps: list[Step] = field(default_factory=list)
-    # 模型给当前 Phase 起的名字与结论（`close_phase`）。**只是标注**，封存仍发生在
-    # 轮末 / 溢出这些真边界上——一条 assistant 消息装着一整轮的所有步，而 `Event.end`
-    # 是消息下标，切不开一条消息的中间。所以「轮中途提前切开」这件事表达不了
-    # （实测调了 11 次，每次都是「没有可封存的内容」）。封存时取用并清空。
-    phase_title: str = ""
-    phase_summary: str = ""
+    # 模型给当前主题起的名字、结论与交接（`close_topic` 调用时写下）。
+    # 内核在步末取用并清空。
+    topic_title: str = ""
+    topic_summary: str = ""
+    topic_handoff: str = ""
     # 已经用 load_tools 装入的领域工具族。核心工具不受它影响，
     # 装在会话上而不是注册表上：注册表按「根 / 子 agent」共享两份，
     # 记在那里会让一个会话装过的工具漏到另一个会话。
     tool_families: list[str] = field(default_factory=list)
-    # 每一族是第几个 Phase 装进来的。收敛（`toolset.prune_families`）用它判断
+    # 每一族是第几个主题装进来的。收敛（`toolset.prune_families`）用它判断
     # 「刚装、还没轮到用」的族，别刚装完就卸掉。
-    family_phase: dict[str, int] = field(default_factory=dict)
+    family_topic: dict[str, int] = field(default_factory=dict)
     # 结构化的任务状态：目标、用户约束、进度、阻塞。整块进上下文的 TASK 层，不参与淘汰
     task_state: TaskState = field(default_factory=TaskState)
     # ---- 子 agent ----
@@ -960,29 +1007,36 @@ class Session:
         return event
 
     @property
-    def event_end(self) -> int:
-        """事件覆盖到第几条消息（不含）；没有事件时是 0。"""
-        return self.events[-1].end if self.events else 0
+    def event_cut(self) -> tuple[int, int]:
+        """RECENT 的起点：最后一条事件的切点；没有事件时是会话开头。"""
+        return self.events[-1].cut if self.events else (0, 0)
+
+    @property
+    def next_topic_index(self) -> int:
+        """下一个主题号。取已有最大值 +1：事件被裁掉之后号也不会重复。"""
+        return max((event.topic_index for event in self.events), default=0) + 1
 
     def sanitize_events(self) -> None:
-        """丢掉越界、非连续的事件。
+        """丢掉切点不递增、或者越过会话末尾的事件。
 
-        事件必须连续：中间缺一段的话，那一段原文就既不在事件里也不在 RECENT 里，
-        内容无声消失，而装配出来的上下文看起来完全正常。
-        所以一旦发现断点，断点之后的事件一律丢掉——保留前面能用的那一段。
+        事件必须首尾相接：切点不递增就有两段原文既在事件里又在 RECENT 里，
+        越过末尾则指向还不存在的内容。发现断点就丢掉断点之后的事件——
+        保留前面能用的那一段。
 
-        **不推 `compact_upto`**：那是「手动/强行压缩」的位置，与「事件归档到哪儿」
-        是两件事。装配时最近一个阶段还要留在 RECENT 里（`keep_last_phase_raw`），
-        把硬边界推到事件末端会让刚做完的那一步立刻失去原文。
+        **不推 `compact_upto`**：那是「手动 / 强行压缩」留下的位置，与「主题归档到哪儿」
+        是两件事，装配时取两者的较早者。
         """
         limit = len(self.messages)
         kept: list[Event] = []
-        cursor = self.summary_upto
+        cursor = (self.summary_upto, 0)
         for event in self.events:
-            if event.start != cursor or event.end <= event.start or event.end > limit:
+            position = event.cut
+            if position <= cursor or position[0] > limit:
+                break
+            if position[0] == limit and position[1] > 0:
                 break
             kept.append(event)
-            cursor = event.end
+            cursor = position
         self.events = kept
         self.event_seq = max(self.event_seq, len(kept))
 
@@ -1039,8 +1093,9 @@ class Session:
             "summary_upto": self.summary_upto,
             "events": [event.to_dict() for event in self.events],
             "event_seq": self.event_seq,
+            "step_seq": self.step_seq,
             "tool_families": list(self.tool_families),
-            "family_phase": dict(self.family_phase),
+            "family_topic": dict(self.family_topic),
             "task_state": self.task_state.to_dict(),
             "parent_id": self.parent_id,
             "root_id": self.root_id,
@@ -1090,14 +1145,17 @@ class Session:
         session.event_seq = int(data.get("event_seq") or 0)
         for event in session.events:
             session.event_seq = max(session.event_seq, _event_serial(event.id))
+        session.step_seq = int(data.get("step_seq") or 0)
+        for event in session.events:
+            session.step_seq = max(session.step_seq, event.step_end - 1)
         raw_families = data.get("tool_families")
         if isinstance(raw_families, list):
             session.tool_families = [str(item) for item in raw_families if str(item)]
-        raw_phases = data.get("family_phase")
-        if isinstance(raw_phases, dict):
-            session.family_phase = {
+        raw_topics = data.get("family_topic", data.get("family_phase"))
+        if isinstance(raw_topics, dict):
+            session.family_topic = {
                 str(key): int(value)
-                for key, value in raw_phases.items()
+                for key, value in raw_topics.items()
                 if str(key) and isinstance(value, int) and not isinstance(value, bool)
             }
         # 读回来就校验一次：手工改过状态文件、或者旧版本写了一半的事件，

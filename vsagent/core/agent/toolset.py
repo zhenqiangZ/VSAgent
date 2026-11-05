@@ -50,21 +50,24 @@ def family_of(name: str) -> str:
     return ""
 
 
-def prune_families(session: Session, used: Iterable[str], phase_index: int) -> list[str]:
-    """Phase 封存时收敛工具族：本阶段没用过的族卸掉，返回卸了哪些。
+def prune_families(session: Session, used: Iterable[str], topic_index: int) -> list[str]:
+    """轮末封存时收敛工具族：这一轮没用过的族卸掉，返回卸了哪些。
 
     只有「装」没有「卸」的话，一次会话装到八族之后每一步都发 12K token 的
-    工具定义，而典型的一个阶段只用得上两三个族（准备受体的阶段不需要
-    `docking`）。Phase 边界天然是「换阶段」的地方，所以收敛挂在那里。
+    工具定义，而典型的一轮只用得上两三个族（准备受体的那一轮不需要
+    `docking`）。轮末封存天然是「换事情」的地方，所以收敛挂在那里。
+
+    **主题封存不收敛**：一轮里换三个主题是常事，每次装卸都改动请求体，
+    整段缓存失效，省下的定义抵不过反复打断缓存。
 
     三条边界：
 
-    - **本阶段一个工具都没用过就不卸**。那多半是纯聊天的一轮，没有依据说
+    - **这一轮一个工具都没用过就不卸**。那多半是纯聊天的一轮，没有依据说
       「这些族用不上」，而卸了要模型下一步重新装一次，那一步的缓存全废。
-    - **本阶段刚装的族不卸**。`session.family_phase` 记着每一族是第几个阶段
+    - **这一轮刚装的族不卸**。`session.family_topic` 记着每一族是第几个主题
       装进来的；模型常常先装后几步才用，装完立刻被收走等于白装一次。
     - **卸掉不等于忘掉**：`load_tools` 随时能装回来。这是刻意的取舍——
-      省下的是每步都发的固定成本，代价是换阶段时一次缓存失效。
+      省下的是每步都发的固定成本，代价是换轮时一次缓存失效。
     """
     used = set(used)
     if not used:
@@ -74,15 +77,15 @@ def prune_families(session: Session, used: Iterable[str], phase_index: int) -> l
     dropped: list[str] = []
     for family in session.tool_families:
         names = set(table.get(family, ()))
-        loaded_at = session.family_phase.get(family, 0)
-        if names & used or loaded_at >= phase_index:
+        loaded_at = session.family_topic.get(family, 0)
+        if names & used or loaded_at >= topic_index:
             keep.append(family)
         else:
             dropped.append(family)
     if dropped:
         session.tool_families = keep
-        session.family_phase = {
-            name: value for name, value in session.family_phase.items() if name in keep
+        session.family_topic = {
+            name: value for name, value in session.family_topic.items() if name in keep
         }
         session.touch()
     return dropped
@@ -113,7 +116,7 @@ class LoadToolsTool(Tool):
             "族与工具：\n"
             + catalog_text()
             + "\n装一次对整个会话有效；已经装过的再装一次只会把清单再列一遍。\n"
-            "**建议一次把本阶段要用的族都装上**：每装一次都会改动工具清单，"
+            "**建议一次把这一轮要用的族都装上**：每装一次都会改动工具清单，"
             "而工具清单是请求前缀的一部分，下一步的 prompt cache（前缀缓存）会整段失效。"
         ),
         parameters={
@@ -165,9 +168,9 @@ class LoadToolsTool(Tool):
         already = family in session.tool_families
         if not already:
             session.tool_families.append(family)
-        # 记下它是第几个阶段装进来的：收敛时不卸「本阶段刚装、还没轮到用」的族，
+        # 记下它是第几个主题装进来的：收敛时不卸「刚装、还没轮到用」的族，
         # 否则模型刚装完就被拿走，下一步还得再装一次（那一次缓存又白费）。
-        session.family_phase[family] = len(session.events) + 1
+        session.family_topic[family] = session.next_topic_index
         prefix = "已经装过" if already else "已装入"
         listed = "、".join(available) + (
             f"（{'、'.join(skipped)} 被项目配置关掉了，没有列进来）" if skipped else ""

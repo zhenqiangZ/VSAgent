@@ -86,8 +86,8 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("search_targets", {"query": "EGFR", "limit": 5}),
     ("fetch_target", {"accession": "P00533"}),
     # 开工前的盘点：受体侧（结构数、最佳分辨率、AlphaFold）与配体侧（活性条数、
-    # 骨架分组、匹配对密度）一起看，判定四类起点之一。**不给 receptor**：这一步
-    # 还没有受体。它取 ChEMBL 时两端各拉一份（最强与最弱），所以要跑几十秒。
+    # 骨架分组、匹配对密度）一起看，给出四条候选起点与一条推荐。**不给 receptor**：
+    # 这一步还没有受体。它取 ChEMBL 时两端各拉一份（最强与最弱），所以要跑几十秒。
     ("assess_campaign", {"accession": "P00533"}),
     # 全部实验结构的全景：按配体分组，每组套数与最佳分辨率。用 Q15858（Nav1.7，
     # 44 套）是因为它同时有小分子配体、肽类毒素与大量脂质——分组口径在这里最容易露馅。
@@ -167,6 +167,8 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "molecule": "aspirin",
         "interactions": True,
     }),
+    # 同一个分子的多个对接模式：看第二种摆法是不是真的不同。只读，不登记。
+    ("alternative_poses", {"docking": "{artifact:docking}", "molecule": "aspirin"}),
     # 同一个位姿换个问法：分数是疏水堆出来的，还是极性原子白埋了。纯几何，不需要 plip。
     ("analyze_hydrophobic", {"docking": "{artifact:docking}", "molecule": "aspirin"}),
     # 整批的接触频次：这一批是不是都挤在同一个亚口袋。只读，不登记。
@@ -205,6 +207,8 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     # 构效关系：先分组，再找匹配分子对，最后用第一组枚举一批类似物。
     # 候选表来自 rank_candidates；那一步没跑成时这几条会照实失败。
     ("scaffold_analysis", {"source": "{artifact:candidates}", "min_size": 1}),
+    # 这批 hit 的共同子结构：组内一次、跨组一次。二维 MCS，不是三维形状。
+    ("common_features", {"source": "{artifact:candidates}", "min_atoms": 6}),
     ("matched_pairs", {"source": "{artifact:candidates}", "min_delta": 0.5}),
     ("enumerate_analogs", {"scaffold": "{artifact:scaffolds}", "group": 1, "max": 10}),
     # 药效团：一份同系列 6 个分子（前一节的参考集只有 3 条，凑不出共识）。

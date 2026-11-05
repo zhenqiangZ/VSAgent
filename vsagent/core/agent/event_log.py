@@ -1,27 +1,26 @@
-"""事件层：把一轮工作记成「一个 Phase 的 Step 流水」，原文让位。
+"""事件层：把工作记成「一个主题的 Step 流水」，原文按位置让位。
 
-四层，不是三层：
+三层组织：
 
-    Task   —— 一条用户消息
-    Phase  —— 一大步（默认 = 一轮），封存后就是一条 Event
+    Topic  —— 一个独立主题，运行中持续累积 Step
     Step   —— 一次模型往返加它的工具调用，内核每步自动记
-    Event  —— 一个 Phase 的流水，Phase 结束自动封存
+    Event  —— 一个主题封存后的记录：标题、结论、交接、流水
 
-**关键差别**：旧设计里 Event 是「一段工作的摘要」，模型判断「话题变了」才写，
-于是它把「记录」挂在了「压缩」上——1M 窗口不需要压缩，记录也就一次都没发生。
-新设计里记录每步都做（零请求），压缩只是记录的副产品。模型不再决定「要不要记」，
-只决定「这个 Phase 叫什么、结论是什么」，而且那一步也是可选的。
+**关键约定**：封存的边界是**位置** `(message_index, part_index)`，不是消息下标。
+一条 assistant 消息装着一整轮的所有往返，按消息切不出轮中途的主题边界；
+按位置切既切得动，也不会把一次工具调用与它的结果分到两边。
+
+封存之后，这条位置之前的原文不再随请求发出，只留摘要。原文一条不删：
+`Step` 上的 `message_index` / `part_start` / `part_end` 就是取回它的地址。
 
 三条规则，写在这里也写在文档里（`docs/session-review-plan.md` §4）：
 
-1. **连续覆盖**。首条事件从 `summary_upto` 开始，后一条接前一条的 `end`，
-   RECENT 从最后一条的 `end` 开始。中间不许有缝——有缝就意味着那一段原文
-   既不在事件里也不在 RECENT 里，内容无声消失，而上下文看起来完全正常。
-2. **边界排除正在写的东西**。封存停在当前这条 assistant 消息之前：
-   它还没写完，收进去等于把半句话当成结论。
+1. **连续覆盖**。后一条事件的切点接着前一条，中间没有缝——有缝就意味着那一段
+   原文既不在事件里也不在 RECENT 里，内容无声消失，而上下文看起来完全正常。
+2. **边界不切正在写的步**。封存只收已经记下来的步；正在执行的那一步留在 RECENT。
 3. **记录不花请求**。Step 全部由本地从 Part 拼装（工具名、参数、状态、handle），
-   不读 reasoning、不请模型写 intent。Phase 的标题与结论模型可以顺手给
-   （`close_phase`），不给就用本地拼的那一份，标 `degraded=True`。
+   不读 reasoning、不请模型写 intent。主题的标题与结论模型顺手给
+   （`close_topic`），不给就本地拼一份，标 `degraded=True`。
 """
 
 from __future__ import annotations
@@ -34,19 +33,24 @@ from ..models import (EVENT_KINDS, STEP_INTENT_MAX, STEP_RESULT_MAX, Event, Part
 from .prompt import estimate_tokens
 from .tools import Tool, ToolResult, ToolSpec
 
-# 标题与结论的长度上限。**代码里截**，不只写在提示词里：
-# 模型不会每次都照做，而这两段进的是每步都要发的索引。
+# 标题、结论、交接的长度上限。**代码里截**，不只写在提示词里：
+# 模型不会每次都照做，而这几段进的是每步都要发的索引。
 EVENT_TITLE_MAX = 40
 EVENT_SUMMARY_MAX = 600
+EVENT_HANDOFF_MAX = 200
 # 本地标题里最多拼几段用户诉求。两段够看出「从哪做到哪」，再多就把标题
 # 变成一份清单；超出的用「等 N 段」交代，不假装没发生。
 TITLE_ASKS = 2
 # `recall_event` 一次最多铺多少行原文。
 EVENT_RECALL_LIMIT = 120
-# 单个 Phase 的原文估算上限。一轮跑了三十步的情况靠它切开：
-# 不切的话一个 Phase 会一直长到把 RECENT 撑爆，而流水是「一大步」的粒度，
+# 单个主题的原文估算上限。一轮跑了三十步的情况靠它切开：
+# 不切的话一个主题会一直长到把 RECENT 撑满，而流水是「一个主题」的粒度，
 # 太长就退化成第二份逐条列表。120K 是 §4.8 的成本表里定下的。
-PHASE_SOFT_LIMIT = 120_000
+TOPIC_SOFT_LIMIT = 120_000
+# 记账工具的名字。它不进流水，也不该算成一步：写进去只会让「第 3 步」
+# 那一行变成「close_topic」，而它封的正是它前面那几步。
+# `close_phase` 是旧名字，读回来的旧会话里还有它。
+ACCOUNTING_TOOLS = ("close_topic", "close_phase")
 
 
 @dataclass
@@ -62,8 +66,6 @@ class EventRuntime:
     """
 
     session: Session
-    # 当前正在写的那条 assistant 消息的下标（不含）。封存收到这里为止。
-    current_index: int = 0
 
 
 def event_boundary(session: Session, index: int) -> int:
@@ -78,7 +80,19 @@ def event_boundary(session: Session, index: int) -> int:
     return end
 
 
-def _user_texts(session: Session, start: int, end: int) -> list[str]:
+def _clamp(session: Session, position: tuple[int, int]) -> tuple[int, int]:
+    """把位置夹到「消息范围内」。越界的部分按末尾处理。"""
+    limit = len(session.messages)
+    if position[0] < 0:
+        return (0, 0)
+    if position[0] > limit:
+        return (limit, 0)
+    if position[0] == limit:
+        return (limit, 0)
+    return (position[0], max(0, position[1]))
+
+
+def _user_texts(session: Session, start: tuple[int, int], end: tuple[int, int]) -> list[str]:
     """这一段里每一句用户原话，按顺序。
 
     标题要描述**整段**，不是只描述开头。事件一合并就会跨过好几句诉求，
@@ -89,10 +103,15 @@ def _user_texts(session: Session, start: int, end: int) -> list[str]:
     既占地方又不提供信息。
     """
     texts: list[str] = []
-    for message in session.messages[start:end]:
+    first = max(0, start[0])
+    last = min(end[0], len(session.messages) - 1)
+    for index in range(first, last + 1):
+        message = session.messages[index]
         if message.role != "user":
             continue
-        for part in message.parts:
+        low = start[1] if index == start[0] else 0
+        high = end[1] if index == end[0] else len(message.parts)
+        for part in message.parts[low:high]:
             if part.type is PartType.TEXT and part.text.strip():
                 flat = " ".join(part.text.split())
                 if flat and flat not in texts:
@@ -180,10 +199,7 @@ def step_from_parts(
             continue
         if part.type is not PartType.TOOL or not part.tool_name:
             continue
-        # `close_phase` 是记账，不是干活：把它写进流水只会让「第 3 步」那一行
-        # 变成「close_phase」，而它封的正是它前面那几步。单独调它时这一步
-        # 干脆不产生 Step（下面的 `if not tools` 会返回 None）。
-        if part.tool_name == "close_phase":
+        if part.tool_name in ACCOUNTING_TOOLS:
             continue
         tools.append(part.tool_name)
         given = part.tool_input if isinstance(part.tool_input, dict) else {}
@@ -221,49 +237,49 @@ def step_from_parts(
     )
 
 
-def _steps_from_messages(session: Session, start: int, end: int) -> list[Step]:
-    """从会话原文里回填流水：一条 assistant 消息里的**每一段**折成一步。
+def _segment_calls(message: Any, begin: int, stop: int) -> tuple[list[Part], list[int]]:
+    """一段里的工具 Part 与它们在消息里的位置。"""
+    calls: list[Part] = []
+    positions: list[int] = []
+    for offset, part in enumerate(message.parts[begin:stop]):
+        if part.type is PartType.TOOL and part.tool_name:
+            calls.append(part)
+            positions.append(begin + offset)
+    return calls, positions
+
+
+def _steps_from_messages(
+    session: Session, start: tuple[int, int], end: tuple[int, int]
+) -> list[Step]:
+    """从会话原文里回填流水：这一段里**每一次模型往返**折成一步。
 
     什么时候用：这一段的 Step 没记下来（进程重启、或者这段是旧版本写的历史）。
-    读的就是 Part，所以回填出来的流水与当场记的那份形状一致，只是没有
-    `part_start` 之外的额外信息。
+    读的就是 Part，所以回填出来的流水与当场记的那份形状一致。
 
-    **必须按 `STEP_START` 分段**：一条 assistant 消息装着一整轮的所有往返
-    （一步一次模型往返），整条折成一步会把「第 1 步装了族、第 2 步才用它」
-    压成一行。`part_start` 取这一段里第一个工具 Part 的位置，与
-    `record_step` 的口径一致——`seal_phase` 按 `(消息, 起始位置)` 合并两份，
-    口径不一致就会把同一步记两遍。
+    **必须按 `STEP_START` 分段**：一条 assistant 消息装着一整轮的所有往返，
+    整条折成一步会把「第 1 步装了族、第 2 步才用它」压成一行。
     """
+    from .context import step_segments
+
     steps: list[Step] = []
-    for index in range(max(0, start), min(end, len(session.messages))):
+    first = max(0, start[0])
+    last = min(end[0], len(session.messages) - 1)
+    for index in range(first, last + 1):
         message = session.messages[index]
         if message.role != "assistant":
             continue
-        starts = [
-            position
-            for position, part in enumerate(message.parts)
-            if part.type is PartType.STEP_START
-        ] or [0]
-        for order, segment in enumerate(starts):
-            stop = starts[order + 1] if order + 1 < len(starts) else len(message.parts)
-            calls = [
-                part
-                for part in message.parts[segment:stop]
-                if part.type is PartType.TOOL and part.tool_name
-            ]
+        for begin, stop in step_segments(message):
+            if (index, begin) < start or (index, begin) >= end:
+                continue
+            calls, positions = _segment_calls(message, begin, stop)
             if not calls:
                 continue
-            positions = [
-                position
-                for position, part in enumerate(message.parts)
-                if any(part is call for call in calls)
-            ]
             step = step_from_parts(
                 len(steps) + 1,
                 calls,
                 index,
-                min(positions) if positions else segment,
-                (max(positions) + 1) if positions else stop,
+                min(positions),
+                max(positions) + 1,
             )
             if step is not None:
                 steps.append(step)
@@ -279,10 +295,10 @@ def record_step(
     part_start: int = 0,
     part_end: int = 0,
 ) -> Step | None:
-    """把这一步的 Part 折成一条 Step，挂到当前 Phase 上。零请求。
+    """把这一步的 Part 折成一条 Step，挂到当前主题上。零请求。
 
     只在内存里累积：每步都重写整份 `state.toml` 不值（一次会话几十步），
-    而丢几步可以接受——原文还在 RECENT 里，最坏是这一阶段少几行流水。
+    而丢几步可以接受——原文还在 RECENT 里，最坏是这一主题少几行流水。
     """
     step = step_from_parts(step_no, parts, message_index, part_start, part_end)
     if step is None:
@@ -292,34 +308,40 @@ def record_step(
     return step
 
 
-def phase_start(session: Session) -> int:
-    """当前 Phase 从第几条消息开始：接着上一条事件的末端。"""
-    return session.events[-1].end if session.events else session.summary_upto
+def topic_start(session: Session) -> tuple[int, int]:
+    """当前主题从哪个位置开始。
+
+    有事件时接着上一条的切点；还没有事件时从摘要覆盖到的地方起——
+    摘要替代的那一段同样不再进 RECENT。
+    """
+    if session.events:
+        return session.event_cut
+    return (session.summary_upto, 0)
 
 
-def _range_tokens(session: Session, start: int, end: int) -> int:
+def _position_tokens(session: Session, start: tuple[int, int], end: tuple[int, int]) -> int:
     """一段原文的估算 token。软预算与「已归档多少」都读它。"""
     total = 0
-    for message in session.messages[max(0, start) : max(0, end)]:
-        for part in message.parts:
+    first = max(0, start[0])
+    last = min(end[0], len(session.messages) - 1)
+    for index in range(first, last + 1):
+        message = session.messages[index]
+        low = start[1] if index == start[0] else 0
+        high = end[1] if index == end[0] else len(message.parts)
+        for part in message.parts[low:high]:
             total += estimate_tokens(part.text or "")
             if part.tool_output:
                 total += estimate_tokens(part.tool_output)
     return total
 
 
-def phase_tokens(session: Session) -> int:
-    """当前这个还没封存的 Phase 已经有多长（估算）。"""
-    return _range_tokens(session, phase_start(session), len(session.messages))
+def open_tokens(session: Session) -> int:
+    """当前这个还没封存的主题已经有多长（估算）。"""
+    return _position_tokens(session, topic_start(session), (len(session.messages), 0))
 
 
-def _next_phase_index(session: Session) -> int:
-    """下一个阶段号。取已有最大值 +1：事件被裁掉之后号也不会重复。"""
-    return max((event.phase_index for event in session.events), default=0) + 1
-
-
-def _local_title(session: Session, start: int, end: int, steps: list[Step]) -> str:
-    """本地拼标题：有用户原话就用原话，否则列工具，再否则报区间。
+def _local_title(session: Session, start: tuple[int, int], end: tuple[int, int], steps: list[Step]) -> str:
+    """本地拼标题：有用户原话就用原话，否则列工具，再否则报位置。
 
     这三条是旧 `build_local_event` 留下的规则，实测够用：模型没写标题时，
     「用户要什么」比「用了什么工具」更能说明这一段在干什么。
@@ -338,17 +360,17 @@ def _local_title(session: Session, start: int, end: int, steps: list[Step]) -> s
     if actions:
         suffix = "" if len(actions) <= 3 else f" 等 {len(actions)} 个"
         return _fit_title("工具：" + "、".join(actions[:3]), suffix)
-    return f"第 {start + 1}–{end} 条"
+    return f"第 {start[0] + 1}–{end[0]} 条"
 
 
-def _local_summary(steps: list[Step], start: int, end: int) -> str:
-    """本地拼结论：「N 步，M 个工具，产物 K 个，未决 J 项」。
+def _local_summary(steps: list[Step], start: tuple[int, int], end: tuple[int, int]) -> str:
+    """本地拼结论：「N 步，产物 K 个，未决 J 项」。
 
     顺序是「最不能丢的在前」：产物与未决是下一步真的要用到的东西，
     工具名最好补（流水里本来就有）。
     """
     if not steps:
-        return f"覆盖第 {start + 1}–{end} 条消息"
+        return f"覆盖第 {start[0] + 1}–{end[0]} 条消息"
     actions: list[str] = []
     artifacts: list[str] = []
     issues: list[str] = []
@@ -372,96 +394,126 @@ def _local_summary(steps: list[Step], start: int, end: int) -> str:
     return "；".join(pieces)[:EVENT_SUMMARY_MAX]
 
 
-def seal_phase(
+def seal_topic(
     session: Session,
     *,
+    cut: tuple[int, int],
     kind: str = "auto",
-    upto: int | None = None,
     title: str = "",
     summary: str = "",
+    handoff: str = "",
     force: bool = False,
 ) -> Event | None:
-    """把 `[phase_start, upto)` 封成一个 Phase，零模型请求。
+    """把 `[上一条事件的切点, cut)` 封成一个主题，零模型请求。
 
-    封存做什么（§4.4）：拼标题与结论（模型没给就本地拼）、算原文 token、
-    追加到 `session.events`、把已经用掉的 Step 从待封存列表里摘掉。
-    覆盖不变式由 `sanitize_events` 兜底：断点之后的事件一律丢掉。
+    切点是**位置**：`cut` 之前的原文从此不再进 RECENT。封的是什么都在
+    `Step` 上，原文一条不删，`recall_event` 按步取回。
 
     `title` 为空表示「模型没写」——那一条会被标成 `degraded=True`，
     读的人一眼看出这份标题是本地拼的。
 
     `force` 决定「一段里一步都没有」时封不封：
     - 轮末自动封存（`force=False`）：纯聊天的一轮没有流水可记，跳过，
-      否则事件层会被一堆空阶段占满；
+      否则事件层会被一堆空主题占满；
     - 溢出 / `/compact` / 强行腾地方（`force=True`）：**必须封**。不封的话
       那一段原文既不在事件里也不在 RECENT 里，内容无声消失，
       而上下文看起来完全正常——这正是连续覆盖那条不变式要防的。
     """
-    start = phase_start(session)
-    end = len(session.messages) if upto is None else min(int(upto), len(session.messages))
+    start = topic_start(session)
+    end = _clamp(session, cut)
     if end <= start:
         return None
     # 流水合并：回填的那一份保证「这一段里每一次模型往返都有一行」，
     # 当场记下来的那一份覆盖上去。只用其中一份的话，中途接手的历史
     # （重启、子 agent fork）会少掉几步，而流水看着完整。
-    #
-    # 合并单位是**消息**，不是「消息 + 起点」：一条 assistant 消息里有**多步**
-    # （`STEP_START` 切开），按消息合并会把同一轮的两步压成一步——实测一次四轮
-    # 会话，第二轮「装族 + 用族」只留下了一步，判据「每个 Step 恰好被一个 Phase
-    # 收走一次」当场不成立。但键也不能细到 Part 位置：回填按 `STEP_START` 分段，
-    # 当场记的按第一个工具 Part，两边口径不同，按精确键去重会把同一步记两遍。
-    # 所以「一条消息只要当场记过步，就整条以当场记的为准」——同一条消息的步
-    # 是在同一轮里连续记下来的，不会只记一半。
-    pending = [step for step in session.pending_steps if start <= step.message_index < end]
-    recorded = {step.message_index for step in pending}
+    pending = [
+        step
+        for step in session.pending_steps
+        if start <= (step.message_index, step.part_start) < end
+    ]
+    recorded = {(step.message_index, step.part_start) for step in pending}
     merged = {
         (step.message_index, step.part_start): step
         for step in _steps_from_messages(session, start, end)
-        if step.message_index not in recorded
+        if (step.message_index, step.part_start) not in recorded
     }
     for step in pending:
         merged[(step.message_index, step.part_start)] = step
     steps = [merged[key] for key in sorted(merged)]
-    # 模型给的名字排第一：`close_phase` 只负责记下这一份（见 `ClosePhaseTool`），
-    # 封存发生在真正的边界上。名字用过一次就清掉——下一段是另一件事，
-    # 不清的话它会顶着上一个阶段的名字被封。
-    title = title.strip() or session.phase_title.strip()
-    summary = summary.strip() or session.phase_summary.strip()
-    session.phase_title = ""
-    session.phase_summary = ""
+    # 模型给的名字排第一：`close_topic` 只负责记下这一份（见 `CloseTopicTool`），
+    # 封存发生在真正的边界上。名字用过一次就清掉——下一个主题是另一件事，
+    # 不清的话它会顶着上一个主题的名字被封。
+    title = title.strip() or session.topic_title.strip()
+    summary = summary.strip() or session.topic_summary.strip()
+    handoff = handoff.strip() or session.topic_handoff.strip()
+    session.topic_title = ""
+    session.topic_summary = ""
+    session.topic_handoff = ""
     written = bool(title)
     if not steps and not written:
         if not force:
             return None
-        title = f"第 {start + 1}–{end} 条"
+        title = f"第 {start[0] + 1}–{end[0]} 条"
     if not written:
         title = _local_title(session, start, end, steps)
     if not summary.strip():
         summary = _local_summary(steps, start, end)
+    # 步号在会话内连号：主题内那一个（`Step.seq`）封存时重排，跨主题的编号
+    # 另存在事件上，供召回时指路。
+    step_start = session.step_seq + 1
+    session.step_seq += len(steps)
     event = Event(
         title=_short(title, EVENT_TITLE_MAX),
         summary=summary.strip()[:EVENT_SUMMARY_MAX],
-        phase_index=_next_phase_index(session),
+        handoff=handoff.strip()[:EVENT_HANDOFF_MAX],
+        topic_index=session.next_topic_index,
         steps=steps,
-        start=start,
-        end=end,
-        tokens=_range_tokens(session, start, end),
+        cut_message=end[0],
+        cut_part=end[1],
+        step_start=step_start if steps else session.step_seq,
+        step_end=step_start + len(steps) if steps else session.step_seq,
+        tokens=_position_tokens(session, start, end),
         kind=kind if kind in EVENT_KINDS else "auto",
         degraded=not written,
     )
-    # 步号在 Phase 内连号，1 起。封存时重排一次：软预算会把一个 Phase 切成两段，
+    # 步号在主题内连号，1 起。软预算会把一个主题切成两段，
     # 不重排的话下一段的步号会从 9 开始，读起来像漏了前八步。
     for position, item in enumerate(steps, 1):
         item.seq = position
-    # 已经封进去的步不能再被下一阶段收一次：它们覆盖的消息已经在事件里了。
+    # 已经封进去的步不能再被下一个主题收一次。
     session.pending_steps = [
-        step for step in session.pending_steps if step.message_index >= end
+        step
+        for step in session.pending_steps
+        if (step.message_index, step.part_start) >= end
     ]
     for position, item in enumerate(session.pending_steps, 1):
         item.seq = position
     session.add_event(event)
     session.sanitize_events()
     return event
+
+
+def seal_range(
+    session: Session,
+    *,
+    kind: str = "auto",
+    upto: int | None = None,
+    title: str = "",
+    summary: str = "",
+    handoff: str = "",
+    force: bool = False,
+) -> Event | None:
+    """把一个消息区间封成一个主题。`upto` 是消息下标（不含）。"""
+    limit = len(session.messages) if upto is None else min(int(upto), len(session.messages))
+    return seal_topic(
+        session,
+        cut=(limit, 0),
+        kind=kind,
+        title=title,
+        summary=summary,
+        handoff=handoff,
+        force=force,
+    )
 
 
 def _render_step_raw(session: Session, step: Step) -> str:
@@ -484,6 +536,14 @@ def _render_step_raw(session: Session, step: Step) -> str:
     return text or "（这一步没有可读的原文）"
 
 
+def _start_of(session: Session, event: Event) -> tuple[int, int]:
+    """一条事件的起点：前一条的切点；首条从摘要覆盖到的地方（或会话开头）。"""
+    for index, item in enumerate(session.events):
+        if item is event:
+            return session.events[index - 1].cut if index else (session.summary_upto, 0)
+    return (0, 0)
+
+
 def render_event_detail(
     session: Session,
     event: Event,
@@ -495,7 +555,7 @@ def render_event_detail(
 
     `offset` 只作用于原文：流水与结论就那么几行，翻页翻掉它们没有意义。
     """
-    from .context import render_range, render_step_line
+    from .context import render_between, render_step_line
 
     if step:
         found = next((item for item in event.steps if item.seq == step), None)
@@ -518,20 +578,23 @@ def render_event_detail(
             lines.append(f"（还有 {len(rows) - done} 行，用 offset={done} 继续）")
         return "\n".join(lines)
 
+    start = _start_of(session, event)
     lines = [
-        f"{event.id} 阶段 {event.phase_index}：{event.title}",
-        f"区间：第 {event.start + 1}–{event.end} 条　来源：{event.kind}"
+        f"{event.id} 主题 {event.topic_index}：{event.title}",
+        f"步号：{event.span or '（没有流水）'}　来源：{event.kind}"
         + ("（本地汇编）" if event.degraded else ""),
-        f"步数：{len(event.steps)}　原文约 {event.tokens} token",
+        f"原文约 {event.tokens} token",
         f"结论：{event.summary or '（没有结论）'}",
     ]
+    if event.handoff:
+        lines.append(f"交接：{event.handoff}")
     if event.steps:
         lines.append("流水：")
         lines.extend(render_step_line(item) for item in event.steps)
     if event.issues:
         lines.append("未决：" + "；".join(event.issues[:5]))
     lines.append("原文：")
-    rows = render_range(session, event.start, event.end).splitlines()
+    rows = render_between(session, start, event.cut).splitlines()
     lines.extend(rows[offset : offset + limit])
     done = offset + min(limit, max(0, len(rows) - offset))
     if len(rows) > done:
@@ -539,17 +602,19 @@ def render_event_detail(
     return "\n".join(lines)
 
 
-class ClosePhaseTool(Tool):
-    """给当前这一大步起名字、写结论。**不切分阶段**，封存仍发生在轮末。"""
+class CloseTopicTool(Tool):
+    """给当前主题起名字、写结论与交接。封存由内核在步末执行。"""
 
     spec = ToolSpec(
-        name="close_phase",
+        name="close_topic",
         description=(
-            "给当前这一大步（Phase）起个名字、写一句结论，封存时用它。\n"
-            "时机：本阶段走到第 3 步之后，最后一条消息会多一行「本阶段已 N 步」——"
-            "看到它，在给出最终答复**之前**调一次（多一个往返）。\n"
-            "它**不会**把阶段切开：阶段仍在一轮结束时封存，这一步之后的调用也还记在"
-            "同一个阶段里。所以一次就够，别重复调（后一次会覆盖前一次）。"
+            "一个主题做完时调一次：起名字、写结论、写后续依赖什么。\n"
+            "时机：当前目标已经达成，或者工作要换到一件不相干的事上。"
+            "最后一条消息里出现「本主题已 N 步」时，就是在提醒你看这件事。\n"
+            "调完之后：**这一步结束时封存**，这一段的原文不再随请求发出，"
+            "只留标题、结论与流水；要看细节用 recall_event。所以结论里要点名产物"
+            "（handle、路径、关键数字），下一个主题要用到的东西写进 handoff。\n"
+            "它自己不算一步。同一个目标还没做完就别调——切成两半会让两个主题都读不通。"
         ),
         parameters={
             "type": "object",
@@ -561,9 +626,16 @@ class ClosePhaseTool(Tool):
                 "summary": {
                     "type": "string",
                     "description": (
-                        f"不超过 {EVENT_SUMMARY_MAX} 字，这一大步的结论："
+                        f"不超过 {EVENT_SUMMARY_MAX} 字，这个主题的结论："
                         "做出了什么（handle、路径、关键数字，写不准就写「未产出」，不要编）、"
                         "还差什么。不写就用本地拼的「N 步、产物、未决」。"
+                    ),
+                },
+                "handoff": {
+                    "type": "string",
+                    "description": (
+                        f"不超过 {EVENT_HANDOFF_MAX} 字，后续依赖这个主题的什么："
+                        "哪个产物、哪个数字、哪条限制。没有依赖就写「无」。"
                     ),
                 },
             },
@@ -574,52 +646,70 @@ class ClosePhaseTool(Tool):
     event_argument = "event_runtime"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        """记下标题与结论；封存时由 `seal_phase` 取用。"""
+        """记下标题、结论与交接；步末由内核封存。"""
         runtime = arguments.get("event_runtime")
         if not isinstance(runtime, EventRuntime):
             return ToolResult(
-                output="内核装配问题：close_phase 需要事件运行时，但这次调用没有拿到。",
+                output="内核装配问题：close_topic 需要事件运行时，但这次调用没有拿到。",
                 failed=True,
             )
         session = runtime.session
+        if not session.pending_steps:
+            # 空主题不封：没有步就没有内容，封出来只是一条占位，还会把
+            # 下一个主题的起点往前挪一格。
+            return ToolResult(
+                output=(
+                    "当前主题还没有记下任何一步，没有可封存的内容。"
+                    "先把这件事做起来，做完再调 close_topic。"
+                ),
+                failed=True,
+            )
         title = _short(arguments.get("title"), EVENT_TITLE_MAX)
         if not title:
             # 不退回「让模型补一份」：那正是这里要取消的第二次请求。缺什么说清楚，
             # 模型下一步补上就行——这条说明会作为工具结果回灌给它。
             return ToolResult(
                 output=(
-                    "close_phase 缺少 title：给这一大步起个名字（不超过 40 字），"
+                    "close_topic 缺少 title：给这个主题起个名字（不超过 40 字），"
                     "例如「准备受体」「对接与打分」。改完再调一次即可。"
                 ),
                 failed=True,
             )
-        session.phase_title = title
-        session.phase_summary = str(arguments.get("summary") or "").strip()[:EVENT_SUMMARY_MAX]
+        session.topic_title = title
+        session.topic_summary = str(arguments.get("summary") or "").strip()[:EVENT_SUMMARY_MAX]
+        session.topic_handoff = str(arguments.get("handoff") or "").strip()[:EVENT_HANDOFF_MAX]
         session.touch()
+        artifacts: list[str] = []
+        for item in session.pending_steps:
+            for value in item.artifacts:
+                if value not in artifacts:
+                    artifacts.append(value)
+        produced = "、".join(artifacts[:5]) if artifacts else "（还没有产物）"
         return ToolResult(
             output=(
-                f"已记下这一大步的标题「{title}」（当前 {len(session.pending_steps)} 步）。"
-                "封存发生在一轮结束时，这一步之后的调用仍记在同一阶段里；"
-                "如果是在收尾，直接给出最终答复即可，不必再调一次。"
+                f"已记下主题「{title}」（{len(session.pending_steps)} 步）。"
+                f"这一步结束时封存，之后这一段原文不再随请求发出，摘要里能看到。"
+                f"已产出的对象：{produced}。"
             ),
             meta={"title": title, "steps": len(session.pending_steps)},
         )
 
 
 class RecallEventTool(Tool):
-    """按编号取回一个阶段：流水、结论，以及原文或某一步的原文。"""
+    """按编号取回一个主题：流水、结论，以及原文或某一步的原文。"""
 
     spec = ToolSpec(
         name="recall_event",
         description=(
-            "不带参数时列出全部阶段；带 event 编号时给出该阶段的流水、结论与原文。"
+            "不带参数时列出全部主题；带 event 编号时给出该主题的流水、结论与原文。"
             "带 step 时只给那一步的原文（工具输出正文）。"
+            "封存之后只有摘要留在上下文里，要核对参数或原始输出时用它。"
             "原文按 offset / limit 分页，默认 120 行。"
         ),
         parameters={
             "type": "object",
             "properties": {
-                "event": {"type": "string", "description": "阶段编号，例如 evt_0003"},
+                "event": {"type": "string", "description": "主题编号，例如 evt_0003"},
                 "step": {
                     "type": "integer",
                     "description": "只看这一步的原文；步号在流水里每行开头",
@@ -637,28 +727,31 @@ class RecallEventTool(Tool):
     session_argument = "session"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        """列清单、读一个阶段，或读某一步。"""
+        """列清单、读一个主题，或读某一步。"""
         session = arguments.get("session")
         events: list[Event] = list(session.events)
         if not events:
-            return ToolResult(output="这份会话还没有阶段记录。")
+            return ToolResult(output="这份会话还没有主题记录。")
         wanted = str(arguments.get("event") or "").strip()
         if not wanted:
             from .context import event_line
 
             return ToolResult(
-                output="\n".join(["本会话的阶段：", *(event_line(item) for item in events)])
+                output="\n".join(["本会话的主题：", *(event_line(item) for item in events)])
             )
         event = next((item for item in events if item.id == wanted), None)
         if event is None:
             available = "、".join(item.id for item in events)
             return ToolResult(
-                output=f"没有 {wanted} 这个阶段。可用的编号：{available}",
+                output=f"没有 {wanted} 这个主题。可用的编号：{available}",
                 failed=True,
             )
         step = arguments.get("step") or 0
         offset = arguments.get("offset") or 0
-        limit = arguments.get("limit") or EVENT_RECALL_LIMIT
+        # 缺省与「给了 0」要分开：`limit=0` 是模型传错了，退回一句话让它改，
+        # 用 `or` 兜成默认值会让它以为这次调用成功了。
+        given = arguments.get("limit")
+        limit = EVENT_RECALL_LIMIT if given is None else given
         if isinstance(step, bool) or not isinstance(step, int) or step < 0:
             return ToolResult(output="参数 step 应当是非负整数", failed=True)
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -670,10 +763,10 @@ class RecallEventTool(Tool):
         )
         return ToolResult(
             output=detail,
-            meta={"event": event.id, "start": event.start, "end": event.end},
+            meta={"event": event.id, "cut": list(event.cut)},
         )
 
 
 def domain_tools() -> list[Tool]:
     """内核事件工具，装配顺序：写在前、读在后。"""
-    return [ClosePhaseTool(), RecallEventTool()]
+    return [CloseTopicTool(), RecallEventTool()]

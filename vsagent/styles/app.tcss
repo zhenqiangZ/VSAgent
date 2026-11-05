@@ -482,8 +482,8 @@ ModalScreen {
 }
 
 /* 会话选择器、模型、主题、帮助、Diff
-   弹窗本体取分层底那一档、留一点透明透出下层的形状；边框与输入框的框线都取分隔线那一档，
-   只有需要用户注意的那个弹窗（询问）才换成橙色边框 */
+   弹窗本体取分层底那一档、留一点透明透出下层的形状；边框与输入框的框线都取分隔线那一档。
+   询问弹窗的版式与配色单独写在下面：它的层级关系与这些列表弹窗不同 */
 #session-picker,
 #theme-selector,
 #tools-panel,
@@ -492,7 +492,6 @@ ModalScreen {
 #confirm-dialog,
 #rename-dialog,
 #connection-form,
-#permission-dialog,
 #message-dialog {
     align: center middle;
     width: 70%;
@@ -522,7 +521,6 @@ ModalScreen {
 #confirm-hint,
 #rename-hint,
 #connection-hint,
-#permission-hint,
 #message-hint {
     color: #5A5A5A;
     height: 1;
@@ -736,22 +734,35 @@ ContextUsageScreen {
     border: tall #4A9EFF;
 }
 
-/* 询问弹窗：与消息区里"询问"状态的工具卡片同一个颜色，一眼能对上 */
+/* 询问弹窗：照 macOS 授权面板的版式。
+   边框与标题都不着色，层级靠亮度区分——标题最亮、说明中灰、按键提示最暗；
+   橙色只留给原因行前面的警示图标。整块染成警告色的弹窗，每一张都像一条错误。
+   宽度取终端的 76%，最宽 84 列；窄终端上正文自行折行，不设最小值，
+   窗口再窄一点时弹窗不会超出屏幕。 */
 #permission-dialog {
-    border: tall #FFB300;
-    width: 72%;
-    max-width: 96;
-    max-height: 28;
+    width: 76%;
+    max-width: 84;
+    height: auto;
+    max-height: 30;
+    padding: 1 2;
+    background: #1A1A1A 96%;
+    border: round #333333;
+}
+
+#permission-eyebrow {
+    color: #8B949E;
+    height: 1;
 }
 
 #permission-title {
-    color: #FFB300;
+    color: #E0E0E0;
     height: 1;
     text-style: bold;
+    margin-top: 1;
 }
 
 #permission-detail {
-    color: #5A5A5A;
+    color: #8B949E;
     height: 1;
 }
 
@@ -761,13 +772,14 @@ ContextUsageScreen {
     margin-top: 1;
 }
 
-/* 参数预览：命令与路径单独框起来，超过八行自己滚动，弹窗不会被撑破。
-   滚动条压到一列宽：默认两列会挤掉一行正文的右侧，读长命令时很碍事。 */
+/* 参数预览：单独一块更暗的底，不描边——描边会和弹窗自身的圆角边框叠成两层框。
+   超过八行自己滚动，弹窗不会被撑破；滚动条压到一列宽，否则读长命令时
+   默认两列的滚动条会挤掉正文右侧。 */
 #permission-argument {
-    background: #0A0A0A;
-    border: round #333333;
+    background: #101010;
     padding: 0 1;
     height: auto;
+    min-height: 3;
     max-height: 8;
     scrollbar-size-vertical: 1;
 }
@@ -777,16 +789,65 @@ ContextUsageScreen {
     height: auto;
 }
 
-#permission-reason {
-    color: #FFB300;
+/* 原因行：图标单独一格，正文用次要色。原因里会出现越界路径，
+   路径带方括号时不能走 markup，因此两个部件都关闭了 markup。 */
+#permission-reason-row {
     height: auto;
     margin-top: 1;
 }
 
-#permission-hint {
+#permission-reason-icon {
+    width: 2;
+    color: #FFB300;
+    height: auto;
+}
+
+#permission-reason {
+    width: 1fr;
     color: #8B949E;
     height: auto;
+}
+
+/* 分隔线：一行反白横线裁到弹窗宽度，颜色取分隔线那一档 */
+#permission-divider {
+    color: #2A2A2A;
+    height: 1;
     margin-top: 1;
+}
+
+/* 按钮行右对齐，主操作放在最右——与 macOS 对话框的按钮顺序一致 */
+#permission-actions {
+    height: 3;
+    align-horizontal: right;
+}
+
+#permission-actions Static {
+    width: auto;
+    height: 3;
+    padding: 0 2;
+    margin-left: 2;
+    content-align: center middle;
+}
+
+/* 拒绝是次要操作，只用灰色文字；全部允许的范围更大，用强调色但不填底，
+   避免它与「允许一次」抢同一个视觉重心 */
+#permission-deny {
+    color: #8B949E;
+}
+
+#permission-all {
+    color: #4A9EFF;
+}
+
+#permission-allow {
+    background: #4A9EFF;
+    color: #0A0A0A;
+    text-style: bold;
+}
+
+#permission-hint {
+    color: #5A5A5A;
+    height: auto;
 }
 
 /* 帮助界面 */

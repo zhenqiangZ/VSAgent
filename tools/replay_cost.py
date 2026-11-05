@@ -24,7 +24,7 @@ python tools/replay_cost.py --json .probe/cost.json   # 逐步数据落盘
 
 **三处已知失真**（方向固定，量级小）：`TASK` 用最终的工作区索引（偏高）；
 证据层不模拟（偏低，它是循环层的运行时状态，不在消息里）；事件的标题与结论
-用本地兜底那份（模型真调 `close_phase` 会稍长）。
+用本地兜底那份（模型真调 `close_topic` 会稍长）。
 """
 
 from __future__ import annotations
@@ -42,12 +42,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from vsagent.core.agent.context import ContextAssembler, estimate_tokens  # noqa: E402
 from vsagent.core.agent.domain.all_tools import domain_tools  # noqa: E402
 from vsagent.core.agent.event_log import (  # noqa: E402
-    PHASE_SOFT_LIMIT,
+    TOPIC_SOFT_LIMIT,
     domain_tools as event_tools,
     event_boundary,
-    phase_tokens,
+    open_tokens,
     record_step,
-    seal_phase,
+    seal_range,
 )
 from vsagent.core.agent.ledger import SessionLedger, default_snapshot_path  # noqa: E402
 from vsagent.core.agent.memory import MemoryStore, RecallTool, RememberTool  # noqa: E402
@@ -208,24 +208,24 @@ def replay(session: Session, window: int) -> list[dict[str, Any]]:
         # 换轮：先把上一轮封存（与循环层轮末那一处同义）。
         if message_index != current_message:
             if current_message >= 0:
-                event = seal_phase(
+                event = seal_range(
                     session, kind="auto", upto=event_boundary(session, message_index)
                 )
                 if event is not None and event.steps:
                     prune_families(
                         session,
                         {name for step in event.steps for name in step.tools},
-                        event.phase_index,
+                        event.topic_index,
                     )
             current_message = message_index
-        elif phase_tokens(session) > PHASE_SOFT_LIMIT:
-            seal_phase(session, kind="auto", upto=event_boundary(session, message_index))
+        elif open_tokens(session) > TOPIC_SOFT_LIMIT:
+            seal_range(session, kind="auto", upto=event_boundary(session, message_index))
 
         view = truncate(session, message_index, start)
         view.events = session.events
         view.pending_steps = session.pending_steps
         view.tool_families = list(session.tool_families)
-        view.family_phase = dict(session.family_phase)
+        view.family_topic = dict(session.family_topic)
 
         bundle = ContextAssembler(window).build(
             view,

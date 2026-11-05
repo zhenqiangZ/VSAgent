@@ -32,6 +32,7 @@ from .prompt import (
     is_key_line,
     item_tokens,
     translate_message,
+    translate_parts,
 )
 
 
@@ -41,7 +42,7 @@ class Layer(Enum):
     PREFIX = "prefix"      # 稳定前缀：身份、工作纪律、项目规则
     MEMORY = "memory"      # 常驻记忆：核心事实（跨会话）
     TASK = "task"          # 任务状态：目标、约束、待办、阻塞；外加工作区索引
-    EVENT = "event"        # 事件：已经收口的阶段，标题 + 摘要（跨轮）
+    EVENT = "event"        # 事件：已经封存的主题，标题 + 摘要（跨轮）
     RECENT = "recent"      # 近期执行：最近若干个完整交互组
     EVIDENCE = "evidence"  # 按需证据：本步相关的片段与检索回来的记忆
     HISTORY = "history"    # 历史：旧对话摘要与可追溯引用
@@ -90,17 +91,17 @@ REFS_TOKEN_LIMIT = 600
 # 摘要小于这么多 token 时不再「砍半」：省不下额度，却会把一句结论砍成半句。
 SUMMARY_SHRINK_MIN = 300
 # 事件块的上限。`min(6000, max(200, available // 6))`：窗口大时封在 6000
-# （约六个阶段铺满流水），窗口很小时按六分之一给，至少 200。
+# （约六个主题铺满流水），窗口很小时按六分之一给，至少 200。
 #
-# 1800 → 6000 是因为事件从「一条一行」变成了「一个阶段一块」：十二步的流水
-# 大约两三百 token，旧上限连一个阶段都放不下，会立刻触发 `event_layer`
-# 把整段历史丢掉。6000 是按「六七个阶段」量的，再多就交给
-# `event_step_detail` 压成一阶段一行。
+# 1800 → 6000 是因为事件从「一条一行」变成了「一个主题一块」：十二步的流水
+# 大约两三百 token，旧上限连一个主题都放不下，会立刻触发 `event_layer`
+# 把整段历史丢掉。6000 是按「六七个主题」量的，再多就交给
+# `event_step_detail` 压成一主题一行。
 EVENT_LIMIT_MAX = 6000
 EVENT_LIMIT_MIN = 200
 # 事件摘要进索引行时的长度上限。完整的摘要留在 `recall_event` 里。
 EVENT_SUMMARY_LIMIT = 160
-# 一个阶段铺多少步。超过 12 步只留「前 3 + 后 3」，中间那些用
+# 一个主题铺多少步。超过 12 步只留「前 3 + 后 3」，中间那些用
 # `recall_event evt_0003 step=7` 取——流水的作用是看出「怎么走到这里的」，
 # 不是把三十步原样列一遍。
 STEPS_INLINE = 12
@@ -113,12 +114,12 @@ PROTOCOL_OVERHEAD = 256
 MIN_AVAILABLE = 512
 # 无论如何都要保留的最近交互组数
 MIN_RECENT_TURNS = 1
-# 本阶段走到第几步才在尾部提示「该收口了」。
+# 本主题走到第几步才在尾部提示「该收口了」。
 #
-# 3 是 `close_phase` 自己的触发线（「这一大步跑了 3 步以上」）：两三轮的小事
+# 3 是 `close_topic` 自己的触发线（「这个主题跑了 3 步以上」）：两三轮的小事
 # 用本地标题就够，提示只会让模型为一次记账多跑一个往返。提示本身是尾部的
 # 一行字，不碰前缀缓存。
-CLOSE_PHASE_AFTER = 3
+CLOSE_TOPIC_AFTER = 3
 # 装配结果的估算值降到窗口的这个比例以内就算合格
 CONTEXT_RATIO = 0.8
 
@@ -175,7 +176,7 @@ DEGRADE_ORDER: tuple[str, ...] = (
     "evidence_detail",     # 证据层收掉正文，只留 ref 与摘要
     "history_summary",     # 摘要缩一档
     "recent_tool_clear",   # 旧工具结果正文换成一行占位（可用 read_turn 取回）
-    "event_step_detail",   # 阶段流水压成一阶段一行（标题与结论还在）
+    "event_step_detail",   # 主题流水压成一主题一行（标题与结论还在）
     "event_layer",         # 丢掉最旧的事件（可用 recall_event 取回）
     "memory",              # 常驻记忆缩一档
     "recent_turns",        # 整组移出最旧的交互组
@@ -204,12 +205,16 @@ class Turn:
     切开会给模型留下「调了工具却没有结果」或「结果没有对应调用」的孤儿形状，
     部分服务端直接返回 400。
 
-    `message_index` 记的是它来自哪一条会话消息，供 `compact_upto` 按消息序号定位。
+    `message_index` 记的是它来自哪一条会话消息，`part_start` 是它在这一条
+    消息里的起点。两个合起来是**位置**：事件封存到哪儿、RECENT 从哪儿开始，
+    用的都是这个口径。一条 assistant 消息装着一整轮的所有步，只记消息下标
+    表达不了「一轮中间切开」，而位置可以。
     """
 
     index: int
     message_index: int
     messages: list[dict[str, Any]] = field(default_factory=list)
+    part_start: int = 0
     # 组内工具结果对应的源 Part，与 `messages` 里的 tool 项一一对应。
     #
     # 模型项是派生物，有两件事只能回到 Part 上问：这次调用**失败了吗**（失败的结果
@@ -280,16 +285,18 @@ def one_line(text: str, limit: int) -> str:
 
 
 def event_head(event: Event) -> str:
-    """一个阶段在上下文里的标题行：编号、阶段号、标题、步数与归档量。
+    """一个主题在上下文里的标题行：编号、主题号、标题、步号区间与归档量。
 
-    不带结论：结论单独一行（`结论：…`），两者分开读才看得出「这一大步
+    不带结论：结论单独一行（`结论：…`），两者分开读才看得出「这一主题
     走到了哪、怎么走到的」。
     """
     title = one_line(event.title or "（未命名）", 40)
     meta = f"{len(event.steps)} 步"
+    if event.span:
+        meta = f"{event.span} · {meta}"
     if event.tokens:
         meta += f" · 原文 {max(1, event.tokens // 1000)}K token 已归档"
-    return f"- {event.id} 阶段 {event.phase_index or '?'}：{title}（{meta}）"
+    return f"- {event.id} 主题 {event.topic_index or '?'}：{title}（{meta}）"
 
 
 def event_line(event: Event) -> str:
@@ -559,13 +566,19 @@ class ContextBundle:
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
+def turn_position(turn: Turn) -> tuple[int, int]:
+    """交互组在会话里的位置，与事件的切点同一套口径。"""
+    return (turn.message_index, turn.part_start)
+
+
 def split_turns(messages: list[Message]) -> list[Turn]:
     """把会话消息切成交互组（Turn）。
 
-    翻译层已经按 `STEP_START` 把一条 assistant 消息分成了若干段，
-    这里只按「assistant 项开头、紧随其后的 tool 项归它」重新分组。
-    于是工具结果永远不会与它的调用分开——这正是交互组要保证的那条不变式，
-    而且它是**由构造保证**的，不靠事后检查。
+    一条 assistant 消息装着一整轮的所有往返，`STEP_START` 把它们分开。
+    这里按这些分界把一条消息切成若干段，**逐段**交给 `translate_parts`：
+    逐段翻译比整条翻译多知道每段从哪个 Part 开始，`Turn.part_start` 就是它。
+    段内再按「assistant 项开头、紧随其后的 tool 项归它」分组，于是工具结果
+    永远不会与它的调用分开——这条不变式由构造保证，不靠事后检查。
 
     用户消息自成一组；找不到调用方的孤儿工具结果也单独成组（正常不会出现）。
     """
@@ -573,32 +586,52 @@ def split_turns(messages: list[Message]) -> list[Turn]:
     serial = 0
     for message_index, message in enumerate(messages):
         by_id = {part.id: part for part in message.parts}
-        fresh: list[Turn] = []
-        for item in translate_message(message):
-            if (
-                item.get("role") == "tool"
-                and turns
-                and turns[-1].message_index == message_index
-            ):
-                turns[-1].messages.append(item)
-                fresh.append(turns[-1])
-                continue
-            serial += 1
-            turn = Turn(index=serial, message_index=message_index, messages=[item])
-            turns.append(turn)
-            fresh.append(turn)
-        # 工具项自带 `tool_call_id`（就是 Part 的 id），照着取源 Part 即可：
-        # 翻译层已经把两边的 id 对齐了，这里不必再复述一遍它的分组规则。
-        for turn in fresh:
-            for item in turn.messages:
-                if item.get("role") != "tool":
+        for begin, stop in step_segments(message):
+            fresh: list[Turn] = []
+            current: Turn | None = None
+            for item in translate_parts(message.role, message.parts[begin:stop]):
+                if item.get("role") == "tool" and current is not None:
+                    current.messages.append(item)
+                    fresh.append(current)
                     continue
-                part = by_id.get(item.get("tool_call_id"))
-                if part is not None and all(
-                    existing.id != part.id for existing in turn.tool_parts
-                ):
-                    turn.tool_parts.append(part)
+                serial += 1
+                current = Turn(index=serial, message_index=message_index, messages=[item])
+                current.part_start = begin
+                turns.append(current)
+                fresh.append(current)
+            # 工具项自带 `tool_call_id`（就是 Part 的 id），照着取源 Part 即可：
+            # 翻译层已经把两边的 id 对齐了，这里不必再复述一遍它的分组规则。
+            for turn in fresh:
+                for item in turn.messages:
+                    if item.get("role") != "tool":
+                        continue
+                    part = by_id.get(item.get("tool_call_id"))
+                    if part is not None and all(
+                        existing.id != part.id for existing in turn.tool_parts
+                    ):
+                        turn.tool_parts.append(part)
     return turns
+
+
+def step_segments(message: Message) -> list[tuple[int, int]]:
+    """一条消息里的段区间：每个 `STEP_START` 开一段，左闭右开。
+
+    首段之前还可能有 Part（用户消息的正文、旧版本写的助手消息），单独成段。
+    """
+    starts = [
+        position
+        for position, part in enumerate(message.parts)
+        if part.type is PartType.STEP_START
+    ]
+    if not starts:
+        return [(0, len(message.parts))]
+    bounds: list[tuple[int, int]] = []
+    if starts[0] > 0:
+        bounds.append((0, starts[0]))
+    for order, begin in enumerate(starts):
+        stop = starts[order + 1] if order + 1 < len(starts) else len(message.parts)
+        bounds.append((begin, stop))
+    return bounds
 
 
 def turns_tokens(turns: list[Turn]) -> int:
@@ -689,6 +722,27 @@ def render_range(session: Session, start: int, end: int) -> str:
     blocks: list[str] = []
     for message in session.messages[max(0, start) : max(0, end)]:
         for part in message.parts:
+            block = render_part(part)
+            if block:
+                blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+def render_between(session: Session, start: tuple[int, int], end: tuple[int, int]) -> str:
+    """把位置区间 `[start, end)` 的原文铺成一段文字。
+
+    事件按位置切，所以召回一段主题要用它：`start` 是上一条事件的切点，
+    `end` 是本条的切点。`render_range` 按整条消息铺，`read_turn` 用它；
+    两者分开是因为一条 assistant 消息可能横跨两个主题。
+    """
+    blocks: list[str] = []
+    first = max(0, start[0])
+    last = min(end[0], len(session.messages) - 1)
+    for index in range(first, last + 1):
+        message = session.messages[index]
+        low = start[1] if index == start[0] else 0
+        high = end[1] if index == end[0] else len(message.parts)
+        for part in message.parts[low:high]:
             block = render_part(part)
             if block:
                 blocks.append(block)
@@ -959,25 +1013,24 @@ class ContextAssembler:
         # 跨轮的推理只留占位。**在估算之前**做：否则预算按原文算、实际发出去的是
         # 占位，`total` 会虚高，降级链可能为了「装不下」白削一层。
         reasoning_placeholder = placeholder_stale_reasoning(turns, session.messages)
-        # RECENT 从哪儿开始。`compact_upto` 是手动/强行压缩推出来的硬边界；
-        # 事件是自动封存推出来的软边界。**最近一个阶段留在 RECENT 里**
-        # （`keep_last_phase_raw = 1`）：刚做完的事要逐字可查，不必靠流水回读。
-        # 更早的阶段只留流水，所以事件块只铺 `end <= compact` 的那些。
-        keep_raw = session.events[-1].start if session.events else 0
-        compact = max(session.compact_upto, keep_raw)
-        compacted = [turn for turn in turns if turn.message_index < compact]
-        live = [turn for turn in turns if turn.message_index >= compact]
-        archived = [event for event in session.events if event.end <= compact]
+        # RECENT 从哪儿开始：事件封存到的位置，与手动 / 强行压缩留下的位置，
+        # 取更靠后的那一个。事件按**位置**切（一条 assistant 消息里可能只封了前
+        # 三步），所以 `compact_upto` 这个消息下标要当成「那条消息的第 0 个 Part
+        # 之前」来比较，否则半条消息的边界会被整条消息的边界吞掉。
+        cut = max((session.compact_upto, 0), session.event_cut)
+        compacted = [turn for turn in turns if turn_position(turn) < cut]
+        live = [turn for turn in turns if turn_position(turn) >= cut]
+        archived = list(session.events)
 
         # 各层先按软配额取一份。软配额只决定「先给谁」，装不下由降级链兜。
         # 被配额削过的层一样记进 `degraded`——削了就是削了，不能因为
         # 「不是降级链那一步削的」就不算，否则 `degraded` 反映不出真实用量。
         raw_memory = memory_block(memory_text)
         memory = _cap_memory(raw_memory)
-        # 进度提示只在本阶段够长时出现（见 `CLOSE_PHASE_AFTER`）。
+        # 进度提示只在本主题够长时出现（见 `CLOSE_TOPIC_AFTER`）。
         progress = self._progress_block(session)
         # 事件块按可用额度的六分之一封顶：它比 RECENT 稳定，但也只是索引，
-        # 不该把「最近发生了什么」挤掉。上限 6000 是量出来的——六七个阶段的流水。
+        # 不该把「最近发生了什么」挤掉。上限 6000 是量出来的——六七个主题的流水。
         event_limit = min(EVENT_LIMIT_MAX, max(EVENT_LIMIT_MIN, available // 6))
         events, event_block = self._cap_events(archived, event_limit)
         fixed = (
@@ -1059,7 +1112,7 @@ class ContextAssembler:
             degraded.append("recent_tool_clear")
             messages, usage = compose()
             total = sum(usage.values())
-        # 阶段流水先压成「一阶段一行」：标题与结论还在，丢的是过程。
+        # 主题流水先压成「一主题一行」：标题与结论还在，丢的是过程。
         # 它比整块丢掉事件温和，所以排在 `event_layer` 之前。
         if total > available and any(event.steps for event in events):
             events, event_block = self._cap_events(archived, event_limit, detail=False)
@@ -1256,22 +1309,39 @@ class ContextAssembler:
         return cleared
 
     def _progress_block(self, session: Session) -> str:
-        """本阶段走到第几步——够长了才提示收口。
+        """当前主题走到哪儿——够长了才提示收口。
 
-        为什么需要这一句：`close_phase` 的两个触发时机里，「换事之前」模型自己能判断，
-        「收尾之前」要它知道**这一大步已经几步了**。实测四轮真跑、三次机会、
-        一次都没调（§4.13）：光在提示词里写「3 步以上就调」，模型手上没有这个数。
-        把它摆到模型眼前，条件才是可执行的。
+        为什么需要这一句：模型要判断「这一主题是不是已经做完」，手上得有两个数：
+        已经走了几步、攒下了哪些产物。实测四轮真跑、三次机会、一次都没调
+        `close_topic`（§4.13）：光在提示词里写「3 步以上就考虑」，模型手上没有这个数。
+
+        这一行同时就是运行中的主题摘要：步数、产物、未决全由本地从 `pending_steps`
+        现算，零请求。主题没有封存，模型也已经能看见它积累了些什么。
 
         为什么放尾部：它每步都变，进 header 就等于每步改写第 1 条消息。
         尾部是纯追加，不碰前缀缓存（这一条在 §4.13 量过）。
         """
         steps = len(session.pending_steps)
-        if steps < CLOSE_PHASE_AFTER:
+        if steps < CLOSE_TOPIC_AFTER:
             return ""
+        artifacts: list[str] = []
+        issues: list[str] = []
+        for step in session.pending_steps:
+            for item in step.artifacts:
+                if item not in artifacts:
+                    artifacts.append(item)
+            for item in step.issues:
+                if item not in issues:
+                    issues.append(item)
+        parts = [f"本主题已 {steps} 步"]
+        if artifacts:
+            parts.append("产物 " + "、".join(artifacts[:4]))
+        if issues:
+            parts.append("未决 " + "；".join(issues[:2]))
         return (
-            f"（本阶段已 {steps} 步。收尾前调一次 close_phase 给这一大步起个名字、写一句结论："
-            "标题写做成了什么，结论写结果与还差什么。阶段仍在一轮结束时封存，它只负责命名。）"
+            "（" + " · ".join(parts) + "。目标做完或工作方向实质改变时调一次 close_topic："
+            "title 写做成了什么，summary 写结论与关键数字，handoff 写后续依赖什么。"
+            "封存之后这一段的原文不再随请求发出，只留摘要，要看细节用 recall_event。）"
         )
 
     def _focus_block(self, state: TaskState) -> str:
@@ -1338,6 +1408,11 @@ class ContextAssembler:
         for position, turn in enumerate(recent):
             if turn.messages and turn.messages[0].get("role") == "user":
                 last_user = position
+        # 主题切在轮中间之后，RECENT 里可能一条用户消息都没有——那段被主题收走了。
+        # 这时复述放在 RECENT 最前面：它仍然紧挨着「接下来要做的事」，而不是掉到
+        # 事件块前面去。
+        if focus_text and last_user < 0:
+            messages.append({"role": "user", "content": focus_text})
         for position, turn in enumerate(recent):
             if focus_text and position == last_user:
                 messages.append({"role": "user", "content": focus_text})
@@ -1453,7 +1528,7 @@ class ContextAssembler:
         return "用户消息" if turn.messages[0].get("role") == "user" else "助手回复"
 
     def _event_lines(self, event: Event, detail: bool = True) -> list[str]:
-        """一个阶段铺成几行：标题、流水、结论、未决。
+        """一个主题铺成几行：标题、流水、结论、交接、未决。
 
         `detail=False` 时只剩标题与结论——那是 `event_step_detail` 那一档，
         丢掉的是「怎么走到的」，留下的是「走到了哪」。
@@ -1472,6 +1547,10 @@ class ContextAssembler:
                 lines.extend(render_step_line(step) for step in steps[-STEPS_TAIL:])
         if event.summary:
             lines.append("  结论：" + one_line(event.summary, EVENT_SUMMARY_LIMIT))
+        if event.handoff:
+            # 交接是「下一个主题依赖什么」，产物与未决由内核算不出来：那几句话
+            # 说的是后续怎么用这些结果，只有模型知道。
+            lines.append("  交接：" + one_line(event.handoff, EVENT_SUMMARY_LIMIT))
         if detail and event.issues:
             lines.append("  未决：" + one_line("；".join(event.issues[:3]), EVENT_SUMMARY_LIMIT))
         return lines
@@ -1479,11 +1558,11 @@ class ContextAssembler:
     def _event_block(
         self, events: list[Event], dropped: int = 0, detail: bool = True
     ) -> str:
-        """事件层：每个阶段一块，从旧到新。空列表时是空串。
+        """事件层：每个主题一块，从旧到新。空列表时是空串。
 
         `dropped` 是被裁掉的条数。**必须说出来**：被裁的事件覆盖的消息既不在
-        事件块里，也不在 RECENT 里（`compact` 已经推到事件末端），不提示的话
-        那一段就是无声消失，而上下文看起来完全正常。
+        事件块里，也不在 RECENT 里，不提示的话那一段就是无声消失，
+        而上下文看起来完全正常。
         """
         if not events:
             return ""
@@ -1492,7 +1571,7 @@ class ContextAssembler:
             lines.extend(self._event_lines(event, detail))
         if dropped:
             lines.append(
-                f"（更早还有 {dropped} 个阶段没放下；recall_event 不带参数可以列清单）"
+                f"（更早还有 {dropped} 个主题没放下；recall_event 不带参数可以列清单）"
             )
         return "\n".join(lines)
 

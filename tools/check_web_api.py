@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -43,6 +44,8 @@ STATE_COPY = PROJECT_ROOT / ".probe" / "web-state" / "state.toml"
 
 CORPUS_DIR = PROJECT_ROOT / ".probe" / "web-corpus"
 SURVEYS_DIR = PROJECT_ROOT / ".probe" / "web-surveys"
+LEDGERS_DIR = PROJECT_ROOT / ".probe" / "web-ledgers"
+"""登记表根目录指到这里：产物面板与下载读它，判据不该翻用户自己那几份产物。"""
 UPLOAD_CAP = 4096
 """上传上限调到 4KB：这样「超限」只要发 5KB，不必真造一个 50MB 的请求。"""
 
@@ -230,6 +233,7 @@ def start_service(state_path, runs_dir, port):
                 "--runs", str(runs_dir),
                 "--corpus", str(CORPUS_DIR),
                 "--surveys", str(SURVEYS_DIR),
+                "--ledgers", str(LEDGERS_DIR),
                 "--max-upload", str(UPLOAD_CAP),
                 "--port", str(port),
             ],
@@ -257,6 +261,250 @@ def load_reference(state_path):
     manager = SessionManager(state_path)
     manager.load_from_toml()
     return {session.id: session for session in manager.list_sessions()}
+
+
+def prepare_ledgers(session_id):
+    """给一个会话造一份登记表：一份文件产物、一份目录产物。
+
+    目录那一项用来核对「下载链接只给文件」：目录没有可下载的字节，页面上只能
+    列出名字。返回文件产物的字节数，下载那条判据拿它比对。
+    """
+    if LEDGERS_DIR.exists():
+        shutil.rmtree(LEDGERS_DIR)
+    files = LEDGERS_DIR / "files"
+    files.mkdir(parents=True)
+    target = files / "artifact-1.json"
+    data = json.dumps({"target": "P00533", "note": "测试产物"}, ensure_ascii=False).encode("utf-8")
+    target.write_bytes(data)
+
+    bundle = files / "docking-4"
+    bundle.mkdir()
+    (bundle / "poses.pdbqt").write_text("MODEL 1\nENDMDL\n", encoding="utf-8")
+
+    snapshot = {
+        "version": 1,
+        "session_id": session_id,
+        "current_receptor": {"kind": "receptor", "seq": 1},
+        "counters": {"receptor": 1, "ligandset": 0, "artifact": 2},
+        "archived": [],
+        "entries": [
+            {
+                "handle": {"kind": "artifact", "seq": 1},
+                "path": str(target),
+                "summary": "靶点 P00533 · 测试产物",
+                "fingerprint": "",
+                "file_state": "ok",
+                "parents": [],
+                "meta": {"source": "test"},
+                "created_at": 1700000000.0,
+            },
+            {
+                "handle": {"kind": "artifact", "seq": 2},
+                "path": str(bundle),
+                "summary": "对接产物 · 测试目录",
+                "fingerprint": "",
+                "file_state": "ok",
+                "parents": [{"kind": "artifact", "seq": 1}],
+                "meta": {"source": "test"},
+                "created_at": 1700000001.0,
+            },
+        ],
+    }
+    (LEDGERS_DIR / f"{session_id}.json").write_text(
+        json.dumps(snapshot, ensure_ascii=False), encoding="utf-8"
+    )
+    return len(data)
+
+
+def request_bytes(url):
+    """取原始字节。下载接口回的不是 JSON，`request()` 解析不了。"""
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def pick_event_session(state_path):
+    """副本里事件最多的会话。事件、片段、产物三组判据都用它。"""
+    reference = load_reference(state_path)
+    return max(reference.values(), key=lambda session: len(session.events)).id
+
+
+def run_event_checks(base, state_path, session_id):
+    """事件、片段、产物三条接口：条数、区间、下载。
+
+    区间那几条盯的是「切点算错一个单元就串段」：相邻事件必须首尾相接，
+    各段单元数加起来必须正好等于整段。这类错在页面上只表现为「前一个工具调用
+    跑到下一个主题里」，肉眼很难发现。
+    """
+    reference = load_reference(state_path)
+    status, listing = request(f"{base}/api/sessions")
+    sessions = listing["sessions"]
+    expected_events = {item.id: len(item.events) for item in reference.values()}
+    check(
+        "会话列表带上事件数，且与状态文件一致",
+        status == 200
+        and all(item["eventCount"] == expected_events.get(item["id"], -1) for item in sessions),
+        f"{[(item['id'], item['eventCount']) for item in sessions][:5]}…",
+    )
+
+    target = next((item for item in sessions if item["id"] == session_id), None)
+    if target is None:
+        check("事件判据的目标会话在清单里", False, session_id)
+        return
+    if target["eventCount"] == 0:
+        print("状态文件里没有带事件的会话，跳过事件与片段两组判据")
+        return
+
+    origin = reference[target["id"]]
+    status, payload = request(f"{base}/api/sessions/{target['id']}/events")
+    events = payload.get("events") or []
+    check(
+        "事件条数与状态文件一致",
+        status == 200 and len(events) == len(origin.events),
+        f"{target['id']} 接口 {len(events)} 条，状态文件 {len(origin.events)} 条",
+    )
+    check(
+        "任务卡的目标与状态文件一致",
+        payload.get("task", {}).get("goal") == origin.task_state.goal,
+        f"目标 {payload.get('task', {}).get('goal', '')[:40]!r}",
+    )
+    check(
+        "每条事件的步数与状态文件一致",
+        [len(item["steps"]) for item in events] == [len(item.steps) for item in origin.events],
+        f"接口 {[len(item['steps']) for item in events][:6]}…",
+    )
+    check(
+        "事件带着切点与产物名",
+        all(item["cut"].get("message") is not None and isinstance(item["artifacts"], list) for item in events),
+        f"末条切点 {events[-1]['cut']}，产物 {len(events[-1]['artifacts'])} 个",
+    )
+
+    # ---- 片段：区间与整段 ----
+    _, whole = request(f"{base}/api/sessions/{target['id']}/segment?event=all")
+    pieces = []
+    for item in events:
+        _, piece = request(f"{base}/api/sessions/{target['id']}/segment?event={item['id']}")
+        pieces.append((item, piece))
+
+    check(
+        "片段的首尾就是事件切点",
+        all(
+            piece["from"]["message"] is not None
+            and piece["to"]["message"] is not None
+            and (piece["to"]["message"], piece["to"]["part"]) == (item["cut"]["message"], item["cut"]["part"])
+            for item, piece in pieces
+        ),
+        f"末段 {pieces[-1][1]['to']}，切点 {pieces[-1][0]['cut']}",
+    )
+    joined = all(
+        (pieces[index][1]["to"]["message"], pieces[index][1]["to"]["part"])
+        == (pieces[index + 1][1]["from"]["message"], pieces[index + 1][1]["from"]["part"])
+        for index in range(len(pieces) - 1)
+    )
+    check(
+        "相邻事件首尾相接，中间没有缝",
+        joined and (pieces[0][1]["from"]["message"], pieces[0][1]["from"]["part"]) == (0, 0),
+        f"首段起点 {pieces[0][1]['from']}，共 {len(pieces)} 段",
+    )
+    total_parts = sum(piece["partCount"] for _, piece in pieces)
+    check(
+        "各事件单元数加起来等于整段（不重不漏）",
+        total_parts == whole["partCount"],
+        f"各段 {total_parts} 个单元，整段 {whole['partCount']} 个",
+    )
+    check(
+        "整段从第 0 条消息起，条数与状态文件一致",
+        whole["from"] == {"message": 0, "part": 0}
+        and len(whole["messages"]) == len(origin.messages),
+        f"{whole['from']} / {len(whole['messages'])} 条消息",
+    )
+    check(
+        "片段的单元数在消息上是连续的",
+        all(
+            sum(len(message["parts"]) for message in piece["messages"]) == piece["partCount"]
+            for _, piece in pieces
+        ),
+        f"{[piece['partCount'] for _, piece in pieces][:6]}…",
+    )
+
+    status, body = request(f"{base}/api/sessions/{target['id']}/segment?event=evt_9999")
+    check(
+        "不存在的事件回 404",
+        status == 404 and "evt_9999" in body.get("error", ""),
+        f"{status} {body.get('error', '')}",
+    )
+
+    # ---- 产物：清单、字节、下载 ----
+    status, payload = request(f"{base}/api/sessions/{target['id']}/artifacts")
+    items = payload.get("items") or []
+    snapshot = json.loads((LEDGERS_DIR / f"{target['id']}.json").read_text(encoding="utf-8"))
+    check(
+        "产物条目与登记表一致",
+        status == 200
+        and [item["handle"] for item in items]
+        == [f"{entry['handle']['kind']}#{entry['handle']['seq']}" for entry in snapshot["entries"]],
+        f"接口 {[item['handle'] for item in items]}",
+    )
+    by_handle = {item["handle"]: item for item in items}
+    file_item = by_handle.get("artifact#1")
+    dir_item = by_handle.get("artifact#2")
+    file_bytes = (LEDGERS_DIR / "files" / "artifact-1.json").stat().st_size
+    check(
+        "文件产物带字节数与下载链接",
+        file_item is not None
+        and file_item["bytes"] == file_bytes
+        and file_item["download"].endswith("artifact%231"),
+        f"{file_item['bytes'] if file_item else '缺失'} 字节，链接 {file_item['download'] if file_item else '无'}",
+    )
+    check(
+        "目录产物不给下载链接（没有可下载的字节）",
+        dir_item is not None and dir_item["download"] == "" and dir_item["isDir"] is True,
+        f"isDir={dir_item['isDir'] if dir_item else '缺失'} 链接={dir_item['download'] if dir_item else '缺失'!r}",
+    )
+    check(
+        "血缘关系原样带出",
+        dir_item is not None and dir_item["parents"] == ["artifact#1"],
+        f"parents={dir_item['parents'] if dir_item else '缺失'}",
+    )
+
+    status, raw = request_bytes(f"{base}/api/sessions/{target['id']}/artifact/artifact%231")
+    check(
+        "下载回来的字节与盘上一致",
+        status == 200 and raw == (LEDGERS_DIR / "files" / "artifact-1.json").read_bytes(),
+        f"{status}，{len(raw)} 字节",
+    )
+
+    status, _ = request(f"{base}/api/sessions/{target['id']}/artifact/artifact%2399")
+    check("未登记的 handle 回 404", status == 404, str(status))
+    status, _ = request(f"{base}/api/sessions/{target['id']}/artifact/..%2F..%2Fstate.toml")
+    check("产物路径不接受目录成分", status == 404, str(status))
+
+    # ---- 搜索：标题、主题结论、产物名，三类各一条 ----
+    word = origin.events[0].title[:4] if origin.events else ""
+    status, found = request(f"{base}/api/search?q={urllib.parse.quote(word)}")
+    topics = found.get("topics") or []
+    check(
+        "搜索能按主题标题命中",
+        status == 200 and bool(topics) and all(word in (item["title"] + item["summary"]) for item in topics),
+        f"用「{word}」命中 {len(topics)} 条主题",
+    )
+    status, found = request(f"{base}/api/search?q={urllib.parse.quote('测试产物')}")
+    artifacts = found.get("artifacts") or []
+    check(
+        "搜索能按产物摘要命中，并带上会话编号",
+        status == 200
+        and [item["handle"] for item in artifacts] == ["artifact#1"]
+        and artifacts[0]["sessionId"] == session_id,
+        f"{[(item['handle'], item['sessionId']) for item in artifacts]}",
+    )
+    status, found = request(f"{base}/api/search?q=")
+    check(
+        "空词不返回任何结果（不把全库铺出来）",
+        status == 200 and not found["sessions"] and not found["topics"] and not found["artifacts"],
+        f"{found}",
+    )
 
 
 def run_checks(base, state_path, runs_dir, link_session, other_session):
@@ -1101,6 +1349,10 @@ def main():
         print(f"状态文件里没有 {LINK_SESSION}，本次改用 {link_session} 核对关联")
     other_session = ensure_other_session(state_path, link_session)
     make_link_run(runs_dir, link_session)
+    # 产物判据要在临时登记表上跑：真实那几份产物属于用户，判据不该读它们，
+    # 更不该断言它们的字节数。
+    event_session = pick_event_session(state_path)
+    prepare_ledgers(event_session)
 
     # 干净的一份留在这里。并发检查会把副本写到半途，之后要拿这份干净的恢复。
     pristine = state_path.read_bytes()
@@ -1111,6 +1363,7 @@ def main():
 
     try:
         run_checks(base, state_path, runs_dir, link_session, other_session)
+        run_event_checks(base, state_path, event_session)
         run_survey_checks(base)
         run_library_checks(base)
         run_chunk_checks(base)

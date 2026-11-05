@@ -24,7 +24,13 @@ from ..ledger import LigandSetHandle, SessionLedger, expect_handle
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
 from . import affinity, chembl, docking, export, pdbtext, preprocess, products, structure, uniprot
 
-__all__ = ["AssessCampaignTool", "THRESHOLDS", "domain_tools"]
+__all__ = [
+    "AssessCampaignTool",
+    "THRESHOLDS",
+    "domain_tools",
+    "render_strategies",
+    "render_verdict",
+]
 
 # 阈值表。每一条都带一句理由：复核时不用翻代码，也不用问写的人当时怎么想的。
 THRESHOLDS: dict[str, float] = {
@@ -361,6 +367,80 @@ def _pick_strategies(
     return recommended, ordered
 
 
+def render_strategies(strategies: Sequence[Strategy], recommended: str) -> list[str]:
+    """候选策略那一段的文本行。
+
+    抽成函数是为了让判据能量它的长度：`assess_campaign` 是常驻工具，返回文本
+    每一步都可能进上下文，候选段写长一次就会一直长着。
+    """
+    viable = [item for item in strategies if item.applies]
+    blocked = [item for item in strategies if not item.applies]
+    lines: list[str] = [""]
+    if len(viable) > 1:
+        lines.append("候选策略（按成本从低到高；都可行，选哪条是这一轮的决策）")
+    else:
+        lines.append("候选策略（只有这一条可行）")
+    for item in viable:
+        cost, _rank = STRATEGY_COSTS[item.start]
+        mark = " ← 推荐" if item.start == recommended else ""
+        lines.append(
+            f"- {START_LABELS[item.start]}（{item.start}）· 成本 {cost}"
+            f" · 能区分 {STRATEGY_DISCRIMINATES[item.start]}{mark}"
+        )
+        if item.start != recommended:
+            lines.append(f"  下一步：{START_STEPS[item.start]}")
+    if blocked:
+        lines.append(
+            "不可行："
+            + "；".join(
+                f"{START_LABELS[item.start]}（{item.blocked}）" for item in blocked
+            )
+        )
+    return lines
+
+
+def pick_draft(drafts: Sequence[dict[str, str]], start: str) -> dict[str, str]:
+    """按起点挑出那份假设草稿。
+
+    `run()` 的 meta 与 `render_verdict()` 的文本用的是同一份草稿，两处各写一次
+    `next(...)` 就有机会挑到不同的那份——`hypothesis` 字段与聊天里那段对不上时，
+    模型会照 meta 里那份走。
+    """
+    return next(item for item in drafts if item["start"] == start)
+
+
+def render_verdict(
+    *,
+    start: str,
+    reason: str,
+    structure_ok: bool,
+    strategies: Sequence[Strategy],
+    drafts: Sequence[dict[str, str]],
+) -> list[str]:
+    """判定那一段的文本行：推荐、候选、假设草稿。
+
+    与 `render_strategies` 一起抽出来，是为了让整段返回文本能不起网络就跑到：
+    这一段原来长在 `run()` 里，只有真连 UniProt 才走得到，漏一个变量名在测试里
+    看不出来。
+    """
+    lines: list[str] = [
+        "",
+        f"判定：{START_LABELS[start]}（{start}）",
+        f"理由：{reason}",
+    ]
+    if not structure_ok:
+        lines.append("提示：结构不可用这一档里，口袋残基要从文献或突变数据来。")
+    lines.append(f"建议装族：{START_FAMILIES[start]}")
+    lines.append(f"下一步：{START_STEPS[start]}")
+    lines.extend(render_strategies(strategies, start))
+    chosen = pick_draft(drafts, start)
+    lines.append("")
+    lines.append(f"假设草稿（{chosen['kind']} / {chosen['mode']}）：{chosen['claim']}")
+    lines.append(f"  检验：{chosen['test']}")
+    lines.append(f"  预期：{chosen['expected']}")
+    return lines
+
+
 class AssessCampaignTool(Tool):
     """盘点受体侧与配体侧，给出这一轮该走哪条路。"""
 
@@ -596,51 +676,21 @@ class AssessCampaignTool(Tool):
             f"{ACTIVES_FLOOR:g} 的有 {len(rows)} 个（保守估计）"
         )
 
-        lines.append("")
-        lines.append(f"判定：{START_LABELS[start]}（{start}）")
-        lines.append(f"理由：{reason}")
-        if not structure_ok:
-            lines.append("提示：结构不可用这一档里，口袋残基要从文献或突变数据来。")
-        lines.append(f"建议装族：{START_FAMILIES[start]}")
-        lines.append(f"下一步：{START_STEPS[start]}")
-
-        viable = [item for item in strategies if item.applies]
-        blocked = [item for item in strategies if not item.applies]
-        lines.append("")
-        if len(viable) > 1:
-            lines.append("候选策略（按成本从低到高；都可行，选哪条是这一轮的决策）")
-        else:
-            lines.append("候选策略（只有这一条可行）")
-        for item in viable:
-            cost, _rank = STRATEGY_COSTS[item.start]
-            mark = " ← 推荐" if item.start == start else ""
-            lines.append(
-                f"- {START_LABELS[item.start]}（{item.start}）· 成本 {cost}"
-                f" · 能区分 {STRATEGY_DISCRIMINATES[item.start]}{mark}"
-            )
-            if item.start != start:
-                lines.append(f"  下一步：{START_STEPS[item.start]}")
-        if blocked:
-            lines.append(
-                "不可行："
-                + "；".join(
-                    f"{START_LABELS[item.start]}（{item.blocked}）" for item in blocked
-                )
-            )
-
         drafts = self._strategy_drafts(
-            viable=viable,
+            strategies=strategies,
             code=code,
             pair_count=pair_count,
             selectivity=selectivity,
         )
-        chosen = next(item for item in drafts if item["start"] == start)
-        lines.append("")
-        lines.append(
-            f"假设草稿（{chosen['kind']} / {chosen['mode']}）：{chosen['claim']}"
+        lines.extend(
+            render_verdict(
+                start=start,
+                reason=reason,
+                structure_ok=structure_ok,
+                strategies=strategies,
+                drafts=drafts,
+            )
         )
-        lines.append(f"  检验：{chosen['test']}")
-        lines.append(f"  预期：{chosen['expected']}")
 
         return ToolResult(
             output="\n".join(lines),
@@ -659,7 +709,7 @@ class AssessCampaignTool(Tool):
                 "selectivity": selectivity,
                 "pockets": pocket_count,
                 "receptor": receptor,
-                "hypothesis": chosen,
+                "hypothesis": pick_draft(drafts, start),
                 "strategies": drafts,
             },
         )
@@ -752,7 +802,7 @@ class AssessCampaignTool(Tool):
     def _strategy_drafts(
         self,
         *,
-        viable: Sequence[Strategy],
+        strategies: Sequence[Strategy],
         code: str,
         pair_count: int,
         selectivity: dict[str, Any],
@@ -762,7 +812,9 @@ class AssessCampaignTool(Tool):
         只给可行的那几条：给走不通的策略写草稿，等于建议模型去走一条它走不通的路。
         """
         drafts: list[dict[str, str]] = []
-        for item in viable:
+        for item in strategies:
+            if not item.applies:
+                continue
             if item.start == START_NARROW:
                 drafts.append(
                     {

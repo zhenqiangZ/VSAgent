@@ -577,10 +577,12 @@ async def run_tool_card_checks() -> None:
 
 PERMISSION_STATE_PATH = ROOT / ".probe" / "state_permission.toml"
 
-# 询问弹窗上四个按键各自的期望：工具最终状态，以及卡片上留下的输出。
+# 询问弹窗上各按键的期望：工具最终状态，以及卡片上留下的输出。
 # escape 与 n 是同一个动作，两条都排进来是为了让"随手按一下不会放过去"这一条有据可查。
+# enter 与 y 同为允许一次：弹窗上填色的那个按钮是默认操作。
 PERMISSION_CASES: list[tuple[str, ToolStatus, str]] = [
     ("y", ToolStatus.COMPLETED, TOOL_OUTPUT),
+    ("enter", ToolStatus.COMPLETED, TOOL_OUTPUT),
     ("n", ToolStatus.FAILED, "用户拒绝"),
     ("a", ToolStatus.COMPLETED, TOOL_OUTPUT),
     ("escape", ToolStatus.FAILED, "用户拒绝"),
@@ -653,14 +655,13 @@ async def run_permission_round(server: FakeModelServer, key: str) -> tuple[ToolS
         check(TOOL_MARK in shown, f"弹窗里写着这次调用的参数：{shown}")
         check("原因" in shown, f"弹窗里写着被拦下来的原因：{shown}")
         hint = str(dialog.query_one("#permission-hint").render())
-        # a 键放行的是**本会话的所有工具**，提示行要如实写出来。
-        # 同时点明它管不到工作目录之外，否则用户会以为 a 是一张通吃整个磁盘的许可证。
+        # a 键的授权范围是整个会话，提示行要如实写出来：越界与计费都包括在内。
         check(
-            "放行所有工具" in hint and "工作目录之外" in hint,
-            f"提示行写明 a 键的真实范围（所有工具，且管不到工作目录之外）：{hint}",
+            "不再询问" in hint and "越界" in hint and "切换会话" in hint,
+            f"提示行写明 a 键的真实范围与恢复方式：{hint}",
         )
         preview = dialog.query_one("#permission-argument")
-        check(preview.region.height >= 3, f"参数单独放在带边框的预览框里：{preview.region}")
+        check(preview.region.height >= 3, f"参数单独放在一块可滚动的预览里：{preview.region}")
         # 标签跟着工具走：bash 的主参数是命令，不是笼统的「参数」。
         check(
             str(dialog.query_one("#permission-label").render()) == "命令",
@@ -671,8 +672,8 @@ async def run_permission_round(server: FakeModelServer, key: str) -> tuple[ToolS
             "预览框里是这次要执行的那条命令",
         )
         check(
-            dialog.query_one("#permission-hint").region.height >= 2,
-            "提示行分成两行，按键与范围说明都完整显示",
+            dialog.query_one("#permission-hint").region.height >= 1,
+            "提示行完整显示",
         )
         await pilot.press(key)
         await wait_idle(app, pilot)
@@ -701,22 +702,21 @@ async def run_permission_round(server: FakeModelServer, key: str) -> tuple[ToolS
                 crossed.verdict is Verdict.ALLOW,
                 f"按 a 之后别的工具也放行：{crossed.note()}",
             )
-            # 但工作目录之外仍然要问：放行的是工具，不是磁盘。
-            # 这一条是「范围扩大之后边界还在」的证据，不是可选项。
+            # 按 a 之后工作目录之外也一并放行：授权范围是整个会话。
             # 越界路径按平台取：POSIX 上反斜杠不是分隔符，`D:\x` 只是站内的文件名。
             outside_path = r"D:\Elsewhere\a.txt" if os.name == "nt" else "/etc/passwd"
             outside = app.agent.policy.check(
                 write, {"path": outside_path, "content": "x"}, "Build"
             )
             check(
-                outside.verdict is Verdict.ASK,
-                f"按 a 之后工作目录之外仍要问：{outside.note()}",
+                outside.verdict is Verdict.ALLOW,
+                f"按 a 之后工作目录之外也放行：{outside.note()}",
             )
         return part.tool_status, part.tool_output
 
 
 async def run_permission_checks(server: FakeModelServer) -> None:
-    """权限弹窗：四个按键各走一轮完整生成。"""
+    """权限弹窗：每个按键各走一轮完整生成。"""
     for key, want_status, want_output in PERMISSION_CASES:
         status, output = await run_permission_round(server, key)
         check(

@@ -514,6 +514,9 @@ class VSAgentApp(App[None]):
         # 权限询问由应用层统一处理，而不是聊天界面：子 agent 在后台跑、
         # 用户停在父会话时，那条询问没有屏幕认领，挂在界面上会永远等下去。
         self.event_bus.subscribe("permission.ask", self._on_permission_ask)
+        # 主题封存之后原文就不再发给模型了：界面上有一条提示，用户才知道
+        # 「刚才那段怎么看不到了」，以及要去哪儿取。
+        self.event_bus.subscribe("event.sealed", self._on_event_sealed)
         self.push_screen(HomeScreen())
 
     def on_unmount(self) -> None:
@@ -1027,7 +1030,7 @@ class VSAgentApp(App[None]):
         if left:
             self.show_toast(f"已压缩，之后这一轮只带最近 {left} 条发给模型", "success")
         else:
-            self.show_toast("已压缩，原文全部让位给阶段流水", "success")
+            self.show_toast("已压缩，原文全部让位给主题摘要", "success")
 
     def _command_connect(self) -> None:
         """显示当前连的是哪一家，以及配置存在哪里。"""
@@ -1069,6 +1072,21 @@ class VSAgentApp(App[None]):
         """
         self._permission_queue.append(dict(data))
         self._show_next_permission()
+
+    def _on_event_sealed(self, data: dict[str, object]) -> None:
+        """一个主题封存了：说一声，并告诉用户在哪儿看细节。
+
+        只提示当前会话的：子 agent 在后台封自己的主题，那些不该打断父会话的阅读。
+        """
+        session_id = str(data.get("session_id", ""))
+        current = self.session_manager.current
+        if current is not None and session_id and session_id != current.id:
+            return
+        index = data.get("topic_index") or 0
+        title = str(data.get("title") or "").strip()
+        steps = data.get("steps") or 0
+        label = f"主题 {index}" + (f" · {title}" if title else "")
+        self.show_toast(f"{label}（{steps} 步）已封存，细节用 /events 看", "info")
 
     def _show_next_permission(self) -> None:
         """弹队列里的下一个询问。已经失效的条目直接跳过。"""
@@ -1116,6 +1134,10 @@ class VSAgentApp(App[None]):
             loop.resolve_permission(part_id, Verdict.DENY)
         else:
             loop.resolve_permission(part_id, answer.verdict, answer.remember)
+            # 弹窗关掉之后界面上什么都不剩，用户没法确认刚才那次按的是「全部允许」。
+            # 一条提示把授权范围与恢复方式说出来，免得下一轮静默跑完一批命令。
+            if answer.remember and answer.verdict is Verdict.ALLOW:
+                self.show_toast("本会话已开启自动授权，后续工具调用不再询问；切换会话恢复", "info")
         self._permission_active = False
         # 等这一帧的卸屏动作走完再挂下一个，否则两个模态会在同一帧里交接。
         self.call_after_refresh(self._show_next_permission)
@@ -1173,19 +1195,25 @@ class VSAgentApp(App[None]):
         self.push_screen(MessageScreen("上下文用量", lines))
 
     def _command_events(self, arguments: str) -> None:
-        """列出本会话的事件；带编号时看详情。
+        """列出本会话的主题；带编号时看详情。
 
-        阶段是「已经封存的一大步」：原文不再进上下文，这里看得到它的流水与结论。
+        主题是「已经封存的一段工作」：原文不再进上下文，这里看得到它的流水与结论。
         想看原文用 `/events <编号>` 或让模型调 `recall_event`。
+        最后一行是正在进行的那个主题——它还没封存，所以只有步数。
         """
         session = self.active_session
-        if not session.events:
-            self.show_toast("这份会话还没有事件", "info")
+        if not session.events and not session.pending_steps:
+            self.show_toast("这份会话还没有主题", "info")
             return
         wanted = arguments.strip()
         if not wanted:
             lines = [event_line(event) for event in session.events]
-            self.push_screen(MessageScreen("会话事件", lines))
+            if session.pending_steps:
+                lines.append(
+                    f"（进行中：{len(session.pending_steps)} 步，还没封存；"
+                    "封存之后原文才让位）"
+                )
+            self.push_screen(MessageScreen("会话主题", lines))
             return
         event = next((item for item in session.events if item.id == wanted), None)
         if event is None:

@@ -1095,21 +1095,6 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 
 #session-head .head-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
-.topic-all {
-  width: 100%;
-  margin-bottom: 8px;
-  padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12.5px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.topic-all.is-active { border-color: #bfdbfe; background: var(--accent-soft); color: var(--accent-strong); }
-
 .topic { margin-bottom: 6px; }
 
 .topic-item {
@@ -1158,6 +1143,8 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
   font-size: 10.5px;
   line-height: 16px;
 }
+
+.topic-flag.is-quiet { background: var(--panel); color: var(--muted); }
 
 .topic-meta { margin-top: 3px; padding-left: 23px; font-size: 11.5px; color: var(--muted); }
 
@@ -1220,46 +1207,237 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 .task-hypotheses { margin-top: 10px; font-size: 12px; color: var(--muted); }
 .task-hypotheses summary { cursor: pointer; }
 
-/* ---------- 事件卡 ---------- */
+/* ---------- 主题章节 ---------- */
 
-.event-card {
-  margin: 14px 20px 6px;
-  padding: 12px 14px;
+/* 一章 = 一个主题。标题吸顶：读到中间抬头还能看见这一段在做什么，
+   滚动到下一章时它自然被下一张标题顶上去。 */
+.topic-card {
+  margin: 0 20px 16px;
   border: 1px solid var(--line);
-  border-left: 3px solid var(--accent);
+  border-left: 3px solid var(--line-strong);
   border-radius: var(--radius);
   background: var(--surface);
-  box-shadow: var(--shadow-sm);
 }
 
-.event-head { display: flex; gap: 8px; align-items: baseline; }
+.topic-card.status-completed { border-left-color: #86efac; }
+.topic-card.status-failed { border-left-color: #fca5a5; }
+.topic-card.status-interrupted { border-left-color: #cbd5e1; }
+.topic-card.is-live { border-left-color: var(--accent); }
 
-.event-index { font-family: var(--mono); font-size: 11px; color: var(--faint); }
-.event-title { flex: 1; min-width: 0; font-weight: 700; line-height: 1.5; }
+.topic-card-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 11px 14px 9px;
+  background: var(--surface);
+  border-bottom: 1px solid transparent;
+  border-radius: var(--radius) var(--radius) 0 0;
+}
 
-.event-kind {
+.topic-card.is-open .topic-card-head { border-bottom-color: var(--line); }
+
+.topic-line { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+
+.topic-no {
   flex-shrink: 0;
-  padding: 1px 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.topic-name {
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+}
+
+.topic-name:hover { color: var(--accent-strong); }
+.topic-name.static { cursor: default; }
+.topic-name.static:hover { color: var(--text); }
+
+.topic-status {
+  flex-shrink: 0;
+  padding: 0 7px;
   border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 17px;
   border: 1px solid var(--line);
   color: var(--muted);
-  font-size: 10.5px;
 }
 
-.event-kind.kind-auto { border-color: #fde68a; background: #fffbeb; color: var(--warn); }
+.topic-status.status-completed { border-color: #bbf7d0; background: #f0fdf4; color: #15803d; }
+.topic-status.status-failed { border-color: #fecaca; background: #fef2f2; color: var(--hot); }
+.topic-status.status-interrupted { border-color: var(--line); background: var(--panel); color: var(--muted); }
+.topic-status.status-running { border-color: #bfdbfe; background: var(--accent-soft); color: var(--accent-strong); }
 
-.event-meta { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
-.event-summary { margin-top: 8px; font-size: 13px; line-height: 1.75; color: var(--text); white-space: pre-wrap; }
+.topic-meta { font-size: 11.5px; color: var(--muted); }
 
-/* 长结论先收成四行；`event-more` 那一下把它放开。 */
-.event-summary.is-clamped {
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  -webkit-box-orient: vertical;
+.topic-toggle {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 2px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.topic-toggle:hover { border-color: var(--accent); color: var(--accent-strong); }
+
+/* 收起时三行足够认出这一段；展开时给全文。 */
+.topic-summary {
+  margin-top: 6px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--muted);
+  white-space: pre-wrap;
   overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
 }
 
-.event-more { margin-top: 4px; padding: 2px 9px; font-size: 11.5px; }
+.topic-card.is-open .topic-summary { display: block; -webkit-line-clamp: unset; }
+
+.topic-alert {
+  margin-top: 7px;
+  padding: 5px 9px;
+  border-left: 2px solid #fca5a5;
+  background: #fef2f2;
+  color: var(--hot);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.topic-degraded { margin-top: 6px; font-size: 11px; color: var(--faint); }
+
+.topic-body { display: none; padding: 4px 14px 13px; }
+.topic-card.is-open .topic-body { display: block; }
+
+.topic-narrative { padding-top: 8px; }
+
+/* ---------- 工具执行：一行摘要，展开是步时间线 ---------- */
+
+.run-block {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+
+.run-head {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  width: 100%;
+  padding: 8px 11px;
+  border: none;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.run-head.static { cursor: default; color: var(--muted); font-size: 12px; }
+.run-label { flex-shrink: 0; font-weight: 600; }
+.run-count { flex-shrink: 0; font-family: var(--mono); font-size: 11px; color: var(--faint); }
+
+.run-note {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.run-toggle { flex-shrink: 0; font-size: 11px; color: var(--accent-strong); }
+
+.run-body { display: none; border-top: 1px solid var(--line); }
+.run-block.is-open .run-body { display: block; }
+
+.run-tools { display: flex; gap: 8px; align-items: center; padding: 7px 11px; }
+.run-tools .link-button { padding: 2px 9px; font-size: 11.5px; }
+.run-hint { margin-left: auto; font-size: 11px; color: var(--faint); }
+
+.step-list { margin: 0; padding: 0 11px 9px; list-style: none; }
+
+.step-row {
+  border-top: 1px solid #eef2f7;
+}
+
+.step-row.is-failed > .step-head .step-intent { color: var(--hot); }
+
+.step-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  width: 100%;
+  padding: 6px 2px;
+  border: none;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.step-head.static { cursor: default; }
+.step-head:hover .step-intent { color: var(--accent-strong); }
+.step-head.static:hover .step-intent { color: var(--text); }
+
+.step-no { flex-shrink: 0; font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+
+.step-intent {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-time { flex-shrink: 0; font-family: var(--mono); font-size: 11px; color: var(--faint); }
+
+.step-status { flex-shrink: 0; font-size: 11px; }
+.step-status.is-done { color: #15803d; }
+.step-status.is-failed { color: var(--hot); }
+.step-status.is-running { color: var(--accent-strong); }
+
+.step-body { display: none; padding: 2px 0 9px 18px; }
+.step-row.is-open > .step-body { display: block; }
+
+.step-result {
+  margin-bottom: 7px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.step-issues { margin-top: 6px; }
+
+.step-row.is-current .step-intent { color: var(--accent-strong); }
+
+/* ---------- 运行中的主题 ---------- */
+
+.live-now { margin-top: 6px; }
+.live-line { font-size: 12.5px; line-height: 1.7; color: var(--muted); }
+.live-line strong { color: var(--text); font-weight: 600; }
+.live-steps .step-result { margin-bottom: 3px; }
+
+/* ---------- 任务卡收尾与产物 ---------- */
 
 .head-goal {
   margin-top: 6px;
@@ -1271,6 +1449,17 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
 }
+
+.event-kind {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.event-kind.kind-auto { border-color: #fde68a; background: #fffbeb; color: var(--warn); }
 
 .event-handoff {
   margin-top: 8px;
@@ -1323,6 +1512,16 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 
 .part-tool.is-failed { border-color: #fecaca; }
 .part-tool.is-failed .tool-head { background: #fef2f2; }
+
+.part-error {
+  margin: 8px 0;
+  padding: 7px 10px;
+  border-left: 2px solid #fca5a5;
+  background: #fef2f2;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--hot);
+}
 
 .part-tool.is-flash { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.25); border-color: var(--accent); }
 

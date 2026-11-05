@@ -20015,6 +20015,66 @@ def _event_fixture(steps: int) -> Session:
     return session
 
 
+def check_live_snapshot() -> None:
+    """实时快照：只带当前主题、首行预览、过期判定。"""
+    from vsagent.core import live
+
+    session = Session(title="实时")
+    message = Message(role="assistant", session_id=session.id)
+    session.add_message(message)
+    message.add_part(Part(type=PartType.STEP_START, text="1 · fake"))
+    session.pending_steps.append(
+        Step(seq=1, intent="dock(x=1)", tools=["dock"], result="成功：docking#1")
+    )
+    running_tool = Part(
+        type=PartType.TOOL,
+        tool_name="analyze_pose",
+        tool_status=ToolStatus.RUNNING,
+        tool_input={"pose": "docking#1"},
+        tool_output="第一行结果\n第二行不该出现在快照里",
+    )
+    message.add_part(running_tool)
+
+    data = live.snapshot(session, running=True, now=1000.0, pid=4242)
+    check(data["topicIndex"] == 1 and data["eventCount"] == 0, "快照的主题号从已封存条数推")
+    check(data["steps"][0]["status"] == "completed", "已完成的步按成功标")
+    check(data["current"]["tool"] == "analyze_pose", "当前工具取最后一个还在跑的调用")
+    check(
+        data["current"]["preview"] == "第一行结果",
+        f"预览只取首行：{data['current']['preview']}",
+    )
+    check("第二行" not in json.dumps(data, ensure_ascii=False), "完整输出不进快照")
+    check(data["calls"] == 2 and set(data["tools"]) == {"dock", "analyze_pose"}, "调用数与工具名去重")
+
+    running_tool.tool_status = ToolStatus.AWAITING
+    waiting = live.snapshot(session, running=True, now=1000.0, pid=4242)
+    check(waiting["current"]["phase"] == "waiting", "等确认的那一次单独标出来")
+
+    idle = live.snapshot(session, running=False, now=1000.0, pid=4242)
+    check(idle["running"] is False and idle["current"] is None, "不跑的时候没有当前工具")
+
+    root = ROOT / ".probe" / "live-check"
+    state = root / "state.toml"
+    live.write(state, session, running=True)
+    stored = live.read(state, session.id)
+    check(stored is not None and stored["running"], "写进去的快照读得回来")
+    check(stored["stale"] is False, "刚写完不算过期")
+    check(
+        live.read(state, session.id, now=stored["updatedAt"] + 60)["stale"] is True,
+        "一分钟没更新按可能断开处理",
+    )
+    check(live.read(state, "ses_missing") is None, "没有快照时返回空")
+
+    cancelled = Event(exit_reason="cancelled")
+    check(cancelled.status == "interrupted", "取消过的主题标成中断")
+    check(Event(exit_reason="tool_failed").status == "failed", "工具连续失败标成失败")
+    check(Event(steps=[Step(issues=["boom"])]).status == "failed", "停在失败上也标成失败")
+    check(Event(steps=[Step(result="成功")]).status == "completed", "正常收尾标成完成")
+    restored = Event.from_dict(Event(exit_reason="cancelled").to_dict())
+    check(restored.exit_reason == "cancelled", "停止原因跟着状态文件一起回来")
+    shutil.rmtree(root, ignore_errors=True)
+
+
 async def check_event_log() -> None:
     """主题流水：每步自动记、封存不花请求、按位置让位、三级召回。"""
     session = _event_fixture(2)  # 4 条消息，2 次 dock（第 2 次失败）
@@ -22186,6 +22246,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("tool-family", check_tool_family),
     ("debug-tools", check_debug_tools),
     ("tool-retry", check_tool_retry),
+    ("live-snapshot", check_live_snapshot),
     ("event-log", check_event_log),
     ("evidence", check_evidence_layer),
     ("bash", check_bash_tool),

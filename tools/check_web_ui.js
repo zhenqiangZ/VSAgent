@@ -5,7 +5,7 @@
 // 所以这里逐条与接口的读数对照，并且按顺序逐个卡片比，不只看总数。
 //
 // 脚本自己准备运行目录、自己起服务、跑完关掉，不依赖已经在跑的服务。
-// 状态文件用的是真实那一份，服务只读它，不会写回。
+// 状态文件用真实那一份的**副本**：判据要在旁边写实时快照，不能写进家目录。
 
 const { chromium } = require("playwright");
 const { execFileSync, spawn } = require("child_process");
@@ -20,6 +20,8 @@ const PYTHON = process.env.VSA_PYTHON || (process.platform === "win32"
   : path.join(ROOT, ".venv", "bin", "python"));
 const FIXTURE = path.join(ROOT, ".probe", "web-ui-runs");
 const SURVEY_FIXTURE = path.join(ROOT, ".probe", "web-ui-surveys");
+const STATE_DIR = path.join(ROOT, ".probe", "web-ui-state");
+const STATE_PATH = path.join(STATE_DIR, "state.toml");
 const SURVEY_ID = "Q15858-survey-ui000001";
 const LOG_PATH = path.join(ROOT, ".probe", "web-ui-serve.log");
 const PORT = Number(process.env.WEB_PORT || 8866);
@@ -47,6 +49,14 @@ const AGENT_STATUS_TEXT = {
   done: "完成",
   failed: "失败",
   cancelled: "已中断",
+};
+
+// 主题卡上的状态词。与 history.js 的 TOPIC_STATUS 是同一组字。
+const TOPIC_STATUS_TEXT = {
+  completed: "已完成",
+  failed: "失败",
+  interrupted: "已中断",
+  running: "进行中",
 };
 
 // 口袋来源徽标的三态与结构页里的文字一致。核对「有没有挂」与「挂的是不是这一个」，
@@ -188,12 +198,37 @@ function makeSourcedRun(sourceDir, targetDir) {
   fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
 }
 
+function prepareState() {
+  // 默认状态文件在哪由包内那一个函数说了算（`VSA_CONFIG_HOME` 会改它），
+  // 在 Node 里按 `~/.vsagent` 拼会漏掉那条环境变量。
+  const source = execFileSync(
+    PYTHON,
+    [
+      "-c",
+      "from vsagent.core.session_manager import default_state_path; print(default_state_path())",
+    ],
+    { cwd: ROOT, encoding: "utf8" }
+  ).trim();
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.rmSync(path.join(STATE_DIR, "live"), { recursive: true, force: true });
+  fs.copyFileSync(source, STATE_PATH);
+  // 真实会话里几乎只有「完成」一种主题，失败与中断很难等到。追加一条三态会话，
+  // 三种状态的颜色与文案就都能在浏览器里核对。
+  const seeded = execFileSync(
+    PYTHON,
+    [path.join(ROOT, "tools", "seed_three_states.py"), "--state", STATE_PATH],
+    { cwd: ROOT, encoding: "utf8" }
+  ).trim();
+  return { source, seeded };
+}
+
 function startServer() {
   const out = fs.openSync(LOG_PATH, "w");
   return spawn(
     PYTHON,
     [
       path.join(ROOT, "tools", "serve_web.py"),
+      "--state", STATE_PATH,
       "--runs", FIXTURE,
       "--surveys", SURVEY_FIXTURE,
       "--port", String(PORT),
@@ -475,32 +510,57 @@ async function checkHistoryPage(page, listing, biggestId) {
   const detail = await getJson(`/api/sessions/${biggestId}`);
   const shelf = await getJson(`/api/sessions/${biggestId}/events`);
 
-  // 打开会话时只载入最后一个主题：这是工作台与旧页面的分界，整份会话不随
-  // 点选一起发过来。下面先核对这一点，再点「整段对话」把全文铺开。
+  // 一章一张卡：所有封存的主题都在页面上，只有最后一个默认展开。
+  // 这是「按主题分段阅读」与「一次铺开整份会话」的分界。
   if (shelf.events.length) {
-    await page.waitForSelector("#conversation .event-card", { timeout: 60000 });
-    const loaded = await page.locator("#conversation .event-card").count();
-    check("打开会话只载入最后一个主题", loaded === 1, `载入了 ${loaded} 张事件卡`);
-    const title = await page.locator("#conversation .event-title").first().textContent();
+    await page.waitForFunction(
+      (count) => document.querySelectorAll("#conversation .topic-card:not(.is-live)").length === count,
+      shelf.events.length,
+      { timeout: 60000 }
+    );
+    const cards = await page.locator("#conversation .topic-card:not(.is-live)").count();
     check(
-      "载入的是最后一条事件",
-      title.trim() === shelf.events[shelf.events.length - 1].title,
-      `页面上是「${title.trim()}」`
+      "每个封存的主题各占一张章节卡",
+      cards === shelf.events.length,
+      `画出 ${cards} 张，接口 ${shelf.events.length} 条`
+    );
+
+    const opened = await page
+      .locator("#conversation .topic-card.is-open")
+      .evaluateAll((nodes) => nodes.map((node) => node.dataset.event));
+    const lastId = shelf.events[shelf.events.length - 1].id;
+    check(
+      "默认只展开最后一个主题",
+      opened.length === 1 && opened[0] === lastId,
+      `展开 ${opened.join("/")}，最后一条是 ${lastId}`
+    );
+
+    const runCollapsed = await page.locator("#conversation .run-block").evaluateAll((nodes) =>
+      nodes.map((node) => node.classList.contains("is-open"))
+    );
+    check(
+      "刚完成的主题默认收起工具过程",
+      runCollapsed.every((open) => !open),
+      `${runCollapsed.filter(Boolean).length} 个工具块是展开的`
+    );
+
+    const statuses = await page
+      .locator("#conversation .topic-card:not(.is-live)")
+      .evaluateAll((nodes) =>
+        nodes.map((node) => [
+          node.dataset.event,
+          node.querySelector(".topic-status")?.textContent.trim() ?? "",
+        ])
+      );
+    const wantStatus = shelf.events.map(
+      (event) => TOPIC_STATUS_TEXT[event.status || "completed"] || "已完成"
+    );
+    check(
+      "主题状态与接口一致",
+      JSON.stringify(statuses.map((item) => item[1])) === JSON.stringify(wantStatus),
+      `页面 ${statuses.map((item) => item[1]).join("/")}，接口 ${wantStatus.join("/")}`
     );
   }
-
-  await page.click(".workbench .topic-all");
-  await page.waitForFunction(
-    (count) => document.querySelectorAll("#conversation article.msg").length === count,
-    detail.messages.length,
-    { timeout: 60000 }
-  );
-  const messageCount = await page.locator("#conversation article.msg").count();
-  check(
-    "正文里的消息条数与接口一致",
-    messageCount === detail.messages.length,
-    `${biggestId} 画出 ${messageCount} 条，接口 ${detail.messages.length} 条`
-  );
 
   const railTopics = await page.locator("#topic-rail .topic-item").count();
   check(
@@ -508,12 +568,101 @@ async function checkHistoryPage(page, listing, biggestId) {
     railTopics === shelf.events.length,
     `左栏 ${railTopics} 条，接口 ${shelf.events.length} 条`
   );
-  const cards = await page.locator("#conversation .event-card").count();
-  check(
-    "整段对话按主题分段，每个主题一张卡",
-    cards === shelf.events.length,
-    `画出 ${cards} 张，接口 ${shelf.events.length} 条`
+
+  // 主动展开一个主题：卡片打开、工具过程跟着打开，选择写进本地存储。
+  if (shelf.events.length) {
+    const firstId = shelf.events[0].id;
+    await page
+      .locator(`#conversation .topic-card[data-event="${firstId}"] .topic-toggle`)
+      .click();
+    await page.waitForFunction(
+      (id) =>
+        document
+          .querySelector(`.topic-card[data-event="${id}"]`)
+          ?.classList.contains("is-open") === true,
+      firstId,
+      { timeout: 60000 }
+    );
+    const runOpened = await page
+      .locator(`#conversation .topic-card[data-event="${firstId}"] .run-block`)
+      .evaluate((node) => node.classList.contains("is-open"));
+    check("用户展开主题时工具过程跟着打开", runOpened === true, `is-open=${runOpened}`);
+
+    const stored = await page.evaluate(
+      (key) => window.localStorage.getItem(key),
+      `vsa.history.open.${biggestId}`
+    );
+    check(
+      "主动展开的主题记在本地存储里",
+      Boolean(stored) && stored.includes(firstId),
+      `${stored}`
+    );
+  }
+
+  // 把剩下的主题都打开，正文才全部挂到页面上；下面几项要数单元。
+  await page.evaluate(() => {
+    for (const card of document.querySelectorAll("#conversation .topic-card:not(.is-open)")) {
+      card.querySelector(".topic-toggle")?.click();
+    }
+  });
+  const narrativeCount = detail.messages.filter((message) =>
+    message.parts.some(
+      (part) => !["tool", "step_start", "step_finish"].includes(part.type)
+    )
+  ).length;
+  await page.waitForFunction(
+    (count) => document.querySelectorAll("#conversation article.msg").length === count,
+    narrativeCount,
+    { timeout: 120000 }
   );
+  const messageCount = await page.locator("#conversation article.msg").count();
+  check(
+    "正文里的消息条数与接口一致（工具单元单独成块，不混在正文里）",
+    messageCount === narrativeCount,
+    `${biggestId} 画出 ${messageCount} 条，接口里有文字的 ${narrativeCount} 条`
+  );
+
+  // 摘要行在主题展开之后才建出来，放在这里核对：它算的是「调用次数」与
+  // 「去重之后的工具数」，两个数字分开写，一个工具调到三次时要看得出。
+  const runCounts = await page
+    .locator("#conversation .topic-card:not(.is-live) .run-count")
+    .evaluateAll((nodes) => nodes.map((node) => node.textContent.trim()));
+  const wantCounts = shelf.events
+    .filter((event) => event.steps.length)
+    .map((event) => {
+      const calls = event.steps.reduce((total, step) => total + step.tools.length, 0);
+      const names = new Set(event.steps.flatMap((step) => step.tools));
+      return `${calls} 次调用 · ${names.size} 个工具`;
+    });
+  check(
+    "工具执行的摘要行写对了调用次数与工具数",
+    JSON.stringify(runCounts) === JSON.stringify(wantCounts),
+    `页面 ${runCounts.length} 行，应为 ${wantCounts.length} 行：${runCounts.slice(0, 2).join(" | ")}`
+  );
+
+  // 三级的最后一层：步展开之后才是工具卡片。
+  const firstCard = page.locator("#conversation .topic-card:not(.is-live)").first();
+  if (await firstCard.locator(".step-row").count()) {
+    const rows = firstCard.locator(".step-row");
+    await rows.first().locator(".step-head").click();
+    await page.waitForTimeout(100);
+    const openedRow = await rows.first().evaluate((node) => node.classList.contains("is-open"));
+    check("点一步展开它的工具卡片", openedRow === true, `is-open=${openedRow}`);
+
+    await firstCard.locator(".run-tools button", { hasText: "展开全部步" }).click();
+    await page.waitForTimeout(150);
+    const allOpen = await firstCard
+      .locator(".step-row")
+      .evaluateAll((nodes) => nodes.every((node) => node.classList.contains("is-open")));
+    check("展开全部步只作用于这一个主题", allOpen, `${await rows.count()} 行`);
+
+    await firstCard.locator(".run-tools button", { hasText: "收起全部步" }).click();
+    await page.waitForTimeout(150);
+    const allClosed = await firstCard
+      .locator(".step-row")
+      .evaluateAll((nodes) => nodes.every((node) => !node.classList.contains("is-open")));
+    check("收起全部步同样只作用于这一个主题", allClosed, `${await rows.count()} 行`);
+  }
 
   const parts = detail.messages.flatMap((message) => message.parts);
 
@@ -533,27 +682,30 @@ async function checkHistoryPage(page, listing, biggestId) {
     domTools.length === apiTools.length,
     `画出 ${domTools.length} 张，接口 ${apiTools.length} 个工具单元`
   );
-  const toolMismatch = [];
-  for (let index = 0; index < Math.min(domTools.length, apiTools.length); index++) {
-    const want = apiTools[index];
-    const got = domTools[index];
-    const wantStatus = STATUS_TEXT[want.toolStatus] || want.toolStatus || "等待";
-    const wantInput = Boolean(want.toolInput && Object.keys(want.toolInput).length);
-    const wantOutput = Boolean(want.toolOutput);
-    if (got.name !== (want.toolName || "tool")) {
-      toolMismatch.push(`第 ${index + 1} 张的工具名是 ${got.name}，接口是 ${want.toolName}`);
-    } else if (got.status !== wantStatus) {
-      toolMismatch.push(`第 ${index + 1} 张的状态是 ${got.status}，接口是 ${wantStatus}`);
-    } else if (got.hasInput !== wantInput) {
-      toolMismatch.push(`第 ${index + 1} 张的输入${got.hasInput ? "有" : "没有"}，接口${wantInput ? "有" : "没有"}`);
-    } else if (got.hasOutput !== wantOutput) {
-      toolMismatch.push(`第 ${index + 1} 张的输出${got.hasOutput ? "有" : "没有"}，接口${wantOutput ? "有" : "没有"}`);
-    }
-  }
+  // 页面上工具按步分组，`close_topic` 这类不进流水的调用单独排在末行，
+  // 所以两份的先后顺序必然不同。比的是「名字 / 状态 / 有无输入 / 有无输出」
+  // 这四项组成的多重集：条数少了、某一张的字段错了，都会在这里显出来。
+  const signature = (item) => `${item.name}|${item.status}|${item.hasInput}|${item.hasOutput}`;
+  const apiSignatures = apiTools
+    .map((part) =>
+      signature({
+        name: part.toolName || "tool",
+        status: STATUS_TEXT[part.toolStatus] || part.toolStatus || "等待",
+        hasInput: Boolean(part.toolInput && Object.keys(part.toolInput).length),
+        hasOutput: Boolean(part.toolOutput),
+      })
+    )
+    .sort();
+  const domSignatures = domTools.map(signature).sort();
+  const firstMismatch = apiSignatures.findIndex(
+    (value, index) => value !== domSignatures[index]
+  );
   check(
     "每张工具卡片的四项都与接口一致",
-    toolMismatch.length === 0,
-    toolMismatch.length ? `前一处：${toolMismatch[0]}` : `${apiTools.length} 张卡片逐张核对工具名、状态、输入、输出`
+    apiSignatures.length === domSignatures.length && firstMismatch < 0,
+    firstMismatch < 0
+      ? `${apiSignatures.length} 张卡片逐张核对工具名、状态、输入、输出`
+      : `页面 ${domSignatures[firstMismatch]}，接口 ${apiSignatures[firstMismatch]}`
   );
 
   // 补丁卡片：增删行数逐个比。行数写成零时卡片照样显示，只有比数才看得出来。
@@ -742,7 +894,7 @@ async function checkStructurePage(page, runId, sessionId) {
   check("结构页有回到会话的链接", (await back.count()) === 1, `${await back.count()} 个链接`);
   await back.click();
   await page.waitForFunction(
-    () => document.querySelectorAll("#conversation article.msg").length > 0,
+    () => document.querySelectorAll("#conversation .topic-card").length > 0,
     undefined,
     { timeout: 60000 }
   );
@@ -1028,6 +1180,175 @@ async function checkSurveyPage(page) {
   );
 }
 
+async function checkLiveCard(page, sessionId) {
+  // 实时快照的文件在状态文件旁边。判据自己写一份进去：应用没在跑的时候，
+  // 这一块是页面上唯一没有数据来源的部分，只能这样验。
+  const liveDir = path.join(STATE_DIR, "live");
+  const target = path.join(liveDir, `${sessionId}.json`);
+  fs.mkdirSync(liveDir, { recursive: true });
+  const payload = {
+    sessionId,
+    running: true,
+    updatedAt: Date.now() / 1000,
+    pid: 1,
+    eventCount: 0,
+    topicIndex: 1,
+    title: "界面判据造的运行中主题",
+    steps: [
+      {
+        seq: 1,
+        intent: "dock(ligandset=ligandset#1)",
+        tools: ["dock"],
+        result: "成功：docking#1",
+        issues: [],
+        status: "completed",
+      },
+    ],
+    current: {
+      phase: "waiting",
+      tool: "analyze_pose",
+      status: "awaiting",
+      preview: "准备读取位姿",
+      since: Date.now() / 1000 - 4,
+      calls: 1,
+    },
+    tools: ["dock", "analyze_pose"],
+    calls: 2,
+  };
+  fs.writeFileSync(target, JSON.stringify(payload), "utf8");
+
+  // 先离开再回来：同一个地址的 hash 导航不会重新挂载页面。
+  await page.goto(`${BASE}/#/history`, { waitUntil: "networkidle" });
+  await page.goto(`${BASE}/#/history/${sessionId}`, { waitUntil: "networkidle" });
+  await page.waitForSelector("#conversation .topic-card.is-live", { timeout: 30000 });
+  const text = await page.locator("#conversation .topic-card.is-live").innerText();
+  check(
+    "运行中的主题显示当前工具与等待确认",
+    text.includes("等待确认：analyze_pose") && text.includes("需要确认"),
+    text.slice(0, 80).replace(/\n/g, " / ")
+  );
+  check(
+    "运行中的主题把已完成的步列出来",
+    text.includes("dock") && text.includes("完成"),
+    text.slice(0, 80).replace(/\n/g, " / ")
+  );
+
+  payload.running = false;
+  payload.current = null;
+  payload.updatedAt = Date.now() / 1000;
+  fs.writeFileSync(target, JSON.stringify(payload), "utf8");
+  try {
+    await page.waitForFunction(
+      () => !document.querySelector("#conversation .topic-card.is-live"),
+      undefined,
+      { timeout: 20000 }
+    );
+    check("轮末之后实时块自己撤掉", true, "两秒轮询之内撤掉");
+  } catch (error) {
+    check("轮末之后实时块自己撤掉", false, "等了二十秒还在");
+  }
+  fs.unlinkSync(target);
+}
+
+async function checkThreeStates(page, sessionId) {
+  // 那条会话由 `tools/seed_three_states.py` 追加：完成 / 失败 / 中断各一个主题，
+  // 外加一份运行中的快照。核对的是「哪种状态画成哪样」，不是数字。
+  await page.goto(`${BASE}/#/history/${sessionId}`, { waitUntil: "networkidle" });
+  await page.waitForFunction(
+    () => document.querySelectorAll("#conversation .topic-card").length >= 4,
+    undefined,
+    { timeout: 30000 }
+  );
+
+  const cards = await page.locator("#conversation .topic-card").evaluateAll((nodes) =>
+    nodes.map((node) => ({
+      live: node.classList.contains("is-live"),
+      status: node.querySelector(".topic-status")?.textContent.trim() ?? "",
+      statusClass: node.querySelector(".topic-status")?.className ?? "",
+      open: node.classList.contains("is-open"),
+      border: getComputedStyle(node).borderLeftColor,
+      alert: node.querySelector(".topic-alert")?.textContent.trim() ?? "",
+    }))
+  );
+  const sealed = cards.filter((item) => !item.live);
+  check(
+    "三态会话里三个封存主题各一张卡",
+    sealed.length === 3,
+    `${sealed.length} 张封存卡`
+  );
+  check(
+    "状态字是完成 / 失败 / 已中断",
+    sealed.map((item) => item.status).join("/") === "已完成/失败/已中断",
+    sealed.map((item) => item.status).join("/")
+  );
+  check(
+    "状态类名跟着状态走",
+    sealed[0].statusClass.includes("status-completed") &&
+      sealed[1].statusClass.includes("status-failed") &&
+      sealed[2].statusClass.includes("status-interrupted"),
+    sealed.map((item) => item.statusClass).join(" | ")
+  );
+  check(
+    "三种状态的左边框颜色互不相同",
+    new Set(sealed.map((item) => item.border)).size === 3,
+    sealed.map((item) => item.border).join(" / ")
+  );
+  check(
+    "收起的失败卡也写出失败原因",
+    sealed[1].open === false && sealed[1].alert.includes("缺少 meeko"),
+    `收起=${!sealed[1].open}，提示「${sealed[1].alert}」`
+  );
+  check(
+    "完成卡与中断卡没有失败提示",
+    !sealed[0].alert && !sealed[2].alert,
+    `「${sealed[0].alert}」「${sealed[2].alert}」`
+  );
+  check(
+    "默认只展开最后一个封存主题",
+    sealed[0].open === false && sealed[1].open === false && sealed[2].open === true,
+    sealed.map((item) => item.open).join("/")
+  );
+
+  // 打开失败那个主题：失败的那一步默认展开，工具卡把输入输出也打开。
+  const failedCard = page.locator('#conversation .topic-card[data-event="evt_0002"]');
+  await failedCard.locator(".topic-toggle").click();
+  await page.waitForFunction(
+    () =>
+      document
+        .querySelector('.topic-card[data-event="evt_0002"]')
+        ?.classList.contains("is-open") === true,
+    undefined,
+    { timeout: 15000 }
+  );
+  const step = await failedCard.locator(".step-row").evaluate((node) => ({
+    failed: node.classList.contains("is-failed"),
+    open: node.classList.contains("is-open"),
+    bodyOpen: node.querySelector(".tool-body")?.open === true,
+    issue: node.querySelector(".issue-line")?.textContent.trim() ?? "",
+  }));
+  check(
+    "失败的那一步默认展开并写出原因",
+    step.failed && step.open && step.issue.includes("缺少 meeko"),
+    JSON.stringify(step)
+  );
+  check(
+    "失败的工具卡默认打开输入输出",
+    step.bodyOpen === true,
+    `details.open=${step.bodyOpen}`
+  );
+
+  // 这份快照是判据准备阶段写的，跑到这里早就过期了。断开的提醒与最后已知的
+  // 状态要同时在场：只说「可能断开」，用户还是不知道停在哪儿。
+  const liveCard = page.locator("#conversation .topic-card.is-live");
+  check("运行中的主题也画出来", (await liveCard.count()) === 1, `${await liveCard.count()} 张`);
+  const stale = await liveCard.locator(".live-now").innerText();
+  check(
+    "过期快照同时给出警告与最后已知状态",
+    stale.includes("可能已断开") && stale.includes("analyze_pose"),
+    stale.replace(/\n/g, " / ")
+  );
+}
+
 async function checkSearchBox(page, sessionId) {
   const shelf = await getJson(`/api/sessions/${sessionId}/events`);
   const source = shelf.events.length ? shelf.events[0].title : shelf.title;
@@ -1065,6 +1386,8 @@ async function checkSearchBox(page, sessionId) {
 async function main() {
   fs.mkdirSync(path.join(ROOT, ".probe"), { recursive: true });
   prepareSurveys();
+  const { source: sourceState, seeded: threeStateId } = prepareState();
+  console.log(`状态文件副本来自 ${sourceState}，三态会话是 ${threeStateId}`);
   const server = startServer();
   let browser = null;
   try {
@@ -1095,6 +1418,8 @@ async function main() {
     page.on("pageerror", (error) => consoleErrors.push(String(error)));
 
     await checkHistoryPage(page, listing, biggest.id);
+    await checkLiveCard(page, biggest.id);
+    await checkThreeStates(page, threeStateId);
     await checkSearchBox(page, biggest.id);
     await checkStructurePage(page, session.runId, biggest.id);
 
@@ -1125,7 +1450,7 @@ async function main() {
     await page.goto(`${BASE}/#/history/${biggest.id}`, { waitUntil: "networkidle" });
     // 等第一段正文画出来再截：只等 networkidle 会拍到「正在读取会话…」那一帧，
     // 截图就失去了对照的价值。
-    await page.waitForSelector("#conversation .event-card, #conversation article.msg", {
+    await page.waitForSelector("#conversation .topic-card", {
       timeout: 60000,
     });
     await page.waitForTimeout(400);

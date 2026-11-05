@@ -40,9 +40,10 @@ from ..ledger import (
     fingerprint_path,
 )
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
-from . import affinity, docking, export, pdbtext, products
+from . import affinity, docking, export, pdbtext, products, screen
 
 __all__ = [
+    "AlternativePosesTool",
     "AnalyzeHydrophobicTool",
     "AnalyzePoseTool",
     "CandidateRow",
@@ -1826,6 +1827,293 @@ def _contact_map(
     return found
 
 
+DEFAULT_POSE_MODES = 9
+MAX_POSE_MODES = 50
+DEFAULT_ALT_JACCARD = 0.5
+MIN_ALT_JACCARD = 0.3
+MAX_ALT_JACCARD = 0.9
+MAX_ALT_CLUSTERS = 10
+
+
+def _split_pdbqt_models(text: str) -> list[str]:
+    """按 `MODEL` / `ENDMDL` 切出每一套模型。没有 `MODEL` 行时整份算一套。
+
+    `pdbtext.parse` 只留第一套模型，多模式文件直接喂进去只剩一个位姿——要比较
+    摆法就必须先切段、每段单独解析。Vina 的 `--out` 用 `MODEL` / `ENDMDL` 分隔，
+    第一段是分数最好的那个。
+    """
+    blocks: list[str] = []
+    current: list[str] = []
+    inside = False
+    for line in text.splitlines(keepends=True):
+        record = line[:6]
+        if record == "MODEL ":
+            inside = True
+            current = []
+            continue
+        if record == "ENDMDL":
+            if current:
+                blocks.append("".join(current))
+            inside = False
+            current = []
+            continue
+        if inside:
+            current.append(line)
+    if current:
+        blocks.append("".join(current))
+    return blocks or [text]
+
+
+class AlternativePosesTool(Tool):
+    """同一个分子的多个对接模式，按占据的空间聚成几簇。"""
+
+    spec = ToolSpec(
+        name="alternative_poses",
+        description=(
+            "看**同一个分子的多个对接模式**：按位姿占的体积聚簇，报每簇的分数与接触残基"
+            "差异。回答的是「这次对接给出的第二种摆法是不是真的不同」。\n"
+            "只读 `dock` 产物里记的 `pose_pdbqt`（Vina 的 `--out` 含全部模式）；"
+            "只有一簇时明说「没有第二个可区分的摆法」——这是有用的读数，不是空结果。\n"
+            "簇的划分用重原子体积的 Jaccard ≥0.5，与 `pick_diverse` 的位姿去重同一口径。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "docking": {"type": "string", "description": "dock 产物的 handle"},
+                "molecule": {
+                    "type": "string",
+                    "description": "产物里的 id 列（不是序号）",
+                },
+                "max_poses": {
+                    "type": "integer",
+                    "description": f"最多看几个模式，默认 {DEFAULT_POSE_MODES}",
+                },
+                "jaccard": {
+                    "type": "number",
+                    "description": f"判同簇的体积重叠下限，默认 {DEFAULT_ALT_JACCARD}",
+                },
+                "cutoff": {
+                    "type": "number",
+                    "description": f"接触判据（埃），默认 {CONTACT_CUTOFF:g}",
+                },
+                "top": {
+                    "type": "integer",
+                    "description": f"最多列几簇，默认 5，上限 {MAX_ALT_CLUSTERS}",
+                },
+            },
+            "required": ["docking", "molecule"],
+            "additionalProperties": False,
+        },
+    )
+    primary_argument = "docking"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：alternative_poses 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+        entry, failure = _docking_entry(
+            ledger, arguments, tool_name="alternative_poses"
+        )
+        if failure is not None:
+            return failure
+
+        molecule = str(arguments.get("molecule") or "").strip()
+        if not molecule:
+            return ToolResult(
+                output="缺少参数 molecule。它是 dock 产物里的 id 列，不是序号。",
+                failed=True,
+            )
+
+        max_poses = arguments.get("max_poses", DEFAULT_POSE_MODES)
+        top = arguments.get("top", 5)
+        for name, value in (("max_poses", max_poses), ("top", top)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                return ToolResult(output=f"参数 {name} 应当是整数", failed=True)
+        if not 2 <= max_poses <= MAX_POSE_MODES:
+            return ToolResult(
+                output=f"max_poses 2–{MAX_POSE_MODES}（现在是 {max_poses}）", failed=True
+            )
+        if not 1 <= top <= MAX_ALT_CLUSTERS:
+            return ToolResult(
+                output=f"top 1–{MAX_ALT_CLUSTERS}（现在是 {top}）", failed=True
+            )
+        jaccard = _number_argument(
+            arguments, "jaccard", DEFAULT_ALT_JACCARD, MIN_ALT_JACCARD, MAX_ALT_JACCARD
+        )
+        cutoff = _number_argument(
+            arguments, "cutoff", CONTACT_CUTOFF, MIN_CONTACT_CUTOFF, MAX_CONTACT_CUTOFF
+        )
+
+        try:
+            manifest = _read_manifest(entry, docking.MANIFEST_FILE)
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+
+        results = manifest.get("results") or []
+        record = next(
+            (item for item in results if str(item.get("id") or "") == molecule), None
+        )
+        if record is None:
+            available = [str(item.get("id") or "") for item in results][:MAX_IDS_SHOWN]
+            listing = "、".join(available) if available else "（这份产物里一条结果都没有）"
+            return ToolResult(
+                output=f"{entry.handle} 里没有 id 为 {molecule} 的分子。可用的 id：{listing}",
+                failed=True,
+            )
+
+        relative = str(record.get("pose_pdbqt") or "").strip()
+        if not relative:
+            return ToolResult(
+                output=(
+                    f"{molecule} 这条没有记 pose_pdbqt，读不到多模式位姿。"
+                    "这份产物可能只保留了最佳位姿的 PDB。"
+                ),
+                failed=True,
+            )
+        path = Path(str(entry.path)) / relative
+        if not path.is_file():
+            return ToolResult(
+                output=f"产物里记的位姿文件不在了：{path}（目录被移动或清过？）",
+                failed=True,
+            )
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as error:
+            return ToolResult(output=f"读位姿文件失败：{error}", failed=True)
+
+        blocks = _split_pdbqt_models(text)[:max_poses]
+        if len(blocks) < 2:
+            return ToolResult(
+                output=(
+                    f"{molecule} 的位姿文件里只有 {len(blocks)} 个模式，没有第二个摆法可比较。"
+                    "这是有用的读数：这次对接只给了一个结果。要排除替代结合模式，"
+                    "换一组盒子或参数重跑，或从晶体结构里找另一个位点。"
+                ),
+                meta={"molecule": molecule, "modes": len(blocks), "clusters": 1},
+            )
+
+        poses: list[tuple[int, tuple[pdbtext.AtomRecord, ...]]] = []
+        skipped: list[int] = []
+        for index, block in enumerate(blocks, start=1):
+            try:
+                document = pdbtext.parse(block)
+            except pdbtext.PdbEditError:
+                skipped.append(index)
+                continue
+            atoms = tuple(atom for atom in document.atoms if pdbtext.is_heavy(atom))
+            if not atoms:
+                skipped.append(index)
+                continue
+            poses.append((index, atoms))
+        if len(poses) < 2:
+            return ToolResult(
+                output=(
+                    f"{molecule} 的 {len(blocks)} 个模式里只有 {len(poses)} 个读得出重原子，"
+                    "比较不了摆法。"
+                ),
+                failed=True,
+            )
+
+        scores = docking.parse_vina_results(text)
+        voxels = {
+            str(index): screen.pose_volume_cells([atom.coord for atom in atoms])
+            for index, atoms in poses
+        }
+        clusters = screen.cluster_by_similarity(
+            list(voxels),
+            lambda left, right: screen.pose_jaccard(voxels[left], voxels[right]),
+            float(jaccard),
+        )
+        grouped: dict[int, list[int]] = {}
+        for index, _atoms in poses:
+            grouped.setdefault(clusters[str(index)], []).append(index)
+        representatives = {
+            cluster_id: min(members) for cluster_id, members in grouped.items()
+        }
+
+        receptor, failure = _receptor_of(ledger, entry, manifest)
+        if failure is not None:
+            return failure
+
+        atoms_by_index = dict(poses)
+        contacts = {
+            cluster_id: {
+                item.label
+                for item in _contacts(
+                    receptor.atoms, atoms_by_index[representative], cutoff
+                )
+            }
+            for cluster_id, representative in representatives.items()
+        }
+
+        base = min(grouped)
+        lines = [
+            f"{molecule} 的 {len(poses)} 个模式聚成 {len(grouped)} 簇"
+            f"（体积 Jaccard ≥{float(jaccard):g}）。"
+        ]
+        for cluster_id in sorted(grouped)[:top]:
+            members = sorted(grouped[cluster_id])
+            representative = representatives[cluster_id]
+            score = (
+                scores[representative - 1].score
+                if representative - 1 < len(scores)
+                else None
+            )
+            span = (
+                f"模式 {members[0]}"
+                if len(members) == 1
+                else f"模式 {members[0]}–{members[-1]}（{len(members)} 个）"
+            )
+            score_text = f"最好 {score:.2f}" if score is not None else "没有分数记录"
+            residues = "、".join(sorted(contacts[cluster_id])[:8])
+            lines.append(
+                f"- 簇 {cluster_id}：{span}，{score_text}；"
+                f"接触 {len(contacts[cluster_id])} 个残基"
+                + (f"（{residues}）" if residues else "（4 Å 内没有残基）")
+            )
+            if cluster_id != base:
+                extra = sorted(contacts[cluster_id] - contacts[base])
+                missing = sorted(contacts[base] - contacts[cluster_id])
+                diff: list[str] = []
+                if extra:
+                    diff.append("多了 " + "、".join(extra[:6]))
+                if missing:
+                    diff.append("少了 " + "、".join(missing[:6]))
+                lines.append(
+                    f"  与簇 {base} 相比："
+                    + (
+                        "；".join(diff)
+                        if diff
+                        else "接触残基相同，差别在构象而不是接触面"
+                    )
+                )
+        if len(grouped) > top:
+            lines.append(f"……另有 {len(grouped) - top} 簇未列出")
+        if len(grouped) == 1:
+            lines.append(
+                "只有一簇：这次对接没有给出第二个可区分的摆法。"
+                "要排除替代结合模式，换一组盒子或参数重跑，或从晶体结构里找另一个位点。"
+            )
+        if skipped:
+            lines.append(f"读不出的模式：{'、'.join(str(item) for item in skipped)}")
+
+        return ToolResult(
+            output="\n".join(lines),
+            meta={
+                "molecule": molecule,
+                "modes": len(blocks),
+                "parsed": len(poses),
+                "clusters": len(grouped),
+                "skipped": skipped,
+                "jaccard": float(jaccard),
+            },
+        )
+
+
 class ContactMapTool(Tool):
     """把一份对接产物里所有位姿的残基接触并成一张频次表。"""
 
@@ -3224,6 +3512,7 @@ def domain_tools() -> list[Tool]:
     return [
         RankCandidatesTool(),
         AnalyzePoseTool(),
+        AlternativePosesTool(),
         ContactMapTool(),
         AnalyzeHydrophobicTool(),
         EfficiencyProfileTool(),

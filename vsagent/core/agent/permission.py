@@ -235,21 +235,22 @@ class PermissionDecision:
 class PermissionPolicy:
     """按几级来源判定一次工具调用能不能执行。
 
-    顺序从高到低：已中断、Plan 方式、项目配置里的拒绝、项目配置里的询问、
-    本会话全放行、工作目录之外的访问、本会话放行的工具、用户配置里的拒绝与询问、
-    默认策略。命中一级就出结论。
+    顺序从高到低：已中断、用户直接敲的命令、本会话全部放行、Plan 方式、
+    项目配置里的规则、工作目录之外的访问、联网计费配额、本会话放行的工具、
+    用户配置里的规则、默认策略。命中一级就出结论。
 
     `explicit` 为用户直接敲出来的命令，那一类只查是否已中断：命令是他自己打的，
     再让他确认一遍自己刚打的东西是噪音。
 
-    两级「本会话记住」的粒度不同，这是有意为之：
+    两级「本会话记住」的粒度不同：
 
-    - `remember_all`（弹窗上的 a）＝**这个会话里所有工具都放行**，之后什么都不问。
-    - `remember`（按工具记）＝只放行这一个工具。
+    - `allow_all`（弹窗上的 a）＝**这个会话里所有工具调用都放行**，之后什么都不问。
+      它排在 Plan 方式与全部配置规则之前，所以按过 a 之后，Plan 限制、越界路径、
+      计费配额与配置里的 deny 都不再拦；唯一还排在它前面的是用户中断。
+    - `remember`（按工具记）＝只放行这一个工具，越界与计费照旧判定。
 
-    两者都排在「工作目录之外的访问」**之前还是之后**是这个类的关键决定：
-    越界询问排在前面，意味着即使用户按了 a，走出工作目录这一步仍然会问一次。
-    这正是要的——「放行」是对**工具**的授权，不是对**磁盘任何位置**的授权。
+    这两种粒度在顺序上的位置不同是有意的：a 是用户当场给出的、覆盖本会话的
+    总开关，按工具记住只说明「这一类工具不必再问」，管不到边界与账单。
     """
 
     def __init__(
@@ -271,7 +272,13 @@ class PermissionPolicy:
         self._billed_runs = 0
 
     def allow_all(self) -> None:
-        """本会话对所有工具放行。弹窗上按 a 走这一条。"""
+        """本会话对所有工具调用放行。弹窗上按 a 走这一条。
+
+        除了用户中断，之后不再有任何一条判定会把调用拦住：Plan 方式、
+        工作目录之外的路径、联网计费配额、配置里的 deny 都跳过。
+        工具本身不可用（没登记、被开关关掉、参数校验不过）仍由别的层处理，
+        这一层只管权限询问。
+        """
         self._allow_all = True
 
     @property
@@ -292,6 +299,10 @@ class PermissionPolicy:
             return PermissionDecision(Verdict.DENY, reason="已经中断")
         if explicit:
             return PermissionDecision(Verdict.ALLOW, reason="用户直接给出的命令")
+        # 本会话全部放行排在其余各级之前：用户在弹窗上按了 a，就是要求之后
+        # 不再被权限层打断。中断仍然排在最前面，用户随时可以停下这一轮。
+        if self._allow_all:
+            return PermissionDecision(Verdict.ALLOW, rule="本会话已放行所有工具")
         name = tool.spec.name
         if agent_name == "Plan" and name in PLAN_DENY:
             return PermissionDecision(
@@ -303,16 +314,14 @@ class PermissionPolicy:
             hit = _first(self.project_rules, verdict, name, value)
             if hit is not None:
                 return PermissionDecision(hit.verdict, rule=hit.describe())
-        # 边界检查排在两级「本会话放行」之前：a 放行的是工具，不是磁盘。
         outside = self.outside_paths(tool, arguments)
         if outside:
             return PermissionDecision(
                 Verdict.ASK,
                 reason=f"这一步会动到工作目录之外：{outside[0]}",
             )
-        # 计费配额也排在两级「本会话放行」之前。「全部允许」放行的是**工具**，
-        # 不是「一直花钱」：超过配额之后仍然每次都问，否则按过一次 a 之后就再也
-        # 没人看着账单了——而搜索是唯一一个用户看不到单价的操作。
+        # 计费配额排在本会话「按工具记住」之前：「记住这个工具」放行的是调用，
+        # 不是让搜索无限花钱；按过 a 之后整条判定不再走到这里。
         if name in BILLED_TOOLS and self._billed_runs >= BILLED_ASK_AFTER:
             return PermissionDecision(
                 Verdict.ASK,
@@ -322,8 +331,6 @@ class PermissionPolicy:
                     "再调会继续计费"
                 ),
             )
-        if self._allow_all:
-            return PermissionDecision(Verdict.ALLOW, rule="本会话已放行所有工具")
         if name in self._session_tools:
             return PermissionDecision(Verdict.ALLOW, rule=f"本会话不再问：{name}")
         for verdict in (Verdict.DENY, Verdict.ASK):

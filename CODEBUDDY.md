@@ -252,44 +252,50 @@ graph TD
   `evidence_detail → history_summary → recent_tool_clear → event_step_detail →
   event_layer → memory → recent_turns → recent_reasoning → recent_output`。
   装不下就抛出 `ContextAssemblyError` 明说，**不静默截断**。
-- `event_log.py` — 事件层按 **Phase → Step 流水**记录：
-  Task（一条用户消息）→ Phase（一大步，默认 = 一轮）→ Step（一次模型往返加它的工具
-  调用）→ Event（一个 Phase 的流水）。**内核每步自动记、Phase 结束自动封存**，
+- `event_log.py` — 事件层按 **Topic → Step 流水**记录：
+  Task（一条用户消息）→ Topic（任务里的一个独立题目）→ Step（一次模型往返加它的
+  工具调用）→ Event（一个 Topic 封存后的记录）。**内核每步自动记，主题结束立即封存**，
   所以记录不依赖任何模型判断。
   Step 全部本地从 Part 拼（工具名、参数、状态、handle），不读 reasoning、零请求；
-  标题与结论模型可以用 `close_phase` 顺手给，不给就用本地拼的那份并标
-  `degraded=True`。封存三时机：轮末（默认）、新用户消息（收上一轮的尾巴）、
-  预算达到 120K（`PHASE_SOFT_LIMIT`）。封存只有这三个时机；`close_phase` 只把
-  `title` / `summary` 记到 `Session.phase_title` 上，封存时取用——轮中途切不开，
-  因为一条 assistant 消息装着一整轮的所有步，而 `Event.end` 是消息下标。
-  它的触发条件是内核摆在尾部的一行「本阶段已 N 步」（≥3 步才出现，放尾部是为了
-  不碰前缀缓存）。
-  **`seal_phase(force=True)` 与 `force=False` 的差别是覆盖**：轮末遇到纯聊天的一轮
+  标题、结论与交接模型可以用 `close_topic` 顺手给，不给就用本地拼的那份并标
+  `degraded=True`。
+  **边界是位置 `(message_index, part_index)`，不是消息下标**：一条 assistant 消息
+  装着一整轮的所有往返，按消息切不出轮中途的主题边界。切点记在 `Event.cut_message` /
+  `cut_part` 上，装配时 RECENT 从最后一条事件的切点开始。
+  `Turn.part_start`（`context.py`）是同一个口径：它由「按 `STEP_START` 分段、逐段
+  `translate_parts`」得来。
+  封存时机：模型调 `close_topic`（步末执行）、轮末、新用户消息、预算达到 120K
+  （`TOPIC_SOFT_LIMIT`）、溢出 / `/compact` / 中断。模型侧的触发条件是尾部那一行
+  「本主题已 N 步 · 产物 … · 未决 …」（≥3 步才出现，放尾部是为了不碰前缀缓存），
+  它同时也是运行中的本地摘要。
+  **`seal_topic(force=True)` 与 `force=False` 的差别是覆盖**：轮末遇到纯聊天的一轮
   可以跳过，溢出 / `/compact` / 强行腾地方必须封，否则那一段原文两边都不在。
   `Event.actions` / `artifacts` / `issues` 是**从 steps 聚合的 property**，不写入磁盘——
-  存两份必然漂移。装配时**最近一个阶段留原文**（`keep_last_phase_raw = 1`，
-  `compact = max(compact_upto, events[-1].start)`），更早的只留流水；
-  所以自动封存**不推进 `compact_upto`**，只有手动/溢出那种明确的边界才推进。
-  召回三级：`recall_event()` 列阶段、`recall_event("evt_0003")` 读流水与结论、
-  `recall_event("evt_0003", step=7)` 读那一步的工具输出原文（靠 `Step.part_start`）。
-  三条不变式（连续覆盖、边界排除当前消息、封存不花请求）见
-  [`docs/event-log-design.md`](docs/event-log-design.md) 与新语义
-  [`docs/session-review-plan.md`](docs/session-review-plan.md) §4。
-  事件块超额裁掉最旧几个阶段时要补一行「更早还有 N 个阶段」——被裁事件覆盖的原文
+  存两份必然漂移。`Event.step_start` / `step_end` 是会话内连号的步区间，只用于显示。
+  封存之后那段原文不再随请求发出；
+  所以自动封存**不推进 `compact_upto`**，只有手动 / 溢出那种明确的边界才推进。
+  原文一条不删：`Step` 上的 `message_index` / `part_start` / `part_end` 就是取回它的地址。
+  召回三级：`recall_event()` 列主题、`recall_event("evt_0003")` 读流水结论与原文、
+  `recall_event("evt_0003", step=7)` 读那一步的工具输出原文。
+  三条不变式（连续覆盖、边界不收当前步、封存不花请求）见
+  [`docs/session-review-plan.md`](docs/session-review-plan.md) §4；
+  [`docs/event-log-design.md`](docs/event-log-design.md) 记录的是旧设计，不随代码更新。
+  事件块超额裁掉最旧几个主题时要补一行「更早还有 N 个主题」——被裁事件覆盖的原文
   既不在事件里也不在 RECENT 里，不说就是无声消失。
-  **摘要已退休**：它的三段分别由 TASK、Step 流水、Phase 结论覆盖；
+  **摘要已退休**：它的三段分别由 TASK、Step 流水、主题结论覆盖；
   `_summarize` 只剩「首轮就溢出、连一段都封不出来」的兜底。
-- `toolset.py` — 按族加载领域工具。73 个工具里领域那 54 个的完整定义约 23K token，
+- `toolset.py` — 按族加载领域工具。75 个工具里领域那 56 个的完整定义约 23K token，
   每一步都要发；核心 19 个（文件、登记表、任务、假设、事件、记忆、`load_tools`、
-  开工前的盘点、结构全景、`write_run` / `open_viewer`）常驻，54 个领域工具分成 18 族由
+  开工前的盘点、结构全景、`write_run` / `open_viewer`）常驻，56 个领域工具分成 18 族由
   `load_tools` 现装现用，
   装过之后每步只发 3.5K。**族记在
   `Session.tool_families` 上，不记在注册表上**（注册表按根 / 子 agent 共享两份，
   记在那里会让一个会话装过的工具漏到另一个）；子 agent 从父会话继承。
-  **装载会随阶段结束而失效**：`prune_families()` 绑定在 Phase 封存上，把这个阶段没用过的族卸掉
-  （P2-1：装到八族之后每步 12K token，而典型阶段只用两三个族）。两条边界——
-  本阶段一个工具都没用过就不卸，本阶段刚装的族也不卸（`Session.family_phase`
-  记着装载时的阶段号），否则模型先装后用的那条路会被自己踩断。
+  **装载会随轮次结束而失效**：`prune_families()` 绑定在轮末封存上，把这一轮没用过的族卸掉
+  （P2-1：装到八族之后每步 12K token，而典型一轮只用两三个族）。主题封存不收敛：
+  一轮里换三个主题是常事，每次装卸都改动请求体，缓存整段失效。两条边界——
+  这一轮一个工具都没用过就不卸，这一轮刚装的族也不卸（`Session.family_topic`
+  记着装载时的主题号），否则模型先装后用的那条路会被自己踩断。
   `hidden_names(session)` 给的是**排除集**：没登记族的工具默认常驻，
   新工具忘了登记时坏处只是白占额度，不会「写了却没装、模型看不见」。
   模型看不见某个工具时最容易直接叫它的名字，所以 `loop.missing_tool_reason` 会认族：
@@ -303,10 +309,10 @@ graph TD
 - `prompt.py` — `stable_prefix` 组装：身份 → **假设规则** → 工作方式 → shell → 登记表 →
   记忆 → 事件 →（派发）→ 项目规则。**前缀里不放时间不放进度**，否则每步都击穿 prompt cache。
   排序是语义：假设规则紧跟身份（它定义「产出长什么样」，先于所有操作纪律），确认点放最后。
-  **固定那几段预算 1900 token（实测 1472），由 `tools/check_prefix.py` 守着**：超预算、
+  **固定那几段预算 1900 token（实测 1521），由 `tools/check_prefix.py` 守着**：超预算、
   点名了首步看不见的工具、出现「全库只有…」这类枚举，都会被检查出来。
   `AGENTS.md` 那一块**不设上限**：它是许可与判据的来源，少一条就可能让模型做一个本来
-  被禁止的动作，判据只报它的体量（现 2818 token / 117 行）。
+  被禁止的动作，判据只报它的体量（现 2890 token / 120 行）。
   `project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`），整份注入、不截断；
   编码坏了返回空串——`stable_prefix` 在装配之前调，那里没有 try，一个异常会掀掉一整轮。
   平台那句由 `platform_note()` 按 `sys.platform` 现取，**必须现取**：把「这套环境是
@@ -316,8 +322,9 @@ graph TD
   摘要指令是八段（目标 / 改动 / 待办 / 约束 / 决定 / 错误 / 当前 / 关键数字），
   `summary_messages` 只喂 `[summary_upto, upto)` 新段 + 旧摘要，不再整段重喂。
 - `permission.py` — `PermissionPolicy.check` 的判定顺序是有讲究的：取消 → 用户手打 bash →
-  Plan 模式 `PLAN_DENY` → 项目规则 → **越界路径检查** → 会话 allow_all → 单工具允许 → 默认
-  `{write, patch, bash, dock}` 要问。越界检查刻意排在会话「全部允许」之前：**允许一个工具不等于允许整个磁盘**。
+  **会话 allow_all** → Plan 模式 `PLAN_DENY` → 项目规则 → **越界路径检查** → 计费配额 →
+  单工具允许 → 默认 `{write, patch, bash, dock}` 要问。会话 allow_all 排在除中断之外一切之前：
+  弹窗上按了 a 就是「这个会话别再问我」，Plan 限制、越界与计费都不再拦，切会话时清掉。
   询问那一步有两条兜底（`loop._ask_permission`）：`permission.ask` 没有任何订阅者时立刻拒绝
   （无人值守运行，等下去是等一个没人回答的 future），以及 300 秒无人答复时拒绝。两处都按
   **拒绝**处理——没人答复不等于用户同意。
@@ -395,17 +402,22 @@ graph TD
   分数方向与 dock **相反**（pK 越高越好），两者不可比较——描述第一段必须写明这一句。
   它不 import torch，也**不能**：`check_chemistry_gate` 的黑名单与
   `test_smoke.walk_packages` 都会当场失败，PyInstaller 还会把 2GB 依赖拖进 exe。
-- `analysis.py` 是「看完所有结果」这一层（族名 `analysis`，7 个工具）：
+- `analysis.py` 是「看完所有结果」这一层（族名 `analysis`，8 个工具）：
   `rank_candidates`（多路合并排序）、`analyze_pose`（接触 / 氢键 / 冲突 / 可选 PLIP 指纹）、
+  `alternative_poses`（同一分子的多个对接模式按体积聚簇，报每簇分数与接触残基差异）、
   `contact_map`（一份产物里所有位姿的残基接触频次）、
   `analyze_hydrophobic`（HP/HM/脱水账）、`efficiency_profile`（LE/LELP/LLE）、
   `validate_docking`（重对接到晶体位姿的 RMSD）、`pick_controls`（正向 / 阴性 / 背离三类对照，
-  并写明每一条为什么算对照）。七个都**只读产物**，`pick_controls` 只读候选表，
+  并写明每一条为什么算对照）。八个都**只读产物**，`pick_controls` 只读候选表，
   但同样声明了 `context_argument`——它要沿 handle 找到那张表，与 `analyze_pose` 同一个理由。
-  要受体坐标的三个（`analyze_pose` / `analyze_hydrophobic` / `contact_map`）共用
-  `_docking_entry()` 与 `_receptor_of()`：前两个经 `_resolve_pose()` 取一个位姿，
+  要受体坐标的四个（`analyze_pose` / `alternative_poses` / `analyze_hydrophobic` / `contact_map`）
+  共用 `_docking_entry()` 与 `_receptor_of()`：前三个经 `_resolve_pose()` 或自读 pdbqt 取位姿，
   `contact_map` 取一次受体再遍历全部位姿。不共用的话那段
   「handle → 产物 → 位姿 → 受体坐标」的校验必然复制错。
+  `alternative_poses` 读的是 `pose_pdbqt` 里的全部模式：`pdbtext.parse` 只留第一套模型，
+  所以先用 `_split_pdbqt_models` 按 `MODEL` / `ENDMDL` 切段再逐段解析；聚簇与
+  `pick_diverse` 的位姿去重共用 `screen.pose_volume_cells` / `pose_jaccard` /
+  `cluster_by_similarity`，两处各写一套的话同一对位姿在两边会被判成不同簇。
   `analyze_hydrophobic` 与 `efficiency_profile` 的口径里都写明「没有计算熵与脱水代价」：
   输出不能让读者以为算过。
 - `pocketcmp.py` 是「口袋定下来之后」的两个问法：`compare_pockets`（同家族两个受体
@@ -414,8 +426,11 @@ graph TD
   两者共用同一套 Needleman–Wunsch；选链按「同一性 × 覆盖」，只看同一性时一条 30 个
   残基的短链会以 70% 压过真同源链。窗口按 UniProt 编号取，给 `pocket` 时先对齐换算。
 - `campaign.py` 是开工前的盘点 `assess_campaign`（**常驻，不登记族**——它决定这一轮
-  装哪几族，自己先要装族就反了）。阈值表写死，四类起点各带一句引用哪几个数的理由，
-  另给一条假设草稿。配体侧的活性用 `chembl.activity_snapshot(spread=True)`：
+  装哪几族，自己先要装族就反了）。阈值表写死，每条带一句引用哪几个数的理由；
+  四条起点逐条判适用（条件不互斥），返回**全部四条 + 一条推荐**，每条带成本档与
+  「这条能区分什么」，走不通的也列出来并写原因——只给推荐等于替模型做了选择。
+  每条可行起点各一份假设草稿，`meta.strategies` 按成本排，`meta.hypothesis` 是推荐那条。
+  配体侧的活性用 `chembl.activity_snapshot(spread=True)`：
   默认只取最强的一段，P00533 的 325 个分子全在 pChEMBL 9.49–11.00，Δ≥2 的匹配对恒为 0。
 - `survey.py` 是结构全景 `survey_structures`（**同样常驻，不登记族**——宽泛问题发生在
   第一轮，那时一族都还没装）。它把这个靶点的**全部**实验结构取回来，按 `chem_comp`
@@ -518,6 +533,17 @@ graph TD
 根目录由 `--surveys` 注入，判据因此不必往家目录里写东西。
 路径逃逸用 `resolve_within` 拒绝（403）。
 
+会话在网页上有三个视图，**正文不再随详情整份发**：`/events` 给主题清单与任务状态
+（几十 KB）、`/segment?event=<id|all>` 按事件切点取一段原文、`/artifacts` 给登记表里的
+产物与这个会话产出的运行。切点用的是 `Event.cut_message` / `cut_part`，与装配器同一组数，
+所以页面上的分段不会跟模型看到的对不上。
+产物下载走一条 `RawRoute`（`/api/sessions/<id>/artifact/<kind>%23<seq>`）：它发字节，
+不能落到「返回对象再编码成 JSON」那条路上；路径取自服务自己读的登记表，
+请求里的字符串只用来对 handle，**不做路径解析**。登记表根由 `--ledgers` 注入，默认
+`~/.vsagent/ledgers/`。
+`GET /api/search?q=` 按标题、主题的标题与结论、产物摘要搜三类，**不搜工具正文**
+（状态文件里几 MB，逐字匹配既慢又吵），正文检索归语料那条链。
+
 **S2 起网页端多了一组语料入口**（`GET /api/library`、`GET /api/library/<kind>:<id>/chunks`、
 `POST /api/library/upload`、`POST /api/library/ingest`、
 `POST /api/library/<kind>:<id>/{rename,delete}`）。章程因此从「只读」改成「查看只读 +
@@ -543,7 +569,11 @@ graph TD
 入库还额外只认 **inbox 里已有的文件名**（不认路径），避免这个入口变成「让索引读任意路径」。
 
 `web/` 无构建步骤，`app.js` 是 hash router（`#/history`、`#/structure/<run_id>`、
-`#/library`），vendored 大包（3MB Mol\*）按页懒加载。`viz/` 是唯一装 npm 包的地方，
+`#/library`），vendored 大包（3MB Mol\*）按页懒加载。历史页是三栏工作台：
+左栏会话树 + 主题（事件）列表、中间按主题分段的对话、右栏产物。
+右侧产物名点进结构页之前，先看 `runs/<id>/meta.json` 的 `provenance.session_id`——
+`write_run` 写这一项，历史页靠它把运行目录挂回会话。
+`viz/` 是唯一装 npm 包的地方，
 用 esbuild 把 Mol\* 和 marked 打成 IIFE 全局 `vsViewer` / `vsMarkdown`——页面代码不
 import 任何 npm 包，换 3D 库只动 `viz/`。
 

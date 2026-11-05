@@ -14,8 +14,8 @@ from .context import (
     ContextBundle,
     EvidenceStore,
 )
-from .event_log import (PHASE_SOFT_LIMIT, EventRuntime, event_boundary,
-                        phase_tokens, record_step, seal_phase)
+from .event_log import (TOPIC_SOFT_LIMIT, EventRuntime, event_boundary,
+                        open_tokens, record_step, seal_range, seal_topic)
 from .toolset import family_of, hidden_names, prune_families
 from .hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from .permission import PermissionDecision, PermissionPolicy, Verdict
@@ -258,9 +258,9 @@ class AgentLoop:
     def resolve_permission(self, part_id: str, verdict: Verdict, remember: bool = False) -> bool:
         """界面把用户的选择交回来，返回是否交到了等着的那个判定上。
 
-        `remember` 为真且判定为允许时，把**本会话的所有工具**一次性放行
-        （弹窗上的 a 就是这一条）。放行的是工具，不是磁盘：工作目录之外的访问
-        在那之前已经判过一次，仍然会来问，所以全放行不会把边界一起放掉。
+        `remember` 为真且判定为允许时，把**本会话的所有工具调用**一次性放行
+        （弹窗上的 a 就是这一条）。放行之后 Plan 限制、工作目录之外的访问与
+        联网计费配额都不再拦，只有用户中断排在它前面；切换会话时清掉。
         """
         pending = self._pending_permissions.get(part_id)
         if pending is None or pending.future.done():
@@ -298,17 +298,16 @@ class AgentLoop:
     def compact_session(self, session: Session) -> int:
         """手动把当前这一段封存掉，返回还剩几条原文要发。
 
-        新语义是「封存当前 Phase」：不再按 `total - keep` 算要丢几条——那个口径
+        语义是「封存当前这一段」：不再按 `total - keep` 算要丢几条——那个口径
         按**条数**压，压掉的是最便宜的那几条，最贵的那条原样留着（P1-4）。
-        现在整段封成一个阶段，`compact_upto` 推到它的末端，原文全部让位给流水。
+        现在整段封成一个主题，切点推到它的末尾，原文全部让位给摘要。
 
-        与自动封存的区别只在**硬边界**：自动封存在轮末发生，最近一个阶段还留在
-        RECENT 里（`keep_last_phase_raw`）；`/compact` 是用户主动要腾地方，
-        连这一份也不留。
+        与自动封存的区别只在**位置**：自动封存在轮末发生，封到这一轮的末尾；
+        `/compact` 是用户主动要腾地方，封到当前能封的地方。
 
         所以「没有新的一段可封」不等于「什么都不用做」：带工具的轮次在轮末已经
-        自动封存过，这里 `_seal_phase` 会返回 `None`，但硬边界仍要推到最后一个
-        事件的末端。不推的话 `/compact` 就是个空操作——界面回「这一段已经压过了」，
+        自动封存过，这里 `_seal_range` 会返回 `None`，但压缩位置仍要推到最后一个
+        事件的切点。不推的话 `/compact` 就是个空操作——界面回「这一段已经压过了」，
         而那一轮的原文还在发。
         """
         total = len(session.messages)
@@ -316,24 +315,21 @@ class AgentLoop:
         def remaining() -> int:
             """还剩几条原文会发出去。
 
-            从**软边界**算起：最近一个阶段按 `keep_last_phase_raw` 留在 RECENT 里，
-            装配时 `compact = max(compact_upto, events[-1].start)`。只减
-            `compact_upto` 会把已经归档的那几段也报成「还要发」。
+            从**最靠后的边界**算起：装配时取 `compact_upto` 与事件切点的较晚者。
+            只减 `compact_upto` 会把已经归档的那几段也报成「还要发」。
             """
-            live = session.compact_upto
-            if session.events:
-                live = max(live, session.events[-1].start)
+            live = max(session.compact_upto, session.event_cut[0])
             return total - live
 
         if total <= KEEP_MESSAGES:
             return remaining()
-        event = self._seal_phase(
+        event = self._seal_range(
             session, kind="local", upto=event_boundary(session, total), force=True
         )
         if event is not None:
-            target = event.end
+            target = event.cut_message
         elif session.events:
-            target = session.events[-1].end
+            target = session.events[-1].cut_message
         else:
             target = session.compact_upto
         session.compact_upto = max(session.compact_upto, target)
@@ -357,11 +353,11 @@ class AgentLoop:
         self.last_cached_tokens = 0
         self._summary_failures = 0
         # 上一轮如果是被中断的，它那一段的 Step 还在内存里：新消息进来时先封掉。
-        # 不封的话这些步会跟着下一轮一起算进新的 Phase，流水的阶段号就错位了。
+        # 不封的话这些步会跟着下一轮一起算进新的主题，流水的主题号就错位了。
         # 只封「真有没封存的步」的那一段：没有 pending 时按历史回填会把整份旧会话
-        # 收成一个阶段，那不是「补上一轮」，是改写历史。
+        # 收成一个主题，那不是「补上一轮」，是改写历史。
         if session.pending_steps:
-            self._seal_phase(
+            self._seal_range(
                 session,
                 kind="local",
                 upto=event_boundary(session, len(session.messages)),
@@ -390,9 +386,9 @@ class AgentLoop:
             # 用户最不知道发生了什么的时候。
             if exit_reason:
                 await self._wrap_up(session, message, exit_reason)
-            # 一轮 = 一大步：轮末自动封存当前 Phase。这是**默认边界**，也是
-            # 「记录不依赖模型判断」的落点——模型不调 close_phase 也照样有流水。
-            self._seal_phase(
+            # 轮末自动封存当前主题。这是**默认边界**，也是「记录不依赖模型判断」
+            # 的落点——模型一次 close_topic 都没调，流水与摘要照样有。
+            self._seal_range(
                 session,
                 kind="auto",
                 upto=event_boundary(session, len(session.messages)),
@@ -512,16 +508,11 @@ class AgentLoop:
         self.bus.publish("context.metrics", {"session_id": session.id, **metrics})
 
     def _event_runtime(self, session: Session) -> EventRuntime:
-        """造一份事件运行时：只决定收口能收到哪儿。
+        """造一份事件运行时。
 
-        收口不再另发请求（标题与摘要由模型随调用给出），所以这里不需要
-        摘要回调，也不需要取消状态——工具本身就是一次同步记账。
+        收口不另发请求（标题与结论由模型随调用给出），所以这里只需要会话本身。
         """
-        return EventRuntime(
-            session=session,
-            # 当前正在写的那条 assistant 消息，收口必须停在它前面。
-            current_index=max(0, len(session.messages) - 1),
-        )
+        return EventRuntime(session=session)
 
     def _memory_text(self, session: Session) -> str:
         """常驻注入的记忆正文；没装配记忆时是空串。
@@ -663,14 +654,13 @@ class AgentLoop:
                 exit_reason = EXIT_ERROR
                 break
             if context.dropped:
-                # 装不下时先把当前这一段封成阶段：流水比原文便宜得多，
+                # 装不下时先把当前这一段封成主题：摘要比原文便宜得多，
                 # 封完再装一次通常就够了。封不动（这一段已经全在事件里）
                 # 才退回摘要那一条路——那是旧机制，只给「首轮就溢出」兜底。
                 boundary = event_boundary(session, max(0, len(session.messages) - 1))
                 covered = min(context.dropped_upto, boundary)
-                if self._seal_phase(session, kind="auto", upto=covered, force=True):
-                    # 装不下是硬约束：这一段的原文必须让位，不能因为
-                    # 「最近一个阶段留原文」又把它留在 RECENT 里。
+                if self._seal_range(session, kind="auto", upto=covered, force=True):
+                    # 装不下是必须解决的约束：这一段的原文必须让位。
                     session.compact_upto = max(session.compact_upto, covered)
                     context = self._assemble(session, prefix)
                 elif await self._summarize(session, message, context.dropped_upto):
@@ -717,7 +707,7 @@ class AgentLoop:
             if not await self._run_tools(session, message, calls):
                 exit_reason = EXIT_CANCELLED
                 break
-            # 这一步做完了，立刻记进当前 Phase 的流水。**零请求**：读的是 Part 上
+            # 这一步做完了，立刻记进当前主题的流水。**零请求**：读的是 Part 上
             # 已经算好的工具名、参数、状态与 handle，不碰 reasoning。
             self._record_step(session, message, calls)
             # 连续这么多次「整步工具全失败」才算卡住。
@@ -735,20 +725,51 @@ class AgentLoop:
                 failed_streak = 0
         return message, step, int((time.time() - started) * 1000), exit_reason
 
-    def _seal_phase(self, session: Session, **options: Any) -> Event | None:
-        """封存一个 Phase，顺手收敛工具族（P2-1）。
+    def _seal_range(self, session: Session, **options: Any) -> Event | None:
+        """在消息边界封存一个主题，顺手收敛工具族（P2-1）。
 
-        两件事绑在一起：Phase 边界就是「换阶段」的地方，准备受体的阶段不需要
+        两件事绑在一起：换轮就是「换事情」的地方，准备受体的那一轮用不到
         `docking` 族。族只装不卸的话，装到八族之后每一步都发 12K token 的定义，
-        而典型阶段只用得上两三个。
+        而典型一轮只用得上两三个。
+
+        模型自己在轮中途换主题（`close_topic`）时**不收敛**：一轮里换三个主题
+        不该把工具清单来回装卸，每次装卸都改动请求体，缓存整段失效。
         """
-        event = seal_phase(session, **options)
+        return self._after_seal(session, seal_range(session, **options))
+
+    def _seal_topic(
+        self, session: Session, message: Message, calls: list[Part]
+    ) -> Event | None:
+        """模型要求换主题时封存：切点取这一步的末尾。
+
+        切在步末而不是调用那一刻：这一步的工具结果刚写完，这一段原文到这里
+        就齐了；下一段从下一个 `STEP_START` 开始，中间不留半句。
+        """
+        event = seal_topic(
+            session, cut=self._step_cut(session, message, calls), kind="manual"
+        )
+        if event is None:
+            return None
+        self.bus.publish(
+            "event.sealed",
+            {
+                "session_id": session.id,
+                "event_id": event.id,
+                "topic_index": event.topic_index,
+                "title": event.title,
+                "steps": len(event.steps),
+            },
+        )
+        return event
+
+    def _after_seal(self, session: Session, event: Event | None) -> Event | None:
+        """封存之后的收尾：没卸族就什么都不做。"""
         if event is None or not event.steps:
             return event
         dropped = prune_families(
             session,
             {name for step in event.steps for name in step.tools},
-            event.phase_index,
+            event.topic_index,
         )
         if dropped:
             self.bus.publish("status.update", {"session_id": session.id})
@@ -757,10 +778,14 @@ class AgentLoop:
     def _record_step(
         self, session: Session, message: Message, calls: list[Part]
     ) -> None:
-        """把这一步折成一条 Step，并在超出软预算时提前切开 Phase。
+        """把这一步折成一条 Step；模型要换主题就当场封存，超出预算时也切一刀。
+
+        切点取**这一步的末尾**，不取消息末尾：一条 assistant 消息装着一整轮的
+        所有步，切在消息末尾会把后面还没写的步也算进这一段，那些步的位置落在
+        切点之前，下一个主题再也收不到它们。
 
         软预算（120K token）管的是「一轮跑了三十步」那种情况：不切的话单个
-        Phase 会一直长到把 RECENT 撑爆，而流水本来只是「一大步」的粒度。
+        主题会一直长到把 RECENT 撑满，而流水是「一个主题」的粒度。
         """
         positions = [
             index
@@ -769,7 +794,7 @@ class AgentLoop:
         ]
         record_step(
             session,
-            # 步号是 Phase 内连号，不是循环层的 step 计数：那一个会把
+            # 步号是主题内连号，不是循环层的 step 计数：那一个会把
             # 「没有工具调用、因此没记步」的那几步也算进去，读起来像漏了号。
             step_no=len(session.pending_steps) + 1,
             parts=calls,
@@ -777,12 +802,28 @@ class AgentLoop:
             part_start=min(positions) if positions else 0,
             part_end=(max(positions) + 1) if positions else 0,
         )
-        if phase_tokens(session) > PHASE_SOFT_LIMIT:
-            self._seal_phase(
+        if session.topic_title:
+            self._seal_topic(session, message, calls)
+        if open_tokens(session) > TOPIC_SOFT_LIMIT:
+            self._after_seal(
                 session,
-                kind="auto",
-                upto=event_boundary(session, len(session.messages)),
+                seal_topic(session, cut=self._step_cut(session, message, calls), kind="auto"),
             )
+
+    @staticmethod
+    def _step_cut(
+        session: Session, message: Message, calls: list[Part]
+    ) -> tuple[int, int]:
+        """这一步结束时的位置：下一个主题从这里开始。"""
+        positions = [
+            index
+            for index, part in enumerate(message.parts)
+            if any(part is call for call in calls)
+        ]
+        return (
+            max(0, len(session.messages) - 1),
+            (max(positions) + 1) if positions else 0,
+        )
 
     @staticmethod
     def _all_tools_failed(calls: list[Part]) -> bool:
@@ -894,7 +935,7 @@ class AgentLoop:
         target = max(session.compact_upto, total // 2)
         if total < 2 or target <= session.compact_upto:
             return False
-        self._seal_phase(session, kind="local", upto=target, force=True)
+        self._seal_range(session, kind="local", upto=target, force=True)
         session.compact_upto = max(session.compact_upto, target)
         session.sanitize_events()
         return True
@@ -1221,6 +1262,18 @@ class AgentLoop:
             except ToolError as error:
                 self._fail_tool(message, part, str(error))
                 return
+            except Exception as error:
+                # 工具里的程序错误不是「这次调用失败」。状态先写成失败再往外抛：
+                # 否则那张卡片一直停在「运行中」，重启之后还停在运行中——
+                # 一次 NameError 让卡片挂了半小时，看起来像工具还在算。
+                # 往外抛是为了让错误在当场可见，吞掉它，用户看到的只是
+                # 「这一轮什么都没做」。
+                self._fail_tool(
+                    message,
+                    part,
+                    f"内核内部错误：{type(error).__name__}: {error}",
+                )
+                raise
         part.tool_output = result.output
         part.patch_added = result.added
         part.patch_removed = result.removed

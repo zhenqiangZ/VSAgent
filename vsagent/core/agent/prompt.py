@@ -37,9 +37,9 @@ RULES_DIR_ENV = "VSA_RULES_DIR"
 SUMMARY_NOTICE = "（以下是本次对话早前部分的摘要）"
 # 常驻记忆插在系统提示之后、摘要之前
 MEMORY_NOTICE = "（以下是本项目已知的事实，来自跨会话记忆）"
-# 事件块（已经封存的阶段）插在摘要之后、最近交互之前
+# 事件块（已经封存的主题）插在摘要之后、最近交互之前
 EVENT_NOTICE = (
-    "（以下是已经封存的阶段：每个阶段是一大步，下面是它的流水与结论，"
+    "（以下是已经封存的主题：每个主题是一段做完的工作，下面是它的流水、结论与交接，"
     "原文不再逐条列出；要某一步的原文用 recall_event <编号> step=<步号>）"
 )
 # 摘要指令。八段固定。前四段回答「这件事是什么」，后四段回答「为什么走到这里」——
@@ -64,9 +64,9 @@ SUMMARY_INSTRUCTION = (
 # 其余字符更少，所以字符数不超，token 数就不会超。
 SUMMARY_INPUT_LIMIT = 60_000
 
-# 事件（阶段）的说明。旧的「摘要指令」已经退休：阶段记录由内核每步自动攒，
-# 标题与结论是模型顺手给的（`close_phase`），不再是一次独立请求。
-# 用法写在 `event_log.ClosePhaseTool.spec` 里，离调用点更近。
+# 事件（主题）的说明。旧的「摘要指令」已经退休：主题记录由内核每步自动攒，
+# 标题与结论是模型顺手给的（`close_topic`），不再是一次独立请求。
+# 用法写在 `event_log.CloseTopicTool.spec` 里，离调用点更近。
 
 # bash 工具的执行方式说明。
 #
@@ -472,19 +472,20 @@ MEMORY_DISCIPLINE = (
     "要把事实留给以后用 remember，**写文件路径，不要写 handle**。"
 )
 
-# 事件层的使用纪律。不给这一句的话，模型不知道有 close_phase 这个东西，
-# 阶段就只能靠轮末自动封存——标题是本地拼的（工具名 + 用户原话），读起来差一些。
+# 事件层的使用纪律。不给这一句的话，模型不知道有 close_topic 这个东西，
+# 主题就只能靠轮末自动封存——标题是本地拼的（工具名 + 用户原话），读起来差一些。
 #
-# 触发条件改过两版，都是真跑量出来的（`docs/session-review-plan.md` §4.13）：
+# 触发条件改过几版，都是真跑量出来的（`docs/session-review-plan.md` §4.13）：
 # 第一版写「觉得这一大步做完了就调」——三次机会一次没调，因为「觉得」不是可执行的判断，
-# 而「轮末会自动封」又明说了不调也行。第二版加了一个「换事之前」的时机，
-# 但一条 assistant 消息装着一整轮的所有步、`Event.end` 又是消息下标，轮中途根本切不开
-# ——模型照着调了 11 次，每次都是「没有可封存的内容」，白白烧掉八步。
-# 现在只剩一个时机：收尾前，而且条件由内核摆到它眼前（「本阶段已 N 步」那一行）。
-# 所以前缀里只留「轮末自动封」与「看到那行提示再补标题」两句，过程性说明全删。
+# 而「轮末会自动封」又明说了不调也行。第二版加「换事之前」，那时轮中途切不开，
+# 模型照着调了 11 次全是「没有可封存的内容」，白白烧掉八步。
+# 现在切点按步算，轮中途切得开，触发条件仍要由内核摆到它眼前：
+# 最后一行那句「本主题已 N 步 · 产物 … · 未决 …」。前缀里只留规则本身。
 EVENT_DISCIPLINE = (
-    "**阶段（Phase）**由内核在轮末自动封存。走到第 3 步之后，最后一条消息里会多一行"
-    "「本阶段已 N 步」——看到它，在收尾之前调 close_phase，给这一大步起名字、写一句结论。"
+    "**主题（Topic）**是一次任务里的一个独立题目。一件事做完了、或者要换到不相干的事上，"
+    "调一次 close_topic：标题写作成了什么，结论写产物与关键数字，交接写后续依赖什么。"
+    "封存之后这一段的原文不再随请求发出，只留标题、结论与流水；"
+    "走到第 3 步之后最后一条消息会多一行「本主题已 N 步」，看到它就该判断是不是该收。"
     "回看原文用 recall_event。"
 )
 
@@ -646,15 +647,26 @@ def item_tokens(item: dict[str, Any]) -> int:
 
 def translate_message(message: Message) -> list[dict[str, Any]]:
     """按消息的角色选翻译方式。"""
-    if message.role == "user":
-        return _translate_user(message)
-    return _translate_assistant(message)
+    return translate_parts(message.role, message.parts)
 
 
-def _translate_user(message: Message) -> list[dict[str, Any]]:
+def translate_parts(role: str, parts: list[Part]) -> list[dict[str, Any]]:
+    """把一段 Part 翻成模型消息。
+
+    按段调用是装配器的需要：一条 assistant 消息装着一整轮的所有步，
+    `split_turns` 要按 `STEP_START` 一段一段切，切完再各自翻译。
+    整条消息翻译与逐段翻译的结果完全一致，逐段那份只是多知道每段从哪个
+    Part 开始——`Turn.part_start` 就取这个位置。
+    """
+    if role == "user":
+        return _translate_user(parts)
+    return _translate_assistant(parts)
+
+
+def _translate_user(parts: list[Part]) -> list[dict[str, Any]]:
     """用户消息：正文与引用文件拼成同一条 content。"""
     chunks: list[str] = []
-    for part in message.parts:
+    for part in parts:
         if part.type is PartType.TEXT and part.text:
             chunks.append(part.text)
         elif part.type is PartType.FILE and part.file_path:
@@ -664,7 +676,7 @@ def _translate_user(message: Message) -> list[dict[str, Any]]:
     return [{"role": "user", "content": "\n".join(chunks)}]
 
 
-def _translate_assistant(message: Message) -> list[dict[str, Any]]:
+def _translate_assistant(parts: list[Part]) -> list[dict[str, Any]]:
     """助手消息：一个 step 里的推理、正文与工具调用合成一条模型消息。
 
     DeepSeek 思考模式下，只要请求携带 tools 参数，历史里每一条 assistant 消息都要
@@ -719,7 +731,7 @@ def _translate_assistant(message: Message) -> list[dict[str, Any]]:
         text.clear()
         tools.clear()
 
-    for part in message.parts:
+    for part in parts:
         if part.type is PartType.STEP_START:
             flush()
         elif part.type is PartType.REASONING:

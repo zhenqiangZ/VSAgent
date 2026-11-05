@@ -700,12 +700,12 @@ JSONL 事件日志。
 | ------------------------------- | -------------------------------------------------------- |
 | `hidden_names(session)`         | 这一步不该发给模型的工具名：属于还没装入的那几族                                 |
 | `family_of(name)`               | 工具名属于哪一族；常驻工具返回空串。给「模型叫了一个看不见的工具」那句提示用                   |
-| `prune_families(session, used, phase_index)` | Phase 封存时收敛：本阶段没用过的族卸掉，返回卸了哪些                    |
+| `prune_families(session, used, topic_index)` | 轮末封存时收敛：这一轮没用过的族卸掉，返回卸了哪些                    |
 | `catalog_text()`                | 一族一行「族名：这一族里有哪些工具」，**从 `catalog()` 现数，不手写**               |
 | `LoadToolsTool`                 | 工具 `load_tools`；`session_argument` + `registry_argument`（后者只为读禁用名单） |
 
 常驻的是：文件五个（`bash` / `read` / `write` / `patch` / `grep`）、记忆两个、
-`task`、`hypothesis`、`assess_campaign`、`read_turn`、`close_phase`、`recall_event`、
+`task`、`hypothesis`、`assess_campaign`、`read_turn`、`close_topic`、`recall_event`、
 `load_tools`、`write_run`、`open_viewer`，加根会话专属的 `spawn_agent` / `agent_status`。
 
 > **值得注意（四处）**：

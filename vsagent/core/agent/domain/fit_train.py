@@ -38,7 +38,16 @@ import pickle
 import sys
 from pathlib import Path
 
-DTA_ROOT = Path(__file__).resolve().parents[4] / "models" / "DTA"
+# 冻结之后 `__file__` 指向 PyInstaller 的解包目录，从那里往上数四层得到的
+# `models/DTA` 并不存在——权重与 venv 都不进包。`VSA_DTA_ROOT` 是这个包对外的
+# 统一入口（`affinity.dta_root()` 已经认它），这里跟着认，两条路径就不会分叉。
+_DTA_ENV = "VSA_DTA_ROOT"
+_raw_root = os.environ.get(_DTA_ENV, "").strip()
+DTA_ROOT = (
+    Path(_raw_root).expanduser()
+    if _raw_root
+    else Path(__file__).resolve().parents[4] / "models" / "DTA"
+)
 sys.path.insert(0, str(DTA_ROOT))
 
 # **把自己所在的目录从 sys.path 上摘掉。** 用脚本方式启动时 Python 会把脚本目录放在

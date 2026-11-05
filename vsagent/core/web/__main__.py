@@ -46,6 +46,12 @@ def main() -> None:
         help="结构全景根目录（默认 ~/.vsagent/surveys）",
     )
     parser.add_argument(
+        "--ledgers",
+        type=Path,
+        default=None,
+        help="会话登记表根目录（默认 ~/.vsagent/ledgers），产物面板与下载读它",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
@@ -70,6 +76,7 @@ def main() -> None:
         args.web.resolve(),
         corpus_root=args.corpus.resolve() if args.corpus else None,
         surveys_root=args.surveys.resolve() if args.surveys else None,
+        ledgers_root=args.ledgers.resolve() if args.ledgers else None,
         **extra,
     )
     print(f"状态文件 {server.state_path}")
@@ -77,6 +84,7 @@ def main() -> None:
     print(f"网页目录 {server.web_root}")
     print(f"语料目录 {server.corpus_root}")
     print(f"全景目录 {server.surveys_root}")
+    print(f"登记表目录 {server.ledgers_root}")
     print(f"http://{HOST}:{port}/")
     server.serve_forever()
 

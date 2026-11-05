@@ -81,6 +81,9 @@ UPLOAD_SUFFIXES = (".pdf", ".md", ".txt")
 LIBRARY_ITEM = re.compile(r"^(doc|web):([0-9a-f]{10})$")
 """`<kind>:<id>/<action>` 里那一段的身份。**路径由 id 拼，不接受用户给的路径。**"""
 
+LEDGER_DIRECTORY = "ledgers"
+"""登记表快照所在目录，与 `ledger.ledger_root()` 同一个名字。"""
+
 
 class HttpError(Exception):
     """带状态码的请求错误。"""
@@ -180,10 +183,15 @@ def part_json(part) -> dict:
     }
 
 
-def message_json(message) -> dict:
-    """一条消息。"""
+def message_json(message, index: int | None = None) -> dict:
+    """一条消息。
+
+    `index` 是它在会话里的位置。分段取回来的消息只带一段单元，页面要按位置把
+    它对应到步流水上的 `messageIndex`，所以这个数必须随消息一起给。
+    """
     return {
         "id": message.id,
+        "index": index,
         "role": message.role,
         "createdAt": message.created_at,
         "modelId": message.model_id,
@@ -200,6 +208,8 @@ def session_summary(session, run_id: str | None) -> dict:
         "id": session.id,
         "title": session.title,
         "messageCount": len(session.messages),
+        # 左栏要在不取正文的前提下显示「这个任务分成了几段」，所以条数随列表一起给。
+        "eventCount": len(session.events),
         "partCount": sum(len(message.parts) for message in session.messages),
         "createdAt": session.created_at,
         "updatedAt": session.updated_at,
@@ -224,8 +234,170 @@ def session_detail(session, run_id: str | None) -> dict:
     data = session_summary(session, run_id)
     data["effort"] = session.effort
     data["compactUpto"] = session.compact_upto
-    data["messages"] = [message_json(message) for message in session.messages]
+    data["messages"] = [
+        message_json(message, index) for index, message in enumerate(session.messages)
+    ]
     return data
+
+
+def step_json(step) -> dict:
+    """一条步记录。键名与页面同名，页面不再做一层映射。"""
+    return {
+        "seq": step.seq,
+        "intent": step.intent,
+        "result": step.result,
+        "tools": list(step.tools),
+        "args": list(step.args),
+        "artifacts": list(step.artifacts),
+        "issues": list(step.issues),
+        # 位置是回原文的地址：页面点一步就按这两个数找到那次工具调用。
+        "messageIndex": step.message_index,
+        "partStart": step.part_start,
+        "partEnd": step.part_end,
+    }
+
+
+def event_json(event) -> dict:
+    """一条已封存的主题。
+
+    `actions` / `artifacts` / `issues` 是 `Event` 上从 steps 聚合出来的属性，
+    这里原样转出：页面上「这一步产出了什么」与事件层算的是同一份。
+    """
+    return {
+        "id": event.id,
+        "title": event.title,
+        "summary": event.summary,
+        "handoff": event.handoff,
+        "topicIndex": event.topic_index,
+        "kind": event.kind,
+        "degraded": event.degraded,
+        "createdAt": event.created_at,
+        "stepStart": event.step_start,
+        "stepEnd": event.step_end,
+        "tokens": event.tokens,
+        "cut": {"message": event.cut_message, "part": event.cut_part},
+        "steps": [step_json(step) for step in event.steps],
+        "actions": event.actions,
+        "artifacts": event.artifacts,
+        "issues": event.issues,
+    }
+
+
+def task_json(state) -> dict:
+    """任务状态：用户提的目标与约束、做完的、待办的、卡住的、提出的假设。
+
+    这是页面顶部那张任务卡的唯一来源，与模型每步看到的 TASK 层是同一份，
+    页面上写的「目标」不会跟模型理解的目标分叉。
+    """
+    return {
+        "goal": state.goal,
+        "constraints": list(state.constraints),
+        "done": list(state.done),
+        "todo": list(state.todo),
+        "blockers": list(state.blockers),
+        "hypotheses": [item.to_dict() for item in state.hypotheses],
+    }
+
+
+def event_span(events) -> list[tuple[str, tuple[int, int], tuple[int, int]]]:
+    """每条事件覆盖的位置区间 `[start, end)`。
+
+    起点就是上一条的切点，首条从 `(0, 0)` 起——事件层「连续覆盖」那条规则的
+    另一处写法。返回的顺序与事件顺序一致，页面按它把消息切开。
+    """
+    spans: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+    start = (0, 0)
+    for event in events:
+        end = event.cut
+        spans.append((event.id, start, end))
+        start = end
+    return spans
+
+
+def slice_messages(session, start: tuple[int, int], end: tuple[int, int]) -> list[dict]:
+    """取一段消息，按位置裁到 `[start, end)`。
+
+    一条 assistant 消息装着整轮的所有往返，所以区间端点要落在**单元**上：
+    只按消息下标切，会把上一条主题的工具调用一起带进来。裁完没有单元的消息
+    不返回——页面上一条空消息只会让人以为内容丢了。
+    """
+    first, last = start[0], min(end[0], len(session.messages))
+    sliced: list[dict] = []
+    for index in range(first, last):
+        message = session.messages[index]
+        low = start[1] if index == start[0] else 0
+        high = end[1] if index == end[0] else len(message.parts)
+        parts = message.parts[low:high]
+        if not parts:
+            continue
+        data = message_json(message, index)
+        data["parts"] = [part_json(part) for part in parts]
+        data["partOffset"] = low
+        sliced.append(data)
+    return sliced
+
+
+def ledger_payload(root: Path, session_id: str) -> dict:
+    """会话登记表：产物清单与血缘。**只读**，不动文件。
+
+    登记表里每一项都带 `path`，那就是「这个 handle 落到盘上哪个文件」的凭据。
+    下载接口只认这里出现过的路径，所以浏览器给什么都不会被当成路径解析。
+    """
+    path = root / f"{session_id}.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"items": [], "note": "这个会话还没有产物登记表"}
+    except (OSError, ValueError) as error:
+        return {"items": [], "note": f"登记表读不出来：{error}"}
+
+    items: list[dict] = []
+    for entry in raw.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        handle = entry.get("handle") or {}
+        kind = str(handle.get("kind") or "")
+        seq = int(handle.get("seq") or 0)
+        if not kind or not seq:
+            continue
+        target = Path(str(entry.get("path") or "")) if entry.get("path") else None
+        is_file = bool(target and target.is_file())
+        items.append(
+            {
+                "handle": f"{kind}#{seq}",
+                "kind": kind,
+                "seq": seq,
+                "summary": str(entry.get("summary") or ""),
+                "path": str(target) if target else "",
+                "name": target.name if target else "",
+                "isFile": is_file,
+                "isDir": bool(target and target.is_dir()),
+                "bytes": target.stat().st_size if is_file else None,
+                # 盘上现在还在不在，比登记时记的 file_state 更可信：那个值是上一次
+                # 核对写下的，进程重启之后不会自己更新。
+                "present": bool(target and target.exists()),
+                "fileState": str(entry.get("file_state") or ""),
+                "parents": [
+                    f"{item.get('kind')}#{item.get('seq')}"
+                    for item in entry.get("parents") or []
+                    if isinstance(item, dict)
+                ],
+                "meta": entry.get("meta") or {},
+                "createdAt": float(entry.get("created_at") or 0),
+                "download": ""
+                if not is_file
+                else f"/api/sessions/{session_id}/artifact/{kind}%23{seq}",
+            }
+        )
+    receptor = raw.get("current_receptor") or {}
+    return {
+        "items": items,
+        "currentReceptor": (
+            f"{receptor.get('kind')}#{receptor.get('seq')}"
+            if isinstance(receptor, dict) and receptor
+            else ""
+        ),
+    }
 
 
 def scan_runs(runs_dir: Path) -> list[dict]:
@@ -845,6 +1017,24 @@ class JsonRoute:
 
 
 @dataclass(frozen=True)
+class RawRoute:
+    """一条自己写响应的路由。
+
+    `JsonRoute` 的处理函数返回一个对象，由分发处编码成 JSON；产物下载返回的是
+    文件字节，编码那一步必须跳过。判别用正则，因为路径里带着 `#` 与编号。
+    """
+
+    pattern: re.Pattern
+    handler: Callable[[Any, Any], None]
+    method: str = "GET"
+
+    def matches(self, path: str, method: str):
+        if self.method != method:
+            return None
+        return self.pattern.match(path)
+
+
+@dataclass(frozen=True)
 class RouteSpec:
     """这台服务认识的全部路径。
 
@@ -853,12 +1043,21 @@ class RouteSpec:
     """
 
     json_routes: tuple[JsonRoute, ...] = field(default_factory=tuple)
+    raw_routes: tuple[RawRoute, ...] = field(default_factory=tuple)
 
     def match(self, path: str, method: str = "GET") -> JsonRoute | None:
         """找出处理这条路径与动词的路由；静态文件与未知路径都返回 None。"""
         for route in self.json_routes:
             if route.matches(path, method):
                 return route
+        return None
+
+    def match_raw(self, path: str, method: str = "GET"):
+        """找出要自己写响应的一条，返回 `(路由, 正则匹配)`。"""
+        for route in self.raw_routes:
+            matched = route.matches(path, method)
+            if matched is not None:
+                return route, matched
         return None
 
 
@@ -874,19 +1073,239 @@ def _session_list(request: "WebHandler", _rest: str) -> dict:
     }
 
 
-def _session_detail(request: "WebHandler", rest: str) -> dict:
-    """单个会话的完整内容。"""
+def _session_events(request: "WebHandler", session) -> dict:
+    """一个会话的主题清单：事件、任务状态、总账。不含任何工具正文。
+
+    左栏与任务卡只需要这些：标题、结论、步数、产物名。正文由 `/segment`
+    按事件一次取一段，所以这里是几十 KB 而不是几 MB。
+    """
+    events = [event_json(event) for event in session.events]
+    artifacts: list[str] = []
+    issues: list[str] = []
+    for event in events:
+        for name in event["artifacts"]:
+            if name not in artifacts:
+                artifacts.append(name)
+        issues.extend(event["issues"])
+    return {
+        "sessionId": session.id,
+        "title": session.title,
+        "status": session.status,
+        "parentId": session.parent_id,
+        "messageCount": len(session.messages),
+        "compactUpto": session.compact_upto,
+        "task": task_json(session.task_state),
+        "events": events,
+        "totals": {
+            "events": len(events),
+            # 按条目数算而不是按 `step_end`：旧会话的事件没有连号步区间
+            # （两个字段都是 0），按号码算会把走过的步报成 0。
+            "steps": sum(len(event["steps"]) for event in events),
+            "artifacts": len(artifacts),
+            "issues": len(issues),
+        },
+    }
+
+
+def _session_segment(request: "WebHandler", session) -> dict:
+    """一个主题的原文：按事件的位置区间切好的消息。
+
+    `event=all` 取整个会话。判断区间用的是 `Event` 上的切点，与装配器读的是
+    同一组数，所以页面上「这一段属于哪个主题」跟模型看到的分段一致。
+    """
+    query = parse_qs(urlsplit(request.path).query)
+    wanted = (query.get("event") or ["all"])[0].strip() or "all"
+    if wanted == "all":
+        start, end = (0, 0), (len(session.messages), 0)
+        label = "all"
+    else:
+        spans = {item[0]: (item[1], item[2]) for item in event_span(session.events)}
+        found = spans.get(wanted)
+        if found is None:
+            raise HttpError(404, f"这个会话里没有这条事件：{wanted}")
+        start, end = found
+        label = wanted
+    messages = slice_messages(session, start, end)
+    return {
+        "sessionId": session.id,
+        "event": label,
+        "from": {"message": start[0], "part": start[1]},
+        "to": {"message": end[0], "part": end[1]},
+        "partCount": sum(len(message["parts"]) for message in messages),
+        "messages": messages,
+    }
+
+
+def _session_artifacts(request: "WebHandler", session) -> dict:
+    """会话产物：登记表里的条目，加这个会话产出的运行目录。"""
+    payload = ledger_payload(request.server.ledgers_root, session.id)
+    runs = [
+        {
+            "id": item["id"],
+            "runId": item["runId"],
+            "name": item["name"],
+            "pdbId": item["pdbId"],
+            "pocketCount": item["pocketCount"],
+            "moleculeCount": item["moleculeCount"],
+        }
+        for item in scan_runs(request.server.runs_dir)
+        if item["sessionId"] == session.id
+    ]
+    return {"sessionId": session.id, "runs": runs, **payload}
+
+
+def _artifact_entry(root: Path, session_id: str, want: str) -> dict | None:
+    """按 handle 在登记表里找条目。**只认登记过的**，浏览器给的字符串不拼路径。"""
+    for entry in ledger_payload(root, session_id)["items"]:
+        if entry["handle"] == want:
+            return entry
+    return None
+
+
+ARTIFACT_HANDLE = re.compile(r"^(receptor|ligandset|artifact)#(\d+)$")
+ARTIFACT_PATTERN = re.compile(r"^/api/sessions/(?P<id>[^/]+)/artifact/(?P<handle>[^/]+)$")
+
+
+def serve_artifact(request: "WebHandler", matched) -> None:
+    """`GET /api/sessions/<id>/artifact/<kind>%23<seq>`：把产物原样发回去。
+
+    路径来自服务自己读的登记表，不是请求里的字符串——所以这里没有路径解析，
+    也就没有穿越可谈。handle 只认三种形状，别的直接 404。
+    """
+    session_id = matched.group("id")
     manager = load_manager(request.server.state_path)
-    session = manager.get_session(rest)
+    if manager.get_session(session_id) is None:
+        raise HttpError(404, f"会话不存在：{session_id}")
+    raw = matched.group("handle")
+    if not ARTIFACT_HANDLE.match(raw):
+        raise HttpError(404, f"产物标识要写成 receptor#1 / ligandset#2 / artifact#3：{raw}")
+    entry = _artifact_entry(request.server.ledgers_root, session_id, raw)
+    if entry is None:
+        raise HttpError(404, f"登记表里没有 {raw}")
+    path = Path(entry["path"]) if entry["path"] else None
+    if path is None or not path.is_file():
+        raise HttpError(404, f"{raw} 指向的文件不在了：{entry['path'] or '（没有记录路径）'}")
+    request.send_body(path.read_bytes(), content_type_for(path))
+
+
+def _session_detail(request: "WebHandler", rest: str) -> dict:
+    """会话本身与它下面的三个只读视图：`/events`、`/segment`、`/artifacts`。
+
+    三处共用一个前缀路由，是因为它们都以会话编号开头；拆成三条前缀路由时，
+    `/api/sessions/` 会先把它们全都接住，谁先谁后都一样。
+    """
+    segments = [item for item in rest.split("/") if item]
+    if not segments:
+        raise HttpError(404, "缺少会话编号")
+    session_id = segments[0]
+    manager = load_manager(request.server.state_path)
+    session = manager.get_session(session_id)
     if session is None:
-        raise HttpError(404, f"会话不存在：{rest}")
-    runs = scan_runs(request.server.runs_dir)
-    return session_detail(session, run_id_for_session(runs, session.id))
+        raise HttpError(404, f"会话不存在：{session_id}")
+
+    if len(segments) == 1:
+        runs = scan_runs(request.server.runs_dir)
+        return session_detail(session, run_id_for_session(runs, session.id))
+    action = segments[1]
+    if len(segments) == 2:
+        if action == "events":
+            return _session_events(request, session)
+        if action == "segment":
+            return _session_segment(request, session)
+        if action == "artifacts":
+            return _session_artifacts(request, session)
+    raise HttpError(404, f"会话下面没有这个接口：{'/'.join(segments[1:])}")
 
 
 def _run_list(request: "WebHandler", _rest: str) -> dict:
     """runs/ 下的运行清单。"""
     return {"runs": scan_runs(request.server.runs_dir)}
+
+
+SEARCH_LIMIT = 8
+"""每一类最多给几条。
+
+搜索的目标是「找到那一条再点进去」，不是把全库铺出来；每类八条在顶部一层
+放得下，也不至于为了一个常见词把几 MB 的正文翻一遍。
+"""
+
+
+def _search(request: "WebHandler", _rest: str) -> dict:
+    """按词找会话、主题、产物。
+
+    **只搜标题与结论**，不搜工具正文：正文在状态文件里有几 MB，逐字符匹配
+    既慢又吵（一个 `PDB` 能命中几百条），而真正要定位的是「哪次任务、哪一段」。
+    正文的检索属于语料库那条链，两者不是一回事。
+    """
+    query = parse_qs(urlsplit(request.path).query)
+    term = (query.get("q") or [""])[0].strip()
+    if not term:
+        return {"query": "", "sessions": [], "topics": [], "artifacts": []}
+    needle = term.lower()
+
+    manager = load_manager(request.server.state_path)
+    sessions: list[dict] = []
+    topics: list[dict] = []
+    for session in manager.list_sessions():
+        if needle in (session.title or "").lower():
+            sessions.append(
+                {
+                    "id": session.id,
+                    "title": session.title,
+                    "updatedAt": session.updated_at,
+                    "eventCount": len(session.events),
+                    "messageCount": len(session.messages),
+                }
+            )
+        for event in session.events:
+            if needle not in f"{event.title} {event.summary}".lower():
+                continue
+            topics.append(
+                {
+                    "sessionId": session.id,
+                    "sessionTitle": session.title,
+                    "eventId": event.id,
+                    "title": event.title,
+                    "summary": event.summary,
+                    "createdAt": event.created_at,
+                }
+            )
+
+    artifacts: list[dict] = []
+    for path in sorted(request.server.ledgers_root.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # 一份坏快照不该让搜索整体失败：跳过它，其余照常。
+            continue
+        for entry in raw.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            handle = entry.get("handle") or {}
+            text = f"{entry.get('summary') or ''} {Path(str(entry.get('path') or '')).name}"
+            if needle not in text.lower():
+                continue
+            artifacts.append(
+                {
+                    "sessionId": path.stem,
+                    "handle": f"{handle.get('kind')}#{handle.get('seq')}",
+                    "summary": str(entry.get("summary") or ""),
+                    "name": Path(str(entry.get("path") or "")).name,
+                    "kind": str(handle.get("kind") or ""),
+                }
+            )
+
+    return {
+        "query": term,
+        "sessions": sessions[:SEARCH_LIMIT],
+        "topics": topics[:SEARCH_LIMIT],
+        "artifacts": artifacts[:SEARCH_LIMIT],
+        "truncated": {
+            "sessions": len(sessions) > SEARCH_LIMIT,
+            "topics": len(topics) > SEARCH_LIMIT,
+            "artifacts": len(artifacts) > SEARCH_LIMIT,
+        },
+    }
 
 
 SURVEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
@@ -982,6 +1401,7 @@ SPEC = RouteSpec(
         JsonRoute("/api/sessions/", _session_detail, prefix=True),
         JsonRoute("/api/sessions", _session_list),
         JsonRoute("/api/runs", _run_list),
+        JsonRoute("/api/search", _search),
         JsonRoute("/api/survey/", _survey, prefix=True),
         JsonRoute("/api/library", _library),
         JsonRoute("/api/library/upload", _library_upload, method="POST"),
@@ -990,7 +1410,10 @@ SPEC = RouteSpec(
         JsonRoute("/api/library/ingest", _library_ingest, method="POST"),
         JsonRoute("/api/library/", _library_chunks, prefix=True, method="GET"),
         JsonRoute("/api/library/", _library_item_action, prefix=True, method="POST"),
-    )
+    ),
+    raw_routes=(
+        RawRoute(ARTIFACT_PATTERN, serve_artifact),
+    ),
 )
 """默认路由表。写入口只有三条，都要求 `X-VSA-Request` 头（见 `_guard_write`）。"""
 
@@ -1016,6 +1439,7 @@ class WebServer(ThreadingHTTPServer):
         max_upload: int = MAX_UPLOAD_BYTES,
         ingest: Callable[[list[Path], Path], list[dict[str, Any]]] | None = None,
         surveys_root: Path | None = None,
+        ledgers_root: Path | None = None,
     ) -> None:
         super().__init__(address, WebHandler)
         self.state_path = state_path
@@ -1028,6 +1452,12 @@ class WebServer(ThreadingHTTPServer):
         self.surveys_root = (
             Path(surveys_root) if surveys_root is not None
             else config_home() / SURVEY_DIRECTORY
+        )
+        # 登记表与全景同样处理：默认是 `~/.vsagent/ledgers/`（`ledger.ledger_root()`
+        # 的同一处），判据指到临时目录，免得把用户那几份产物当成夹具读。
+        self.ledgers_root = (
+            Path(ledgers_root) if ledgers_root is not None
+            else config_home() / LEDGER_DIRECTORY
         )
         self.max_upload = max_upload
         # 入库的**唯一写者**就在这个进程里：应用装配时把它传进来。独立运行的
@@ -1068,7 +1498,13 @@ class WebHandler(BaseHTTPRequestHandler):
         """按路径分发：先问路由表，再从运行目录取静态文件，最后是网页目录。
 
         静态文件只服务 GET：`POST /index.html` 没有意义，也不该被当成一次写。
+        产物下载排在最前面：它发的是字节，不能落到「返回对象再编码成 JSON」那条路上。
         """
+        raw = self.server.spec.match_raw(path, method)
+        if raw is not None:
+            route, matched = raw
+            route.handler(self, matched)
+            return
         matched = self.server.spec.match(path, method)
         if matched is not None:
             rest = path[len(matched.path):] if matched.prefix else ""

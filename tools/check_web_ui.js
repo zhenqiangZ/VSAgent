@@ -473,16 +473,46 @@ async function checkHistoryPage(page, listing, biggestId) {
 
   await page.locator(`#session-list li[data-session-id="${biggestId}"]`).click();
   const detail = await getJson(`/api/sessions/${biggestId}`);
+  const shelf = await getJson(`/api/sessions/${biggestId}/events`);
+
+  // 打开会话时只载入最后一个主题：这是工作台与旧页面的分界，整份会话不随
+  // 点选一起发过来。下面先核对这一点，再点「整段对话」把全文铺开。
+  if (shelf.events.length) {
+    await page.waitForSelector("#conversation .event-card", { timeout: 60000 });
+    const loaded = await page.locator("#conversation .event-card").count();
+    check("打开会话只载入最后一个主题", loaded === 1, `载入了 ${loaded} 张事件卡`);
+    const title = await page.locator("#conversation .event-title").first().textContent();
+    check(
+      "载入的是最后一条事件",
+      title.trim() === shelf.events[shelf.events.length - 1].title,
+      `页面上是「${title.trim()}」`
+    );
+  }
+
+  await page.click(".workbench .topic-all");
   await page.waitForFunction(
-    (count) => document.querySelectorAll("#session-body article.msg").length === count,
+    (count) => document.querySelectorAll("#conversation article.msg").length === count,
     detail.messages.length,
     { timeout: 60000 }
   );
-  const messageCount = await page.locator("#session-body article.msg").count();
+  const messageCount = await page.locator("#conversation article.msg").count();
   check(
     "正文里的消息条数与接口一致",
     messageCount === detail.messages.length,
     `${biggestId} 画出 ${messageCount} 条，接口 ${detail.messages.length} 条`
+  );
+
+  const railTopics = await page.locator("#topic-rail .topic-item").count();
+  check(
+    "左栏主题条数与事件接口一致",
+    railTopics === shelf.events.length,
+    `左栏 ${railTopics} 条，接口 ${shelf.events.length} 条`
+  );
+  const cards = await page.locator("#conversation .event-card").count();
+  check(
+    "整段对话按主题分段，每个主题一张卡",
+    cards === shelf.events.length,
+    `画出 ${cards} 张，接口 ${shelf.events.length} 条`
   );
 
   const parts = detail.messages.flatMap((message) => message.parts);
@@ -490,12 +520,12 @@ async function checkHistoryPage(page, listing, biggestId) {
   // 工具卡片：逐个比工具名、状态文字、输入与输出四项。
   // 只数卡片总数看不出「卡片在但输出丢了」这一类问题。
   const apiTools = parts.filter((part) => part.type === "tool");
-  const domTools = await page.locator("#session-body .part-tool").evaluateAll((nodes) =>
+  const domTools = await page.locator("#conversation .part-tool").evaluateAll((nodes) =>
     nodes.map((node) => ({
       name: node.querySelector(".tool-name")?.textContent.trim() ?? "",
       status: node.querySelector(".status")?.textContent.trim() ?? "",
-      hasInput: Boolean(node.querySelector(":scope > .tool-section > pre")),
-      hasOutput: Boolean(node.querySelector("details.tool-output-details")),
+      hasInput: Boolean(node.querySelector(".tool-body .tool-section.is-input pre")),
+      hasOutput: Boolean(node.querySelector(".tool-body .tool-section.is-output")),
     }))
   );
   check(
@@ -528,7 +558,7 @@ async function checkHistoryPage(page, listing, biggestId) {
 
   // 补丁卡片：增删行数逐个比。行数写成零时卡片照样显示，只有比数才看得出来。
   const apiPatches = parts.filter((part) => part.type === "patch");
-  const domPatches = await page.locator("#session-body .part-patch").evaluateAll((nodes) =>
+  const domPatches = await page.locator("#conversation .part-patch").evaluateAll((nodes) =>
     nodes.map((node) => ({
       file: node.querySelector(".patch-path")?.textContent.trim() ?? "",
       added: node.querySelector(".patch-added")?.textContent.trim() ?? "",
@@ -561,7 +591,7 @@ async function checkHistoryPage(page, listing, biggestId) {
   // 思考过程：折叠块的数量与接口一致，并且默认是收起的。
   const apiReasoning = parts.filter((part) => part.type === "reasoning").length;
   const reasoningOpen = await page
-    .locator("#session-body details.part-reasoning")
+    .locator("#conversation details.part-reasoning")
     .evaluateAll((nodes) => nodes.map((node) => node.open));
   check(
     "思考过程折叠块条数与接口一致",
@@ -712,7 +742,7 @@ async function checkStructurePage(page, runId, sessionId) {
   check("结构页有回到会话的链接", (await back.count()) === 1, `${await back.count()} 个链接`);
   await back.click();
   await page.waitForFunction(
-    () => document.querySelectorAll("#session-body article.msg").length > 0,
+    () => document.querySelectorAll("#conversation article.msg").length > 0,
     undefined,
     { timeout: 60000 }
   );
@@ -998,6 +1028,40 @@ async function checkSurveyPage(page) {
   );
 }
 
+async function checkSearchBox(page, sessionId) {
+  const shelf = await getJson(`/api/sessions/${sessionId}/events`);
+  const source = shelf.events.length ? shelf.events[0].title : shelf.title;
+  const term = source.slice(0, 4);
+
+  await page.goto(`${BASE}/#/history/${sessionId}`, { waitUntil: "networkidle" });
+  await page.fill("#global-search", term);
+  await page.waitForSelector("#search-results .search-item", { timeout: 30000 });
+
+  const groups = await page.locator("#search-results .search-group-title").allTextContents();
+  check(
+    "顶部搜索给出分组结果",
+    groups.length > 0,
+    `用「${term}」搜到 ${groups.join(" / ")}`
+  );
+  const first = page.locator("#search-results .search-item").first();
+  const label = (await first.textContent()).trim().slice(0, 24);
+  await first.click();
+  await page.waitForTimeout(800);
+  const hash = await page.evaluate(() => window.location.hash);
+  check(
+    "点搜索结果能跳到会话或主题",
+    hash.startsWith("#/history/"),
+    `「${label}」跳到了 ${hash}`
+  );
+  check(
+    "跳转之后结果面板收起",
+    (await page.locator("#search-results.is-hidden").count()) === 1,
+    `面板收起状态 ${await page.locator("#search-results").getAttribute("class")}`
+  );
+  // 深链接会整页重挂：等头部画出来再交给下一组判据，否则它读到的是空壳。
+  await page.waitForSelector("#session-head .head-actions", { timeout: 30000 });
+}
+
 async function main() {
   fs.mkdirSync(path.join(ROOT, ".probe"), { recursive: true });
   prepareSurveys();
@@ -1031,6 +1095,7 @@ async function main() {
     page.on("pageerror", (error) => consoleErrors.push(String(error)));
 
     await checkHistoryPage(page, listing, biggest.id);
+    await checkSearchBox(page, biggest.id);
     await checkStructurePage(page, session.runId, biggest.id);
 
     // 新形状与旧形状各走一遍。新形状那份按 meta 现算期望值，不写死几个徽标。
@@ -1058,7 +1123,12 @@ async function main() {
     const output = path.join(ROOT, "tests", "output");
     fs.mkdirSync(output, { recursive: true });
     await page.goto(`${BASE}/#/history/${biggest.id}`, { waitUntil: "networkidle" });
-    await page.waitForTimeout(1200);
+    // 等第一段正文画出来再截：只等 networkidle 会拍到「正在读取会话…」那一帧，
+    // 截图就失去了对照的价值。
+    await page.waitForSelector("#conversation .event-card, #conversation article.msg", {
+      timeout: 60000,
+    });
+    await page.waitForTimeout(400);
     await page.screenshot({ path: path.join(output, "web-history.png"), fullPage: false });
     await page.goto(`${BASE}/#/structure/${encodeURIComponent(session.runId)}`, { waitUntil: "networkidle" });
     await page.waitForFunction(() => window.__ready === true, undefined, { timeout: 120000 });

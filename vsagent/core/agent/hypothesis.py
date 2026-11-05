@@ -43,6 +43,34 @@ _EXPECTED_SIGNAL = re.compile(r"[<>≤≥~=]|\d|对照|不低于|不高于|以�
 _EDITABLE = ("claim", "mechanism", "evidence", "test", "expected", "mode")
 
 
+def _rivals(
+    state: TaskState, arguments: dict[str, Any], *, self_id: str = ""
+) -> list[str] | None:
+    """解析 `rivals` 并确认编号存在。没给这个参数时返回 `None`。
+
+    `None` 与空数组是两件事：前者是「这次不动竞争关系」，后者是「清空」。
+    两者混成一个值，`update` 只改 claim 时会把已有的竞争关系抹掉。
+    """
+    raw = arguments.get("rivals")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ToolError('rivals 要写成数组，例如 ["hyp#2"]。')
+    values: list[str] = []
+    for item in raw:
+        value = str(item or "").strip()
+        if value and value not in values:
+            values.append(value)
+    known = {other.id for other in state.hypotheses if other.id and other.id != self_id}
+    unknown = [value for value in values if value not in known]
+    if unknown:
+        raise ToolError(
+            f"rivals 里这些编号不存在：{'、'.join(unknown)}。"
+            f"现有的：{'、'.join(sorted(known)) or '（还没有）'}。"
+        )
+    return values
+
+
 class HypothesisTool(Tool):
     """提出、修订、关闭一条假设。"""
 
@@ -59,6 +87,8 @@ class HypothesisTool(Tool):
             "必须给 `mode`（expand 组外找新骨架 / narrow 组内做同系物优化）；"
             "`kind=mechanism` 是这批分子为什么活。两类都要提——只谈机制会在错的库上"
             "做精细分析，只谈策略则永远不知道为什么要这么筛。\n"
+            "两条假设给出**不同预期**时，用 `rivals` 写下对方编号，并在 `test` 里说清"
+            "哪个结果能区分它们。没有竞争关系的假设各自检验，不要互填。\n"
             "`action=close` 要说明依据；拿到实验数据后用 `record_assay(hypothesis=...)` "
             "回填，状态会按预期与实际自动改，不必手工关。"
         ),
@@ -88,6 +118,14 @@ class HypothesisTool(Tool):
                 "expected": {
                     "type": "string",
                     "description": "预期结果，要含数值、阈值或对照，例如「IC50 < 100 nM」",
+                },
+                "rivals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "与之竞争的假设编号（如 hyp#2）。只在两条假设给出不同预期时填，"
+                        "且 test 里要写明哪个结果能区分它们"
+                    ),
                 },
                 "status": {
                     "type": "string",
@@ -167,6 +205,13 @@ class HypothesisTool(Tool):
                 "没有可判真假的预期，实验数据回来也没法结案。"
             )
 
+        rivals = _rivals(state, arguments) or []
+        if rivals and not any(value in test for value in rivals):
+            raise ToolError(
+                "写了 rivals 就要在 test 里说清哪个结果能区分它们："
+                f"现在 test 里没有提到 {'、'.join(rivals)}。"
+            )
+
         item = Hypothesis(
             id=state.next_hypothesis_id(),
             kind=kind,
@@ -176,6 +221,7 @@ class HypothesisTool(Tool):
             evidence=str(arguments.get("evidence") or "").strip(),
             test=test,
             expected=expected,
+            rivals=rivals,
         )
         state.hypotheses.append(item)
         state.version += 1
@@ -198,6 +244,17 @@ class HypothesisTool(Tool):
                 "它现在是证据的一部分；要提新判断就 propose 一条新的。"
             )
         changed: list[str] = []
+        rivals = _rivals(state, arguments, self_id=item.id)
+        if rivals is not None:
+            test_text = str(arguments.get("test") or item.test or "")
+            if rivals and not any(value in test_text for value in rivals):
+                raise ToolError(
+                    "写了 rivals 就要在 test 里说清哪个结果能区分它们："
+                    f"现在 test 里没有提到 {'、'.join(rivals)}。"
+                )
+            if item.rivals != rivals:
+                item.rivals = rivals
+                changed.append("rivals")
         for name in _EDITABLE:
             if arguments.get(name) is None:
                 continue

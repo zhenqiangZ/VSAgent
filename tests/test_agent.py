@@ -94,16 +94,17 @@ from vsagent.core.agent.context import (  # noqa: E402
     split_turns,
 )
 from vsagent.core.agent.event_log import (  # noqa: E402
-    PHASE_SOFT_LIMIT,
-    ClosePhaseTool,
+    TOPIC_SOFT_LIMIT,
+    CloseTopicTool,
     EventRuntime,
     RecallEventTool,
     event_boundary,
-    phase_start,
-    phase_tokens,
+    open_tokens,
     record_step,
-    seal_phase,
     render_event_detail,
+    seal_range,
+    seal_topic,
+    topic_start,
 )
 from vsagent.core.agent.task import TaskTool  # noqa: E402
 from vsagent.core.agent.hypothesis import HypothesisTool  # noqa: E402
@@ -391,6 +392,19 @@ class FailTool(Tool):
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         raise ToolError(str(arguments["reason"]))
+
+
+class BoomTool(Tool):
+    """抛一个不是 `ToolError` 的程序错误。"""
+
+    spec = ToolSpec(
+        name="boom",
+        description="抛出程序错误",
+        parameters={"type": "object", "properties": {}, "required": []},
+    )
+
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
+        raise RuntimeError("拼 meta 时用了一个不存在的名字")
 
 
 class PresetTool(Tool):
@@ -1176,6 +1190,24 @@ def check_permission() -> None:
             decision.verdict is Verdict.ALLOW and "所有工具" in decision.rule,
             f"全放行之后 {name} 不再问：{decision.rule}",
         )
+    # a 排在 Plan 方式与配置规则之前，这两级也不再拦。
+    check(
+        judge(session_policy, "bash", {"command": "ls"}, agent_name="Plan").verdict
+        is Verdict.ALLOW,
+        "全放行之后 Plan 方式不再拦",
+    )
+    guarded = PermissionPolicy(
+        project_rules=[PermissionRule("bash", "rm -rf*", Verdict.DENY, "项目配置")]
+    )
+    guarded.allow_all()
+    check(
+        judge(guarded, "bash", {"command": "rm -rf /"}).verdict is Verdict.ALLOW,
+        "全放行之后项目 deny 也不再拦",
+    )
+    check(
+        judge(guarded, "bash", {"command": "rm -rf /"}, cancelled=True).verdict is Verdict.DENY,
+        "中断排在全部放行之前",
+    )
     session_policy.clear_session()
     check(not session_policy.allows_all, "切换会话把全放行标记一并清掉")
     check(
@@ -1215,12 +1247,6 @@ def check_permission() -> None:
         judge(quota, "read", {"path": "a.py"}).verdict is Verdict.ALLOW,
         "不花钱的工具不受配额影响",
     )
-    # 「全部允许」放行的是工具，不是账单：按过 a 之后超过配额仍然要问。
-    quota.allow_all()
-    check(
-        judge(quota, "search_web", {"query": "q-all"}).verdict is Verdict.ASK,
-        "全放行也盖不住计费配额",
-    )
     # 被拒的那一次不算：`check` 只判定，计数由循环层在执行前调 `note_tool_run`。
     before = quota.billed_runs
     check(
@@ -1230,6 +1256,12 @@ def check_permission() -> None:
     check(
         quota.billed_runs == before,
         f"判定本身不推进计数（只有真正执行的那一次才算）：{quota.billed_runs}",
+    )
+    # 按过 a 之后计费配额也一并跳过：a 的语义是本会话不再询问。
+    quota.allow_all()
+    check(
+        judge(quota, "search_web", {"query": "q-all"}).verdict is Verdict.ALLOW,
+        "全放行之后计费工具不再问",
     )
     quota.clear_session()
     check(quota.billed_runs == 0, "换会话把配额清零")
@@ -1269,8 +1301,8 @@ def check_permission() -> None:
             f"第七级：默认策略下 {name} 要问一次",
         )
 
-    # 工作目录之外的访问：单独一级判定，排在两级「本会话放行」之前。
-    # 这一级的存在意义就是让「按 a 全放行」不等于「整个磁盘随便动」。
+    # 工作目录之外的访问：单独一级判定，排在「按工具记住」之前。
+    # 这一级管的是没按过 a 的情况：模型走到工作目录外面时要让用户看一次。
     bounded = PermissionPolicy(workspace_root=WORKSPACE_FIXTURE)
     outside = OUTSIDE_PATH
     check(
@@ -1298,23 +1330,28 @@ def check_permission() -> None:
         judge(bounded, "bash", {"command": "dir"}).verdict is Verdict.ASK,
         "bash 站内命令走它自己那一档（默认要问）",
     )
-    # 关键的不变式：按 a 之后越界仍然要问。
+    # 按 a 之后越界不再问：a 的授权范围是整个会话，越界与计费都在里面。
     bounded.allow_all()
     check(
         judge(bounded, "bash", {"command": "dir"}).verdict is Verdict.ALLOW,
         "全放行之后 bash 站内不再问",
     )
     check(
-        judge(bounded, "bash", {"command": f"type {outside}"}).verdict is Verdict.ASK,
-        "全放行之后 bash 越界仍然要问（a 放行的是工具，不是磁盘）",
+        judge(bounded, "bash", {"command": f"type {outside}"}).verdict is Verdict.ALLOW,
+        "全放行之后 bash 越界也不再问",
     )
     check(
-        judge(bounded, "read", {"path": outside}).verdict is Verdict.ASK,
-        "全放行之后越界读仍然要问",
+        judge(bounded, "read", {"path": outside}).verdict is Verdict.ALLOW,
+        "全放行之后越界读不再问",
     )
     check(
         judge(bounded, "read", {"path": "notes.md"}).verdict is Verdict.ALLOW,
         "全放行之后站内读不再问",
+    )
+    # 中断排在 a 之前：按了 a 也不等于按了中断之后还能接着执行。
+    check(
+        judge(bounded, "read", {"path": outside}, cancelled=True).verdict is Verdict.DENY,
+        "全放行之后中断仍然拒绝",
     )
     bounded.clear_session()
 
@@ -1383,7 +1420,7 @@ def check_permission() -> None:
         )
 
     # 根与顶层目录：以前只认两级以上的路径，`rm -rf /usr`、`rm -rf /` 都判成
-    # 「没有越界」——按过 a（本会话全放行）之后就直接执行了。这是这一组最该守的。
+    # 「没有越界」，没按过 a 时也会被当成站内命令直接执行。这是这一组最该守的。
     for risky in ("rm -rf /", "rm -rf /usr", "cat /etc", "rm -rf ~", "rm -rf ~/data"):
         check(
             bool(bounded.outside_paths(registry.get("bash"), {"command": risky})),
@@ -2911,6 +2948,7 @@ async def check_loop(server: FakeModelServer) -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
     registry.register(FailTool())
+    registry.register(BoomTool())
     registry.register(BashTool(cwd=WORKSPACE_FIXTURE, timeout=30))
     loop = build_loop(server, bus, registry)
 
@@ -3107,6 +3145,46 @@ async def check_loop(server: FakeModelServer) -> None:
             f"{label}的失败原因回灌给模型",
         )
 
+    # 程序错误不是「这次调用失败」。卡片要写成失败，错误本身照旧往外抛：
+    # 停在「运行中」的话，界面看着像它还在算（一次 NameError 挂了半小时）。
+    server.clear()
+    recorder.clear()
+    server.script(
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[tool_call_delta(0, call_id="c1", name="boom", arguments="{}")]
+                ),
+                usage_chunk(1, 1),
+            ]
+        )
+    )
+    session_boom = Session(id="ses_boom", title="程序错误")
+    recorder.session = session_boom
+    ask(session_boom, "试一下")
+    raised: BaseException | None = None
+    try:
+        await loop.stream_reply(session_boom, "")
+    except BaseException as error:  # 内核的程序错误照旧向外抛，这里只收下来看
+        raised = error
+    check(
+        isinstance(raised, RuntimeError),
+        f"程序错误照旧抛出去：{type(raised).__name__}",
+    )
+    boom_parts = [
+        part
+        for part in session_boom.messages[-1].parts
+        if part.type is PartType.TOOL
+    ]
+    check(
+        bool(boom_parts) and boom_parts[0].tool_status is ToolStatus.FAILED,
+        f"卡片写成失败，不停在运行中：{boom_parts[0].tool_status if boom_parts else '没有工具 Part'}",
+    )
+    check(
+        "内核内部错误" in (boom_parts[0].tool_output or "") and "RuntimeError" in (boom_parts[0].tool_output or ""),
+        f"失败原因写明是内核错误：{boom_parts[0].tool_output if boom_parts else ''}",
+    )
+
     server.clear()
     recorder.clear()
     server.script(
@@ -3253,8 +3331,8 @@ async def check_loop(server: FakeModelServer) -> None:
     # 摘要机制本身已经退休（§4.7）：它的三段分别由 TASK、流水、阶段结论覆盖。
     compactions = [part for part in message.parts if part.type is PartType.COMPACTION]
     check(compactions == [], "溢出不再写摘要 Part（摘要已退休）")
-    check(bool(compact_session.events), "溢出时封出一个阶段")
-    check(compact_session.events[-1].kind == "auto", "自动封存的阶段标成 auto")
+    check(bool(compact_session.events), "溢出时封出一个主题")
+    check(compact_session.events[-1].kind == "auto", "自动封存的主题标成 auto")
     check(
         compact_session.summary == "" and compact_session.summary_upto == 0,
         "摘要不再被写",
@@ -3262,9 +3340,9 @@ async def check_loop(server: FakeModelServer) -> None:
     request = server.requests[-1]["messages"]
     check(request[0]["role"] == "system", "第一条仍然是系统提示")
     body = "\n".join(str(item["content"]) for item in request)
-    check(EVENT_NOTICE in body, "阶段块进了请求体")
-    covered = compact_session.events[-1].end
-    # 按**消息本身**数，不按子串数：阶段标题与结论里也会出现「第 N 条消息」，
+    check(EVENT_NOTICE in body, "主题块进了请求体")
+    covered = max(compact_session.compact_upto, compact_session.event_cut[0])
+    # 按**消息本身**数，不按子串数：主题标题与结论里也会出现「第 N 条消息」，
     # 用子串数会把流水里的引用算成「原文还在」。
     present = sum(
         1
@@ -3438,13 +3516,13 @@ async def check_compact(server: FakeModelServer) -> None:
     check(full > KEEP_MESSAGES, f"没压缩时发出去的消息远多于保留条数：{full}")
 
     kept = loop.compact_session(session)
-    check(kept == 0, f"压完之后原文全部让位给流水：还剩 {kept} 条")
+    check(kept == 0, f"压完之后原文全部让位给摘要：还剩 {kept} 条")
     check(session.compact_upto == sent, "压缩位置推到这一段末端")
     check(len(session.messages) == sent, "压缩不动会话里的消息")
     check(session.summary == "", "压缩这一步本身不写摘要")
-    check(bool(session.events), "压缩这一步把这一段封成一个阶段")
-    check(session.events[-1].kind == "local", "用户按出来的阶段标成 local")
-    check(session.events[-1].end == session.compact_upto, "阶段覆盖到压缩位置")
+    check(bool(session.events), "压缩这一步把这一段封成一个主题")
+    check(session.events[-1].kind == "local", "用户按出来的主题标成 local")
+    check(session.events[-1].cut_message == session.compact_upto, "主题覆盖到压缩位置")
 
     server.clear()
     server.script(Reply(chunks=[*text_chunks("接着答", size=2), usage_chunk(1, 1)]))
@@ -3509,20 +3587,20 @@ async def check_compact(server: FakeModelServer) -> None:
             )
         )
         reply.add_part(Part(type=PartType.STEP_FINISH))
-        seal_phase(
+        seal_range(
             sealed,
             kind="auto",
             upto=event_boundary(sealed, len(sealed.messages)),
-            title=f"阶段{index + 1}",
+            title=f"主题{index + 1}",
         )
-    check(sealed.compact_upto == 0 and len(sealed.events) == 6, "轮末封存不推硬边界")
+    check(sealed.compact_upto == 0 and len(sealed.events) == 6, "轮末封存不推压缩位置")
     check(
         loop.compact_session(sealed) == 0,
         "已经封存过的会话按下去也要把原文压掉，返回 0 条要发",
     )
     check(
         sealed.compact_upto == len(sealed.messages),
-        f"硬边界推到最后一个事件的末端：{sealed.compact_upto}",
+        f"压缩位置推到最后一个事件的切点：{sealed.compact_upto}",
     )
     check(len(sealed.events) == 6, "没有新的一段可封时不重复封")
     check(loop.compact_session(sealed) == 0, "再按一次仍是 0 条，位置不往回退")
@@ -3559,25 +3637,25 @@ async def check_overflow_phase(server: FakeModelServer) -> None:
     assert message is not None
     check(len(server.requests) == 1, f"溢出不再多花一次摘要请求：{len(server.requests)}")
     check(session.summary_upto == 0, "摘要没被写（它已经退休）")
-    check(bool(session.events), "溢出封出了阶段")
-    covered = session.events[-1].end
-    check(covered > 0, f"阶段覆盖到第 {covered} 条")
+    check(bool(session.events), "溢出封出了主题")
+    covered = max(session.compact_upto, session.event_cut[0])
+    check(covered > 0, f"主题覆盖到第 {covered} 条")
 
     fed = server.requests[-1]["messages"]
     check(fed[0]["role"] == "system", "发出去的第一条是系统提示")
     body = "\n".join(str(item.get("content") or "") for item in fed)
-    check(EVENT_NOTICE in body, "阶段块进了请求体")
-    check("结论：" in body, "阶段结论也进了请求体")
+    check(EVENT_NOTICE in body, "主题块进了请求体")
+    check("结论：" in body, "主题结论也进了请求体")
     check(
         session.events[-1].steps == [],
-        "纯文本会话没有工具调用，阶段只有标题与结论",
+        "纯文本会话没有工具调用，主题只有标题与结论",
     )
     raw = sum(
         1
         for item in fed
         if str(item.get("content") or "").startswith("第 ")
     )
-    check(raw == 31 - covered, f"被阶段覆盖的原文不再发出去：还剩 {raw} 条")
+    check(raw == 31 - covered, f"被主题覆盖的原文不再发出去：还剩 {raw} 条")
 
     kept = [part.text for message in session.messages[:31] for part in message.parts]
     check(kept == original, "会话里的 Part 内容一条不少、一字不改")
@@ -4033,11 +4111,10 @@ async def check_permission_in_loop(server: FakeModelServer) -> None:
     check(tools[0].tool_status is ToolStatus.FAILED, "拒绝之后工具标成失败")
     check(tools[0].tool_output == "用户拒绝", f"拒绝原因回灌给模型：{tools[0].tool_output}")
 
-    # 全放行之后，越界仍然要问：a 放行的是工具，不是磁盘。
-    # 这一条是「放行范围扩大之后边界还在」的证据。
+    # 没按过 a 时，越界仍然要问一次。
     server.clear()
     recorder.clear()
-    bound_session = Session(id="ses_bound", title="越界仍要问")
+    bound_session = Session(id="ses_bound", title="越界要问")
     recorder.session = bound_session
     ask(bound_session, "读一个外面的文件")
     server.script(
@@ -4073,6 +4150,37 @@ async def check_permission_in_loop(server: FakeModelServer) -> None:
     await running
     tools = [part for part in bound_session.messages[-1].parts if part.type is PartType.TOOL]
     check(tools[0].tool_status is ToolStatus.FAILED, "越界被拒之后工具标成失败")
+
+    # 按 a 之后越界不再问：授权范围是整个会话，越界与计费都在里面。
+    server.clear()
+    recorder.clear()
+    loop.policy.allow_all()
+    free_session = Session(id="ses_free_all", title="全放行之后越界")
+    recorder.session = free_session
+    ask(free_session, "跑一条带外面的路径的命令")
+    server.script(
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[
+                        tool_call_delta(
+                            0,
+                            call_id="c6",
+                            name="bash",
+                            arguments=json.dumps({"command": f"echo {OUTSIDE_PATH}"}),
+                        )
+                    ]
+                ),
+                usage_chunk(2, 2),
+            ]
+        ),
+        Reply(chunks=[*text_chunks("跑完了", size=2), usage_chunk(1, 1)]),
+    )
+    await loop.stream_reply(free_session, "")
+    tools = [part for part in free_session.messages[-1].parts if part.type is PartType.TOOL]
+    check(not recorder.names("permission.ask"), "全放行之后越界不再发 permission.ask")
+    check(tools[0].tool_status is ToolStatus.COMPLETED, f"越界的命令直接执行：{tools[0].tool_status}")
+    loop.policy.clear_session()
 
     # 等答复的时候按中断，判定要被放掉，循环不能停在等待上
     server.clear()
@@ -4772,7 +4880,7 @@ def check_ledger_digest() -> None:
         "索引算进 TASK 层的用量（否则它是一段看不见的开销）",
     )
 
-    # 进度提示：本阶段够长才出现，而且**只能出现在尾部**。
+    # 进度提示：本主题够长才出现，而且**只能出现在尾部**。
     # 进 header 的话它每步都变（「已 3 步」→「已 4 步」），第 1 条消息每步都不同，
     # 整条前缀缓存作废——那正是长会话命中率掉下来的原因（§4.13 量过）。
     tick = Session(title="进度")
@@ -4780,10 +4888,11 @@ def check_ledger_digest() -> None:
     for count in (1, 2):
         tick.pending_steps.append(Step(seq=count, intent="bash", tools=["bash"]))
     short = ContextAssembler(200_000).build(tick, prefix)
-    check("本阶段已" not in short.messages[-1]["content"], "两步以内不提示收口")
+    check("本主题已" not in short.messages[-1]["content"], "两步以内不提示收口")
     tick.pending_steps.append(Step(seq=3, intent="bash", tools=["bash"]))
     long_run = ContextAssembler(200_000).build(tick, prefix)
-    check("本阶段已 3 步" in long_run.messages[-1]["content"], "第 3 步起在尾部提示收口")
+    check("本主题已 3 步" in long_run.messages[-1]["content"], "第 3 步起在尾部提示收口")
+    check("close_topic" in long_run.messages[-1]["content"], "提示里点名要调哪个工具")
     check(
         long_run.messages[1]["content"] == short.messages[1]["content"],
         "提示不进 user 头：前缀一个字节都没动",
@@ -9887,6 +9996,181 @@ async def check_analyze_pose() -> None:
     check(after == before, f"只读：调用前后产物条目数不变（{before} → {after}）")
 
 
+async def check_alternative_poses() -> None:
+    """替代结合模式：多模式位姿按体积聚簇，报每簇的接触差异。
+
+    坐标手写：模型 1、2 挤在 THR315 旁边（第二套只挪 0.3 埃，算同一个摆法），
+    模型 3 挪到 10 埃外的 PHE331 旁边。这样「两簇」与「接触残基互不相同」都能
+    口算核对，不需要真跑 Vina。
+    """
+
+    def line(kind: str, serial: int, name: str, resname: str, number: int,
+             x: float, y: float, z: float, element: str) -> str:
+        return (
+            f"{kind:<6}{serial:>5} {name:<4} {resname:>3} A{number:>4}    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{1.00:>6.2f}{20.00:>6.2f}          "
+            f"{element:>2}"
+        )
+
+    def model(index: int, score: float, x: float, z: float) -> str:
+        body = [f"MODEL {index}"]
+        body.append(f"REMARK VINA RESULT:    {score:6.1f}      0.000      0.000")
+        body.append(line("ATOM", 1, "C1", "UNL", 1, x, -3.0, z, "C"))
+        body.append(line("ATOM", 2, "C2", "UNL", 1, x + 1.0, -3.0, z, "C"))
+        body.append("ENDMDL")
+        return "\n".join(body)
+
+    work = PROBE / "alternative_poses"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    receptor_path = work / "receptor.pdb"
+    receptor_path.write_text(
+        "\n".join(
+            [
+                line("ATOM", 1, "OG1", "THR", 315, 0.0, 0.0, 0.0, "O"),
+                line("ATOM", 2, "CE1", "PHE", 331, 0.0, 0.0, 10.0, "C"),
+                # 远到任何模式都碰不到：用来验「接触表不会凭空多出残基」
+                line("ATOM", 3, "SD", "MET", 330, 40.0, 0.0, 0.0, "S"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def write_poses(name: str, models: list[str]) -> None:
+        (work / name).write_text("\n".join(models) + "\n", encoding="utf-8")
+
+    write_poses("three.pdbqt", [model(1, -9.0, 0.0, 0.0),
+                                model(2, -8.5, 0.3, 0.0),
+                                model(3, -8.0, 0.0, 10.0)])
+    write_poses("same.pdbqt", [model(1, -9.0, 0.0, 0.0),
+                               model(2, -8.5, 0.3, 0.0)])
+    write_poses("single.pdbqt", [model(1, -9.0, 0.0, 0.0)])
+
+    ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+    receptor = ledger.add(
+        "receptor",
+        path=receptor_path,
+        summary="合成受体",
+        fingerprint=fingerprint_text(receptor_path.read_text(encoding="utf-8")),
+        meta={"stage": "raw"},
+    )
+    docking_entry = ledger.add(
+        "artifact",
+        path=work,
+        summary="对接产物",
+        fingerprint="fp-alt-dock",
+        meta={"kind": "docking", "stage": "docking"},
+    )
+    products_module.write_json_atomic(
+        work / analysis_module.docking.MANIFEST_FILE,
+        {
+            "kind": "docking",
+            "stage": "docking",
+            "receptor": {"handle": str(receptor.handle)},
+            "results": [
+                {"id": "mol-three", "name": "cmpd_three", "score": -9.0,
+                 "pose_pdbqt": "three.pdbqt", "pose_pdb": ""},
+                {"id": "mol-same", "name": "cmpd_same", "score": -9.0,
+                 "pose_pdbqt": "same.pdbqt", "pose_pdb": ""},
+                {"id": "mol-single", "name": "cmpd_single", "score": -9.0,
+                 "pose_pdbqt": "single.pdbqt", "pose_pdb": ""},
+                {"id": "mol-nopose", "name": "cmpd_np", "score": -7.0, "pose_pdb": ""},
+            ],
+        },
+    )
+
+    alt = analysis_module.AlternativePosesTool()
+    before = len(ledger.find(kind="artifact", include_archived=True))
+
+    result = await alt.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-three"}, context=ledger
+    )
+    check(not result.failed, f"多模式分析成功：{result.output.splitlines()[0]}")
+    check(result.meta.get("modes") == 3, f"三个模式都读到：{result.meta}")
+    check(result.meta.get("parsed") == 3, f"三个都能解析：{result.meta}")
+    check(result.meta.get("clusters") == 2, f"聚成两簇：{result.meta}")
+    check(
+        result.meta.get("skipped") == [],
+        f"没有读不出的模式：{result.meta.get('skipped')}",
+    )
+    check(
+        "3 个模式聚成 2 簇" in result.output,
+        f"第一行写清读了几个、聚成几簇：{result.output.splitlines()[0]}",
+    )
+    check(
+        "模式 1–2（2 个）" in result.output and "最好 -9.00" in result.output,
+        f"簇 1 是模型 1、2，分数取代表模式：{result.output}",
+    )
+    check(
+        "多了 A:331:PHE" in result.output and "少了 A:315:THR" in result.output,
+        f"第二个摆法换了一处接触面，要逐条写出来：{result.output}",
+    )
+    check(
+        "只有一簇" not in result.output,
+        "两簇时不写「只有一簇」那句",
+    )
+
+    # 两套模式几乎重合：并成一簇，并明说「没有第二个可区分的摆法」
+    same = await alt.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-same"}, context=ledger
+    )
+    check(not same.failed and same.meta.get("clusters") == 1, f"重合的并成一簇：{same.meta}")
+    check(
+        "只有一簇：这次对接没有给出第二个可区分的摆法" in same.output,
+        f"一簇是读数不是空结果，要说清：{same.output}",
+    )
+
+    # 只有一个模式：不聚簇，直接说没有第二个摆法
+    single = await alt.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-single"}, context=ledger
+    )
+    check(
+        not single.failed and "只有 1 个模式" in single.output,
+        f"只有一个模式时说明白：{single.output}",
+    )
+    check(single.meta.get("clusters") == 1, f"meta 里也写一簇：{single.meta}")
+
+    # 没有记 pose_pdbqt：说清缺什么，不猜
+    no_pose = await alt.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-nopose"}, context=ledger
+    )
+    check(
+        no_pose.failed and "pose_pdbqt" in no_pose.output,
+        f"缺多模式位姿要指名缺哪个字段：{no_pose.output}",
+    )
+
+    unknown = await alt.execute(
+        {"docking": str(docking_entry.handle), "molecule": "nope"}, context=ledger
+    )
+    check(
+        unknown.failed and "mol-three" in unknown.output,
+        f"id 打错时列出可用的 id：{unknown.output}",
+    )
+    bad_modes = await alt.execute(
+        {"docking": str(docking_entry.handle), "molecule": "mol-three", "max_poses": 1},
+        context=ledger,
+    )
+    check(bad_modes.failed and "max_poses" in bad_modes.output, f"上限越界要拒绝：{bad_modes.output}")
+
+    # 切段：没有 MODEL 行的整份算一套；三套就切三段
+    check(
+        len(analysis_module._split_pdbqt_models("ATOM      1  C1\n")) == 1,
+        "没有 MODEL 行时整份算一套",
+    )
+    three_text = "\n".join([model(1, -9.0, 0.0, 0.0),
+                            model(2, -8.5, 0.3, 0.0),
+                            model(3, -8.0, 0.0, 10.0)])
+    check(
+        len(analysis_module._split_pdbqt_models(three_text)) == 3,
+        "按 MODEL/ENDMDL 切出三段（pdbtext.parse 只留第一段，不切就只剩一个位姿）",
+    )
+
+    after = len(ledger.find(kind="artifact", include_archived=True))
+    check(after == before, f"只读：调用前后产物条目数不变（{before} → {after}）")
+
+
 async def check_curate_ligands() -> None:
     """待筛库第一道闸：PAINS/Brenk、去重三种键、窗口闭区间、flag 模式。
 
@@ -11357,7 +11641,50 @@ async def check_sar() -> None:
         )
         check(bad_group.failed, f"组号越界要拒绝：{bad_group.output}")
 
-        # ---- 四、实验回填 ----
+        # ---- 四、共同子结构 ----
+        features_tool = sar_module.CommonFeaturesTool()
+        features = await features_tool.execute(
+            {"source": str(source.handle), "min_atoms": 6}, context=ledger
+        )
+        check(not features.failed, f"共同子结构成功：{features.output.splitlines()[0]}")
+        check(
+            features.meta.get("ring") == 3 and features.meta.get("acyclic") == 1,
+            f"三个有环、一个无环：{features.meta}",
+        )
+        check(
+            features.meta.get("covered") == 3,
+            f"苯环覆盖全部三个有环分子：{features.meta}",
+        )
+        check(features.meta.get("atoms") == 6, f"共同部分就是苯环：{features.meta}")
+        from rdkit import Chem as _Chem_features
+
+        pattern = _Chem_features.MolFromSmarts(str(features.meta.get("smarts") or ""))
+        check(pattern is not None, f"报出的 SMARTS 能解析：{features.meta.get('smarts')}")
+        check(
+            "无环的 1 个" in features.output and "c4" in features.output,
+            f"无环分子单独列出，不混进覆盖率：{features.output}",
+        )
+        # 默认 8 个原子：这三个分子只共有苯环，要如实说「不够」，而不是拿 6 个顶上去
+        strict = await features_tool.execute(
+            {"source": str(source.handle)}, context=ledger
+        )
+        check(
+            "全局没有达到 8 个原子的共同子结构" in strict.output,
+            f"默认阈值下如实报不够：{strict.output.splitlines()[1]}",
+        )
+        check(
+            strict.meta.get("covered") == 3,
+            f"覆盖数照给，读的人能自己判断这 6 个原子值不值：{strict.meta}",
+        )
+        bad_atoms = await features_tool.execute(
+            {"source": str(source.handle), "min_atoms": 1}, context=ledger
+        )
+        check(
+            bad_atoms.failed and "min_atoms" in bad_atoms.output,
+            f"阈值越界要拒绝：{bad_atoms.output}",
+        )
+
+        # ---- 五、实验回填 ----
         assay_csv = work / "assay-in.csv"
         assay_csv.write_text(
             "molecule,value\nc1,>10000\nc2,120\nc3,not-a-number\n", encoding="utf-8"
@@ -11433,10 +11760,13 @@ def check_strategy_compare() -> None:
     from vsagent.core.agent.domain.campaign import (
         START_BORROW,
         START_EXPAND,
+        START_LABELS,
         START_LIGAND,
         START_NARROW,
         AssessCampaignTool,
         _pick_strategies,
+        render_strategies,
+        render_verdict,
     )
 
     def split(**facts: Any) -> tuple[str, list[str], list[str]]:
@@ -11493,15 +11823,74 @@ def check_strategy_compare() -> None:
     )
     viable = [item for item in items if item.applies]
     drafts = tool._strategy_drafts(
-        viable=viable, code="P00533", pair_count=13, selectivity={}
+        strategies=items, code="P00533", pair_count=13, selectivity={}
     )
     check(
         [item["start"] for item in drafts] == [item.start for item in viable],
-        f"草稿与可行策略一一对应：{[item['start'] for item in drafts]}",
+        f"草稿只给可行的那几条，顺序与候选段一致：{[item['start'] for item in drafts]}",
     )
     check(
         all(item["kind"] == "strategy" and item["expected"] for item in drafts),
         "每份草稿都是策略假设、都带可判真假的预期",
+    )
+
+    # 整段判定文本走一遍：这一段原来长在 run() 里，不起网络就到不了，
+    # 一个没定义的变量名在测试里看不出来。
+    for facts, want in (
+        ({"structure_ok": True, "actives": 30, "largest_scaffold": 8, "pair_count": 13},
+         START_NARROW),
+        ({"structure_ok": True, "actives": 8, "largest_scaffold": 2, "pair_count": 0},
+         START_EXPAND),
+        ({"structure_ok": False, "actives": 15, "largest_scaffold": 3, "pair_count": 0},
+         START_LIGAND),
+        ({"structure_ok": False, "actives": 5, "largest_scaffold": 1, "pair_count": 0},
+         START_BORROW),
+    ):
+        chosen_start, chosen_items = _pick_strategies(**facts)
+        text = "\n".join(
+            render_verdict(
+                start=chosen_start,
+                reason="合成理由",
+                structure_ok=facts["structure_ok"],
+                strategies=chosen_items,
+                drafts=tool._strategy_drafts(
+                    strategies=chosen_items,
+                    code="P00533",
+                    pair_count=facts["pair_count"],
+                    selectivity={},
+                ),
+            )
+        )
+        check(
+            f"判定：{START_LABELS[chosen_start]}（{chosen_start}）" in text,
+            f"判定行写的是推荐那条：{text.splitlines()[1]}",
+        )
+        check(
+            "候选策略" in text and "假设草稿" in text,
+            f"候选段与草稿段都在：{text.splitlines()[:4]}",
+        )
+        check(
+            chosen_start == want,
+            f"推荐仍是原来的优先级结果：{chosen_start}",
+        )
+        check(
+            text.count("假设草稿") == 1,
+            "只给推荐那条写一份草稿，不把几条草稿一起摊开",
+        )
+        if not facts["structure_ok"]:
+            check(
+                "口袋残基要从文献或突变数据来" in text,
+                "无结构时提示口袋残基的来源",
+            )
+
+    # 候选段是常驻工具的返回文本，长度要有上限。两条可行加两条不可行是最长的一种。
+    worst = _pick_strategies(
+        structure_ok=True, actives=30, largest_scaffold=8, pair_count=13
+    )[1]
+    segment = "\n".join(render_strategies(worst, START_NARROW))
+    check(
+        len(segment) <= 450,
+        f"候选策略段不超过 450 字（现在 {len(segment)}）：{segment}",
     )
 
     # 渲染配额按粒度分开：三条策略不能把机制假设挤出窗口。
@@ -11553,6 +11942,70 @@ def check_strategy_compare() -> None:
     check(
         "另有 1 条未列出：策略 1 条" in only_strategy.render(),
         "只有策略时仍按策略配额截断",
+    )
+
+
+async def check_campaign_run() -> None:
+    """`assess_campaign` 整条跑一遍：返回的 meta 与聊天里那段必须是同一份草稿。
+
+    判定文本抽走之后，`meta` 里那两个字段还指着辅助函数的局部名字，整轮跑完在
+    最后一步崩掉，而只测 `render_verdict` 看不出来。这里只把 UniProt 那一步换成
+    本地记录，其余照真跑。
+    """
+    from vsagent.core.agent.domain.campaign import AssessCampaignTool
+
+    work = PROBE / "campaign-run"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    actives_csv = work / "actives.csv"
+    actives_csv.write_text(
+        "molecule_chembl_id,molecule_pref_name,smiles,pchembl_value\n"
+        + "".join(
+            f"C{index:04d},分子 {index},{'C' * index}O,{6 + index % 5}\n"
+            for index in range(1, 31)
+        ),
+        encoding="utf-8",
+    )
+    ledger = SessionLedger(session_id="", snapshot_path=work / "ledger.json")
+    actives_handle = ledger.add(
+        "ligandset", path=actives_csv, summary="合成活性集", meta={"kind": "ligandset"}
+    )
+
+    campaign = AssessCampaignTool()
+
+    async def fake_target_record(
+        code: str, notes: list[str]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return (
+            {"accession": code},
+            {
+                "accession": code,
+                "pdb_count": 3,
+                "pdb_structures": [
+                    {"pdb_id": "1M17", "resolution": 2.6},
+                    {"pdb_id": "4HJO", "resolution": 2.5},
+                ],
+                "alphafold_id": "",
+            },
+        )
+
+    campaign._target_record = fake_target_record  # type: ignore[method-assign]
+    result = await campaign.execute(
+        {"accession": "P00533", "actives": actives_handle.handle}, context=ledger
+    )
+    check(not result.failed, f"给了活性集就能整条跑完：{result.output[:120]}")
+    check(
+        result.meta["hypothesis"]["start"] == result.meta["start"],
+        f"meta 里的草稿就是推荐那条：{result.meta['hypothesis'].get('start')}",
+    )
+    check(
+        f"假设草稿（{result.meta['hypothesis']['kind']}" in result.output,
+        "聊天里那段与 meta 里那份是同一份草稿",
+    )
+    drafts = result.meta["strategies"]
+    check(
+        all(item.get("claim") and item.get("expected") for item in drafts),
+        f"meta.strategies 每份草稿都带主张与预期：{len(drafts)} 份",
     )
 
 
@@ -11646,6 +12099,46 @@ async def check_hypothesis() -> None:
     )
     listed = await call({"action": "list"})
     check("共 6 条假设" in listed.output, f"list 能看到全部：{listed.output}")
+
+    # ---- 竞争关系：只在两条假设给出不同预期时填 ----
+    competing = await call(
+        {"action": "propose", "kind": "mechanism",
+         "claim": "活性来自疏水锚定",
+         "test": "测一批去掉疏水基团的类似物，与 hyp#1 的骨架优化对照",
+         "expected": "活性下降 ≥10 倍", "rivals": ["hyp#1"]}
+    )
+    check(competing.meta.get("id") == "hyp#7", f"带竞争的假设正常建号：{competing.meta}")
+    check(
+        "竞争：hyp#1" in state.find_hypothesis("hyp#7").render(),
+        f"竞争关系进渲染：{state.find_hypothesis('hyp#7').render()}",
+    )
+    bad_rival = await call(
+        {"action": "propose", "kind": "mechanism",
+         "claim": "编号写错的竞争", "test": "测一批", "expected": "IC50 < 100 nM",
+         "rivals": ["hyp#99"]}
+    )
+    check(
+        bad_rival.failed and "不存在" in bad_rival.output,
+        f"竞争对手编号不存在要拒绝：{bad_rival.output}",
+    )
+    no_test = await call(
+        {"action": "propose", "kind": "mechanism",
+         "claim": "没写怎么区分的竞争", "test": "测一批", "expected": "IC50 < 100 nM",
+         "rivals": ["hyp#1"]}
+    )
+    check(
+        no_test.failed and "区分" in no_test.output,
+        f"test 不提竞争对手要拒绝：{no_test.output}",
+    )
+
+    from vsagent.core.models import Hypothesis
+
+    restored_rival = Hypothesis.from_dict(state.find_hypothesis("hyp#7").to_dict())
+    check(restored_rival.rivals == ["hyp#1"], f"竞争关系随会话序列化：{restored_rival.rivals}")
+    old = Hypothesis.from_dict(
+        {"id": "hyp#9", "claim": "旧会话", "test": "测一批", "expected": "< 100"}
+    )
+    check(old.rivals == [], "旧会话没有 rivals 键时是空表")
 
     # ---- 三、update / close 的边界 ----
     updated = await call({"action": "update", "id": "hyp#2", "expected": "IC50 > 500 nM"})
@@ -11784,6 +12277,20 @@ async def check_hypothesis() -> None:
     check(
         meta["provenance"]["hypotheses"][1]["status"] == "refuted",
         "已结的状态一起导出",
+    )
+    # 会话编号是网页把运行目录挂回会话的唯一凭据：缺了它，历史页上「有结构」
+    # 标记与结构页的来源都只能靠猜。
+    linked = export_module._build_meta(
+        run_id="r2", name="n", pdb_id="1M17", uniprot="P00533", chains=["A"],
+        reference="", bundle=bundle, ligands=[], session_id="ses_test_link",
+    )
+    check(
+        linked["provenance"]["session_id"] == "ses_test_link",
+        "provenance 记下产出它的会话",
+    )
+    check(
+        "session_id" not in meta["provenance"],
+        "没有会话编号时不写这个键（演示数据与旧调用保持原形状）",
     )
 
     # 状态要能落盘再读回来：不然重开会话假设就没了。
@@ -19173,7 +19680,7 @@ async def check_tool_family() -> None:
     )
     check(f"{len(groups)} 族" in description, "说明里的族数就是目录里的族数")
     check(
-        "一次把本阶段要用的族都装上" in description,
+        "一次把这一轮要用的族都装上" in description,
         "load_tools 的说明里也写了「一次装完」（模型先读说明，再读返回）",
     )
     # 光比对内容抓不到「写死一个恰好正确的数」。原先这条拿 "13 族" 当哨兵，
@@ -19243,19 +19750,19 @@ async def check_tool_family() -> None:
     check(unknown.failed and "scoring" in unknown.output, f"未知族列出可选项：{unknown.output}")
     check(session.tool_families == ["scoring"], "未知族不改会话状态")
 
-    # Phase 封存时收敛（P2-1）：族只装不卸的话，装到八族之后每步都发 12K token
-    # 的工具定义，而典型的一个阶段只用得上两三个族。
+    # 轮末封存时收敛（P2-1）：族只装不卸的话，装到八族之后每步都发 12K token
+    # 的工具定义，而典型的一轮只用得上两三个族。
     prune_session = Session(id="ses_family_prune")
     prune_session.tool_families = ["scoring"]
-    prune_session.family_phase = {"scoring": 1}
+    prune_session.family_topic = {"scoring": 1}
     check(
         prune_families(prune_session, {"dock"}, 1) == []
         and prune_session.tool_families == ["scoring"],
-        "本阶段用过的族不会被移除",
+        "这一轮用过的族不会被移除",
     )
     check(
         prune_families(prune_session, {"fetch_structure"}, 1) == [],
-        "本阶段刚装的族不卸（还没轮到用）",
+        "刚装的族不卸（还没轮到用）",
     )
     dropped = prune_families(prune_session, {"fetch_structure"}, 2)
     check(
@@ -19509,9 +20016,9 @@ def _event_fixture(steps: int) -> Session:
 
 
 async def check_event_log() -> None:
-    """阶段流水：每步自动记、封存不花请求、渲染三条规则、三级召回。"""
+    """主题流水：每步自动记、封存不花请求、按位置让位、三级召回。"""
     session = _event_fixture(2)  # 4 条消息，2 次 dock（第 2 次失败）
-    check(session.events == [] and session.pending_steps == [], "新会话没有阶段也没有待封存的步")
+    check(session.events == [] and session.pending_steps == [], "新会话没有主题也没有待封存的步")
 
     # 第一步：从 Part 折出来，零请求。
     assistant = session.messages[1]
@@ -19539,7 +20046,7 @@ async def check_event_log() -> None:
         f"Part 区间记下来了（Step 级召回靠它）：{step.part_start}-{step.part_end}",
     )
     check(len(session.pending_steps) == 1, "待封存的步挂在会话上")
-    check(phase_tokens(session) > 0, "软预算读得到这一段的大小")
+    check(open_tokens(session) > 0, "预算读得到这一段的大小")
 
     # 第二步是失败的那一条：失败要长在它自己那一步上。
     assistant = session.messages[3]
@@ -19550,31 +20057,32 @@ async def check_event_log() -> None:
     check(failed is not None and failed.issues and "结果1" in failed.issues[0], f"失败项取自 Part：{failed.issues}")
     check("失败：" in failed.result, f"结果里写明失败：{failed.result}")
 
-    event = seal_phase(session, upto=4)
-    check(event is not None and event.kind == "auto", "轮末自动封存成一条阶段")
+    event = seal_topic(session, cut=(4, 0))
+    check(event is not None and event.kind == "auto", "轮末自动封存成一条主题")
     check(event.degraded, "模型没写标题时标成降级")
-    check(event.phase_index == 1 and len(event.steps) == 2, f"阶段号与步数：{event.phase_index}/{len(event.steps)}")
-    check(event.start == 0 and event.end == 4, f"覆盖整段：{event.start}–{event.end}")
+    check(event.topic_index == 1 and len(event.steps) == 2, f"主题号与步数：{event.topic_index}/{len(event.steps)}")
+    check(event.cut == (4, 0), f"切点记在事件上：{event.cut}")
+    check(event.span == "第 1–2 步", f"步号区间：{event.span}")
     check(event.tokens > 0, "记下了原文估算")
     check("第 0 步：跑对接" in event.title, f"标题用用户原话：{event.title}")
     check("2 步" in event.summary and "docking#0" in event.summary, f"结论本地拼：{event.summary}")
     check(event.issues and "结果1" in event.issues[0], f"未决从 steps 聚合：{event.issues}")
     check(event.actions == ["dock"], f"动作从 steps 聚合：{event.actions}")
     check(session.pending_steps == [], "封存之后待封存的步清空")
-    check(session.event_end == 4, "事件覆盖到第 4 条")
-    check(session.compact_upto == 0, "自动封存不推手动压缩位置（最近一段还要留原文）")
-    check(seal_phase(session, upto=4) is None, "同一段再封一次是 no-op")
-    check(phase_start(session) == 4, "下一个阶段从这一条的末端开始")
+    check(session.event_cut == (4, 0), "事件的切点就是下一段的起点")
+    check(session.compact_upto == 0, "自动封存不推手动压缩位置")
+    check(seal_topic(session, cut=(4, 0)) is None, "同一段再封一次是 no-op")
+    check(topic_start(session) == (4, 0), "下一个主题从切点开始")
 
     # 纯聊天的一轮没有流水可记，轮末跳过；溢出 / compact 那种强行封存必须盖住。
     chat = Session(id="ses_chat")
     user = chat.add_message(Message(role="user"))
     user.add_part(Part(type=PartType.TEXT, text="你好"))
     chat.add_message(Message(role="assistant"))
-    check(seal_phase(chat, upto=2) is None, "没有流水的一轮不封阶段")
-    forced = seal_phase(chat, kind="local", upto=2, force=True)
+    check(seal_range(chat, upto=2) is None, "没有流水的一轮不封主题")
+    forced = seal_range(chat, kind="local", upto=2, force=True)
     check(
-        forced is not None and (forced.start, forced.end) == (0, 2),
+        forced is not None and forced.cut == (2, 0),
         "强行封存仍要盖住那一段，不能留缝",
     )
     check(
@@ -19584,7 +20092,7 @@ async def check_event_log() -> None:
 
     # 回填：Step 没记下来（进程重启、旧版本写的历史）时按 Part 现数。
     backfill = _event_fixture(2)
-    restored_event = seal_phase(backfill, upto=4)
+    restored_event = seal_range(backfill, upto=4)
     check(
         restored_event is not None and len(restored_event.steps) == 2,
         "没记过 Step 时按 Part 回填流水",
@@ -19613,7 +20121,7 @@ async def check_event_log() -> None:
         return built
 
     folded = _multi_step()
-    folded_event = seal_phase(folded, upto=2)
+    folded_event = seal_range(folded, upto=2)
     check(
         folded_event is not None and [step.tools for step in folded_event.steps]
         == [["load_tools"], ["fetch_target"]],
@@ -19636,7 +20144,7 @@ async def check_event_log() -> None:
             part_start=min(positions),
             part_end=max(positions) + 1,
         )
-    recorded_event = seal_phase(recorded, upto=2)
+    recorded_event = seal_range(recorded, upto=2)
     check(
         recorded_event is not None
         and [step.tools for step in recorded_event.steps]
@@ -19654,7 +20162,7 @@ async def check_event_log() -> None:
             parts=[part for part in message.parts if part.type is PartType.TOOL],
             message_index=index,
         )
-    head = seal_phase(split, upto=4)
+    head = seal_range(split, upto=4)
     check(head is not None and [item.seq for item in head.steps] == [1, 2], "前半段的步号从 1 起")
     check(
         [item.seq for item in split.pending_steps] == [1, 2],
@@ -19662,54 +20170,90 @@ async def check_event_log() -> None:
     )
     check([item.message_index for item in split.pending_steps] == [5, 7], "剩下的步没被前一段收走")
 
-    # close_phase：只记名字与结论，**不切分阶段**（阶段仍在一轮结束时封）。
-    # 轮中途「提前切开」表达不了：一条 assistant 消息装着一整轮的所有步，
-    # 而 `Event.end` 是消息下标——实测照提示调了 11 次，每次都是「没有可封存的内容」。
+    # close_topic：记下标题、结论与交接，**封存由内核在步末做**。
+    # 它自己不算一步，也不该把当前这一步切开。
     manual_session = _event_fixture(2)
-    runtime = EventRuntime(session=manual_session, current_index=4)
-    missing = await ClosePhaseTool().execute({}, event_runtime=runtime)
+    for index in (1, 3):
+        message = manual_session.messages[index]
+        record_step(
+            manual_session,
+            step_no=len(manual_session.pending_steps) + 1,
+            parts=[part for part in message.parts if part.type is PartType.TOOL],
+            message_index=index,
+        )
+    runtime = EventRuntime(session=manual_session)
+    missing = await CloseTopicTool().execute({}, event_runtime=runtime)
     check(missing.failed and "缺少 title" in missing.output, f"没给标题就退回：{missing.output}")
-    blank = await ClosePhaseTool().execute({"title": "   "}, event_runtime=runtime)
+    blank = await CloseTopicTool().execute({"title": "   "}, event_runtime=runtime)
     check(blank.failed and "缺少 title" in blank.output, f"空白标题也算缺：{blank.output}")
-    recorded = await ClosePhaseTool().execute(
-        {"title": "跑完两轮对接", "summary": "两轮都产出了 docking"},
+    recorded = await CloseTopicTool().execute(
+        {
+            "title": "跑完两轮对接",
+            "summary": "两轮都产出了 docking",
+            "handoff": "下一段用 docking#0 做排序",
+        },
         event_runtime=runtime,
     )
     check(not recorded.failed and "已记下" in recorded.output, f"记下标题：{recorded.output}")
-    check(manual_session.events == [], "记名字不当场封存")
+    check(manual_session.events == [], "记名字不当场封存，封存在步末")
     check(
-        (manual_session.phase_title, manual_session.phase_summary)
-        == ("跑完两轮对接", "两轮都产出了 docking"),
-        "名字与结论挂在会话上，等封存时取",
+        (
+            manual_session.topic_title,
+            manual_session.topic_summary,
+            manual_session.topic_handoff,
+        )
+        == ("跑完两轮对接", "两轮都产出了 docking", "下一段用 docking#0 做排序"),
+        "标题、结论与交接挂在会话上，等封存时取",
     )
-    manual = seal_phase(manual_session, upto=4)
+    again = await CloseTopicTool().execute({"title": "再来一次"}, event_runtime=runtime)
+    check(
+        "已记下" in again.output and manual_session.topic_title == "再来一次",
+        f"再调一次是覆盖，不是报错：{again.output}",
+    )
+    await CloseTopicTool().execute(
+        {
+            "title": "跑完两轮对接",
+            "summary": "两轮都产出了 docking",
+            "handoff": "下一段用 docking#0 做排序",
+        },
+        event_runtime=runtime,
+    )
+    manual = seal_range(manual_session, upto=4)
     check(manual is not None and not manual.degraded, "封存时取用模型给的那份，不标降级")
     check(
         manual.title == "跑完两轮对接" and manual.summary.startswith("两轮"),
         "标题与结论照模型给的那份",
     )
-    check(manual_session.phase_title == "", "用过一次就清掉，不会顶到下一段")
+    check(manual.handoff.startswith("下一段"), f"交接也写进事件：{manual.handoff}")
+    check(manual_session.topic_title == "", "用过一次就清掉，不会顶到下一个主题")
     check(len(manual.steps) == 2 and manual.actions == ["dock"], f"流水仍从 Part 数出来：{manual.actions}")
-    again = await ClosePhaseTool().execute({"title": "再来一次"}, event_runtime=runtime)
-    check(
-        "已记下" in again.output and manual_session.phase_title == "再来一次",
-        f"再调一次是覆盖，不是报错：{again.output}",
+    closed_again = await CloseTopicTool().execute(
+        {"title": "已经封过了"}, event_runtime=runtime
     )
-    manual_session.phase_title = ""
+    check(
+        closed_again.failed and "还没有记下任何一步" in closed_again.output,
+        f"封完之后没有新步，再调就拒绝：{closed_again.output}",
+    )
 
-    # close_phase 是记账不是干活：它不进流水，单独调它也不产生一步。
-    # 它封的是它前面那几步，写进流水只会让「第 3 步」那一行变成「close_phase」。
+    # 一步都没有时拒绝：空主题封出来只是一条占位，还会把下一个主题的起点往前挪。
+    empty = _event_fixture(1)
+    refused = await CloseTopicTool().execute(
+        {"title": "空主题"}, event_runtime=EventRuntime(session=empty)
+    )
+    check(refused.failed and "还没有记下任何一步" in refused.output, f"空主题不许封：{refused.output}")
+
+    # close_topic 是记账不是干活：它不进流水，单独调它也不产生一步。
     accounting = _event_fixture(1)
     close_part = Part(
         type=PartType.TOOL,
-        tool_name="close_phase",
+        tool_name="close_topic",
         tool_status=ToolStatus.COMPLETED,
         tool_input={"title": "定口袋"},
-        tool_output="已记下这一大步的标题",
+        tool_output="已记下主题",
     )
     check(
         record_step(accounting, step_no=1, parts=[close_part], message_index=1) is None,
-        "单独调 close_phase 不产生流水",
+        "单独调 close_topic 不产生流水",
     )
     mixed = record_step(
         accounting,
@@ -19722,20 +20266,21 @@ async def check_event_log() -> None:
         f"同一步里的记账调用不占流水：{mixed.tools if mixed else None}",
     )
 
-    # 渲染三条规则：每步一行、失败留在流水里、结论与未决是阶段级的。
+    # 渲染三条规则：每步一行、失败留在流水里、结论与未决是主题级的。
     line = event_line(manual)
-    check("阶段 1" in line and "跑完两轮对接" in line, f"索引行带阶段号与标题：{line}")
+    check("主题 1" in line and "跑完两轮对接" in line, f"索引行带主题号与标题：{line}")
     block = ContextAssembler(128_000)._event_block([manual])
     check("  1. " in block and "  2. " in block, f"流水每步一行：{block}")
-    check("结论：" in block, "结论是阶段级的单独一行")
+    check("结论：" in block, "结论是主题级的单独一行")
+    check("交接：" in block, "交接单独一行")
     check("失败" in block, "失败留在流水里，不挪进单独的列表")
 
     # 超过 12 步只留「前 3 + 后 3」，中间用 step 召回。
     long_event = Event(
         id="evt_0099",
-        title="很长的阶段",
+        title="很长的主题",
         summary="三十步",
-        phase_index=9,
+        topic_index=9,
         steps=[Step(seq=index, intent=f"调用 {index}", result="成功") for index in range(1, 31)],
     )
     long_block = ContextAssembler(128_000)._event_block([long_event])
@@ -19744,7 +20289,7 @@ async def check_event_log() -> None:
     check("  15. " not in long_block, "中间那些确实没铺开")
     check("recall_event evt_0099 step=" in long_block, "省略处写明怎么取回来")
 
-    # event_step_detail：压成「一阶段一行」，标题与结论还在。
+    # event_step_detail：压成「一主题一行」，标题与结论还在。
     flat = ContextAssembler(128_000)._event_block([manual], detail=False)
     check("  1. " not in flat and "结论：" in flat, "压流水只丢过程，不丢结论")
     check(
@@ -19754,15 +20299,21 @@ async def check_event_log() -> None:
 
     # 事件多到装不下时，被裁掉的那几条必须留一句提示。
     many = [
-        Event(id=f"evt_{index:04d}", title=f"第 {index} 段", summary="做完了一段", start=index, end=index + 1)
+        Event(
+            id=f"evt_{index:04d}",
+            title=f"第 {index} 段",
+            summary="做完了一段",
+            cut_message=index,
+            cut_part=0,
+        )
         for index in range(1, 9)
     ]
     kept, capped = ContextAssembler(128_000)._cap_events(many, 60)
     check(len(kept) < len(many) and "更早还有" in capped, f"裁掉的事件要留提示：{capped}")
 
-    # 三级召回：清单 / 一个阶段 / 某一步的原文。
+    # 三级召回：清单 / 一个主题 / 某一步的原文。
     listing = await RecallEventTool().execute({}, session=manual_session)
-    check(manual.id in listing.output and "跑完两轮对接" in listing.output, "不带参数时列出阶段")
+    check(manual.id in listing.output and "跑完两轮对接" in listing.output, "不带参数时列出主题")
     detail = await RecallEventTool().execute({"event": manual.id}, session=manual_session)
     check("流水：" in detail.output and "  1. " in detail.output, "详情里有流水")
     check("第 0 步：跑对接" in detail.output, "recall_event 取回原文")
@@ -19791,7 +20342,7 @@ async def check_event_log() -> None:
         )
     )
     long_message.add_part(Part(type=PartType.STEP_FINISH))
-    long_event = seal_phase(long_session, upto=2)
+    long_event = seal_range(long_session, upto=2)
     assert long_event is not None
     page = await RecallEventTool().execute(
         {"event": long_event.id, "step": 1, "limit": 5}, session=long_session
@@ -19812,37 +20363,123 @@ async def check_event_log() -> None:
     unknown = await RecallEventTool().execute({"event": "evt_9999"}, session=manual_session)
     check(unknown.failed and manual.id in unknown.output, f"未知编号时列出可用编号：{unknown.output}")
 
-    # 装配：更早的阶段进上下文，最近一个阶段留原文（keep_last_phase_raw = 1）。
+    # 边界一：没有主题的会话。回一句话，不抛。
+    bare = Session(id="ses_bare")
+    nothing = await RecallEventTool().execute({}, session=bare)
+    check(
+        not nothing.failed and "还没有主题记录" in nothing.output,
+        f"没有主题时给一句话：{nothing.output}",
+    )
+
+    # 边界二：参数不合法。四个参数各验一次，都是 failed 而不是异常。
+    for bad, label in (
+        ({"event": manual.id, "step": -1}, "step 为负"),
+        ({"event": manual.id, "step": True}, "step 是布尔"),
+        ({"event": manual.id, "offset": -5}, "offset 为负"),
+        ({"event": manual.id, "limit": 0}, "limit 为零"),
+    ):
+        answer = await RecallEventTool().execute(bad, session=manual_session)
+        check(
+            answer.failed and "整数" in answer.output,
+            f"{label}时要退回：{answer.output}",
+        )
+
+    # 边界三：翻过原文末尾。不报错，也不谎称还有更多。
+    beyond = await RecallEventTool().execute(
+        {"event": manual.id, "offset": 9999, "limit": 10}, session=manual_session
+    )
+    check(
+        not beyond.failed and "继续" not in beyond.output,
+        f"offset 超过原文长度时不报错也不提示继续：{beyond.output[-40:]!r}",
+    )
+
+    # 边界四：返回行数夹到 400。说多少都不多给，否则一次召回能把窗口吃光。
+    big = Session(id="ses_big")
+    big.add_message(Message(role="user")).add_part(Part(type=PartType.TEXT, text="长输出"))
+    big_message = big.add_message(Message(role="assistant"))
+    big_message.add_part(Part(type=PartType.STEP_START))
+    big_message.add_part(
+        Part(
+            type=PartType.TOOL,
+            tool_name="bash",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"command": "seq 1 900"},
+            tool_output="\n".join(str(index) for index in range(1, 901)),
+        )
+    )
+    big_event = seal_range(big, upto=2)
+    assert big_event is not None
+    capped = await RecallEventTool().execute(
+        {"event": big_event.id, "step": 1, "limit": 100_000}, session=big
+    )
+    check(
+        "用 offset=400 继续" in capped.output,
+        f"单次最多 400 行，超出的用 offset 接着取：{capped.output[-50:]!r}",
+    )
+
+    # 边界五：空主题（强行封存出来的那一条）。流水是空的，结论仍在。
+    empty_detail = await RecallEventTool().execute({"event": forced.id}, session=chat)
+    check(
+        "（没有流水）" in empty_detail.output and "结论：" in empty_detail.output,
+        f"空主题的详情写明没有流水：{empty_detail.output[:120]}",
+    )
+    empty_step = await RecallEventTool().execute(
+        {"event": forced.id, "step": 1}, session=chat
+    )
+    check(
+        "没有第 1 步" in empty_step.output and "没有流水" in empty_step.output,
+        f"空主题里按步查也说清楚：{empty_step.output}",
+    )
+
+    # 边界六：步还在，它指向的那条消息已经不在了。说清是哪一种取不到，
+    # 别让人以为「这一步没内容」。
+    orphan = Session(id="ses_orphan")
+    orphan.add_message(Message(role="user")).add_part(Part(type=PartType.TEXT, text="开头"))
+    orphan.add_event(
+        Event(
+            id="evt_0001",
+            title="孤儿",
+            steps=[Step(seq=1, intent="bash", result="ok", message_index=9, part_start=0, part_end=1)],
+            cut_message=1,
+            cut_part=0,
+        )
+    )
+    orphan.sanitize_events()
+    lost = await RecallEventTool().execute({"event": "evt_0001", "step": 1}, session=orphan)
+    check(
+        "已经不在会话里" in lost.output,
+        f"原文那条消息不在了时说清楚：{lost.output}",
+    )
+
+    # 装配：主题封存之后，那一段原文不再发出去，只剩摘要。
     two = _event_fixture(4)
-    first = seal_phase(two, upto=4)
-    second = seal_phase(two, upto=8)
-    check(first is not None and second is not None, "两段各封成一个阶段")
+    first = seal_range(two, upto=4)
+    second = seal_range(two, upto=8)
+    check(first is not None and second is not None, "两段各封成一个主题")
     built = ContextAssembler(128_000).build(two, "系统提示。" * 20)
     body = "\n".join(str(item.get("content") or "") for item in built.messages)
-    check(first.title in body, "更早的阶段以流水形式进上下文")
+    check(first.title in body, "封过的那一段以流水形式进上下文")
     check("  1. " in body, "流水进了上下文")
-    raw = sum(
-        1 for item in built.messages if str(item.get("content") or "").startswith("第 ")
-    )
-    check(raw == 2, f"只有最近一个阶段的原文还发出去：{raw} 条")
-    check("第 2 步：跑对接" in body, "最近一个阶段的原文还在 RECENT 里")
-    check("阶段 2：" not in body, "最近一个阶段不再重复铺一份流水")
+    tool_items = [item for item in built.messages if item.get("role") == "tool"]
+    check(tool_items == [], f"封存之后不再发工具原文：{len(tool_items)} 条")
+    check("主题 2：" in body, "两条主题都在事件块里")
     check(built.usage[Layer.EVENT] > 0, "事件层有用量")
-    check(built.dropped == 0, f"被阶段覆盖的组不算「本次移出」：{built.dropped}")
-    check(built.metrics["events"] == 1, "度量里数得到已归档的阶段")
+    check(built.dropped == 0, f"被主题覆盖的组不算「本次移出」：{built.dropped}")
+    check(built.metrics["events"] == 2, "度量里数得到已归档的主题")
 
     # 写盘与读回：流水跟着状态走，派生字段也还原得出来。
     restored = Session.from_dict(manual_session.to_dict())
     check(
         len(restored.events) == 1 and len(restored.events[0].steps) == 2,
-        "阶段与流水随状态写盘、读回来还在",
+        "主题与流水随状态写盘、读回来还在",
     )
     check(
         restored.events[0].steps[0].intent == manual.steps[0].intent,
         "步的意图逐字读回来",
     )
     check(restored.events[0].actions == ["dock"], "派生字段读回来也还在")
-    check(restored.event_end == 4, "读回来之后事件覆盖位置仍在")
+    check(restored.events[0].cut == (4, 0), "读回来之后切点仍在")
+    check(restored.event_cut == (4, 0), "会话上的起点也从事件算得出来")
 
     # 旧形状（没有 steps）的事件也要读得回来：升级不该让已有会话丢历史。
     legacy = Event.from_dict(
@@ -19865,17 +20502,20 @@ async def check_event_log() -> None:
         legacy.artifacts == ["docking#1"] and legacy.issues == ["炸了"],
         "旧字段仍读得出来",
     )
+    check(legacy.cut == (2, 0), f"旧的消息区间折成切点：{legacy.cut}")
 
     # 越界与断点：这两类都必须在进装配之前裁掉。
     broken = _event_fixture(2)
-    broken.events = [Event(id="evt_0001", start=0, end=99, kind="auto")]
+    broken.events = [Event(id="evt_0001", cut_message=99, cut_part=0, kind="auto")]
     broken.sanitize_events()
-    check(broken.events == [], "越界的事件被丢掉")
+    check(broken.events == [], "越过末尾的事件被丢掉")
     gap = _event_fixture(2)
-    gap.summary_upto = 2
-    gap.events = [Event(id="evt_0001", start=0, end=2)]
+    gap.events = [
+        Event(id="evt_0001", cut_message=2, cut_part=0),
+        Event(id="evt_0002", cut_message=2, cut_part=0),
+    ]
     gap.sanitize_events()
-    check(gap.events == [], "首条不从 summary_upto 开始时丢掉")
+    check(len(gap.events) == 1, "切点不递增的事件被丢掉，前面那段留着")
 
     tail = Session(id="ses_tail")
     tail.add_message(Message(role="assistant"))
@@ -19883,23 +20523,193 @@ async def check_event_log() -> None:
     check(event_boundary(tail, 2) == 1, "紧邻的用户消息不进事件")
     check(event_boundary(_event_fixture(2), 4) == 4, "正常情况收到当前位置")
     check(render_range(tail, 0, 2).count("\n") >= 0, "render_range 可用（read_turn 与 recall 共用）")
-    check(PHASE_SOFT_LIMIT == 120_000, "软预算按方案定的 120K")
+    check(TOPIC_SOFT_LIMIT == 120_000, "预算按方案定的 120K")
+
+
+async def check_topic(server: FakeModelServer) -> None:
+    """一轮里多个主题：切点按步算，封一段就让一段原文离开上下文。
+
+    这是「事件按位置切」存在的全部理由：一条 assistant 消息装着一整轮的所有
+    往返，按消息切不出轮中途的边界。
+    """
+    session = Session(id="ses_topic", title="多主题")
+    session.add_message(
+        Message(role="user", parts=[Part(type=PartType.TEXT, text="先看结构再查配体")])
+    )
+    message = session.add_message(Message(role="assistant"))
+    for name in ("fetch_structure", "detect_pockets", "search_chembl"):
+        message.add_part(Part(type=PartType.STEP_START))
+        message.add_part(
+            Part(
+                type=PartType.TOOL,
+                tool_name=name,
+                tool_status=ToolStatus.COMPLETED,
+                tool_input={},
+                tool_output=f"{name} 的结果",
+                tool_meta={"handle": f"{name}#1"},
+            )
+        )
+
+    # 每一段都是一个独立的交互组，位置记在组上：切点用的就是它。
+    turns = split_turns(session.messages)
+    check(
+        [(turn.message_index, turn.part_start) for turn in turns]
+        == [(0, 0), (1, 0), (1, 2), (1, 4)],
+        f"三段各自成一个交互组，位置分开记：{[(t.message_index, t.part_start) for t in turns]}",
+    )
+
+    for index, name in ((1, "fetch_structure"), (3, "detect_pockets")):
+        record_step(
+            session,
+            step_no=len(session.pending_steps) + 1,
+            parts=[part for part in message.parts if part.tool_name == name],
+            message_index=1,
+            part_start=index,
+            part_end=index + 1,
+        )
+
+    first = seal_topic(session, cut=(1, 4), kind="manual", title="结构分析")
+    check(first is not None and len(first.steps) == 2, "前两步封成一个主题")
+    check(first.cut == (1, 4), f"切点落在第三段之前：{first.cut}")
+    check(first.step_start == 1 and first.step_end == 3, f"全局步号：{first.span}")
+    check(session.pending_steps == [], "封过的步不再挂在待封存上")
+
+    # 第三个主题继续在同一个消息里跑。
+    record_step(
+        session,
+        step_no=1,
+        parts=[part for part in message.parts if part.tool_name == "search_chembl"],
+        message_index=1,
+        part_start=5,
+        part_end=6,
+    )
+    check(
+        [step.seq for step in session.pending_steps] == [1],
+        "新主题的步号从 1 重新起",
+    )
+
+    built = ContextAssembler(128_000).build(session, "系统提示。")
+    tool_items = [item for item in built.messages if item.get("role") == "tool"]
+    check(
+        len(tool_items) == 1 and "search_chembl" in str(tool_items[0].get("content")),
+        f"只有当前主题的工具原文发出去：{[str(i.get('content'))[:20] for i in tool_items]}",
+    )
+    assistants = [item for item in built.messages if item.get("role") == "assistant"]
+    check(len(assistants) == 1, f"封过的那两段 assistant 项也不再发：{len(assistants)} 条")
+    body = "\n".join(str(item.get("content") or "") for item in built.messages)
+    check("结构分析" in body, "封过的主题以摘要进上下文")
+    check("主题 1：" in body, f"索引行写的是主题：{body[:120]}")
+
+    # 后封的主题不回头改前一条。
+    snapshot = [step.intent for step in session.events[0].steps]
+    second = seal_range(session, kind="auto", upto=2)
+    check(second is not None and second.cut == (2, 0), "轮末把剩下的封成一个主题")
+    check(second.step_start == 3 and second.step_end == 4, f"步号接着往下排：{second.span}")
+    check(
+        [step.intent for step in session.events[0].steps] == snapshot,
+        "前面那条主题的流水一个字没动",
+    )
+    check(len(session.events) == 2 and session.event_cut == (2, 0), "两条主题首尾相接")
+
+    # 召回一条主题只铺它自己那一段原文。
+    detail = render_event_detail(session, session.events[0])
+    check("fetch_structure" in detail and "search_chembl" not in detail, "详情只铺本主题的原文")
+    second_detail = render_event_detail(session, session.events[1])
+    check("search_chembl" in second_detail, "第二个主题的详情铺它自己的原文")
+    check("第 1–2 步" in detail, f"详情里写着步号区间：{detail.splitlines()[1]}")
+
+    # 封存之后再装配：一条原文都不剩，只剩两条摘要。
+    built = ContextAssembler(128_000).build(session, "系统提示。")
+    check(
+        [item for item in built.messages if item.get("role") == "tool"] == [],
+        "全部封完之后没有工具原文再发出去",
+    )
+    check(built.metrics["events"] == 2, "度量里数得到两条主题")
+
+    # 真跑一轮：先调一个工具，再调 close_topic，然后收尾。
+    # 这一条验的是接线：工具结果里那段原文，在下一步请求里就没了。
+    bus = EventBus()
+    seen: list[dict[str, Any]] = []
+    bus.subscribe("event.sealed", seen.append)
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    registry.register(CloseTopicTool())
+    loop = build_loop(server, bus, registry)
+    live = Session(id="ses_topic_loop", title="多主题")
+    ask(live, "查一条记录")
+    marker = "RAW_ECHO_口袋在残基45"
+    # 标记放在 120 字之后：流水只留结果首行的一百来字，标记落在截断线外的
+    # 那一部分，出现就只可能来自工具原文。
+    payload = "填充" * 80 + marker
+    server.clear()
+    server.script(
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[
+                        tool_call_delta(
+                            0,
+                            call_id="c1",
+                            name="echo",
+                            arguments=json.dumps({"text": payload}),
+                        )
+                    ]
+                ),
+                usage_chunk(3, 3),
+            ]
+        ),
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[
+                        tool_call_delta(
+                            0,
+                            call_id="c2",
+                            name="close_topic",
+                            arguments=json.dumps(
+                                {
+                                    "title": "查口袋",
+                                    "summary": "口袋在残基 45",
+                                    "handoff": "下一步用它做盒子",
+                                }
+                            ),
+                        )
+                    ]
+                ),
+                usage_chunk(3, 3),
+            ]
+        ),
+        Reply(chunks=[*text_chunks("记下了", size=2), usage_chunk(1, 1)]),
+    )
+    await loop.stream_reply(live, "")
+    check(len(server.requests) == 3, f"三步各一次请求：{len(server.requests)}")
+    sealed = next((event for event in live.events if event.title == "查口袋"), None)
+    check(sealed is not None and sealed.kind == "manual", "模型给的名字封成一条主题")
+    check(sealed.actions == ["echo"], f"流水里是那一步的工具：{sealed.actions if sealed else None}")
+    check(sealed.handoff.startswith("下一步"), f"交接跟着写进去：{sealed.handoff}")
+    final_body = json.dumps(server.requests[-1]["messages"], ensure_ascii=False)
+    check(marker not in final_body, "封存之后，那一步的工具原文不再随请求发出")
+    check("查口袋" in final_body, "摘要顶上了原文的位置")
+    recalled = await RecallEventTool().execute(
+        {"event": sealed.id, "step": 1}, session=live
+    )
+    check(marker in recalled.output, "原文一条没删，按步召得回来")
+    check(seen and seen[0]["title"] == "查口袋", f"封存时给界面发一条总线事件：{seen}")
 
 
 async def check_event_capture(server: FakeModelServer) -> None:
-    """阶段封存：标题随调用给出，没给结论就本地兜底，全程不另发请求。"""
+    """主题封存：标题随调用给出，没给结论就本地兜底，全程不另发请求。"""
     bus = EventBus()
     loop = build_loop(server, bus, ToolRegistry())
     session = _event_fixture(2)
-    session.summary_upto = 0
     session.add_event(
         Event(
             id="evt_0001",
             title="前一段",
             summary="前一段做完了",
-            phase_index=1,
-            start=0,
-            end=2,
+            topic_index=1,
+            cut_message=2,
+            cut_part=0,
             kind="manual",
         )
     )
@@ -19914,40 +20724,40 @@ async def check_event_capture(server: FakeModelServer) -> None:
         parts=[part for part in assistant.parts if part.type is PartType.TOOL],
         message_index=3,
     )
-    # 再挂一条「正在写」的助手消息：封存停在它之前（它还没写完）。
-    session.add_message(Message(role="assistant", session_id=session.id))
 
     server.clear()
     runtime = loop._event_runtime(session)
-    missing = await ClosePhaseTool().execute({}, event_runtime=runtime)
+    missing = await CloseTopicTool().execute({}, event_runtime=runtime)
     check(missing.failed and "缺少 title" in missing.output, f"没给标题就退回：{missing.output}")
-    blank = await ClosePhaseTool().execute({"title": "   "}, event_runtime=runtime)
+    blank = await CloseTopicTool().execute({"title": "   "}, event_runtime=runtime)
     check(blank.failed and "缺少 title" in blank.output, f"空白标题也算缺：{blank.output}")
     check(len(server.requests) == 0, f"退回时不发任何请求：{len(server.requests)}")
     check(not session.events[1:], "退回时不落半条事件")
 
-    recorded = await ClosePhaseTool().execute({"title": "准备受体"}, event_runtime=runtime)
+    recorded = await CloseTopicTool().execute({"title": "准备受体"}, event_runtime=runtime)
     check(not recorded.failed, f"只给标题也能用：{recorded.output}")
     check(len(server.requests) == 0, "记名字不花请求")
-    check(session.events[-1].id == "evt_0001", "记名字不当场封存（阶段仍在一轮结束时封）")
-    check(session.phase_title == "准备受体", "名字挂在会话上，等封存时取")
+    check(session.events[-1].id == "evt_0001", "记名字不当场封存（封存在步末）")
+    check(session.topic_title == "准备受体", "名字挂在会话上，等封存时取")
 
     # 轮末封存：取用模型给的那一份，用完就清。
-    ended = loop._seal_phase(session, kind="auto", upto=4)
+    ended = loop._seal_range(session, kind="auto", upto=4)
     check(ended is not None, "轮末照常封存")
     newest = session.events[-1]
     check(newest.title == "准备受体" and newest.summary, "封存用模型写的标题，结论本地拼一份")
     check(not newest.degraded, "标题是模型写的不算降级")
     check(newest.actions == ["dock"], f"动作仍从 Part 数出来：{newest.actions}")
     check("docking#1" in newest.artifacts, f"产物仍从 tool_meta 取：{newest.artifacts}")
-    check(newest.start == 2 and newest.end == 4, f"只封到正在写的那条之前：{newest.start}–{newest.end}")
+    check(newest.cut == (4, 0), f"封到这一段的末尾：{newest.cut}")
     check(session.events[-2].id == "evt_0001", "前面那条事件没被动过")
-    check(session.events[-1].phase_index == 2, "阶段号接着往下排")
-    check(session.phase_title == "", "名字用过一次就清掉，不会顶到下一段")
+    check(session.events[-1].topic_index == 2, "主题号接着往下排")
+    check(session.topic_title == "", "名字用过一次就清掉，不会顶到下一个主题")
 
-    # 已有事件时溢出：补一个阶段，不额外请求模型。
+    # 已有事件时溢出：补一个主题，不额外请求模型。
     crowded = _event_fixture(3)
-    crowded.add_event(Event(id="evt_0001", title="开头", summary="开头", start=0, end=2, kind="auto"))
+    crowded.add_event(
+        Event(id="evt_0001", title="开头", summary="开头", cut_message=2, cut_part=0, kind="auto")
+    )
     for index in range(3, 25):
         user = crowded.add_message(Message(role="user"))
         user.add_part(Part(type=PartType.TEXT, text=f"第 {index} 步：" + "内容" * 100))
@@ -19959,11 +20769,11 @@ async def check_event_capture(server: FakeModelServer) -> None:
     answer = await loop.stream_reply(crowded, "")
     loop.context_window = 200_000
     check(answer is not None, "小窗口下这一轮照常结束")
-    check(len(server.requests) == 1, f"溢出走本地阶段，不多发请求：{len(server.requests)}")
-    check(crowded.events[-1].kind in ("auto", "local"), f"补上的是本地阶段：{crowded.events[-1].kind}")
-    check(crowded.events[-1].end > 2, "覆盖范围往前推了")
+    check(len(server.requests) == 1, f"溢出走本地主题，不多发请求：{len(server.requests)}")
+    check(crowded.events[-1].kind in ("auto", "local"), f"补上的是本地主题：{crowded.events[-1].kind}")
+    check(crowded.event_cut > (2, 0), "切点往前推了")
 
-    # 已经有一份摘要、还没有事件时：新的溢出也交给阶段（摘要从此冻结）。
+    # 已经有一份摘要、还没有事件时：新的溢出也交给主题（摘要从此冻结）。
     # 否则事件层永远等不到第一条，长会话只会一路摘要下去。
     switched = _event_fixture(3)
     switched.summary = "一、目标\n早前做过的事"
@@ -19982,7 +20792,7 @@ async def check_event_capture(server: FakeModelServer) -> None:
     check(len(server.requests) == 1, f"有摘要之后不再请求摘要：{len(server.requests)}")
     check(bool(switched.events), "补上了第一条事件")
     check(switched.events[0].kind == "auto", "第一条是本地兜底事件")
-    check(switched.events[0].start == 2, f"事件从摘要覆盖到的位置起：{switched.events[0].start}")
+    check(switched.events[0].cut[0] >= 2, f"事件从摘要覆盖到的位置之后起：{switched.events[0].cut}")
     check(switched.summary_upto == 2, "摘要冻结在原来的位置")
 
 
@@ -21316,6 +22126,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("pocket-profile", check_pocket_profile),
     ("rank-candidates", check_rank_candidates),
     ("analyze-pose", check_analyze_pose),
+    ("alternative-poses", check_alternative_poses),
     ("contact-map", check_contact_map),
     ("hydrophobic", check_hydrophobic),
     ("efficiency", check_efficiency),
@@ -21331,6 +22142,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("sar", check_sar),
     ("hypothesis", check_hypothesis),
     ("strategy", check_strategy_compare),
+    ("campaign-run", check_campaign_run),
     ("pharmacophore", check_pharmacophore),
     ("identity", check_identity_floor),
     ("align-prior", check_align_and_prior),
@@ -21391,6 +22203,7 @@ SERVER_GROUPS: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("context-metrics", check_context_metrics),
     ("tool-family-loop", check_tool_family_loop),
     ("event-capture", check_event_capture),
+    ("topic", check_topic),
     ("phase-compaction", check_overflow_phase),
     ("live-app", check_live_app),
 )

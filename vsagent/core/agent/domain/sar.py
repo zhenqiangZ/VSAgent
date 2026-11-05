@@ -1,14 +1,15 @@
-"""构效关系：骨架分组、匹配分子对、类似物枚举、实验回填。
+"""构效关系：骨架分组、共同子结构、匹配分子对、类似物枚举、实验回填。
 
 这一层回答的是「下一轮该改哪里」：哪些分子属于同一个骨架（先看骨架再看单个分子）、
+这批命中共有的子结构是什么（最大共同子结构）、
 哪一对只差一个基团而活性差了多少（匹配分子对，SAR 里最硬的证据）、把骨架与替换基团
 重新组合能生出哪些没测过的分子、以及用户测完回来怎么把数据接上。
 
-**四个工具的输入都带分数或结构，不重新打分。** 分数从候选表来（`rank_candidates`
+**五个工具的输入都带分数或结构，不重新打分。** 分数从候选表来（`rank_candidates`
 的产物），结构与 R 基用 RDKit 拆；这一层不做预测，只做整理与组合。
 
 **实验数据是唯一收路径的地方之一。** `record_assay` 要读用户手里的 CSV——那是模型编不
-出来的东西。其余三个仍只收 handle。
+出来的东西。其余四个仍只收 handle。
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from . import export, ligand, products
 from .chemistry import CHEM_TOOL_DESCRIPTION_NOTE, require_chem
 
 __all__ = [
+    "CommonFeaturesTool",
     "EnumerateAnalogsTool",
     "MatchedPairsTool",
     "RecordAssayTool",
@@ -536,6 +538,262 @@ def _render_mmp(handle: str, pairs: Sequence[dict[str, Any]], scanned: int,
     lines.append(f"产物目录：{target}")
     lines.append("用途：同一骨架下只改一个基团，活性差多少——这是最硬的构效证据。")
     return "\n".join(lines)
+
+
+# MCS 的默认口径。8 个原子大约是「两个并环」的规模：更小的共同子结构在多数
+# 分子之间都能找到，说明不了「这批有共同骨架」。
+DEFAULT_MCS_ATOMS = 8
+MAX_MCS_ATOMS = 50
+DEFAULT_MCS_TIMEOUT = 10
+MAX_MCS_TIMEOUT = 60
+MAX_MCS_GROUPS = 20
+MCS_MIN_GROUP = 3
+"""组内至少这么多个分子才单独算一次：两个分子的 MCS 就是它们各自的公共部分，
+在组里说「这组有共同骨架」没有意义。"""
+
+
+def _mcs(mols: Sequence[Any], *, timeout: int) -> tuple[str, int, bool]:
+    """跑一次最大共同子结构。返回 `(SMARTS, 原子数, 是否超时)`。
+
+    `ringMatchesRingOnly` 与 `completeRingsOnly` 一起打开：关掉的话一条链可以
+    「匹配」进一个环，得到的 SMARTS 在三维上不是同一块形状。
+    """
+    from rdkit.Chem import rdFMCS
+
+    if len(mols) < 2:
+        return "", 0, False
+    result = rdFMCS.FindMCS(
+        list(mols),
+        timeout=timeout,
+        atomCompare=rdFMCS.AtomCompare.CompareElements,
+        bondCompare=rdFMCS.BondCompare.CompareOrder,
+        ringMatchesRingOnly=True,
+        completeRingsOnly=True,
+    )
+    if result.canceled:
+        return "", int(result.numAtoms or 0), True
+    return str(result.smartsString or ""), int(result.numAtoms or 0), False
+
+
+def _mcs_coverage(mols: Sequence[Any], pattern: Any) -> int:
+    """有多少个分子含这个子结构。`pattern` 为 `None` 时返回 0。"""
+    if pattern is None:
+        return 0
+    return sum(1 for mol in mols if mol.HasSubstructMatch(pattern))
+
+
+def _short_smarts(smarts: str, limit: int = 120) -> str:
+    return smarts if len(smarts) <= limit else smarts[: limit - 1] + "…"
+
+
+class CommonFeaturesTool(Tool):
+    """一批命中里共有的子结构。"""
+
+    spec = ToolSpec(
+        name="common_features",
+        description=(
+            "找一批分子**共有的子结构**（最大共同子结构，MCS）：先按 Murcko 骨架分组，"
+            "组内算一次、跨组再算一次，回答「这批 hit 的共同骨架是什么」。"
+            + CHEM_TOOL_DESCRIPTION_NOTE
+            + "\n"
+            "这是**二维**共同子结构，不是三维形状：形状与位姿的共性用 `analyze_pose` "
+            "与 `alternative_poses`。\n"
+            "覆盖不到的分子要列出来并写原因（无环、解析失败）——只报覆盖数会把"
+            "「这批其实分成两半」读成「它们都一样」。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "候选表或配体集的 handle"},
+                "min_atoms": {
+                    "type": "integer",
+                    "description": f"共同子结构至少几个原子，默认 {DEFAULT_MCS_ATOMS}",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": f"每次 MCS 最多算几秒，默认 {DEFAULT_MCS_TIMEOUT}",
+                },
+                "top": {
+                    "type": "integer",
+                    "description": f"最多列几组，默认 10，上限 {MAX_MCS_GROUPS}",
+                },
+            },
+            "required": ["source"],
+            "additionalProperties": False,
+        },
+    )
+    primary_argument = "source"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：common_features 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+        raw = str(arguments.get("source") or "").strip()
+        if not raw:
+            return ToolResult(output="缺少参数 source。先 list_workspace。", failed=True)
+        try:
+            entry = ledger.get(raw)
+        except Exception as error:
+            return ToolResult(output=str(error), failed=True)
+
+        min_atoms = arguments.get("min_atoms", DEFAULT_MCS_ATOMS)
+        timeout = arguments.get("timeout", DEFAULT_MCS_TIMEOUT)
+        top = arguments.get("top", 10)
+        for name, value in (("min_atoms", min_atoms), ("timeout", timeout), ("top", top)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                return ToolResult(output=f"参数 {name} 应当是整数", failed=True)
+        if not 2 <= min_atoms <= MAX_MCS_ATOMS:
+            return ToolResult(
+                output=f"min_atoms 2–{MAX_MCS_ATOMS}（现在是 {min_atoms}）", failed=True
+            )
+        if not 1 <= timeout <= MAX_MCS_TIMEOUT:
+            return ToolResult(
+                output=f"timeout 1–{MAX_MCS_TIMEOUT} 秒（现在是 {timeout}）", failed=True
+            )
+        if not 1 <= top <= MAX_MCS_GROUPS:
+            return ToolResult(
+                output=f"top 1–{MAX_MCS_GROUPS}（现在是 {top}）", failed=True
+            )
+
+        try:
+            require_chem()
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+        try:
+            rows, _column, _higher = _rows_of(entry)
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+        rows = [row for row in rows[:MAX_MOLECULES] if row["smiles"]]
+        if not rows:
+            return ToolResult(output=f"{entry.handle} 里没有带结构的分子。", failed=True)
+
+        from rdkit import Chem, rdBase
+
+        groups: dict[str, list[tuple[dict[str, Any], Any]]] = {}
+        acyclic: list[dict[str, Any]] = []
+        broken: list[dict[str, Any]] = []
+        with rdBase.BlockLogs():
+            for row in rows:
+                mol = Chem.MolFromSmiles(row["smiles"])
+                if mol is None:
+                    broken.append(row)
+                    continue
+                scaffold = scaffold_of(mol, "murcko")
+                if not scaffold:
+                    acyclic.append(row)
+                    continue
+                groups.setdefault(scaffold, []).append((row, mol))
+
+        if not groups:
+            return ToolResult(
+                output=(
+                    f"{len(rows)} 个分子里没有一个带环的骨架，算不了共同子结构。"
+                    "无环分子之间没有可比的骨架，换一批有环的库再来。"
+                ),
+                failed=True,
+            )
+
+        ring_items = [item for members in groups.values() for item in members]
+        ring_mols = [mol for _row, mol in ring_items]
+        smarts, atoms, canceled = _mcs(ring_mols, timeout=timeout)
+        pattern = Chem.MolFromSmarts(smarts) if smarts else None
+        covered = _mcs_coverage(ring_mols, pattern)
+        missed = [
+            row["id"]
+            for row, mol in ring_items
+            if pattern is not None and not mol.HasSubstructMatch(pattern)
+        ]
+
+        lines = [
+            f"{len(rows)} 个分子：有环 {len(ring_mols)} 个、无环 {len(acyclic)} 个、"
+            f"解析失败 {len(broken)} 个。"
+        ]
+        if canceled:
+            lines.append(
+                f"全局 MCS 在 {timeout} 秒内没算完（分子太多或差异太大），下面只给分组的结果。"
+            )
+        elif pattern is not None and atoms >= min_atoms:
+            lines.append(
+                f"全局共同子结构：{atoms} 个原子，覆盖 {covered}/{len(ring_mols)} 个"
+                f"（{covered / len(ring_mols):.0%}）。"
+            )
+            lines.append(f"  SMARTS {_short_smarts(smarts)}")
+        else:
+            lines.append(
+                f"全局没有达到 {min_atoms} 个原子的共同子结构"
+                + (f"（最大只有 {atoms} 个原子）" if atoms else "")
+                + "：这批分子的骨架并不统一，按分组看更合适。"
+            )
+
+        ordered = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
+        lines.append("")
+        lines.append(f"分组（组内 ≥{MCS_MIN_GROUP} 个；按成员数排）")
+        listed = 0
+        for scaffold, members in ordered:
+            if len(members) < MCS_MIN_GROUP:
+                continue
+            if listed >= top:
+                break
+            listed += 1
+            group_mols = [mol for _row, mol in members]
+            group_smarts, group_atoms, group_canceled = _mcs(
+                group_mols, timeout=timeout
+            )
+            if group_canceled:
+                lines.append(f"- {scaffold} ×{len(members)}：{timeout} 秒内没算完")
+                continue
+            if not group_smarts or group_atoms < min_atoms:
+                lines.append(
+                    f"- {scaffold} ×{len(members)}：共同部分只有 {group_atoms} 个原子"
+                    f"（<{min_atoms}）"
+                )
+                continue
+            group_pattern = Chem.MolFromSmarts(group_smarts)
+            lines.append(
+                f"- {scaffold} ×{len(members)}：{group_atoms} 个原子，"
+                f"覆盖 {_mcs_coverage(group_mols, group_pattern)}"
+            )
+            lines.append(f"  SMARTS {_short_smarts(group_smarts)}")
+        if not listed:
+            lines.append(f"- 没有一个组到 {MCS_MIN_GROUP} 个分子")
+
+        if missed:
+            shown = "、".join(missed[:10]) + ("……" if len(missed) > 10 else "")
+            lines.append("")
+            lines.append(
+                f"不含全局共同子结构的 {len(missed)} 个：{shown}。"
+                "它们要么是另一个化学型，要么是这批里的离群分子——先看它们落在哪个骨架组。"
+            )
+        if acyclic:
+            shown = "、".join(row["id"] for row in acyclic[:10]) + (
+                "……" if len(acyclic) > 10 else ""
+            )
+            lines.append(f"无环的 {len(acyclic)} 个（没有骨架，不参与分组）：{shown}")
+        if broken:
+            shown = "、".join(row["id"] for row in broken[:10]) + (
+                "……" if len(broken) > 10 else ""
+            )
+            lines.append(f"解析失败的 {len(broken)} 个：{shown}")
+
+        return ToolResult(
+            output="\n".join(lines),
+            meta={
+                "source": str(entry.handle),
+                "molecules": len(rows),
+                "ring": len(ring_mols),
+                "acyclic": len(acyclic),
+                "broken": len(broken),
+                "smarts": smarts,
+                "atoms": atoms,
+                "covered": covered,
+                "groups": listed,
+                "canceled": canceled,
+            },
+        )
 
 
 class MatchedPairsTool(Tool):
@@ -1483,8 +1741,8 @@ class RecordAssayTool(Tool):
 
 
 def domain_tools() -> list[Tool]:
-    return [ScaffoldAnalysisTool(), MatchedPairsTool(), EnumerateAnalogsTool(),
-            RecordAssayTool()]
+    return [ScaffoldAnalysisTool(), CommonFeaturesTool(), MatchedPairsTool(),
+            EnumerateAnalogsTool(), RecordAssayTool()]
 
 
 if __name__ == "__main__":  # pragma: no cover

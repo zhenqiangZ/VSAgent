@@ -18,7 +18,7 @@ import csv
 import io
 import math
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from ..ledger import (
     LigandSetHandle,
@@ -35,7 +35,10 @@ __all__ = [
     "ScreenShapeTool",
     "ScreenSimilarityTool",
     "candidates_dir",
+    "cluster_by_similarity",
     "domain_tools",
+    "pose_jaccard",
+    "pose_volume_cells",
     "selected_dir",
     "usr_descriptor",
 ]
@@ -980,14 +983,18 @@ def _pose_voxels(entry: Any, wanted: set[str]) -> tuple[dict[str, set[tuple[int,
         if not relative:
             continue
         points = _pdb_points(Path(str(entry.path)) / relative)
-        cells = _volume_cells(points)
+        cells = pose_volume_cells(points)
         if cells:
             voxels[identifier] = cells
     return voxels, ""
 
 
-def _volume_cells(points: Sequence[Sequence[float]]) -> set[tuple[int, int, int]]:
-    """一组原子坐标占的 1.0 埃格子。半径 1.8 埃的球并起来。"""
+def pose_volume_cells(points: Sequence[Sequence[float]]) -> set[tuple[int, int, int]]:
+    """一组原子坐标占的 1.0 埃格子。半径 1.8 埃的球并起来。
+
+    `pick_diverse` 的位姿去重与 `alternative_poses` 的摆法聚簇共用这一份：
+    两处各写一套的话，同一对位姿在两边会被判成不同簇。
+    """
     cells: set[tuple[int, int, int]] = set()
     reach = int(POSE_SPHERE_RADIUS / POSE_VOXEL) + 1
     for point in points:
@@ -1002,23 +1009,24 @@ def _volume_cells(points: Sequence[Sequence[float]]) -> set[tuple[int, int, int]
     return cells
 
 
-def _jaccard(left: set, right: set) -> float:
+def pose_jaccard(left: set, right: set) -> float:
     if not left or not right:
         return 0.0
     union = len(left | right)
     return len(left & right) / union if union else 0.0
 
 
-def _pose_clusters(
-    rows: Sequence[dict[str, Any]], voxels: dict[str, set[tuple[int, int, int]]]
+def cluster_by_similarity(
+    items: Sequence[str],
+    similarity: Callable[[str, str], float],
+    threshold: float,
 ) -> dict[str, int]:
-    """位姿体积重叠聚簇：Jaccard ≥ 0.5 的并成一簇。返回 `分子 → 簇号`。
+    """单链接聚簇：相似度 ≥ threshold 的并成一簇。返回 `项 → 簇号`。
 
-    单链接：A 像 B、B 像 C 就算同一簇。链式相连会把一长串略有重叠的位姿并成
-    一大簇，所以簇号只用来「每簇留名次最高的一个」，不参与别的判断。
+    单链接：A 像 B、B 像 C 就算同一簇。链式相连会把一长串略有重叠的项并成
+    一大簇，所以簇号只用来「每簇留一个代表」，不参与别的判断。
     """
-    ids = [row["id"] for row in rows if row["id"] in voxels]
-    parent = {identifier: identifier for identifier in ids}
+    parent = {item: item for item in items}
 
     def find(key: str) -> str:
         while parent[key] != key:
@@ -1026,20 +1034,32 @@ def _pose_clusters(
             key = parent[key]
         return key
 
-    for index, left in enumerate(ids):
-        for right in ids[index + 1 :]:
-            if _jaccard(voxels[left], voxels[right]) >= POSE_JACCARD:
+    for index, left in enumerate(items):
+        for right in items[index + 1 :]:
+            if similarity(left, right) >= threshold:
                 a, b = find(left), find(right)
                 if a != b:
                     parent[b] = a
     roots: dict[str, int] = {}
     out: dict[str, int] = {}
-    for identifier in ids:
-        root = find(identifier)
+    for item in items:
+        root = find(item)
         if root not in roots:
             roots[root] = len(roots) + 1
-        out[identifier] = roots[root]
+        out[item] = roots[root]
     return out
+
+
+def _pose_clusters(
+    rows: Sequence[dict[str, Any]], voxels: dict[str, set[tuple[int, int, int]]]
+) -> dict[str, int]:
+    """位姿体积重叠聚簇：Jaccard ≥ 0.5 的并成一簇。返回 `分子 → 簇号`。"""
+    ids = [row["id"] for row in rows if row["id"] in voxels]
+    return cluster_by_similarity(
+        ids,
+        lambda left, right: pose_jaccard(voxels[left], voxels[right]),
+        POSE_JACCARD,
+    )
 
 
 def _batch_summary(rows: Sequence[dict[str, Any]], voxels: dict[str, set]) -> str:

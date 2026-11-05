@@ -97,6 +97,130 @@ async function render() {
 
 window.addEventListener("hashchange", render);
 
+// ------------------------------------------------------------------
+// 顶部搜索：会话、主题、产物三类，点一条跳过去。
+//
+// 长任务里找东西不该靠翻聊天记录，但这里**只搜标题与结论**：工具正文在状态
+// 文件里有几 MB，逐字匹配既慢又吵（一个 "PDB" 能命中几百条）。正文检索归
+// 语料库那条链。
+// ------------------------------------------------------------------
+
+const searchInput = document.getElementById("global-search");
+const searchResults = document.getElementById("search-results");
+let searchTimer = 0;
+let searchSerial = 0;
+
+function closeSearch() {
+  searchResults.classList.add("is-hidden");
+  searchResults.innerHTML = "";
+}
+
+function searchGroup(title, items, builder) {
+  if (!items.length) return null;
+  const group = document.createElement("div");
+  group.className = "search-group";
+  const head = document.createElement("div");
+  head.className = "search-group-title";
+  head.textContent = `${title}（${items.length}）`;
+  group.appendChild(head);
+  for (const item of items) group.appendChild(builder(item));
+  return group;
+}
+
+function searchItem(title, meta, href) {
+  const node = document.createElement("button");
+  node.type = "button";
+  node.className = "search-item";
+  const name = document.createElement("div");
+  name.className = "search-item-title";
+  name.textContent = title;
+  node.appendChild(name);
+  if (meta) {
+    const note = document.createElement("div");
+    note.className = "search-item-meta";
+    note.textContent = meta;
+    node.appendChild(note);
+  }
+  node.addEventListener("click", () => {
+    window.location.hash = href;
+    searchInput.value = "";
+    closeSearch();
+  });
+  return node;
+}
+
+async function runSearch(term) {
+  const serial = ++searchSerial;
+  let payload;
+  try {
+    payload = await fetchJson(`/api/search?q=${encodeURIComponent(term)}`);
+  } catch (error) {
+    if (serial !== searchSerial) return;
+    searchResults.innerHTML = "";
+    searchResults.appendChild(
+      Object.assign(document.createElement("div"), {
+        className: "search-empty",
+        textContent: `搜索失败：${error.message}`,
+      })
+    );
+    searchResults.classList.remove("is-hidden");
+    return;
+  }
+  if (serial !== searchSerial) return;
+
+  searchResults.innerHTML = "";
+  const groups = [
+    searchGroup("任务", payload.sessions || [], (item) =>
+      searchItem(item.title, `${item.eventCount} 个主题 · ${item.messageCount} 条消息`, `#/history/${encodeURIComponent(item.id)}`)
+    ),
+    searchGroup("主题", payload.topics || [], (item) =>
+      searchItem(
+        item.title,
+        `${item.sessionTitle} · ${item.eventId}`,
+        `#/history/${encodeURIComponent(item.sessionId)}?event=${encodeURIComponent(item.eventId)}`
+      )
+    ),
+    searchGroup("产物", payload.artifacts || [], (item) =>
+      searchItem(
+        `${item.handle} ${item.name}`,
+        item.summary,
+        `#/history/${encodeURIComponent(item.sessionId)}`
+      )
+    ),
+  ].filter(Boolean);
+
+  if (!groups.length) {
+    const empty = document.createElement("div");
+    empty.className = "search-empty";
+    empty.textContent = `没有匹配「${payload.query}」的任务、主题或产物。`;
+    searchResults.appendChild(empty);
+  } else {
+    for (const group of groups) searchResults.appendChild(group);
+  }
+  searchResults.classList.remove("is-hidden");
+}
+
+searchInput.addEventListener("input", () => {
+  const term = searchInput.value.trim();
+  window.clearTimeout(searchTimer);
+  if (!term) {
+    closeSearch();
+    return;
+  }
+  searchTimer = window.setTimeout(() => runSearch(term), 240);
+});
+
+searchInput.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    searchInput.value = "";
+    closeSearch();
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!document.getElementById("app-search").contains(event.target)) closeSearch();
+});
+
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", render);
 } else {

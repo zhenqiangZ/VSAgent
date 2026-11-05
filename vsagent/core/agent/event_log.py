@@ -403,6 +403,7 @@ def seal_topic(
     summary: str = "",
     handoff: str = "",
     force: bool = False,
+    exit_reason: str = "",
 ) -> Event | None:
     """把 `[上一条事件的切点, cut)` 封成一个主题，零模型请求。
 
@@ -475,6 +476,8 @@ def seal_topic(
         tokens=_position_tokens(session, start, end),
         kind=kind if kind in EVENT_KINDS else "auto",
         degraded=not written,
+        # 只有轮末那一次封存知道这一轮为什么停下；轮中途换主题与预算切段传空串。
+        exit_reason=exit_reason,
     )
     # 步号在主题内连号，1 起。软预算会把一个主题切成两段，
     # 不重排的话下一段的步号会从 9 开始，读起来像漏了前八步。
@@ -502,6 +505,7 @@ def seal_range(
     summary: str = "",
     handoff: str = "",
     force: bool = False,
+    exit_reason: str = "",
 ) -> Event | None:
     """把一个消息区间封成一个主题。`upto` 是消息下标（不含）。"""
     limit = len(session.messages) if upto is None else min(int(upto), len(session.messages))
@@ -513,6 +517,7 @@ def seal_range(
         summary=summary,
         handoff=handoff,
         force=force,
+        exit_reason=exit_reason,
     )
 
 

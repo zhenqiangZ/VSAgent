@@ -20,6 +20,7 @@ from typing import Any, Callable
 from ..file_refs import resolve_file_refs
 from ..models import Message, Part, PartType, Session
 from ..session_manager import SessionManager
+from .. import live
 from .context import ContextAssembler
 from .ledger import SessionLedger
 from .loop import EXIT_CANCELLED, EXIT_ERROR, EXIT_LABELS, EXIT_TOOL_FAILED, AgentLoop
@@ -27,6 +28,9 @@ from .spawn import SEED_RATIO, fork_messages, task_preamble
 
 # 子 agent 最多能再往下派几层。0 表示根会话，1 表示子 agent。
 MAX_DEPTH = 1
+
+LIVE_THROTTLE = 0.5
+"""实时快照两次写之间的最短间隔，单位秒。"""
 
 
 class AgentHost:
@@ -54,6 +58,13 @@ class AgentHost:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         # 按根会话共享：子 agent 的 handle 与父会话是同一份。
         self._ledgers: dict[str, SessionLedger] = {}
+        # 实时快照的节流时刻。一次模型往返里有几百个 `part.update`（每个文本增量
+        # 都发一次），每个都写一遍文件没有意义；半秒一次足够页面显示「正在做什么」。
+        self._live_at: dict[str, float] = {}
+        # 每条正在跑的会话各有一对订阅（`part.add` / `part.update`）。
+        # 只在跑的时候挂：不跑的时候总线上多两个处理函数，界面那几条「订阅数」的
+        # 判据会跟着变，而它们在空闲时验的正是「没有多余的东西挂着」。
+        self._live_subs: dict[str, list[Callable[[], None]]] = {}
 
     # ------------------------------------------------------------------
     # 循环层与登记表
@@ -357,8 +368,34 @@ class AgentHost:
     def _start(self, session: Session, coroutine: Any) -> None:
         """起一条后台任务，并把它记在会话名下。"""
         self._set_status(session, "running")
+        # 先把「开始跑了」写出去：网页端在第一次工具调用之前也要知道这一轮起来了。
+        self._live_at.pop(session.id, None)
+        live.write(self.manager.state_path, session, running=True)
+        if session.id not in self._live_subs:
+            self._live_subs[session.id] = [
+                self.bus.subscribe("part.add", self._on_live_update),
+                self.bus.subscribe("part.update", self._on_live_update),
+            ]
         task = asyncio.create_task(self._run(session, coroutine))
         self._tasks[session.id] = task
+
+    def _on_live_update(self, data: dict[str, Any]) -> None:
+        """把当前主题的进展写一份快照，页面按两秒一次来取。
+
+        只写正在跑的会话：子 agent 的事件也走同一条总线，没在跑就跳过。
+        节流放在这里而不是写入侧，因为文本增量一秒钟能发几十次。
+        """
+        session_id = str(data.get("session_id") or "")
+        if session_id not in self._tasks:
+            return
+        now = time.time()
+        if now - self._live_at.get(session_id, 0.0) < LIVE_THROTTLE:
+            return
+        session = self.manager.get_session(session_id)
+        if session is None:
+            return
+        self._live_at[session_id] = now
+        live.write(self.manager.state_path, session, running=True)
 
     async def _run(self, session: Session, coroutine: Any) -> None:
         """跑完一轮之后落状态。异常也要落，否则右栏会一直显示运行中。"""
@@ -391,6 +428,12 @@ class AgentHost:
             self._set_status(session, status, note)
             if self.save_state is not None:
                 self.save_state()
+            # 状态文件写完才标「不跑了」：页面看到这一句就去重取主题清单，
+            # 反过来的话它会拉到还不含刚封存那一段的旧状态。
+            live.write(self.manager.state_path, session, running=False)
+            self._live_at.pop(session.id, None)
+            for unsubscribe in self._live_subs.pop(session.id, []):
+                unsubscribe()
 
     # ------------------------------------------------------------------
     # 中断与查询

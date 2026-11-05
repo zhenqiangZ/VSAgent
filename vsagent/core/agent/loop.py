@@ -392,6 +392,9 @@ class AgentLoop:
                 session,
                 kind="auto",
                 upto=event_boundary(session, len(session.messages)),
+                # 这一轮怎么停的随主题一起存下来：取消之后同样会走到这里，
+                # 不存的话事后分不出「做完的」与「被停下的」。
+                exit_reason=exit_reason or "",
             )
         finally:
             self.last_latency_ms = int((time.time() - started) * 1000)

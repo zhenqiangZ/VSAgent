@@ -1,4 +1,4 @@
-// 会话工作台：左边会话树与主题导航，中间按主题分段的对话，右边产物。
+// 会话工作台：左边会话树与主题导航，中间按主题分章的对话，右边产物。
 //
 // 页面不再一次拉整份会话。事件清单与正文是两条接口，正文按事件取一段：
 // 一个会话的消息单元可以上百个、工具输出动辄几万字，整份发给页面时切换主题与
@@ -6,6 +6,10 @@
 //
 // 主题的边界来自事件层记录的切点，与模型装配时读的是同一组位置，所以页面上
 // 「这一步属于哪个主题」不会与上下文里的分段对不上。
+//
+// 三层折叠的顺序：主题卡（标题、状态、一句话结论）→ 工具执行（步时间线）→
+// 单个工具（参数、原始输出、错误）。默认只展开最后一个主题，工具过程仍收着；
+// 用户点开一个主题时，那一块的工具过程跟着打开——这是「我要查这一段」的信号。
 
 (function () {
   const { ensureMarkdown, fetchJson, formatTime, formatNumber } = window.vsWeb;
@@ -36,6 +40,15 @@
     running: "执行中",
     completed: "完成",
     failed: "失败",
+  };
+
+  // 主题的显示状态。`interrupted` 只有循环层记下了停止原因时才会出现；
+  // 空状态（旧会话、还在跑）按「已完成」画，不给它编一个没发生过的结论。
+  const TOPIC_STATUS = {
+    completed: "已完成",
+    failed: "失败",
+    interrupted: "已中断",
+    running: "进行中",
   };
 
   // 子 agent 的运行状态。与 TUI 右栏用词一致，颜色由 CSS 的 agent-dot 决定。
@@ -69,22 +82,35 @@
     artifact: "产物",
   };
 
+  const LIVE_INTERVAL = 2000;
+
   let sessions = [];
   let activeId = "";
   let keyword = "";
   let root = null;
   // 折叠的父会话编号。只在本次页面生命周期内有效；刷新页面回到全展开，
-  // 免得昨天折叠过的那条一直藏着新派出去的子 agent。
+  // 免得昨天折叠过的那一条一直藏着新派出去的子 agent。
   const collapsed = new Set();
 
   // 当前打开的会话。
   let events = [];
   let task = null;
   let compactUpto = 0;
-  let activeEvent = "all";
   let artifacts = null;
-  const segmentCache = new Map();
-  const expandedTopics = new Set();
+  const segments = new Map();
+  // 用户手动展开 / 收起的主题。存进 localStorage：刷新之后还是他选的样子。
+  // 没碰过的主题按「最后一个自动展开」处理，新主题出现时上一条自然收起。
+  let manualOpen = new Set();
+  let manualClosed = new Set();
+  // 主题里的「工具执行」块与单个步，只在本次页面里记，不写本地存储。
+  const runOpen = new Set();
+  const stepOpen = new Set();
+  // 左栏主题条下面挂着的步。与正文的展开状态彼此独立：左栏是导航，正文是阅读。
+  const railOpen = new Set();
+  let activeTopic = "";
+  let live = null;
+  let liveTimer = null;
+  const segmentLoads = new Map();
   // 换会话时旧请求可能还在路上；回来时页码对不上就不画，免得把上一个会话的
   // 内容画到这一个上。
   let loadToken = 0;
@@ -110,10 +136,68 @@
     return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
 
+  function formatDuration(seconds) {
+    if (!(seconds > 0)) return "";
+    if (seconds < 10) return `${seconds.toFixed(1)} 秒`;
+    if (seconds < 60) return `${Math.round(seconds)} 秒`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes} 分 ${Math.round(seconds % 60)} 秒`;
+  }
+
   function cmpPos(left, right) {
     if (left.message !== right.message) return left.message < right.message ? -1 : 1;
     if (left.part !== right.part) return left.part < right.part ? -1 : 1;
     return 0;
+  }
+
+  function oneLine(text, limit) {
+    const line = String(text || "").split("\n").find((item) => item.trim()) || "";
+    const trimmed = line.trim();
+    return trimmed.length > limit ? `${trimmed.slice(0, limit)}…` : trimmed;
+  }
+
+  // ------------------------------------------------------------------
+  // 展开状态
+  // ------------------------------------------------------------------
+
+  function storageKey() {
+    return `vsa.history.open.${activeId}`;
+  }
+
+  function loadOpenState() {
+    manualOpen = new Set();
+    manualClosed = new Set();
+    try {
+      const raw = window.localStorage.getItem(storageKey());
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      manualOpen = new Set(Array.isArray(data.open) ? data.open : []);
+      manualClosed = new Set(Array.isArray(data.closed) ? data.closed : []);
+    } catch (error) {
+      // 存坏了就当没存过：一条读不出来的偏好不该让整页打不开。
+      manualOpen = new Set();
+      manualClosed = new Set();
+    }
+  }
+
+  function saveOpenState() {
+    if (!activeId) return;
+    try {
+      window.localStorage.setItem(
+        storageKey(),
+        JSON.stringify({ open: [...manualOpen], closed: [...manualClosed] })
+      );
+    } catch (error) {
+      // 无痕模式禁用本地存储：这一页里照样能展开，只是刷新之后不记得。
+    }
+  }
+
+  function topicOpen(eventId) {
+    if (manualOpen.has(eventId)) return true;
+    if (manualClosed.has(eventId)) return false;
+    // 没碰过的按默认：只有最后一个主题展开。新主题出现时上一条就自动收起。
+    const last = events[events.length - 1];
+    return Boolean(last) && last.id === eventId;
   }
 
   // ------------------------------------------------------------------
@@ -307,8 +391,7 @@
     }
     head.appendChild(el("div", "head-meta", bits.join(" · ")));
 
-    // 目标放在头部一行：切到单个主题时任务卡不出现，而「这一轮在做什么」是
-    // 读任何一段之前都要先知道的。
+    // 目标放在头部一行：所有主题都收起来时，这一行仍然说明整件事要做什么。
     if (task && task.goal) {
       const goal = el("div", "head-goal");
       goal.append("目标 ", task.goal);
@@ -337,7 +420,7 @@
   }
 
   // ------------------------------------------------------------------
-  // 中间：对话
+  // 中间：主题章节
   // ------------------------------------------------------------------
 
   function toolNode(part, messageIndex, partIndex) {
@@ -357,16 +440,12 @@
     );
     if (part.permission) head.appendChild(el("span", "tool-label", `判定 ${part.permission}`));
     // 结果的第一行放在标题上：不展开也能看出这一步做成了什么。
-    const preview = (part.toolOutput || "").split("\n").find((line) => line.trim());
-    if (preview) {
-      head.appendChild(
-        el("span", "tool-preview", preview.length > 90 ? `${preview.slice(0, 90)}…` : preview)
-      );
-    }
+    const preview = oneLine(part.toolOutput, 90);
+    if (preview) head.appendChild(el("span", "tool-preview", preview));
     box.appendChild(head);
 
     const body = el("details", "tool-body");
-    // 失败的那一步默认打开：它就是要被看见的那一条。其余收起，需要时再点开。
+    // 失败的那一条默认打开：它就是要被看见的那一段。其余收起，需要时再点开。
     body.open = failed;
     body.appendChild(
       el(
@@ -433,6 +512,18 @@
         box.appendChild(head);
         return box;
       }
+      case "error": {
+        const box = el("div", "part part-error");
+        box.appendChild(el("div", "tool-label", "出错了"));
+        box.appendChild(el("div", "part-text", part.text || ""));
+        return box;
+      }
+      case "summary": {
+        const details = el("details", "part part-reasoning part-summary");
+        details.appendChild(el("summary", "", "这一轮停在哪儿"));
+        details.appendChild(el("div", "reason-body", part.text || ""));
+        return details;
+      }
       case "file": {
         const box = el("div", "part part-note");
         box.append("引用文件 ", el("code", "", part.filePath));
@@ -441,7 +532,6 @@
       case "agent":
         return el("div", "part part-note", `子 agent ${part.agentName}`);
       case "step_start":
-        // 步分隔只在同一段里出现多次时才有信息量，样式做得很轻。
         return el("div", "part part-step", `第 ${(part.text || "").split(" · ")[0]} 步`);
       case "step_finish":
         return null;
@@ -455,6 +545,8 @@
         return el("div", "part part-note", part.text || part.type);
     }
   }
+
+  const NARRATIVE_SKIP = new Set(["tool", "step_start", "step_finish"]);
 
   function partsInRange(message, from, to) {
     const offset = message.partOffset || 0;
@@ -500,66 +592,21 @@
     return nodes;
   }
 
-  function eventCard(event) {
-    const card = el("div", "event-card");
-    const head = el("div", "event-head");
-    head.appendChild(el("span", "event-index", String(event.topicIndex || 0).padStart(2, "0")));
-    head.appendChild(el("span", "event-title", event.title || "（没有标题）"));
-    head.appendChild(
-      el("span", `event-kind kind-${event.kind}`, EVENT_KIND[event.kind] || event.kind)
-    );
-    card.appendChild(head);
-
-    const bits = [
-      formatClock(event.createdAt),
-      `${event.steps.length} 步`,
-      `${event.artifacts.length} 个产物`,
-    ];
-    if (event.degraded) bits.push("标题与结论是本地拼的");
-    card.appendChild(el("div", "event-meta", bits.join(" · ")));
-
-    if (event.summary) {
-      const summary = el("div", "event-summary", event.summary);
-      // 结论最长能写到 600 字，整段铺开会把对话挤到一屏之外；先收成四行，
-      // 要看全文的点一下。
-      if (event.summary.length > 160) {
-        summary.classList.add("is-clamped");
-        const toggle = el("button", "link-button event-more", "展开摘要");
-        toggle.type = "button";
-        toggle.addEventListener("click", () => {
-          const open = summary.classList.toggle("is-clamped");
-          toggle.textContent = open ? "展开摘要" : "收起摘要";
-        });
-        card.appendChild(summary);
-        card.appendChild(toggle);
-      } else {
-        card.appendChild(summary);
-      }
+  // 主题里的叙述：用户原话、模型文字、思考、文件引用。工具调用单独成块，
+  // 由 `runBlock` 画——两类信息一个在讲结论、一个在给证据，混在一起读不出重点。
+  function narrativeNode(payload, from, to) {
+    const box = el("div", "topic-narrative");
+    let drawn = 0;
+    for (const message of payload.messages) {
+      const kept = partsInRange(message, from, to).filter(
+        (item) => !NARRATIVE_SKIP.has(item.part.type)
+      );
+      if (!kept.length) continue;
+      for (const node of messageNode(message, kept, compactUpto)) box.appendChild(node);
+      drawn += 1;
     }
-    if (event.handoff) {
-      const box = el("div", "event-handoff");
-      box.append(el("span", "tool-label", "留给后续主题："), event.handoff);
-      card.appendChild(box);
-    }
-    if (event.artifacts.length) {
-      const chips = el("div", "event-chips");
-      for (const name of event.artifacts.slice(0, 8)) {
-        chips.appendChild(el("span", "chip", name));
-      }
-      if (event.artifacts.length > 8) {
-        chips.appendChild(el("span", "chip chip-more", `还有 ${event.artifacts.length - 8} 个`));
-      }
-      card.appendChild(chips);
-    }
-    if (event.issues.length) {
-      const box = el("div", "event-issues");
-      box.appendChild(el("div", "tool-label", `未解决（${event.issues.length}）`));
-      for (const line of event.issues.slice(0, 4)) {
-        box.appendChild(el("div", "issue-line", line));
-      }
-      card.appendChild(box);
-    }
-    return card;
+    if (!drawn) box.appendChild(el("p", "empty-hint", "这一段没有可显示的文字。"));
+    return box;
   }
 
   function spansOf(list) {
@@ -572,44 +619,396 @@
     return spans;
   }
 
-  function renderRange(messages, from, to, container) {
-    let drawn = 0;
-    for (const message of messages) {
-      const kept = partsInRange(message, from, to);
-      if (!kept.length) continue;
-      for (const node of messageNode(message, kept, compactUpto)) {
-        container.appendChild(node);
-      }
-      drawn += 1;
-    }
-    if (!drawn) container.appendChild(el("p", "empty-hint", "这一段没有可显示的原文。"));
+  function spanOf(eventId) {
+    return spansOf(events).find((item) => item.event.id === eventId) || null;
   }
 
-  function renderConversation(payload) {
-    const box = root.querySelector("#conversation");
-    box.innerHTML = "";
+  // 一步的时长：从它那个 `STEP_START` 到下一个 `STEP_START`（最后一步到消息末尾）。
+  // 这是墙钟时间，含模型生成与工具执行；工具级耗时没有单独记，所以标题上写明口径，
+  // 免得读的人把它当成一次工具调用的耗时。
+  function stepDuration(step, payload) {
+    const message = payload.messages.find((item) => item.index === step.messageIndex);
+    if (!message) return "";
+    const offset = message.partOffset || 0;
+    let start = 0;
+    let end = 0;
+    message.parts.forEach((part, index) => {
+      if (part.type !== "step_start") return;
+      const position = offset + index;
+      if (position <= step.partStart) start = part.timestamp;
+      else if (!end) end = part.timestamp;
+    });
+    if (!start) return "";
+    if (!end) {
+      const last = message.parts[message.parts.length - 1];
+      end = last ? last.timestamp : 0;
+    }
+    return end > start ? formatDuration(end - start) : "";
+  }
 
-    if (activeEvent === "all") {
-      box.appendChild(taskCard());
-      if (!events.length) {
-        renderRange(payload.messages, payload.from, payload.to, box);
-        return;
+  function stepTools(step, payload) {
+    const message = payload.messages.find((item) => item.index === step.messageIndex);
+    if (!message) return [];
+    const offset = message.partOffset || 0;
+    const kept = [];
+    message.parts.forEach((part, index) => {
+      const position = offset + index;
+      if (position < step.partStart || position >= step.partEnd) return;
+      if (part.type !== "tool") return;
+      kept.push({ part, partIndex: position });
+    });
+    return kept;
+  }
+
+  function uncoveredTools(event, payload) {
+    const covered = new Set();
+    for (const step of event.steps) {
+      for (const item of stepTools(step, payload)) covered.add(item.partIndex);
+    }
+    const kept = [];
+    for (const message of payload.messages) {
+      const offset = message.partOffset || 0;
+      message.parts.forEach((part, index) => {
+        if (part.type !== "tool") return;
+        const position = offset + index;
+        if (covered.has(position)) return;
+        kept.push({ part, partIndex: position, messageIndex: message.index });
+      });
+    }
+    return kept;
+  }
+
+  function stepRow(event, step, payload, extra) {
+    const key = `${event.id}:${step.seq}`;
+    const failed = step.issues.length > 0;
+    // 失败的那一步默认打开：信息不该藏在一次点击后面。用户收起之后在本页记住。
+    const open = stepOpen.has(key) || (failed && !stepOpen.has(`${key}:closed`));
+
+    const row = el("li", "step-row");
+    if (failed) row.classList.add("is-failed");
+    if (open) row.classList.add("is-open");
+
+    const head = el("button", "step-head");
+    head.type = "button";
+    head.appendChild(el("span", "step-no", extra ? "·" : String(step.seq).padStart(2, "0")));
+    head.appendChild(el("span", "step-intent", step.intent || "（没有记录）"));
+    const duration = stepDuration(step, payload);
+    if (duration) {
+      const clock = el("span", "step-time", duration);
+      clock.title = "这一轮的全部时间，含模型生成与工具执行";
+      head.appendChild(clock);
+    }
+    head.appendChild(
+      el(
+        "span",
+        `step-status ${failed ? "is-failed" : "is-done"}`,
+        failed ? "失败" : "完成"
+      )
+    );
+    row.appendChild(head);
+
+    const body = el("div", "step-body");
+    if (step.result) body.appendChild(el("div", "step-result", step.result));
+    const tools = extra || stepTools(step, payload);
+    for (const item of tools) {
+      body.appendChild(toolNode(item.part, item.messageIndex ?? step.messageIndex, item.partIndex));
+    }
+    if (step.issues.length) {
+      const box = el("div", "step-issues");
+      for (const line of step.issues.slice(0, 4)) box.appendChild(el("div", "issue-line", line));
+      body.appendChild(box);
+    }
+    row.appendChild(body);
+
+    // 展开状态在闭包里自己留着：这一行不重画，读闭包里那个初值会在第二次
+    // 点击时给出相反的结论。
+    let expanded = open;
+    head.addEventListener("click", () => {
+      expanded = !expanded;
+      if (expanded) {
+        stepOpen.add(key);
+        stepOpen.delete(`${key}:closed`);
+      } else {
+        stepOpen.delete(key);
+        stepOpen.add(`${key}:closed`);
       }
-      for (const span of spansOf(events)) {
-        box.appendChild(eventCard(span.event));
-        renderRange(payload.messages, span.from, span.to, box);
-      }
-      // 最后一条事件之后的内容：通常是还在进行、尚未封存的那一段。
-      const last = events[events.length - 1];
-      if (cmpPos(last.cut, payload.to) < 0) {
-        renderRange(payload.messages, last.cut, payload.to, box);
-      }
-      return;
+      row.classList.toggle("is-open", expanded);
+      head.setAttribute("aria-expanded", String(expanded));
+    });
+    head.setAttribute("aria-expanded", String(open));
+    return row;
+  }
+
+  function runBlock(event, payload) {
+    const block = el("div", "run-block");
+    if (!event.steps.length) {
+      block.appendChild(
+        el("div", "run-head static", "这一步没有调用工具，只有模型自己的文字。")
+      );
+      return block;
     }
 
-    const event = events.find((item) => item.id === activeEvent);
-    if (event) box.appendChild(eventCard(event));
-    renderRange(payload.messages, payload.from, payload.to, box);
+    const calls = event.steps.reduce((total, step) => total + step.tools.length, 0);
+    const names = [];
+    for (const step of event.steps) {
+      for (const name of step.tools) if (!names.includes(name)) names.push(name);
+    }
+    const failed = event.steps.filter((step) => step.issues.length).length;
+    const last = event.steps[event.steps.length - 1];
+    // 有失败时摘要取自那一步，不取最后一步：最后一步常常是换了做法之后成功的
+    // 那一次，拿它当摘要会把「没做成」写成「成功了」。
+    const firstFailure = event.steps.find((step) => step.issues.length);
+    const note = failed
+      ? `${failed} 步没有做成${firstFailure && oneLine(firstFailure.result, 60) ? `：${oneLine(firstFailure.result, 60)}` : ""}`
+      : oneLine(last.result, 80);
+
+    const head = el("button", "run-head");
+    head.type = "button";
+    head.appendChild(el("span", "run-label", "工具执行"));
+    head.appendChild(
+      el("span", "run-count", `${calls} 次调用 · ${names.length} 个工具`)
+    );
+    if (note) head.appendChild(el("span", "run-note", note));
+    head.appendChild(el("span", "run-toggle", runOpen.has(event.id) ? "收起" : "展开"));
+    block.appendChild(head);
+
+    const body = el("div", "run-body");
+    const toolbar = el("div", "run-tools");
+    const openAll = el("button", "link-button", "展开全部步");
+    openAll.type = "button";
+    openAll.addEventListener("click", () => {
+      for (const step of event.steps) {
+        stepOpen.add(`${event.id}:${step.seq}`);
+        stepOpen.delete(`${event.id}:${step.seq}:closed`);
+      }
+      runOpen.add(event.id);
+      fillTopicBody(event);
+      renderTopicRail();
+    });
+    const closeAll = el("button", "link-button", "收起全部步");
+    closeAll.type = "button";
+    closeAll.addEventListener("click", () => {
+      for (const step of event.steps) {
+        stepOpen.add(`${event.id}:${step.seq}:closed`);
+        stepOpen.delete(`${event.id}:${step.seq}`);
+      }
+      fillTopicBody(event);
+      renderTopicRail();
+    });
+    const hint = el("span", "run-hint", "时长是这一轮的全部时间，含模型生成与工具执行");
+    toolbar.append(openAll, closeAll, hint);
+    body.appendChild(toolbar);
+
+    const list = el("ol", "step-list");
+    for (const step of event.steps) list.appendChild(stepRow(event, step, payload, null));
+    const stray = uncoveredTools(event, payload);
+    if (stray.length) {
+      // 流水只记「有工具的那几步」，`close_topic` 这类记账调用不在里面。
+      // 不补这一行的话它们在页面上无声消失。
+      list.appendChild(
+        stepRow(
+          event,
+          { seq: 0, intent: "其他工具调用", tools: [], result: "", issues: [] },
+          payload,
+          stray
+        )
+      );
+    }
+    body.appendChild(list);
+    block.appendChild(body);
+    block.classList.toggle("is-open", runOpen.has(event.id));
+
+    head.addEventListener("click", () => {
+      if (runOpen.has(event.id)) runOpen.delete(event.id);
+      else runOpen.add(event.id);
+      block.classList.toggle("is-open", runOpen.has(event.id));
+      head.querySelector(".run-toggle").textContent = runOpen.has(event.id) ? "收起" : "展开";
+    });
+    return block;
+  }
+
+  function topicCard(event) {
+    const card = el("section", `topic-card status-${event.status || "completed"}`);
+    card.dataset.event = event.id;
+    if (topicOpen(event.id)) card.classList.add("is-open");
+
+    const head = el("header", "topic-card-head");
+    const line = el("div", "topic-line");
+    line.appendChild(
+      el("span", "topic-no", String(event.topicIndex || 0).padStart(2, "0"))
+    );
+    const title = el("button", "topic-name", event.title || "（没有标题）");
+    title.type = "button";
+    title.addEventListener("click", () => toggleTopic(event.id, true));
+    line.appendChild(title);
+    line.appendChild(
+      el(
+        "span",
+        `topic-status status-${event.status || "completed"}`,
+        TOPIC_STATUS[event.status || "completed"] || "已完成"
+      )
+    );
+    if (event.kind !== "manual") {
+      line.appendChild(
+        el("span", `event-kind kind-${event.kind}`, EVENT_KIND[event.kind] || event.kind)
+      );
+    }
+
+    const bits = [`${event.steps.length} 步`];
+    const calls = event.steps.reduce((total, step) => total + step.tools.length, 0);
+    if (calls && calls !== event.steps.length) bits.push(`${calls} 次调用`);
+    if (event.artifacts.length) bits.push(`${event.artifacts.length} 个产物`);
+    bits.push(formatClock(event.createdAt));
+    line.appendChild(el("span", "topic-meta", bits.join(" · ")));
+
+    const toggle = el("button", "topic-toggle", topicOpen(event.id) ? "收起" : "展开");
+    toggle.type = "button";
+    toggle.setAttribute("aria-expanded", String(topicOpen(event.id)));
+    toggle.addEventListener("click", () => toggleTopic(event.id, true));
+    line.appendChild(toggle);
+    head.appendChild(line);
+
+    if (event.summary) {
+      const summary = el("div", "topic-summary", event.summary);
+      summary.title = event.summary;
+      head.appendChild(summary);
+    }
+    if (event.artifacts.length) {
+      const chips = el("div", "event-chips");
+      for (const name of event.artifacts.slice(0, 5)) chips.appendChild(el("span", "chip", name));
+      if (event.artifacts.length > 5) {
+        chips.appendChild(el("span", "chip chip-more", `还有 ${event.artifacts.length - 5} 个`));
+      }
+      head.appendChild(chips);
+    }
+    if (event.status === "failed" && event.issues.length) {
+      // 收起状态也要看得见失败原因：一行就够，详情在正文里。
+      const alert = el("div", "topic-alert", oneLine(event.issues[0], 120));
+      alert.title = event.issues.join("\n");
+      head.appendChild(alert);
+    }
+    if (event.degraded) {
+      head.appendChild(el("div", "topic-degraded", "标题与结论是本地拼的"));
+    }
+    card.appendChild(head);
+
+    const body = el("div", "topic-body");
+    card.appendChild(body);
+    return card;
+  }
+
+  function fillTopicBody(event) {
+    const card = root.querySelector(`.topic-card[data-event="${event.id}"]`);
+    if (!card) return;
+    const body = card.querySelector(".topic-body");
+    const open = topicOpen(event.id);
+    card.classList.toggle("is-open", open);
+    // 标题上的按钮跟着状态走：只改卡片类名的话，按钮还写着「展开」。
+    const toggle = card.querySelector(".topic-toggle");
+    if (toggle) {
+      toggle.textContent = open ? "收起" : "展开";
+      toggle.setAttribute("aria-expanded", String(open));
+    }
+    body.innerHTML = "";
+    if (!open) return;
+
+    const payload = segments.get(event.id);
+    if (!payload) {
+      body.appendChild(el("p", "empty-hint", "正在读取这一段…"));
+      loadSegment(event).then((loaded) => {
+        // 取不到（切了会话、或者服务报错）时节流不再往下走：那两种情况都已经
+        // 各自画过提示，重试由下一次展开或刷新触发。
+        if (loaded) fillTopicBody(event);
+      });
+      return;
+    }
+    const span = spanOf(event.id);
+    if (!span) {
+      body.appendChild(el("p", "empty-hint", "这一段不在当前会话的区间里。"));
+      return;
+    }
+    body.appendChild(narrativeNode(payload, span.from, span.to));
+    body.appendChild(runBlock(event, payload));
+
+    if (event.handoff) {
+      const box = el("div", "event-handoff");
+      box.append(el("span", "tool-label", "留给后续主题："), event.handoff);
+      body.appendChild(box);
+    }
+    if (event.issues.length) {
+      const box = el("div", "event-issues");
+      box.appendChild(el("div", "tool-label", `未解决（${event.issues.length}）`));
+      for (const line of event.issues.slice(0, 4)) {
+        box.appendChild(el("div", "issue-line", line));
+      }
+      body.appendChild(box);
+    }
+  }
+
+  function toggleTopic(eventId, byUser) {
+    const open = topicOpen(eventId);
+    if (open) {
+      manualClosed.add(eventId);
+      manualOpen.delete(eventId);
+      runOpen.delete(eventId);
+    } else {
+      manualOpen.add(eventId);
+      manualClosed.delete(eventId);
+      // 用户主动点开一个主题时，工具过程跟着打开：这是「我要查这一段」的信号。
+      runOpen.add(eventId);
+    }
+    if (byUser) saveOpenState();
+    activeTopic = eventId;
+    fillTopicBody(events.find((item) => item.id === eventId) || {});
+    renderTopicRail();
+  }
+
+  function loadSegment(event) {
+    if (segments.has(event.id)) return Promise.resolve(segments.get(event.id));
+    // 同一段被两处同时要（正文与左栏跳转）时只发一次请求：并发取同一段时
+    // 后回来的那一份会覆盖先回来的，滚动位置跟着跳。
+    const pending = segmentLoads.get(event.id);
+    if (pending) return pending;
+
+    const token = loadToken;
+    const promise = fetchJson(
+      `/api/sessions/${encodeURIComponent(activeId)}/segment?event=${encodeURIComponent(event.id)}`
+    )
+      .then((payload) => {
+        if (token !== loadToken) return null;
+        segments.set(event.id, payload);
+        return payload;
+      })
+      .catch((error) => {
+        if (token !== loadToken) return null;
+        const card = root.querySelector(`.topic-card[data-event="${event.id}"]`);
+        if (card) {
+          const body = card.querySelector(".topic-body");
+          body.innerHTML = "";
+          body.appendChild(el("p", "empty-hint", `读取这一段失败：${error.message}`));
+        }
+        return null;
+      })
+      .finally(() => {
+        segmentLoads.delete(event.id);
+      });
+    segmentLoads.set(event.id, promise);
+    return promise;
+  }
+
+  function renderConversation() {
+    const box = root.querySelector("#conversation");
+    box.innerHTML = "";
+    box.appendChild(taskCard());
+    if (!events.length && !(live && live.running)) {
+      box.appendChild(el("p", "empty-hint", "这个会话还没有封存的主题。"));
+      return;
+    }
+    for (const event of events) {
+      box.appendChild(topicCard(event));
+      fillTopicBody(event);
+    }
+    if (live && live.running) box.appendChild(liveCard());
   }
 
   function taskCard() {
@@ -657,17 +1056,218 @@
   }
 
   // ------------------------------------------------------------------
+  // 运行中的主题
+  // ------------------------------------------------------------------
+
+  function liveCard() {
+    // 运行中的这一块不折叠：它的内容就是「现在在做什么」，没有收起来的理由。
+    const card = el("section", "topic-card is-live is-open");
+    card.dataset.live = "1";
+
+    const head = el("header", "topic-card-head");
+    const line = el("div", "topic-line");
+    line.appendChild(
+      el("span", "topic-no", String(live.topicIndex || 0).padStart(2, "0"))
+    );
+    line.appendChild(el("span", "topic-name static", live.title || "正在进行的主题"));
+    line.appendChild(el("span", "topic-status status-running", "进行中"));
+    const bits = [];
+    if (live.steps.length) bits.push(`${live.steps.length} 步完成`);
+    if (live.calls) bits.push(`${live.calls} 次调用`);
+    if (live.tools.length) bits.push(`${live.tools.length} 个工具`);
+    if (bits.length) line.appendChild(el("span", "topic-meta", bits.join(" · ")));
+    head.appendChild(line);
+
+    const now = el("div", "live-now");
+    head.appendChild(now);
+    card.appendChild(head);
+
+    const body = el("div", "topic-body is-open");
+    const list = el("ol", "step-list live-steps");
+    for (const step of live.steps) {
+      const row = el("li", `step-row is-open ${step.status === "failed" ? "is-failed" : ""}`);
+      const rowHead = el("div", "step-head static");
+      rowHead.appendChild(el("span", "step-no", String(step.seq).padStart(2, "0")));
+      rowHead.appendChild(el("span", "step-intent", step.intent || "（没有记录）"));
+      rowHead.appendChild(
+        el(
+          "span",
+          `step-status ${step.status === "failed" ? "is-failed" : "is-done"}`,
+          step.status === "failed" ? "失败" : "完成"
+        )
+      );
+      row.appendChild(rowHead);
+      if (step.result) {
+        // 运行中的流水只给一行：整段结果在主题封存之后的主卡片里看。
+        row.appendChild(el("div", "step-result", oneLine(step.result, 100)));
+      }
+      list.appendChild(row);
+    }
+    const current = live.current;
+    if (current) {
+      const row = el("li", "step-row is-open is-current");
+      const rowHead = el("div", "step-head static");
+      rowHead.appendChild(el("span", "step-no", String((live.steps.length || 0) + 1).padStart(2, "0")));
+      const label =
+        current.phase === "waiting"
+          ? `等待确认：${current.tool}`
+          : current.phase === "tool"
+            ? `正在执行 ${current.tool}`
+            : "模型正在生成";
+      rowHead.appendChild(el("span", "step-intent", label));
+      if (current.since && live.updatedAt) {
+        const elapsed = live.updatedAt - current.since;
+        if (elapsed > 0) {
+          const clock = el("span", "step-time", formatDuration(elapsed));
+          clock.title = "从这一次调用开始到现在";
+          rowHead.appendChild(clock);
+        }
+      }
+      rowHead.appendChild(el("span", "step-status is-running", "进行中"));
+      row.appendChild(rowHead);
+      if (current.preview) row.appendChild(el("div", "step-result", current.preview));
+      list.appendChild(row);
+    }
+    body.appendChild(list);
+    card.appendChild(body);
+    updateLiveNow(card);
+    return card;
+  }
+
+  function updateLiveNow(card) {
+    const box = card.querySelector(".live-now");
+    if (!box) return;
+    box.innerHTML = "";
+    if (!live) return;
+    if (live.stale) {
+      // 断开只是一句提醒，最后已知的状态照样要画：只说「可能断开」而不说
+      // 最后停在哪，用户还是不知道发生了什么。
+      box.appendChild(
+        el(
+          "div",
+          "topic-alert",
+          `可能已断开：最后一次更新在 ${formatClock(live.updatedAt)}`
+        )
+      );
+    }
+    const current = live.current;
+    if (!current) {
+      // 刚起一轮时最后一条还是用户消息，取不到当前步；这一句与「已收尾」必须分开写，
+      // 否则页面上一开跑就说这一轮结束了。
+      box.appendChild(
+        el(
+          "div",
+          "live-line",
+          live.running ? "这一轮刚开始，正在准备第一步。" : "这一轮已经收尾。"
+        )
+      );
+      return;
+    }
+    if (current.phase === "waiting") {
+      box.appendChild(
+        el(
+          "div",
+          live.stale ? "live-line" : "topic-alert",
+          `${current.tool} 需要确认，请回到终端回答；网页端是只读的。`
+        )
+      );
+    } else if (current.phase === "tool") {
+      const line = el("div", "live-line");
+      line.append("正在执行 ", el("strong", "", current.tool));
+      if (current.preview) line.append(` · ${current.preview}`);
+      box.appendChild(line);
+    } else {
+      box.appendChild(
+        el("div", "live-line", "模型正在生成下一步；这一步还没有工具输出。")
+      );
+    }
+  }
+
+  function updateLiveCard() {
+    const card = root.querySelector('[data-live="1"]');
+    if (!card) {
+      if (live && live.running) renderConversation();
+      return;
+    }
+    // 头部里的序号、步数与当前动作随时在变；整块重画会把用户展开的位置弄丢，
+    // 所以只换掉这几个字段。
+    const meta = card.querySelector(".topic-meta");
+    if (meta) {
+      const bits = [];
+      if (live.steps.length) bits.push(`${live.steps.length} 步完成`);
+      if (live.calls) bits.push(`${live.calls} 次调用`);
+      if (live.tools.length) bits.push(`${live.tools.length} 个工具`);
+      meta.textContent = bits.join(" · ");
+    }
+    const titleNode = card.querySelector(".topic-name");
+    if (titleNode && live.title) titleNode.textContent = live.title;
+    updateLiveNow(card);
+    const list = card.querySelector(".live-steps");
+    if (!list) return;
+    // 步数变了才重画流水；否则每两秒重建整段会让滚动位置抖动。
+    const rows = list.querySelectorAll(".step-row").length;
+    const expected = live.steps.length + (live.current ? 1 : 0);
+    if (rows !== expected) {
+      const fresh = liveCard();
+      card.replaceWith(fresh);
+    }
+  }
+
+  async function pollLive() {
+    if (!activeId || document.visibilityState !== "visible") return;
+    const token = loadToken;
+    let next = null;
+    try {
+      const data = await fetchJson(`/api/sessions/${encodeURIComponent(activeId)}/live`);
+      if (token !== loadToken) return;
+      next = data && data.present ? data : null;
+    } catch (error) {
+      // 轮询失败不打断阅读：下一轮再试，页面上保留上一帧。
+      return;
+    }
+    if (token !== loadToken) return;
+    const wasRunning = Boolean(live && live.running);
+    const wasCount = live ? live.eventCount : 0;
+    live = next;
+
+    if (live && live.running) {
+      if (wasRunning && wasCount !== live.eventCount) {
+        // 轮中途封了一个主题：把新的那一段接进来，再更新实时块。
+        await refreshSession();
+        return;
+      }
+      if (!wasRunning) renderConversation();
+      else updateLiveCard();
+      return;
+    }
+    if (wasRunning) {
+      // 这一轮结束了：状态文件这时候已经写完，重取主题清单就能看到刚封的那一段。
+      // 左栏的「N 个主题」也要跟着变，所以连列表一起重取。
+      await loadSessions();
+      await refreshSession();
+      return;
+    }
+    const card = root.querySelector('[data-live="1"]');
+    if (card) card.remove();
+  }
+
+  function startLive() {
+    stopLive();
+    liveTimer = window.setInterval(pollLive, LIVE_INTERVAL);
+  }
+
+  function stopLive() {
+    if (liveTimer) window.clearInterval(liveTimer);
+    liveTimer = null;
+  }
+
+  // ------------------------------------------------------------------
   // 左侧导航：主题与步
   // ------------------------------------------------------------------
 
   function renderTopicRail() {
     const rail = root.querySelector("#topic-rail");
     rail.innerHTML = "";
-
-    const all = el("button", "topic-all", "整段对话");
-    all.classList.toggle("is-active", activeEvent === "all");
-    all.addEventListener("click", () => selectEvent("all"));
-    rail.appendChild(all);
 
     if (!events.length) {
       rail.appendChild(el("p", "empty-hint", "这个会话还没有封存的主题。"));
@@ -677,7 +1277,7 @@
     for (const event of events) {
       const box = el("div", "topic");
       const item = el("button", "topic-item");
-      item.classList.toggle("is-active", event.id === activeEvent);
+      item.classList.toggle("is-active", event.id === activeTopic);
       item.type = "button";
 
       const head = el("div", "topic-head");
@@ -685,7 +1285,11 @@
         el("span", "topic-index", String(event.topicIndex || 0).padStart(2, "0"))
       );
       head.appendChild(el("span", "topic-title", event.title || "（没有标题）"));
-      if (event.issues.length) {
+      if (event.status === "failed") {
+        head.appendChild(el("span", "topic-flag", "失败"));
+      } else if (event.status === "interrupted") {
+        head.appendChild(el("span", "topic-flag is-quiet", "中断"));
+      } else if (event.issues.length) {
         head.appendChild(el("span", "topic-flag", `${event.issues.length} 未决`));
       }
       item.appendChild(head);
@@ -696,13 +1300,23 @@
       item.appendChild(el("div", "topic-meta", bits.join(" · ")));
 
       item.addEventListener("click", () => {
-        if (expandedTopics.has(event.id)) expandedTopics.delete(event.id);
-        else expandedTopics.add(event.id);
-        selectEvent(event.id);
+        if (railOpen.has(event.id)) railOpen.delete(event.id);
+        else railOpen.add(event.id);
+        activeTopic = event.id;
+        // 左栏是导航：点一条就把正文那一章打开并滚过去。
+        if (!topicOpen(event.id)) {
+          manualOpen.add(event.id);
+          manualClosed.delete(event.id);
+          saveOpenState();
+        }
+        fillTopicBody(event);
+        renderTopicRail();
+        const card = root.querySelector(`.topic-card[data-event="${event.id}"]`);
+        if (card) card.scrollIntoView({ block: "start", behavior: "smooth" });
       });
       box.appendChild(item);
 
-      if (expandedTopics.has(event.id) && event.steps.length) {
+      if (railOpen.has(event.id) && event.steps.length) {
         const list = el("div", "topic-steps");
         for (const step of event.steps) {
           const row = el("button", "step-item");
@@ -724,17 +1338,26 @@
     }
   }
 
-  function focusStep(step, event) {
-    const box = root.querySelector("#conversation");
-    const target = box.querySelector(`[data-pos="${step.messageIndex}:${step.partStart}"]`);
-    if (!target) {
-      // 这一步不在当前载入的片段里（正看另一个主题）：先切到它所属的主题再定位。
-      // 主题由调用处给，不靠步号猜——每条主题的步号都从 1 起，猜不出唯一的归属。
-      if (event && event.id !== activeEvent) {
-        selectEvent(event.id).then(() => focusStep(step, event));
-      }
-      return;
+  async function focusStep(step, event) {
+    if (!topicOpen(event.id)) {
+      manualOpen.add(event.id);
+      manualClosed.delete(event.id);
+      saveOpenState();
     }
+    runOpen.add(event.id);
+    const key = `${event.id}:${step.seq}`;
+    stepOpen.add(key);
+    stepOpen.delete(`${key}:closed`);
+    activeTopic = event.id;
+    // 段还没取回来时先等它：不等的话正文刚建出来，`[data-pos]` 还没挂上，
+    // 滚动会静默地什么都不做。
+    if (!segments.has(event.id)) await loadSegment(event);
+    fillTopicBody(event);
+    renderTopicRail();
+    const card = root.querySelector(`.topic-card[data-event="${event.id}"]`);
+    if (!card) return;
+    const target = card.querySelector(`[data-pos="${step.messageIndex}:${step.partStart}"]`);
+    if (!target) return;
     target.scrollIntoView({ block: "center", behavior: "smooth" });
     target.classList.add("is-flash");
     window.setTimeout(() => target.classList.remove("is-flash"), 1200);
@@ -806,36 +1429,25 @@
   // 选择与取数
   // ------------------------------------------------------------------
 
-  async function selectEvent(eventId) {
-    activeEvent = eventId;
-    expandedTopics.add(eventId);
+  async function loadDetail(sessionId, token) {
+    const [list, shelf] = await Promise.all([
+      fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/events`),
+      fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts`),
+    ]);
+    if (token !== loadToken) return false;
+    events = list.events || [];
+    task = list.task || null;
+    compactUpto = Number(list.compactUpto || 0);
+    artifacts = shelf;
+    const session = sessions.find((item) => item.id === sessionId);
+    renderHead({ ...(session || {}), title: list.title || (session && session.title) || "" });
     renderTopicRail();
-    const box = root.querySelector("#conversation");
-    box.innerHTML = "";
-    box.appendChild(el("p", "empty-hint", "正在读取这一段…"));
-
-    const token = loadToken;
-    let payload = segmentCache.get(eventId);
-    if (!payload) {
-      try {
-        payload = await fetchJson(
-          `/api/sessions/${encodeURIComponent(activeId)}/segment?event=${encodeURIComponent(eventId)}`
-        );
-      } catch (error) {
-        if (token !== loadToken) return;
-        box.innerHTML = "";
-        box.appendChild(el("p", "empty-hint", `读取这一段失败：${error.message}`));
-        return;
-      }
-      if (token !== loadToken) return;
-      segmentCache.set(eventId, payload);
-    }
-    if (token !== loadToken) return;
-    renderConversation(payload);
-    box.scrollTop = 0;
+    renderArtifactPane();
+    renderConversation();
+    return true;
   }
 
-  async function selectSession(sessionId) {
+  async function selectSession(sessionId, focusEvent) {
     activeId = sessionId;
     loadToken += 1;
     const token = loadToken;
@@ -843,9 +1455,15 @@
     task = null;
     compactUpto = 0;
     artifacts = null;
-    segmentCache.clear();
-    expandedTopics.clear();
-    activeEvent = "all";
+    segments.clear();
+    segmentLoads.clear();
+    runOpen.clear();
+    stepOpen.clear();
+    railOpen.clear();
+    live = null;
+    activeTopic = "";
+    startLive();
+    loadOpenState();
     renderList();
 
     root.querySelector("#session-head").classList.add("is-hidden");
@@ -863,25 +1481,41 @@
     }
 
     try {
-      const [list, shelf] = await Promise.all([
-        fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/events`),
-        fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts`),
-      ]);
-      if (token !== loadToken) return;
-      events = list.events || [];
-      task = list.task || null;
-      compactUpto = Number(list.compactUpto || 0);
-      artifacts = shelf;
-      renderHead({ ...session, title: list.title || session.title });
-      renderTopicRail();
-      renderArtifactPane();
-      // 默认打开最后一个主题：那是刚做完的一段，通常也是要接着看的地方。
-      const last = events[events.length - 1];
-      await selectEvent(last ? last.id : "all");
+      if (!(await loadDetail(sessionId, token))) return;
+      // 先问一次实时快照：正在跑的时候会整块重画，重画之后再定位深链接，
+      // 滚动位置才留得住。
+      await pollLive();
+      // 深链接点名的那一条优先：它既不看本地存的展开状态，也不等默认规则。
+      if (focusEvent && events.some((item) => item.id === focusEvent)) {
+        manualOpen.add(focusEvent);
+        manualClosed.delete(focusEvent);
+        runOpen.add(focusEvent);
+        activeTopic = focusEvent;
+        fillTopicBody(events.find((item) => item.id === focusEvent));
+        renderTopicRail();
+        const card = root.querySelector(`.topic-card[data-event="${focusEvent}"]`);
+        if (card) card.scrollIntoView({ block: "start" });
+      }
+      await pollLive();
     } catch (error) {
       if (token !== loadToken) return;
       box.innerHTML = "";
       box.appendChild(el("p", "empty-hint", `读取这个会话失败：${error.message}`));
+    }
+  }
+
+  async function refreshSession() {
+    if (!activeId) return;
+    loadToken += 1;
+    const token = loadToken;
+    // 已封存的主题不会变，旧的正文段可以留着；新主题按需再取。
+    try {
+      if (await loadDetail(activeId, token)) return;
+    } catch (error) {
+      if (token !== loadToken) return;
+      const box = root.querySelector("#conversation");
+      box.innerHTML = "";
+      box.appendChild(el("p", "empty-hint", `刷新这一段失败：${error.message}`));
     }
   }
 
@@ -906,9 +1540,8 @@
     events = [];
     task = null;
     artifacts = null;
-    activeEvent = "all";
-    segmentCache.clear();
-    expandedTopics.clear();
+    segments.clear();
+    live = null;
     loadToken = 0;
 
     container.querySelector("#session-search").addEventListener("input", (event) => {
@@ -917,17 +1550,28 @@
     });
     container.querySelector("#session-refresh").addEventListener("click", async () => {
       await loadSessions();
-      if (activeId) await selectSession(activeId);
+      if (activeId) await refreshSession();
     });
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") pollLive();
+    };
+    document.addEventListener("visibilitychange", onVisible);
 
     await loadSessions();
     if (param) {
-      await selectSession(param);
       const wanted = query && query.get("event");
-      if (wanted && events.some((item) => item.id === wanted)) await selectEvent(wanted);
+      await selectSession(param, wanted || "");
     }
 
-    return { unmount() { root = null; loadToken += 1; } };
+    return {
+      unmount() {
+        document.removeEventListener("visibilitychange", onVisible);
+        stopLive();
+        root = null;
+        loadToken += 1;
+      },
+    };
   }
 
   window.vsPages.history = { mount };

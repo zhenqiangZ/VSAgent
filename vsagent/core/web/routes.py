@@ -37,7 +37,7 @@ from tomllib import TOMLDecodeError
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlparse
 
-from .. import corpus, corpus_config, index
+from .. import corpus, corpus_config, index, live
 from ..paths import SURVEY_DIRECTORY, config_home
 from ..session_manager import SessionManager
 
@@ -83,6 +83,9 @@ LIBRARY_ITEM = re.compile(r"^(doc|web):([0-9a-f]{10})$")
 
 LEDGER_DIRECTORY = "ledgers"
 """登记表快照所在目录，与 `ledger.ledger_root()` 同一个名字。"""
+
+LIVE_SESSION = re.compile(r"^[A-Za-z0-9_-]+$")
+"""实时快照的文件名用会话编号拼，先按字符集挡一道路径穿越。"""
 
 
 class HttpError(Exception):
@@ -271,6 +274,9 @@ def event_json(event) -> dict:
         "topicIndex": event.topic_index,
         "kind": event.kind,
         "degraded": event.degraded,
+        # 状态与停止原因：页面按 status 画徽标，exitReason 只给鼠标悬停看。
+        "status": event.status,
+        "exitReason": event.exit_reason,
         "createdAt": event.created_at,
         "stepStart": event.step_start,
         "stepEnd": event.step_end,
@@ -1188,16 +1194,39 @@ def serve_artifact(request: "WebHandler", matched) -> None:
     request.send_body(path.read_bytes(), content_type_for(path))
 
 
-def _session_detail(request: "WebHandler", rest: str) -> dict:
-    """会话本身与它下面的三个只读视图：`/events`、`/segment`、`/artifacts`。
+def _session_live(request: "WebHandler", session_id: str) -> dict:
+    """当前主题的实时快照。**不读状态文件**。
 
-    三处共用一个前缀路由，是因为它们都以会话编号开头；拆成三条前缀路由时，
+    页面两秒拉一次，而 `state.toml` 有几 MB，解析一遍的时间比这一条要回答的问题
+    还长。快照文件由装配根在每一步写、轮末标成不跑；没有这个文件就说明这一轮
+    没在跑（独立服务、刚启动、或者上一次没跑过）。
+    """
+    if not LIVE_SESSION.match(session_id):
+        raise HttpError(404, f"会话编号不合法：{session_id}")
+    data = live.read(request.server.state_path, session_id)
+    if data is None:
+        return {
+            "sessionId": session_id,
+            "present": False,
+            "running": False,
+            "stale": False,
+        }
+    return {**data, "present": True}
+
+
+def _session_detail(request: "WebHandler", rest: str) -> dict:
+    """会话本身与它下面的四个只读视图：`/events`、`/segment`、`/artifacts`、`/live`。
+
+    四条共用一个前缀路由，是因为它们都以会话编号开头；拆成四条前缀路由时，
     `/api/sessions/` 会先把它们全都接住，谁先谁后都一样。
     """
     segments = [item for item in rest.split("/") if item]
     if not segments:
         raise HttpError(404, "缺少会话编号")
     session_id = segments[0]
+    # 实时快照先走：它两秒被拉一次，而解析状态文件要几 MB 的时间。
+    if len(segments) == 2 and segments[1] == "live":
+        return _session_live(request, session_id)
     manager = load_manager(request.server.state_path)
     session = manager.get_session(session_id)
     if session is None:

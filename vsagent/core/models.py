@@ -776,12 +776,32 @@ class Event:
     tokens: int = 0          # 这一段原文的估算 token，预算用
     kind: str = "manual"     # manual / auto / local，见 EVENT_KINDS
     degraded: bool = False   # 标题与结论是本地拼的
+    # 这一轮停下来时循环层给的原因（`EXIT_*`），空串表示模型自己说完了。
+    # 主题的显示状态从它来：`cancelled` 画成中断，`error` / `tool_failed` 画成失败。
+    # 不存这一项的话，取消之后照常封存，事后分不出「做完的」与「被停下的」。
+    exit_reason: str = ""
     created_at: float = field(default_factory=time.time)
 
     @property
     def cut(self) -> tuple[int, int]:
         """本主题之后的第一段原文在哪。"""
         return (self.cut_message, self.cut_part)
+
+    @property
+    def status(self) -> str:
+        """显示状态：`completed` / `failed` / `interrupted`。
+
+        `exit_reason` 的取值来自循环层的 `EXIT_*`。没有停止原因时看最后一步
+        有没有未决项：中间某步失败、后面换了做法做成了，读起来仍然是完成的，
+        只有停在失败上才算这一段没有做成。
+        """
+        if self.exit_reason == "cancelled":
+            return "interrupted"
+        if self.exit_reason in ("error", "tool_failed"):
+            return "failed"
+        if self.steps and self.steps[-1].issues:
+            return "failed"
+        return "completed"
 
     @property
     def span(self) -> str:
@@ -839,6 +859,7 @@ class Event:
             "tokens": self.tokens,
             "kind": self.kind,
             "degraded": self.degraded,
+            "exit_reason": self.exit_reason,
             "created_at": self.created_at,
         }
 
@@ -904,6 +925,7 @@ class Event:
             tokens=int(data.get("tokens") or 0),
             kind=kind if kind in EVENT_KINDS else "manual",
             degraded=bool(data.get("degraded")),
+            exit_reason=str(data.get("exit_reason") or ""),
             created_at=float(data.get("created_at") or time.time()),
         )
 

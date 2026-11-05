@@ -35,7 +35,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from vsagent.core import index
+from vsagent.core import index, live
 from vsagent.core.models import PartType
 from vsagent.core.session_manager import SessionManager, default_state_path
 
@@ -380,6 +380,12 @@ def run_event_checks(base, state_path, session_id):
         all(item["cut"].get("message") is not None and isinstance(item["artifacts"], list) for item in events),
         f"末条切点 {events[-1]['cut']}，产物 {len(events[-1]['artifacts'])} 个",
     )
+    check(
+        "事件带着显示状态与停止原因",
+        [item["status"] for item in events] == [item.status for item in origin.events]
+        and all(item.get("status") in {"completed", "failed", "interrupted"} for item in events),
+        f"{[item['status'] for item in events][:6]}…",
+    )
 
     # ---- 片段：区间与整段 ----
     _, whole = request(f"{base}/api/sessions/{target['id']}/segment?event=all")
@@ -505,6 +511,76 @@ def run_event_checks(base, state_path, session_id):
         status == 200 and not found["sessions"] and not found["topics"] and not found["artifacts"],
         f"{found}",
     )
+
+
+def run_live_checks(base, state_path, session_id):
+    """实时快照：没有文件、正在跑、过期三态，以及编号不合法时挡住。
+
+    这一条不读状态文件，所以它给的结论不能与状态文件比对；判据比的是
+    「文件里写了什么、接口原样带出来」。
+    """
+    target = live.path_for(state_path, session_id)
+    target.unlink(missing_ok=True)
+
+    status, body = request(f"{base}/api/sessions/{session_id}/live")
+    check(
+        "没有快照时回「没在跑」，不报错",
+        status == 200 and body.get("present") is False and body.get("running") is False,
+        f"{status} {body}",
+    )
+
+    now = time.time()
+    payload = {
+        "sessionId": session_id,
+        "running": True,
+        "updatedAt": now,
+        "pid": 1,
+        "eventCount": 4,
+        "topicIndex": 5,
+        "title": "对接中",
+        "steps": [{"seq": 1, "intent": "dock(x=1)", "tools": ["dock"], "result": "成功", "issues": [], "status": "completed"}],
+        "current": {"phase": "tool", "tool": "analyze_pose", "status": "running", "preview": "第一行", "since": now - 3, "calls": 1},
+        "tools": ["dock", "analyze_pose"],
+        "calls": 2,
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    status, body = request(f"{base}/api/sessions/{session_id}/live")
+    check(
+        "正在跑的时候带出主题号、当前工具与首行结果",
+        status == 200
+        and body.get("present") is True
+        and body.get("running") is True
+        and body.get("stale") is False
+        and body.get("topicIndex") == 5
+        and body.get("current", {}).get("tool") == "analyze_pose"
+        and body.get("current", {}).get("preview") == "第一行",
+        f"{status} {body.get('topicIndex')} {body.get('current')}",
+    )
+
+    payload["updatedAt"] = now - 60
+    target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    status, body = request(f"{base}/api/sessions/{session_id}/live")
+    check(
+        "一分钟没更新标成可能断开",
+        status == 200 and body.get("stale") is True,
+        f"{status} stale={body.get('stale')}",
+    )
+
+    payload["running"] = False
+    payload["current"] = None
+    target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    status, body = request(f"{base}/api/sessions/{session_id}/live")
+    check(
+        "轮末标成不跑了，页面据此去重取主题",
+        status == 200 and body.get("running") is False and body.get("present") is True,
+        f"{status} running={body.get('running')}",
+    )
+
+    status, _ = request(f"{base}/api/sessions/..%2Fstate/live")
+    check("快照编号不接受目录成分", status == 404, str(status))
+    target.unlink(missing_ok=True)
 
 
 def run_checks(base, state_path, runs_dir, link_session, other_session):
@@ -1364,6 +1440,7 @@ def main():
     try:
         run_checks(base, state_path, runs_dir, link_session, other_session)
         run_event_checks(base, state_path, event_session)
+        run_live_checks(base, state_path, event_session)
         run_survey_checks(base)
         run_library_checks(base)
         run_chunk_checks(base)

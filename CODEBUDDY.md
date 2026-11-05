@@ -149,7 +149,10 @@ python -m vsagent.core.embed index          # 只补向量（换模型后跑这�
 # 前端（viz/ 是唯一装 npm 包的地方）
 cd viz && npm install && npm run build     # esbuild → viz/build/{viewer,markdown}-lib.js
 node tools/check_web_ui.js                 # WEB_PORT，默认 8866；自己造夹具、自己 spawn serve_web.py
-                                           # 含：数据驱动、口袋深链接、对接分数排序方向
+                                           # 含：数据驱动、口袋深链接、对接分数排序方向、
+                                           # 三态主题（完成/失败/中断）与运行中卡片
+python tools/seed_three_states.py --state .probe/web-ui-state/state.toml
+                                           # 三条状态夹具，check_web_ui 自己会调；单独跑用于手工看
 
 # 打包（Windows）
 pip install -r requirements-pack.txt
@@ -524,6 +527,10 @@ graph TD
 读回来调 `sync_sequences` 把 ID 计数器推进到已加载 ID 之前。网页端**每个请求都重新从磁盘读**，
 所以网页看到的永远和 `state.toml` 一致——这是它跟 TUI 之间唯一的数据通路，没有 SSE、没有 websocket。
 
+同目录的 `live/<sid>.json` 是唯一一份不在这条通路上的数据：当前主题的实时快照，
+原子替换但**不做 fsync**，只给网页端补「状态文件还没写进去的那一截」。它不参与恢复，
+进程退出时丢掉也不影响任何东西；状态文件仍然是唯一真相。
+
 ### 网页端
 
 `core/web/routes.py` 的 `SPEC` 是路由的**唯一真相**，包内常驻服务和 `tools/serve_web.py`
@@ -533,10 +540,24 @@ graph TD
 根目录由 `--surveys` 注入，判据因此不必往家目录里写东西。
 路径逃逸用 `resolve_within` 拒绝（403）。
 
-会话在网页上有三个视图，**正文不再随详情整份发**：`/events` 给主题清单与任务状态
+会话在网页上有四个视图，**正文不再随详情整份发**：`/events` 给主题清单与任务状态
 （几十 KB）、`/segment?event=<id|all>` 按事件切点取一段原文、`/artifacts` 给登记表里的
-产物与这个会话产出的运行。切点用的是 `Event.cut_message` / `cut_part`，与装配器同一组数，
-所以页面上的分段不会跟模型看到的对不上。
+产物与这个会话产出的运行、`/live` 给当前主题的实时快照。切点用的是
+`Event.cut_message` / `cut_part`，与装配器同一组数，所以页面上的分段不会跟模型看到的对不上。
+
+**`/live` 不读状态文件**：页面两秒拉一次，而 `state.toml` 有几 MB。快照是
+`core/live.py` 写的 `live/<sid>.json`（与状态文件同目录），只装当前主题的序号与标题、
+已完成的步、当前工具与状态、首行结果、是否在等确认。`AgentHost` 在 `_start` 时写
+`running=true`，订阅 `part.add` / `part.update` 按 500 ms 节流更新，`_run` 的 `finally`
+里**先存状态文件、再写 `running=false`**——顺序反了，页面会拿到还不含刚封存那一段的旧状态。
+快照不写 reasoning、不写完整输出：它每两秒被拉一次，放多了等于把工具正文复制出第二份。
+超过 15 秒没更新由读取侧标 `stale`，页面显示「可能已断开」。进程被强杀时只丢最后一帧。
+
+**主题的显示状态（完成 / 失败 / 中断）存在 `Event.exit_reason` 上**：轮末封存时由循环层
+把 `EXIT_*` 写进去。不存这一项的话，取消之后照常封存，事后分不出「做完的」与「被停下的」。
+取值到显示状态的换算是 `Event.status`：`cancelled` 是中断，`error` / `tool_failed` 是失败，
+其余看最后一步有没有未决项（中间失败、后面做成了的仍然算完成）。
+
 产物下载走一条 `RawRoute`（`/api/sessions/<id>/artifact/<kind>%23<seq>`）：它发字节，
 不能落到「返回对象再编码成 JSON」那条路上；路径取自服务自己读的登记表，
 请求里的字符串只用来对 handle，**不做路径解析**。登记表根由 `--ledgers` 注入，默认
@@ -570,7 +591,21 @@ graph TD
 
 `web/` 无构建步骤，`app.js` 是 hash router（`#/history`、`#/structure/<run_id>`、
 `#/library`），vendored 大包（3MB Mol\*）按页懒加载。历史页是三栏工作台：
-左栏会话树 + 主题（事件）列表、中间按主题分段的对话、右栏产物。
+左栏会话树 + 主题列表、中间按主题分章的对话、右栏产物。
+
+**中间那栏是三层的**：主题卡（标题、状态、一句话结论）→ 工具执行（步时间线）→
+单个工具（参数、原始输出、错误）。主题标题吸顶，卡与卡之间靠留白与左边那道状态色分开。
+默认只展开最后一个主题，且它的工具过程收着；用户点开某个主题时工具过程跟着打开。
+步与工具卡都只在自己那一层展开，正文里的文字不混进工具输出。工具按步分组之后，
+`close_topic` 这类不进流水的记账调用单独排成末行——它们不在任何步里，丢掉就是无声消失。
+展开状态存 `localStorage`（只存用户点过的），深链接 `?event=` 优先于它，自动展开只
+在后两者都没有时生效；新主题出现时上一条自然收起。步的时长从 `STEP_START` 的时间戳算到
+下一个，含模型生成与工具执行，页面上写明这个口径。
+
+页面每两秒拉一次 `/live`（标签页不可见时停），运行中的主题画成同一套章节卡的实时版：
+已完成的步、当前工具、等待确认的提示。这一轮结束时重取 `/events` 与列表，新封的那一段
+直接接上去。
+
 右侧产物名点进结构页之前，先看 `runs/<id>/meta.json` 的 `provenance.session_id`——
 `write_run` 写这一项，历史页靠它把运行目录挂回会话。
 `viz/` 是唯一装 npm 包的地方，

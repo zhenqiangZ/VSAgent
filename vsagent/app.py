@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 from collections import deque
 from pathlib import Path
 
@@ -160,6 +162,9 @@ class VSAgentApp(App[None]):
         # 判定规则读一次，每个循环层各拿一份新策略：本会话的「全部允许」
         # 不能顺着共享对象漏到子 agent 头上。
         self._policy_rules: tuple[dict, dict] | None = None
+        # 网页端提交任务时要回到这个循环里执行（状态管理器不是线程安全的）。
+        # `on_mount` 里才拿得到，构造期还没有循环在跑。
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.web_service = self._build_web_service()
         # 会话运行时：每个会话一个循环层，子 agent 在后台并行跑。
         # 循环层里那些 cancelled / evidence / 待答复判定都是会话级的，
@@ -231,6 +236,9 @@ class VSAgentApp(App[None]):
             # 网页上的「入库」转交到这里：写索引的仍然是这个进程，网页自己不碰库。
             # 与模型调 `import_documents` 走的是同一个 `ingest_files`。
             ingest=lambda files, root: ingest_files(files, root=root),
+            # 提交任务同样转交回来。这里取的是绑定方法，`self.host` 在调用那一刻
+            # 才读，所以装配顺序不必调整。
+            submit=self._submit_task,
         )
 
     def _build_loop(self, session: Session, ledger: SessionLedger) -> AgentLoop:
@@ -510,13 +518,13 @@ class VSAgentApp(App[None]):
         ):
             self.agent.switch_model(session.model_id)
         self.trace.start()
+        # 先记下循环再起服务：网页可能在服务起来的第一秒就提交任务，
+        # 那一刻 `_submit_task` 需要一个能 `call_soon_threadsafe` 的对象。
+        self._loop = asyncio.get_running_loop()
         self.web_service.start()
         # 权限询问由应用层统一处理，而不是聊天界面：子 agent 在后台跑、
         # 用户停在父会话时，那条询问没有屏幕认领，挂在界面上会永远等下去。
         self.event_bus.subscribe("permission.ask", self._on_permission_ask)
-        # 主题封存之后原文就不再发给模型了：界面上有一条提示，用户才知道
-        # 「刚才那段怎么看不到了」，以及要去哪儿取。
-        self.event_bus.subscribe("event.sealed", self._on_event_sealed)
         self.push_screen(HomeScreen())
 
     def on_unmount(self) -> None:
@@ -567,6 +575,54 @@ class VSAgentApp(App[None]):
         self.session_manager.last_model_id = self.agent.config.model
         self.session_manager.theme = self.theme
         self.session_manager.save_to_toml()
+
+    def _submit_task(self, text: str, session_id: str = "") -> dict[str, object]:
+        """网页端提交任务：把全部动作交回事件循环线程。
+
+        `SessionManager` 不是线程安全的，而 HTTP 处理跑在另一个线程里。这里只等
+        一个结果，创建会话、写用户消息、起一轮都在循环线程里做。
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return {"error": "应用还没有准备好，稍后再试", "status": 503}
+        future: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+        loop.call_soon_threadsafe(self._submit_in_loop, future, text, session_id)
+        return future.result(timeout=5.0)
+
+    def _submit_in_loop(
+        self,
+        future: concurrent.futures.Future[dict[str, object]],
+        text: str,
+        session_id: str,
+    ) -> None:
+        """在事件循环线程里完成一次提交。结果写进 `future`，HTTP 线程取走。"""
+        try:
+            if not self._provider_config().configured:
+                future.set_result({"error": "先在终端里用 /model 配置模型", "status": 400})
+                return
+            created = False
+            if session_id:
+                session = self.session_manager.get_session(session_id)
+                if session is None:
+                    future.set_result({"error": f"没有这个会话：{session_id}", "status": 404})
+                    return
+                if self.host.is_running(session.id):
+                    future.set_result({"error": "这一轮还没结束", "status": 409})
+                    return
+            else:
+                # 标题取正文第一行前 40 字：列表里要能认出这是哪一件事。
+                title = (text.strip().splitlines() or [""])[0][:40].strip() or "新任务"
+                session = self.session_manager.create_session(title)
+                created = True
+            if not self.host.prompt(session.id, text):
+                future.set_result({"error": "这一轮还没结束", "status": 409})
+                return
+            # 页面提交之后立刻跳到 `#/history/<id>`，那个接口读的是状态文件；
+            # 不先写盘，新会话在网页上就是 404。
+            self.save_state()
+            future.set_result({"sessionId": session.id, "created": created})
+        except Exception as error:  # 转交给 HTTP 线程：不转的话它只会等到超时
+            future.set_exception(error)
 
     def show_toast(self, text: str, kind: str = "info") -> None:
         """显示一条会自动消失的通知。"""
@@ -790,7 +846,7 @@ class VSAgentApp(App[None]):
     def _command_sessions(self) -> None:
         """列出会话。子 agent 不进这个列表，它们在右栏里。"""
         sessions = self.session_manager.root_sessions()
-        self.push_screen(SessionPickerScreen(sessions), self._on_session_picked)
+        self.push_screen(SessionPickerScreen(sessions), self.open_session)
 
     def _command_model(self, arguments: str) -> None:
         """配置模型接口，或者只换模型名。
@@ -1073,21 +1129,6 @@ class VSAgentApp(App[None]):
         self._permission_queue.append(dict(data))
         self._show_next_permission()
 
-    def _on_event_sealed(self, data: dict[str, object]) -> None:
-        """一个主题封存了：说一声，并告诉用户在哪儿看细节。
-
-        只提示当前会话的：子 agent 在后台封自己的主题，那些不该打断父会话的阅读。
-        """
-        session_id = str(data.get("session_id", ""))
-        current = self.session_manager.current
-        if current is not None and session_id and session_id != current.id:
-            return
-        index = data.get("topic_index") or 0
-        title = str(data.get("title") or "").strip()
-        steps = data.get("steps") or 0
-        label = f"主题 {index}" + (f" · {title}" if title else "")
-        self.show_toast(f"{label}（{steps} 步）已封存，细节用 /events 看", "info")
-
     def _show_next_permission(self) -> None:
         """弹队列里的下一个询问。已经失效的条目直接跳过。"""
         if self._permission_active:
@@ -1247,8 +1288,12 @@ class VSAgentApp(App[None]):
             self.refresh_chat()
         return True
 
-    def _on_session_picked(self, session_id: str | None) -> None:
-        """切换会话。"""
+    def open_session(self, session_id: str | None) -> None:
+        """切到某个会话并进入聊天界面。
+
+        会话选择器、主界面左栏与聊天界面左栏共用这一个入口：三处各写一份的话，
+        「切过去」与「进聊天界面」这两步迟早有一处会漏。
+        """
         if not session_id:
             return
         self.session_manager.switch_session(session_id)

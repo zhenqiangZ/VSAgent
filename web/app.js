@@ -61,7 +61,8 @@ function parseHash() {
   const [path, queryText = ""] = raw.split("?");
   const segments = path.split("/").filter((item) => item.length > 0);
   return {
-    page: segments[0] ? decodeURIComponent(segments[0]) : "history",
+    // 默认页是工作空间：任务入口与最近任务都在那一页，会话历史是它的下钻。
+    page: segments[0] ? decodeURIComponent(segments[0]) : "home",
     param: decodeURIComponent(segments[1] || ""),
     segments: segments.slice(1).map((item) => decodeURIComponent(item)),
     query: new URLSearchParams(queryText),
@@ -69,8 +70,26 @@ function parseHash() {
 }
 
 let mounted = null;
+// 页面模块把状态放在自己的闭包里（`root`、`loadToken`、`sessions` 都是模块级的），
+// 两个挂载同时进行会互相覆盖：前一个还在取数据，后一个已经把它的 `loadToken`
+// 归零，前一个取回来就丢掉结果，中间栏停在「正在读取会话…」。
+// 所以挂载串行执行，一次只跑一个。
+let mountQueue = Promise.resolve();
+// 已经挂好的地址。同一个地址再触发一次 hashchange 时不重挂：重挂会清空中间栏，
+// 用户刚点开的那一条跟着消失。
+let mountedHash = null;
 
-async function render() {
+function render() {
+  const hash = window.location.hash;
+  mountQueue = mountQueue.then(() => mountFor(hash)).catch(() => {});
+  return mountQueue;
+}
+
+async function mountFor(hash) {
+  // 排到的时候地址可能又变了，这一份交给后面那一次。
+  if (window.location.hash !== hash) return;
+  if (hash === mountedHash) return;
+
   const { page, param, segments, query } = parseHash();
   const module = window.vsPages[page] || window.vsPages.history;
 
@@ -85,8 +104,13 @@ async function render() {
 
   const view = document.getElementById("app-view");
   view.innerHTML = "";
+  delete view.dataset.ready;
   try {
     mounted = await module.mount(view, param, query, segments);
+    mountedHash = hash;
+    // 判据脚本靠这一项知道「这一页已经画完」：挂载是异步的，只看 DOM 里有没有
+    // 某个元素会读到上一页残留的那一份。
+    view.dataset.ready = "1";
   } catch (error) {
     const box = document.createElement("div");
     box.className = "page-error";

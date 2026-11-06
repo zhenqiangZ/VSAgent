@@ -1399,6 +1399,155 @@ def run_broken_state_check(base, state_path, pristine):
     )
 
 
+def run_summary_field_checks(base, event_session):
+    """首页最近任务要的两项：产物数与最近主题。
+
+    登记表由 `prepare_ledgers` 造在一个临时目录里，只有 `event_session` 有一份。
+    其余会话读不到登记表时产物数按 0 算，这一条顺带验了那个分支。
+    """
+    status, listing = request(f"{base}/api/sessions")
+    sessions = listing.get("sessions") or []
+    check(
+        "列表每项都有产物数与最近主题",
+        status == 200
+        and all(isinstance(item.get("artifactCount"), int) for item in sessions)
+        and all(
+            item.get("lastEvent") is None
+            or set(item["lastEvent"]) >= {"id", "title", "status", "topicIndex"}
+            for item in sessions
+        ),
+        f"{len(sessions)} 条",
+    )
+
+    target = next((item for item in sessions if item["id"] == event_session), None)
+    _, shelf = request(f"{base}/api/sessions/{event_session}/artifacts")
+    items = shelf.get("items") or []
+    check(
+        "有登记表的会话：产物数与产物接口一致",
+        target is not None and target["artifactCount"] == len(items) and len(items) > 0,
+        f"列表 {target['artifactCount'] if target else '缺行'}，产物接口 {len(items)}",
+    )
+
+    others = [item for item in sessions if item["id"] != event_session]
+    check(
+        "没有登记表的会话：产物数是 0",
+        all(item["artifactCount"] == 0 for item in others),
+        f"其余 {len(others)} 条",
+    )
+
+    _, payload = request(f"{base}/api/sessions/{event_session}/events")
+    ids = [event["id"] for event in payload.get("events") or []]
+    last = target["lastEvent"] if target else None
+    check(
+        "最近主题指向事件清单的最后一条",
+        last is not None and bool(ids) and last["id"] == ids[-1],
+        f"列表 {last['id'] if last else '空'}，事件清单末条 {ids[-1] if ids else '无'}",
+    )
+
+
+def run_task_checks(base, pristine):
+    """提交任务：独立进程拒绝；带回调时建会话、写进状态文件、重复提交回 409。
+
+    `base` 是独立进程起的服务，没有 `submit`，只能回 503。真正那条路在这里
+    另起一个同进程的 `WebServer`，回调**真的**往一份副本里写一个新会话——
+    判据要断言「返回的编号能在 `/api/sessions` 里查到」，假返回一个不存在的
+    编号就验不到那一步。
+    """
+    import threading
+
+    from vsagent.core.web.routes import WebServer, load_manager
+
+    status, payload = post_json(f"{base}/api/tasks", {"text": "列出 P00533 的记录"})
+    check(
+        "提交任务缺自定义头：403",
+        status == 403 and "X-VSA-Request" in str(payload.get("error", "")),
+        f"{status} {payload.get('error', '')}",
+    )
+
+    status, payload = post_json(
+        f"{base}/api/tasks", {"text": "列出 P00533 的记录"}, WRITE_HEADER
+    )
+    check(
+        "独立进程不接受提交：明确 503 而不是自己跑",
+        status == 503 and "任务" in str(payload.get("error", "")),
+        f"{status} {payload.get('error', '')}",
+    )
+
+    # 单独一份状态文件：这一组会真的往里加会话，不能弄脏主判据那份。
+    task_state = STATE_COPY.parent / "tasks-state.toml"
+    task_state.write_bytes(pristine)
+
+    def fake_submit(text, session_id=""):
+        if "这一轮还没结束" in text:
+            return {"error": "这一轮还没结束", "status": 409}
+        manager = load_manager(task_state)
+        if session_id:
+            if manager.get_session(session_id) is None:
+                return {"error": f"没有这个会话：{session_id}", "status": 404}
+            return {"sessionId": session_id, "created": False}
+        session = manager.create_session(text[:40])
+        manager.save_to_toml()
+        return {"sessionId": session.id, "created": True}
+
+    port = free_port()
+    server = WebServer(
+        ("127.0.0.1", port),
+        task_state,
+        FIXTURE_DIR,
+        PROJECT_ROOT / "web",
+        submit=fake_submit,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    local = f"http://127.0.0.1:{port}"
+    try:
+        status, payload = post_json(
+            f"{local}/api/tasks", {"text": "列出 P00533 的 UniProt 记录"}, WRITE_HEADER
+        )
+        new_id = str(payload.get("sessionId") or "")
+        check(
+            "提交任务：新建会话并返回编号",
+            status == 200 and payload.get("created") is True and new_id.startswith("ses_"),
+            f"{status} {payload}",
+        )
+        _, listing = request(f"{local}/api/sessions")
+        ids = [item["id"] for item in listing.get("sessions") or []]
+        check(
+            "新会话能在会话列表里查到",
+            bool(new_id) and new_id in ids,
+            f"提交得到 {new_id}，列表 {len(ids)} 条",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/tasks", {"text": "接着做", "sessionId": new_id}, WRITE_HEADER
+        )
+        check(
+            "提交到已有会话：created 为 false",
+            status == 200 and payload.get("created") is False and payload.get("sessionId") == new_id,
+            f"{status} {payload}",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/tasks", {"text": "这一轮还没结束"}, WRITE_HEADER
+        )
+        check(
+            "会话正在跑时回 409",
+            status == 409 and "还没结束" in str(payload.get("error", "")),
+            f"{status} {payload.get('error', '')}",
+        )
+
+        status, payload = post_json(f"{local}/api/tasks", {"text": "  "}, WRITE_HEADER)
+        check(
+            "空任务回 400",
+            status == 400,
+            f"{status} {payload.get('error', '')}",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
 def main():
     parser = argparse.ArgumentParser(description="网页端接口判据")
     parser.add_argument("--keep", action="store_true", help="跑完不关服务，便于手工查看")
@@ -1439,6 +1588,7 @@ def main():
 
     try:
         run_checks(base, state_path, runs_dir, link_session, other_session)
+        run_summary_field_checks(base, event_session)
         run_event_checks(base, state_path, event_session)
         run_live_checks(base, state_path, event_session)
         run_survey_checks(base)
@@ -1447,6 +1597,7 @@ def main():
         run_ingest_checks(base, CORPUS_DIR)
         run_concurrency_check(base, state_path, pristine)
         run_broken_state_check(base, state_path, pristine)
+        run_task_checks(base, pristine)
     finally:
         if not args.keep:
             process.terminate()

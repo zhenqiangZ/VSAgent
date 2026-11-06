@@ -8,13 +8,15 @@
    路由与字段名分成两份时，改一处忘一处会让页面上的字段悄悄少一个。
    两者都从这里导入（判据用注入验这一点：改这里，两边同时变）。
 
-**章程（S2 起）**：查看只读 + 语料投递与管理。
+**章程（S2 起）**：查看只读 + 语料投递与管理 + 提交任务。
 
-- 会话与运行仍然是纯 GET，没有写入口。
+- 会话与运行仍然是纯 GET。
 - 语料那三处写入口**只做三件小事**：往 `corpus/inbox/` 落文件、写 `labels.json`
   的显示名、把目录挪进 `corpus/.trash/`。**网页端从不写索引、不建块、不改原件**——
   写者仍然只有 TUI / agent 一个（方案稿 §9）。索引这边只做 `mode=ro` 的只读打开，
   用来显示块数与向量覆盖。
+- 提交任务（`POST /api/tasks`）同样只是转交：真正的写入在应用进程的事件循环里做，
+  这个进程连状态文件都不碰。独立运行时没有转交对象，回 503。
 - 只绑 `127.0.0.1`，不做鉴权。本地无鉴权 + 浏览器可跨站发 `multipart/form-data`
   是个真实的口子：所以所有写入口都要求一个**自定义头** `X-VSA-Request: 1`
   （跨站请求带上它就得先过预检，而预检会被拒），并校验 `Origin`。
@@ -80,6 +82,10 @@ UPLOAD_SUFFIXES = (".pdf", ".md", ".txt")
 
 LIBRARY_ITEM = re.compile(r"^(doc|web):([0-9a-f]{10})$")
 """`<kind>:<id>/<action>` 里那一段的身份。**路径由 id 拼，不接受用户给的路径。**"""
+
+MAX_TASK_CHARS = 8000
+"""一次提交的任务正文上限。终端里粘一整篇文献也就几万字，这里给到 8000 字；
+再长的交给 `import_documents`，不该从任务框里塞进去。"""
 
 LEDGER_DIRECTORY = "ledgers"
 """登记表快照所在目录，与 `ledger.ledger_root()` 同一个名字。"""
@@ -205,8 +211,18 @@ def message_json(message, index: int | None = None) -> dict:
     }
 
 
-def session_summary(session, run_id: str | None) -> dict:
-    """会话列表里的一项。"""
+def session_summary(
+    session,
+    run_id: str | None,
+    *,
+    artifact_count: int = 0,
+    last_event: dict | None = None,
+) -> dict:
+    """会话列表里的一项。
+
+    `artifact_count` 与 `last_event` 由调用方算好再传进来：列表接口要为每个会话
+    读一份登记表，这一层不做 IO。
+    """
     return {
         "id": session.id,
         "title": session.title,
@@ -221,6 +237,10 @@ def session_summary(session, run_id: str | None) -> dict:
         "totalTokens": session.total_tokens(),
         "totalCost": session.total_cost(),
         "runId": run_id,
+        # 首页的最近任务列表要显示「几个产物」与「最近一个主题」，两样都在这里给，
+        # 免得页面为每一行再发一次请求。
+        "artifactCount": artifact_count,
+        "lastEvent": last_event,
         # 子 agent：网页端只读展示，靠这几个字段决定缩进与状态点。
         "parentId": session.parent_id,
         "depth": session.depth,
@@ -232,9 +252,33 @@ def session_summary(session, run_id: str | None) -> dict:
     }
 
 
-def session_detail(session, run_id: str | None) -> dict:
+def last_event_summary(session) -> dict | None:
+    """最近封存的那个主题，只取首页一行要用的四个键。"""
+    if not session.events:
+        return None
+    event = session.events[-1]
+    return {
+        "id": event.id,
+        "title": event.title,
+        "status": event.status,
+        "topicIndex": event.topic_index,
+    }
+
+
+def session_detail(
+    session,
+    run_id: str | None,
+    *,
+    artifact_count: int = 0,
+    last_event: dict | None = None,
+) -> dict:
     """单个会话的完整内容。"""
-    data = session_summary(session, run_id)
+    data = session_summary(
+        session,
+        run_id,
+        artifact_count=artifact_count,
+        last_event=last_event,
+    )
     data["effort"] = session.effort
     data["compactUpto"] = session.compact_upto
     data["messages"] = [
@@ -1067,13 +1111,27 @@ class RouteSpec:
         return None
 
 
+def _summary_extras(request: "WebHandler", session) -> dict:
+    """首页最近任务要的两项：登记表条数与最近一个主题。
+
+    登记表读一份要不到 1 毫秒（本机 23 个会话合计 9 毫秒），跟着列表一起算，
+    比让页面为每一行再发一次请求省事。
+    """
+    items = ledger_payload(request.server.ledgers_root, session.id)["items"]
+    return {"artifact_count": len(items), "last_event": last_event_summary(session)}
+
+
 def _session_list(request: "WebHandler", _rest: str) -> dict:
     """会话列表，按更新时间倒序（`list_sessions` 已有序）。"""
     manager = load_manager(request.server.state_path)
     runs = scan_runs(request.server.runs_dir)
     return {
         "sessions": [
-            session_summary(session, run_id_for_session(runs, session.id))
+            session_summary(
+                session,
+                run_id_for_session(runs, session.id),
+                **_summary_extras(request, session),
+            )
             for session in manager.list_sessions()
         ]
     }
@@ -1234,7 +1292,11 @@ def _session_detail(request: "WebHandler", rest: str) -> dict:
 
     if len(segments) == 1:
         runs = scan_runs(request.server.runs_dir)
-        return session_detail(session, run_id_for_session(runs, session.id))
+        return session_detail(
+            session,
+            run_id_for_session(runs, session.id),
+            **_summary_extras(request, session),
+        )
     action = segments[1]
     if len(segments) == 2:
         if action == "events":
@@ -1425,6 +1487,38 @@ def _library_item_action(request: "WebHandler", rest: str) -> dict:
     raise HttpError(404, f"不认识的语料操作：{rest}")
 
 
+def _create_task(request: "WebHandler", _rest: str) -> dict:
+    """`POST /api/tasks`：把一个任务交给应用进程去跑。
+
+    **这个进程不写状态文件**。会话的创建、用户消息的写入、轮次的启动全在应用
+    那个事件循环里做（`SessionManager` 不是线程安全的），这里只是等一个结果。
+    独立运行的服务没有可转交的对象，明确回 503，而不是自己开一个写者。
+
+    回调返回两种形状：成功是 `{"sessionId": ..., "created": ...}`；被拒绝是
+    `{"error": ..., "status": 400|404|409}`，状态码由它决定。
+    """
+    _guard_write(request)
+    server = request.server
+    if server.submit is None:
+        raise HttpError(
+            503,
+            "这个进程不负责跑任务：用 python -m vsagent 启动应用之后再从网页上提交，"
+            "或者在终端里直接输入。",
+        )
+    payload = _json_body(request)
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HttpError(400, "任务内容不能为空")
+    if len(text) > MAX_TASK_CHARS:
+        raise HttpError(413, f"任务内容超过 {MAX_TASK_CHARS} 字，请先存成文件再让模型读")
+    session_id = str(payload.get("sessionId") or "").strip()
+    outcome = server.submit(text, session_id)
+    status = int(outcome.get("status") or 200)
+    if status != 200:
+        raise HttpError(status, str(outcome.get("error") or "提交失败"))
+    return {"sessionId": outcome["sessionId"], "created": bool(outcome.get("created"))}
+
+
 SPEC = RouteSpec(
     json_routes=(
         JsonRoute("/api/sessions/", _session_detail, prefix=True),
@@ -1439,12 +1533,13 @@ SPEC = RouteSpec(
         JsonRoute("/api/library/ingest", _library_ingest, method="POST"),
         JsonRoute("/api/library/", _library_chunks, prefix=True, method="GET"),
         JsonRoute("/api/library/", _library_item_action, prefix=True, method="POST"),
+        JsonRoute("/api/tasks", _create_task, method="POST"),
     ),
     raw_routes=(
         RawRoute(ARTIFACT_PATTERN, serve_artifact),
     ),
 )
-"""默认路由表。写入口只有三条，都要求 `X-VSA-Request` 头（见 `_guard_write`）。"""
+"""默认路由表。写入口都要 `X-VSA-Request` 头（见 `_guard_write`）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -1469,6 +1564,7 @@ class WebServer(ThreadingHTTPServer):
         ingest: Callable[[list[Path], Path], list[dict[str, Any]]] | None = None,
         surveys_root: Path | None = None,
         ledgers_root: Path | None = None,
+        submit: Callable[[str, str], dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(address, WebHandler)
         self.state_path = state_path
@@ -1493,6 +1589,9 @@ class WebServer(ThreadingHTTPServer):
         # 服务没有这一项（None），`/api/library/ingest` 会明确回 503，而不是
         # 自己开第二个写者。
         self.ingest = ingest
+        # 提交任务同样只能转交：真正写状态文件的是应用进程里的那个事件循环。
+        # 独立运行的服务没有这一项（None），`/api/tasks` 会明确回 503。
+        self.submit = submit
         self.ingest_lock = threading.Lock()
         self.ingest_state: dict[str, Any] = {
             "running": False,

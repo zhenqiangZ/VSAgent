@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import time
+
 from rich.text import Text
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.message import Message as TextualMessage
 from textual.reactive import Reactive
 from textual.screen import Screen
 from textual.selection import SelectState
@@ -11,10 +15,16 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 from .. import __version__
+from ..core.session_manager import HOME_MAX, HOME_MIN
 from ..widgets.agent_autocomplete import AGENTS
 from ..widgets.command_autocomplete import CommandAutocomplete
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import COMMAND_TOKEN, ScrollingTextArea
+from ..widgets.session_list import SessionList, SessionRow
+from ..widgets.splitter import Splitter
+
+# 中间那一栏至少留这么多列：字标一行 60 格，再窄就放不下了。
+MIN_CENTER_WIDTH = 40
 
 # 字标逐行写、最后补齐到同一宽度再拼起来。**不能省掉补齐**：`#home-logo` 是
 # `text-align: center`，每行各自居中，长短不一的几行会互相错开一格，整块看着是歪的。
@@ -33,6 +43,15 @@ PLACEHOLDER = "说一件事，例如「EGFR 的 ATP 口袋在哪」"
 HELP_TEXT = "tab 切换 Agent    ctrl+p 命令面板    / 列出命令"
 
 
+def _clock(seconds: float) -> str:
+    """列表里的时间：当天的只写时分，更早的带上月日。"""
+    if not seconds:
+        return ""
+    if time.time() - seconds < 86400:
+        return time.strftime("%H:%M", time.localtime(seconds))
+    return time.strftime("%m-%d", time.localtime(seconds))
+
+
 class HomeInput(ScrollingTextArea):
     """启动界面输入框：内容换行时框体随之增高，超出高度上界后滚动掩盖最早的内容。"""
 
@@ -41,6 +60,28 @@ class HomeInput(ScrollingTextArea):
     def action_insert_newline(self) -> None:
         """插入换行而不提交。"""
         self.insert("\n")
+
+
+class HomeAction(Static):
+    """输入框底部的一格操作提示。
+
+    只是一行字，点一下才做事：附件插入 `@`，模型与工具打开各自的面板，发送等于回车。
+    做成组件而不是给整行挂点击，是为了每一格有自己的动作，也能各自响应悬停。
+    """
+
+    class Pressed(TextualMessage):
+        """用户点了某一格。"""
+
+        def __init__(self, action: str) -> None:
+            super().__init__()
+            self.action = action
+
+    def __init__(self, action: str, label: str, id: str | None = None) -> None:
+        super().__init__(label, id=id, classes="home-action", markup=False)
+        self.action_name = action
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self.action_name))
 
 
 class HomeScreen(Screen):
@@ -59,6 +100,8 @@ class HomeScreen(Screen):
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         # esc 关掉命令补全之后，这一次输入不再弹窗，直到输入不再是命令前缀。
         self._command_dismissed = False
+        # 当前画出来的左栏宽度，拖动时按这一份加减；样式里那份可能被窄屏夹过。
+        self._rail_width = 34
 
     # 与聊天界面同一套：只留命令面板、切 Agent、退出这三个键，
     # 其余（新建会话、模型、主题、帮助、会话列表）都打 /命令，或者 ctrl+p 打开面板。
@@ -77,23 +120,36 @@ class HomeScreen(Screen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="home-frame"):
-            with Vertical(id="home-center"):
-                yield Static(ASCII_LOGO, id="home-logo")
-                yield Static(TAGLINE, id="home-tagline", markup=False)
-                with Horizontal(id="home-box"):
-                    yield Static("", id="home-accent-bar")
-                    with Vertical(id="home-box-main"):
-                        with Horizontal(id="home-prompt-row"):
-                            yield Static("[ ]", id="home-prompt-mark", markup=False)
-                            # 与聊天界面的输入框一样关掉光标行底色：那一层 `$boost`
-                            # 随主题取值，会让光标所在行整行变一个颜色。
-                            yield HomeInput(
-                                placeholder=PLACEHOLDER,
-                                id="home-input",
-                                highlight_cursor_line=False,
-                            )
-                        yield Static(self._info_text(), id="home-info")
-                yield Static(HELP_TEXT, id="home-help")
+            with Horizontal(id="home-body"):
+                # 左栏是导航：运行中的任务单独一段，其余按更新时间排。点一行就切过去。
+                yield SessionList(id="home-side")
+                yield Splitter(id="home-split")
+                with Vertical(id="home-center"):
+                    yield Static(ASCII_LOGO, id="home-logo")
+                    yield Static(TAGLINE, id="home-tagline", markup=False)
+                    with Horizontal(id="home-box"):
+                        yield Static("", id="home-accent-bar")
+                        with Vertical(id="home-box-main"):
+                            with Horizontal(id="home-prompt-row"):
+                                yield Static("[ ]", id="home-prompt-mark", markup=False)
+                                # 与聊天界面的输入框一样关掉光标行底色：那一层 `$boost`
+                                # 随主题取值，会让光标所在行整行变一个颜色。
+                                yield HomeInput(
+                                    placeholder=PLACEHOLDER,
+                                    id="home-input",
+                                    highlight_cursor_line=False,
+                                )
+                            yield Static(self._info_text(), id="home-info")
+                            # 输入框底部的操作提示：附件、模型、工具与发送。
+                            # 前三个只把入口摆出来，点一下才动作；发送那一格是回车的替身。
+                            with Horizontal(id="home-actions"):
+                                yield HomeAction("file", "@ 文件", id="home-action-file")
+                                yield HomeAction("model", "/model 模型", id="home-action-model")
+                                yield HomeAction("tools", "/tools 工具", id="home-action-tools")
+                                yield HomeAction("send", "Enter 发送", id="home-send-hint")
+                    # 输入框下面是最近几条任务：左栏回答「有哪些」，这里回答「最近做了什么」。
+                    yield Vertical(id="home-recent")
+                    yield Static(HELP_TEXT, id="home-help")
             # 斜杠命令补全弹窗：默认 display:none，往上浮、底边停在最底下那行状态栏上沿。
             # 不能挂在 `#home-center` 里：那一块是居中布局，弹窗虽然不占布局流，高度仍然
             # 算进它的内容总高，一弹出就把 logo 与输入框整块往上挪（实测挪了 5 行）。
@@ -105,8 +161,93 @@ class HomeScreen(Screen):
                 yield Static(__version__, id="home-footer-right")
 
     def on_mount(self) -> None:
-        """把焦点交给输入框。"""
+        """把焦点交给输入框，并把左栏与最近任务画出来。"""
+        self.apply_widths()
         self.input.focus()
+        self.refresh_tasks()
+
+    def on_resize(self, event: events.Resize) -> None:
+        """窄终端里收起左栏。
+
+        字标一行 60 格，加上导航之后 80 列的终端放不下，字标会折成两行。
+        任务列表是导航，输入框与最近任务才是这一屏要回答的问题，先让导航退场。
+        """
+        if not self.is_mounted:
+            return
+        self.apply_widths()
+        # 最近任务那几行是按当时的宽度截断的，宽度变了要重截一遍；
+        # 留着旧的那份会在窄屏里溢出、宽屏里过早省略。
+        self.refresh_tasks()
+
+    def apply_widths(self) -> None:
+        """按终端宽度摆好左栏与分栏界线。
+
+        存的是用户拖出来的宽度，画的时候再按当前终端夹一次：临时缩小不该把设定改掉。
+        """
+        manager = self.app.session_manager
+        total = self.app.size.width
+        visible = total >= 92
+        self.query_one("#home-side").styles.display = "block" if visible else "none"
+        self.query_one("#home-split").styles.display = "block" if visible else "none"
+        room = max(HOME_MIN, total - 1 - MIN_CENTER_WIDTH)
+        width = max(HOME_MIN, min(manager.home_rail_width, HOME_MAX, room))
+        self._rail_width = width
+        self.query_one("#home-side").styles.width = width
+
+    def on_splitter_resize_requested(self, event: Splitter.ResizeRequested) -> None:
+        """拖动界线或按方向键：改左栏宽度。"""
+        if event.splitter.id != "home-split":
+            return
+        manager = self.app.session_manager
+        manager.home_rail_width = max(
+            HOME_MIN, min(HOME_MAX, self._rail_width + event.delta)
+        )
+        self.apply_widths()
+        self.refresh_tasks()
+
+    def on_splitter_resize_finished(self, event: Splitter.ResizeFinished) -> None:
+        """松手之后才写盘：拖动过程中每移一格都写一次状态文件太重。"""
+        self.app.save_state()
+
+    def refresh_tasks(self) -> None:
+        """重画左栏与「最近任务」。会话列表随切换与新建变化，进屏幕时重取一次。"""
+        self.query_one("#home-side", SessionList).refresh_sessions()
+        box = self.query_one("#home-recent", Vertical)
+        box.remove_children()
+        sessions = self.app.session_manager.root_sessions()[:4]
+        if not sessions:
+            return
+        box.mount(Static("最近任务", classes="rail-section -first"))
+        current = self.app.session_manager.current_session_id
+        for item in sessions:
+            meta = f"{len(item.events)} 主题 · {_clock(item.updated_at)}"
+            box.mount(
+                SessionRow(
+                    item,
+                    current=item.id == current,
+                    width=max(20, box.content_size.width or 78),
+                    meta=meta,
+                )
+            )
+
+    def on_session_row_picked(self, message: SessionRow.Picked) -> None:
+        """点左栏或最近任务里的一行：切到那个会话并进入聊天界面。"""
+        message.stop()
+        self.app.open_session(message.session_id)
+
+    def on_home_action_pressed(self, message: HomeAction.Pressed) -> None:
+        """输入框底部那几格：附件插入引用前缀，模型与工具开面板，发送等于回车。"""
+        message.stop()
+        if message.action == "file":
+            # 提交时由 `resolve_file_refs` 把 @路径 读成文件引用；这里只负责起个头。
+            self.input.insert("@")
+            self.input.focus()
+            return
+        if message.action == "send":
+            self.action_submit_input()
+            return
+        # 模型与工具各自有面板，直接走命令；输入框里的草稿留着不动。
+        self.app.execute_command(message.action)
 
     @property
     def input(self) -> HomeInput:
@@ -153,8 +294,9 @@ class HomeScreen(Screen):
         popup.set_commands(registry.complete(query))
 
     def on_screen_resume(self) -> None:
-        """弹窗关闭后按最新的模型与 Agent 重画状态行。"""
+        """弹窗关闭后按最新的模型与 Agent 重画状态行，并把任务列表重取一次。"""
         self._refresh_info()
+        self.refresh_tasks()
 
     def _watch__select_state(self, select_state: SelectState | None) -> None:
         """清空选区时不重画整屏。

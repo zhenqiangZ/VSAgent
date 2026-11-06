@@ -133,6 +133,7 @@ class WebService:
         spec: RouteSpec | None = None,
         corpus_root: Path | None = None,
         ingest: Callable[[list[Path], Path], list[dict[str, Any]]] | None = None,
+        submit: Callable[[str, str], dict[str, Any]] | None = None,
     ) -> None:
         self.state_path = Path(state_path)
         self.runs_dir = Path(runs_dir)
@@ -141,6 +142,8 @@ class WebService:
         # 入库要转交给**持有写权的那个进程**。应用装配时传进来；命令行壳不传，
         # 网页上的「入库」在那里会明确回 503。
         self.ingest = ingest
+        # 提交任务同一条道理：写状态文件的是应用的事件循环，网页只把文本交过去。
+        self.submit = submit
         self.preferred_port = port
         self.spec = SPEC if spec is None else spec
         self._server: WebServer | None = None
@@ -165,6 +168,7 @@ class WebService:
                 self.spec,
                 corpus_root=self.corpus_root,
                 ingest=self.ingest,
+                submit=self.submit,
             )
             thread = threading.Thread(
                 target=server.serve_forever,

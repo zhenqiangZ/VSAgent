@@ -42,10 +42,65 @@ ModalScreen {
     background: #000000;
 }
 
-#home-center {
+/* 左栏是任务导航，中间是输入框与最近任务。左栏不抢焦点：点它才切会话，
+   键盘仍然留在输入框里。左边界由 `Splitter` 那一列画。 */
+#home-body {
     width: 100%;
     height: 1fr;
+}
+
+#home-side {
+    width: 34;
+    height: 100%;
+    padding: 1 1;
+    background: #0A0A0A;
+}
+
+#home-center {
+    width: 1fr;
+    height: 100%;
     align: center middle;
+}
+
+/* 最近任务：一行一条，最多四条；更多看左栏。高度封顶，矮终端里不把输入框顶上去。 */
+#home-recent {
+    width: 82;
+    max-width: 100%;
+    height: auto;
+    max-height: 6;
+    margin-top: 1;
+}
+
+/* 左栏的分节标题：与上面那段留一行空白，第一段不留（列表顶部本来就贴着栏边）。
+   列表行的高度写在组件自己的 DEFAULT_CSS 里（一行一条）。行用的类名是 `rail-row`：
+   会话选择器那一屏的 `.session-row` 是两行条目，同名会把高度覆盖掉。 */
+.rail-section {
+    height: 1;
+    margin-top: 1;
+    color: #5A5A5A;
+    text-style: bold;
+}
+
+.rail-section.-first {
+    margin-top: 0;
+}
+
+.rail-row:hover {
+    background: #1A1A1A;
+}
+
+.rail-row.-current {
+    background: #1A1A1A;
+}
+
+.rail-empty {
+    height: 1;
+    padding: 0 1;
+    color: #4A4A4A;
+}
+
+.topic-row:hover {
+    background: #1A1A1A;
 }
 
 /* 字标：与输入框同宽、逐行居中。`home.py` 把每行补齐到同一宽度再拼，
@@ -139,6 +194,31 @@ ModalScreen {
     margin-top: 1;
 }
 
+/* 输入框底部的操作提示：一行小字，点一下才动作。悬停抬一档，告诉用户这一格能点。 */
+#home-actions {
+    width: 100%;
+    height: 1;
+}
+
+.home-action {
+    width: auto;
+    height: 1;
+    margin-right: 2;
+    color: #5A5A5A;
+}
+
+.home-action:hover {
+    color: #E0E0E0;
+}
+
+/* 发送那一格靠右：它对应的动作是回车，摆在末位读起来像一句收尾。 */
+#home-send-hint {
+    width: 1fr;
+    margin-right: 0;
+    text-align: right;
+    color: #4A4A4A;
+}
+
 #home-help {
     width: 82;
     max-width: 100%;
@@ -174,9 +254,34 @@ ModalScreen {
     height: 1fr;
 }
 
-#messages-pane {
+/* 左栏：会话树在上、这一轮的主题在下。两段各自滚动，中间用一条横线分开。
+   左边界由 `Splitter` 那一列画，这里不再写 border-right：两条线并排会看出双线。 */
+#chat-rail {
+    width: 30;
+    height: 100%;
+    padding: 0 1;
+    background: #0A0A0A;
+}
+
+#chat-sessions {
+    height: auto;
+    max-height: 40%;
+}
+
+#chat-topics {
+    height: 1fr;
+    border-top: solid #1A1A1A;
+}
+
+/* 中间那一栏：对话与输入框。两者同宽同左边界，输入框不再横贯整屏。 */
+#chat-main {
     width: 1fr;
     height: 100%;
+}
+
+#messages-pane {
+    width: 1fr;
+    height: 1fr;
     padding: 0 1;
     /* 轨道与屏幕底色同色所以不显形，条本身取三级文字那一档：在纯黑底上看得见，
        又不会比正文更抢眼。悬停与拖动各提一档，告诉用户手指点在了什么上面 */
@@ -186,11 +291,11 @@ ModalScreen {
     scrollbar-color-active: #E0E0E0;
 }
 
-/* 上下文侧栏：默认隐藏，/sidebar 打开后占 30 列，消息区让出这块宽度 */
+/* 上下文侧栏：默认隐藏，/sidebar 打开后占 30 列，中间那一栏让出这块宽度。
+   与左栏同一条分界线画在 `#side-split` 上。 */
 #side-panel {
     width: 30;
     height: 100%;
-    border-left: solid #333333;
     background: #0A0A0A;
     padding: 0 1;
     display: none;
@@ -389,6 +494,12 @@ ModalScreen {
     color: #E0E0E0;
     text-style: bold;
     margin-top: 1;
+}
+
+/* 思考过程属于某一步：左边那一条竖线落在步行的「▸」那一列，正文与步行的文字同一列。
+   与正文取齐时它看起来像另起一段回复，看不出它属于哪一步。 */
+.part-reasoning {
+    margin-left: 2;
 }
 
 .part-reasoning.-hidden {

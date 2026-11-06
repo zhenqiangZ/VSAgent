@@ -107,6 +107,7 @@ from vsagent.core.agent.event_log import (  # noqa: E402
     topic_start,
 )
 from vsagent.core.agent.task import TaskTool  # noqa: E402
+from vsagent.core.agent.topics import step_seconds, topic_views  # noqa: E402
 from vsagent.core.agent.hypothesis import HypothesisTool  # noqa: E402
 from vsagent.core.agent.spawn import (  # noqa: E402
     REPORT_TOKENS,
@@ -20075,6 +20076,71 @@ def check_live_snapshot() -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
+def check_topic_views() -> None:
+    """主题视图：边界、计数、状态，以及未封存那条的几种情形。"""
+    session = _event_fixture(2)
+    first = seal_range(session, upto=2)
+    second = seal_range(session, upto=4)
+    check(first is not None and second is not None, "两段各封成一条主题")
+
+    views = topic_views(session, running=False)
+    check(len(views) == 2, f"封完两条就两行：{len(views)}")
+    head, tail = views
+    check(head.start == (0, 0) and head.end == (2, 0), f"第一条的端点：{head.start}-{head.end}")
+    check(tail.start == (2, 0) and tail.end == (4, 0), f"第二条接着前一条：{tail.start}-{tail.end}")
+    check(head.contains((0, 0)) and not head.contains((2, 0)), "位置归属按左闭右开")
+    check(head.key != tail.key, "两条主题的键不同")
+    check(head.sealed and tail.sealed, "封存过的都标成已封存")
+    check(head.steps and head.tools == ["dock"], f"工具从流水聚合：{head.tools}")
+    check(head.calls == 1, f"调用数按步里的工具数：{head.calls}")
+    check(head.artifacts == ["docking#0"], f"产物带出来：{head.artifacts}")
+    check(tail.status == "failed", f"最后一步有未决项就是失败：{tail.status}")
+    check(tail.issues and "结果1" in tail.issues[0], f"未决项写在主题上：{tail.issues}")
+
+    # 未封存的尾部：跑着的是进行中，进程不在了是未封存，纯聊天的一轮是已完成。
+    running = _event_fixture(1)
+    live_view = topic_views(running, running=True)[-1]
+    check(live_view.status == "running" and not live_view.sealed, "跑着的尾部标进行中")
+    check(live_view.index == 1, f"第一个主题的号是 1：{live_view.index}")
+    check(
+        (live_view.current or {}).get("phase") == "thinking",
+        f"工具跑完之后当前动作是模型在写：{live_view.current}",
+    )
+
+    stopped = _event_fixture(1)
+    stopped.pending_steps.append(
+        Step(seq=1, intent="dock(x=1)", tools=["dock"], result="成功：docking#0")
+    )
+    stopped_view = topic_views(stopped, running=False)[-1]
+    check(stopped_view.status == "unsealed", f"有步却没在跑：{stopped_view.status}")
+    check(stopped_view.steps and stopped_view.tools == ["dock"], "未封存的主题也数得出工具")
+
+    chat = Session(id="ses_chat_only")
+    chat.add_message(Message(role="user")).add_part(Part(type=PartType.TEXT, text="你好"))
+    chat.add_message(Message(role="assistant")).add_part(Part(type=PartType.TEXT, text="在"))
+    chat_view = topic_views(chat, running=False)[-1]
+    check(chat_view.status == "completed", f"纯聊天的一轮已经说完：{chat_view.status}")
+
+    # 重启回来：pending_steps 空了，步按原文回填，工具数不能写成 0。
+    restored = _event_fixture(1)
+    restored_view = topic_views(restored, running=False)[-1]
+    check(len(restored_view.steps) == 1, f"没有流水时按 Part 回填：{len(restored_view.steps)}")
+    check(restored_view.tools == ["dock"], f"回填之后工具名还在：{restored_view.tools}")
+
+    # 步时长：从本步的 STEP_START 到下一个 STEP_START。
+    timed = Message(role="assistant")
+    timed.add_part(Part(type=PartType.STEP_START, timestamp=100.0))
+    timed.add_part(Part(type=PartType.TOOL, tool_name="bash", timestamp=100.0))
+    timed.add_part(Part(type=PartType.STEP_START, timestamp=104.0))
+    timed.add_part(Part(type=PartType.TOOL, tool_name="bash", timestamp=104.0))
+    step = Step(seq=1, tools=["bash"], message_index=0, part_start=1, part_end=2)
+    check(
+        abs(step_seconds([timed], step) - 4.0) < 1e-6,
+        f"步时长到下一步为止：{step_seconds([timed], step)}",
+    )
+    check(step_seconds([], step) == 0.0, "没有消息时不算时长")
+
+
 async def check_event_log() -> None:
     """主题流水：每步自动记、封存不花请求、按位置让位、三级召回。"""
     session = _event_fixture(2)  # 4 条消息，2 次 dock（第 2 次失败）
@@ -22247,6 +22313,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("debug-tools", check_debug_tools),
     ("tool-retry", check_tool_retry),
     ("live-snapshot", check_live_snapshot),
+    ("topic-view", check_topic_views),
     ("event-log", check_event_log),
     ("evidence", check_evidence_layer),
     ("bash", check_bash_tool),

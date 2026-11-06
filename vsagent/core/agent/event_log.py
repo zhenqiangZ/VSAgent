@@ -248,7 +248,7 @@ def _segment_calls(message: Any, begin: int, stop: int) -> tuple[list[Part], lis
     return calls, positions
 
 
-def _steps_from_messages(
+def steps_from_messages(
     session: Session, start: tuple[int, int], end: tuple[int, int]
 ) -> list[Step]:
     """从会话原文里回填流水：这一段里**每一次模型往返**折成一步。
@@ -435,7 +435,7 @@ def seal_topic(
     recorded = {(step.message_index, step.part_start) for step in pending}
     merged = {
         (step.message_index, step.part_start): step
-        for step in _steps_from_messages(session, start, end)
+        for step in steps_from_messages(session, start, end)
         if (step.message_index, step.part_start) not in recorded
     }
     for step in pending:

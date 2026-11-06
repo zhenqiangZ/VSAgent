@@ -10,7 +10,14 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Markdown, Static
 
-from ..core.models import Message, Part, PartType, ToolStatus
+from ..core.agent.topics import (
+    TopicView,
+    position_key,
+    step_seconds,
+    topic_views,
+)
+from ..core.models import Message, Part, PartType, Session, Step, ToolStatus
+from .topic_card import StepRow, TopicHeader, format_seconds
 
 if TYPE_CHECKING:
     from ..app import VSAgentApp
@@ -25,19 +32,26 @@ STATUS_ICON = {
     ToolStatus.FAILED: "✕",
 }
 
+# 会话（任务）状态的文案。主界面的任务行、右栏的子 agent 用的是同一套词，
+# 与网页端一致；集中在这里，两处各写一份必然有一处会改漏。
+SESSION_STATUS_TEXT = {
+    "idle": "空闲",
+    "running": "运行中",
+    "done": "完成",
+    "failed": "失败",
+    "cancelled": "已中断",
+}
 
-def format_seconds(seconds: float) -> str:
-    """把秒数写成「0.4s」「12s」「2m03s」。
 
-    十秒以内留一位小数：工具大多几秒就回来了，都写成「0s」「3s」的话，
-    看不出哪个快哪个慢。
+def _part_index(message: Message, part: Part) -> int:
+    """这个 Part 在消息里的位置。
+
+    流式追加时它就是最后一条，补挂与重建时可能不是；按位置找比按长度推稳。
     """
-    seconds = max(0.0, seconds)
-    if seconds < 10:
-        return f"{seconds:.1f}s"
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    return f"{int(seconds) // 60}m{int(seconds) % 60:02d}s"
+    for index, item in enumerate(message.parts):
+        if item is part:
+            return index
+    return max(0, len(message.parts) - 1)
 
 
 # 工具输出最多显示这么多行，超出的部分折成一行提示，免得长输出把消息区整个刷过去。
@@ -205,16 +219,17 @@ class ReasoningPartView(FoldBlock):
 
 
 class ToolCard(Container):
-    """工具调用卡片，输出截断且可收起。
+    """工具调用卡片，输入输出默认收起，点标题行才展开。
 
-    卡片头只有三样：状态字形、工具名、耗时（有的话）。原先还带一个按工具类别挑的图标，
-    二十多个工具里有五个共用同一个字形，「这是检索还是计算」这个问题它答不了，
-    答得了的是工具名本身。
+    卡片头只写状态字形、工具名、耗时（有的话）与第一个参数。原先还带一个按工具
+    类别挑的图标，二十多个工具里有五个共用同一个字形，「这是检索还是计算」这个问题
+    它答不了，答得了的是工具名本身。
 
     卡片上有两级折叠，各自管一段：
 
-    - 标题行（`▾/▸`）收起整段输出。点标题行才切换，点正文什么都不做——
-      用户点一下输出多半只是想选中它读一眼，整段消失是最烦人的一种「帮忙」。
+    - 标题行（`▾/▸`）收起整段输出。默认是收起的，`/details` 可以一次全展开；
+      点标题行才切换，点正文什么都不做——用户点一下输出多半只是想选中它读一眼，
+      整段消失是最烦人的一种「帮忙」。
     - 省略行（`▾ 中间省略 N 行 · 点开看全文`）只展开被折掉的中间部分，点一下换回「收起」。
       没有这一条，长输出被折掉的那几十行在界面上就再也看不到了，只能去翻 trace。
     """
@@ -223,7 +238,8 @@ class ToolCard(Container):
     ToolCard {
         height: auto;
         padding: 0 1;
-        margin: 0 0 1 0;
+        /* 比步行再深一级：主题头 → 步行 → 工具卡，缩进本身就是这三层的关系。 */
+        margin: 0 0 1 4;
     }
     /* 状态只用字形与标题那一档颜色表达，不另加左侧竖线：
        一条彩色的竖线在整屏里比卡片本身的正文还显眼。 */
@@ -243,7 +259,9 @@ class ToolCard(Container):
         super().__init__(classes="part part-tool")
         self.part_id = part.id
         self._part = part
-        self._show_output = True
+        # 默认收起：卡上只留一行标题（状态、工具名、耗时、第一个参数）。
+        # 一轮十几步、每步几个工具，全部摊开的话工具正文会把对话淹掉。
+        self._show_output = False
         self._expanded = False
         # 执行耗时：只认亲眼看到的那一段。卡片是完成态建出来的（打开旧会话）时
         # `part.timestamp` 是几天前，减出来没有意义，宁可不显示。
@@ -535,7 +553,7 @@ class MessageView(Container):
     }
     """
 
-    def __init__(self, message: Message, pane: MessagesPane) -> None:
+    def __init__(self, message: Message, pane: MessagesPane, index: int = -1) -> None:
         # 只有派发标记的消息不是「用户说了什么」：给它单独的样式类，
         # 让底色不套在它身上。
         notice = bool(message.parts) and all(
@@ -547,15 +565,22 @@ class MessageView(Container):
         super().__init__(classes=classes)
         self.message = message
         self.pane = pane
+        # 主题头与步行按 (消息, Part) 定位，重建时要能报出自己的位置。
+        self.index = index
         self.parts_box: Vertical | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="message-parts") as box:
             self.parts_box = box
-            for part in self.message.parts:
+            for part_index, part in enumerate(self.message.parts):
                 if part.id in self.pane._part_views:
                     continue
-                yield self.pane._build_and_register(part)
+                # 位置 0 上的行由消息区挂在消息外面：用户消息的头排在气泡下面，
+                # 其余消息的头排在它前面。消息中间开始的那些插在这里。
+                if part_index:
+                    for row in self.pane._rows_before(self.index, part_index):
+                        yield row
+                yield self.pane._build_and_register(part, self.index, part_index)
 
 
 class NewMessagesHint(Static):
@@ -596,13 +621,22 @@ class MessagesPane(ScrollableContainer):
     手动滚动时停止自动跟随，滚回底部再恢复。
     """
 
+    DEFAULT_CSS = """
+    /* 主题与步两层折叠各用一个类：主题收起时它盖住的整段都不占位置，
+       步收起时只藏它的工具卡。两个类都只改 display，不碰组件自己的输出开关。 */
+    MessagesPane .-topic-hidden,
+    MessagesPane .-step-hidden {
+        display: none;
+    }
+    """
+
     def __init__(self, on_removed: Callable[[], None] | None = None) -> None:
         super().__init__(id="messages-pane")
         self._on_removed = on_removed
         self._message_views: dict[str, MessageView] = {}
         self._part_views: dict[str, Widget] = {}
         self._follow = True
-        self._show_details = True
+        self._show_details = False
         self._show_thinking = True
         self._tool_cards: list[ToolCard] = []
         self._reasoning_views: list[ReasoningPartView] = []
@@ -617,6 +651,19 @@ class MessagesPane(ScrollableContainer):
         self._was_at_bottom = False
         self._history_hint: Static | None = None
         self._new_hint: NewMessagesHint | None = None
+        # 主题视图。展开状态只在这一层：行组件不认识字典，点击时回来问。
+        # 键是起点位置（`topics.position_key`），封存前后不变，用户展开过的主题
+        # 不会因为换了一个事件 id 就自己合上。
+        self._session: Session | None = None
+        self._running = False
+        self._topics: list[TopicView] = []
+        self._topic_by_key: dict[str, TopicView] = {}
+        self._header_views: dict[str, TopicHeader] = {}
+        self._step_rows: dict[tuple[int, int], StepRow] = {}
+        self._step_spans: list[tuple[tuple[int, int], tuple[int, int], Step]] = []
+        self._open: dict[str, bool] = {}
+        self._manual_open: set[str] = set()
+        self._step_open: dict[tuple[int, int], bool] = {}
 
     def compose(self) -> ComposeResult:
         """底部那条「有新内容」提示。停靠的组件不参与内容滚动，也不进窗口索引。"""
@@ -668,15 +715,454 @@ class MessagesPane(ScrollableContainer):
         """
         self.app.stylesheet.update_nodes([self], animate=True)
 
+    @property
+    def topics(self) -> list[TopicView]:
+        """当前算出来的主题清单。左栏的主题列表读这一份，不另外算一遍边界。"""
+        return self._topics
+
+    def refresh_topics(self, reset: bool = False) -> None:
+        """重算主题视图，并给新出现的主题定默认展开状态。
+
+        默认只开最后一个，以及没有步的主题（纯聊天的一轮收起来就什么都不剩了）。
+        自动折叠只动 `_manual_open` 之外的：用户点开过的主题，下一条消息进来时
+        不会被合上。
+        """
+        if self._session is None:
+            self._topics = []
+            self._topic_by_key = {}
+            self._step_spans = []
+            return
+        self._topics = topic_views(self._session, running=self._running)
+        self._topic_by_key = {topic.key: topic for topic in self._topics}
+        self._step_spans = [
+            (
+                (step.message_index, step.part_start),
+                (step.message_index, step.part_end),
+                step,
+            )
+            for topic in self._topics
+            for step in topic.steps
+        ]
+        if reset:
+            self._open.clear()
+            self._manual_open.clear()
+            self._step_open.clear()
+        last = self._topics[-1].key if self._topics else ""
+        for topic in self._topics:
+            self._open.setdefault(topic.key, topic.key == last or not topic.steps)
+        for start, _end, step in self._step_spans:
+            self._step_open.setdefault(start, True)
+        for key, header in list(self._header_views.items()):
+            topic = self._topic_by_key.get(key)
+            if topic is not None:
+                header.sync(topic, self._is_open(key))
+        for key, row in list(self._step_rows.items()):
+            step = self._step_by_key(key)
+            if step is not None:
+                row.sync(step, step_seconds(self._messages, step), self._step_is_open(key))
+        self._sync_step_rows()
+
+    def refresh_live(self) -> None:
+        """步被记下来时调用：主题头跟着变，新的一步补一行。"""
+        self.refresh_topics()
+
+    def set_running(self, running: bool) -> None:
+        """宿主在不在跑这个会话。
+
+        末尾那个主题靠它区分「进行中」与「未封存」：进程在一轮中间中断时消息还在、
+        循环已经不在了，画成进行中等于告诉用户还在等一个不会来的结果。
+        """
+        if running == self._running:
+            return
+        self._running = running
+        self.refresh_topics()
+
+    def _is_open(self, key: str) -> bool:
+        return self._open.get(key, True)
+
+    def _step_is_open(self, key: tuple[int, int]) -> bool:
+        return self._step_open.get(key, True)
+
+    def _topic_starting_at(self, position: tuple[int, int]) -> TopicView | None:
+        return self._topic_by_key.get(position_key(position))
+
+    def _topic_for(self, position: tuple[int, int]) -> TopicView | None:
+        """这个位置属于哪个主题。一条消息可以被两个主题分掉，所以按区间找。"""
+        for topic in self._topics:
+            if topic.contains(position):
+                return topic
+        return None
+
+    def _step_starting_at(self, position: tuple[int, int]) -> Step | None:
+        for start, _end, step in self._step_spans:
+            if start == position:
+                return step
+        return None
+
+    def _step_for(self, position: tuple[int, int]) -> Step | None:
+        for start, end, step in self._step_spans:
+            if start <= position < end:
+                return step
+        return None
+
+    def _step_by_key(self, key: tuple[int, int]) -> Step | None:
+        for start, _end, step in self._step_spans:
+            if start == key:
+                return step
+        return None
+
+    def _header_for(self, topic: TopicView) -> TopicHeader:
+        """主题头一列只有一个：重建与流式追加都从这里取。"""
+        header = self._header_views.get(topic.key)
+        if header is None:
+            header = TopicHeader(topic, self)
+            self._header_views[topic.key] = header
+        return header
+
+    def _rows_before(self, message_index: int, part_index: int) -> list[Widget]:
+        """这个位置前面该放的行：主题头在前，步行在后。
+
+        两个都可以出现在这里：主题能从一条助手消息中间开始（`close_topic` 的切点
+        就在同一条消息里），步从第一个工具调用那一格开始。
+
+        位置 0 上的行挂在消息区这一层，其余挂在消息内部。两层的内容起点差两列，
+        挂出去之前补一个类，两种挂法都从同一列开始。
+        """
+        rows: list[Widget] = []
+        topic = self._topic_starting_at((message_index, part_index))
+        if topic is not None:
+            rows.append(self._header_for(topic))
+        step = self._step_starting_at((message_index, part_index))
+        if step is not None:
+            key = (step.message_index, step.part_start)
+            row = self._step_rows.get(key)
+            if row is None:
+                row = StepRow(step, step_seconds(self._messages, step), self)
+                self._step_rows[key] = row
+            # 行是随消息一起建出来的，不走 `_build_and_register`，可见性得在这里补。
+            self._apply_classes(row, key, None)
+            rows.append(row)
+        for row in rows:
+            row.set_class(part_index == 0, "-pane-row")
+        return rows
+
+    def _sync_step_rows(self) -> None:
+        """给刚记下来的步补一行。
+
+        步是工具跑完之后才挂到会话上的，追加 Part 那一刻这一步还不在流水里，
+        按位置插入来不及。等 `step.recorded` 到了，再把行补到它第一个工具卡前面。
+        """
+        mounted = False
+        for topic in self._topics:
+            for step in topic.steps:
+                key = (step.message_index, step.part_start)
+                if key in self._step_rows or step.message_index >= len(self._messages):
+                    continue
+                message = self._messages[step.message_index]
+                view = self._message_views.get(message.id)
+                if view is None or view.parts_box is None or not view.parts_box.is_attached:
+                    continue
+                row = StepRow(step, step_seconds(self._messages, step), self)
+                self._step_rows[key] = row
+                anchor = None
+                for position in range(step.part_start, min(step.part_end, len(message.parts))):
+                    widget = self._part_views.get(message.parts[position].id)
+                    if widget is not None:
+                        anchor = widget
+                        break
+                if anchor is None:
+                    view.parts_box.mount(row)
+                else:
+                    view.parts_box.mount(row, before=anchor)
+                if self._topics:
+                    self._apply_classes(row, key, None)
+                mounted = True
+        # 行插在上面，多出来一行高度；停在底部时要重新贴回去。
+        if mounted and self._follow:
+            self.call_after_refresh(self.scroll_end, animate=False)
+
+    def toggle_topic(self, key: str) -> None:
+        """点主题头：收起或展开整段。"""
+        topic = self._topic_by_key.get(key)
+        if topic is None:
+            return
+        open_now = not self._is_open(key)
+        self._open[key] = open_now
+        if open_now:
+            self._manual_open.add(key)
+        else:
+            self._manual_open.discard(key)
+        self._sync_visibility()
+
+    def toggle_step(self, message_index: int, part_start: int) -> None:
+        """点步行：收起或展开这一步的工具卡。"""
+        key = (message_index, part_start)
+        step = self._step_by_key(key)
+        if step is None:
+            return
+        self._step_open[key] = not self._step_is_open(key)
+        open_now = self._step_open[key]
+
+        def mutate() -> None:
+            for position in range(step.part_start, step.part_end):
+                if position >= len(self._messages[message_index].parts):
+                    continue
+                part = self._messages[message_index].parts[position]
+                widget = self._part_views.get(part.id)
+                if widget is not None:
+                    widget.set_class(not open_now, "-step-hidden")
+            row = self._step_rows.get(key)
+            if row is not None:
+                row.sync(step, step_seconds(self._messages, step), open_now)
+
+        self._change_height(mutate)
+
+    def focus_topic(self, key: str) -> bool:
+        """把某个主题打开，并滚到它的标题行。左栏的主题列表点一下走这里。
+
+        主题可能在当前挂载窗口之外（更早的那一段没有建组件），那种情况先把窗口
+        挪到它开头那一条消息，再滚过去。跳到更早的位置是一次明确的用户动作，
+        整段重建的代价可以接受。
+        """
+        topic = self._topic_by_key.get(key)
+        if topic is None:
+            return False
+        self._manual_open.add(key)
+        self._open[key] = True
+        header = self._header_views.get(key)
+        if header is not None and header.is_mounted:
+            self._change_height(lambda: self._apply_visibility())
+            self.scroll_to_widget(header, animate=False, top=True)
+            return True
+        self._jump_window(topic.start[0], key)
+        return True
+
+    def _jump_window(self, index: int, key: str) -> None:
+        """把挂载窗口挪到 `index` 这一条消息，画完之后滚到 `key` 那个主题的标题行。"""
+        for view in list(self._message_views.values()):
+            view.remove()
+        if self._history_hint is not None:
+            self._history_hint.remove()
+            self._history_hint = None
+        for header in list(self._header_views.values()):
+            if header.is_mounted:
+                header.remove()
+        for row in list(self._step_rows.values()):
+            if row.is_mounted:
+                row.remove()
+        self._message_views.clear()
+        self._part_views.clear()
+        self._tool_cards.clear()
+        self._reasoning_views.clear()
+        self._pending_parts.clear()
+        self._header_views.clear()
+        self._step_rows.clear()
+
+        total = len(self._messages)
+        if total == 0:
+            return
+        self._mounted_start = max(0, min(index, total - 1))
+        self._mounted_end = min(total, self._mounted_start + HISTORY_PAGE * 2)
+        self.refresh_topics()
+        widgets: list[Widget] = []
+        if self._mounted_start:
+            self._history_hint = Static(
+                self._history_hint_text(), id="history-hint", markup=False
+            )
+            widgets.append(self._history_hint)
+        widgets.extend(self._build_views(self._mounted_start, self._mounted_end))
+        if widgets:
+            self.mount_all(widgets)
+        self._set_follow(False)
+        self.call_after_refresh(self._focus_after_jump, key)
+
+    def _focus_after_jump(self, key: str) -> None:
+        """窗口重建之后把主题头滚到顶部。"""
+        self._apply_visibility()
+        header = self._header_views.get(key)
+        if header is not None and header.is_mounted:
+            self.scroll_to_widget(header, animate=False, top=True)
+        self._fill_viewport()
+
+    def fold_sealed_topics(self) -> None:
+        """自动折叠：封存过的主题全部收起，用户主动打开过的留在原样。
+
+        只在新的用户消息进来时调。`part.update` 与轮末都不调——收起一个正在读的
+        主题会改掉内容高度，屏幕会跳。
+        """
+        changed = False
+        for topic in self._topics:
+            if not topic.sealed or not topic.steps:
+                continue
+            if topic.key in self._manual_open:
+                continue
+            if self._is_open(topic.key):
+                self._open[topic.key] = False
+                changed = True
+        if changed:
+            self._sync_visibility()
+
+    def _is_task_header(self, index: int) -> bool:
+        """这条消息是不是一个任务的头（用户消息）。
+
+        用户消息不进主题的可见性：它回答的是「这一轮问了什么」，收起主题是为了
+        收起过程，把提问一起收走之后整段对话就没有起点了。
+        """
+        if index < 0 or index >= len(self._messages):
+            return False
+        return self._messages[index].role == "user"
+
+    def _message_hidden(self, index: int) -> bool:
+        """整条消息是不是属于某个收起的主题。用户消息永远不算。"""
+        if self._is_task_header(index):
+            return False
+        position = (index, 0)
+        after = (index + 1, 0)
+        for topic in self._topics:
+            if self._is_open(topic.key):
+                continue
+            if topic.start <= position and after <= topic.end:
+                return True
+        return False
+
+    def _apply_classes(
+        self, widget: Widget, position: tuple[int, int], part: Part | None
+    ) -> None:
+        """按位置给一个组件设两层可见性。两层各管一段，互不覆盖。"""
+        topic = None if self._is_task_header(position[0]) else self._topic_for(position)
+        by_topic = topic is not None and not self._is_open(topic.key)
+        widget.set_class(by_topic, "-topic-hidden")
+        if part is None or part.type is not PartType.TOOL:
+            return
+        step = self._step_for(position)
+        by_step = step is not None and not self._step_is_open(
+            (step.message_index, step.part_start)
+        )
+        widget.set_class(by_step, "-step-hidden")
+
+    def _sync_visibility(self) -> None:
+        """把展开状态写进界面。
+
+        一次处理全部主题：逐主题各做一遍的话，一次自动折叠会补偿好几次滚动。
+        """
+        self._change_height(self._apply_visibility)
+
+    def _apply_visibility(self) -> None:
+        for index in range(self._mounted_start, self._mounted_end):
+            message = self._messages[index]
+            for part_index, part in enumerate(message.parts):
+                widget = self._part_views.get(part.id)
+                if widget is not None:
+                    self._apply_classes(widget, (index, part_index), part)
+        for topic in self._topics:
+            header = self._header_views.get(topic.key)
+            if header is not None:
+                header.sync(topic, self._is_open(topic.key))
+        for key, row in list(self._step_rows.items()):
+            step = self._step_by_key(key)
+            if step is not None:
+                row.sync(step, step_seconds(self._messages, step), self._step_is_open(key))
+        self._unmount_hidden_messages()
+        self._mount_visible_messages()
+
+    def _unmount_hidden_messages(self) -> None:
+        if not self._topics:
+            return
+        start = self._mounted_start
+        while start < self._mounted_end:
+            if not self._message_hidden(start):
+                start += 1
+                continue
+            stop = start
+            while stop < self._mounted_end and self._message_hidden(stop):
+                stop += 1
+            # 标题行留着：收起的是过程，那个主题的入口还得在。整段滑出窗口时
+            # 才由裁剪把它一起摘掉（`_trim_up` / `_trim_down`）。
+            self._unmount_range(start, stop, drop_headers=False)
+            start = stop
+
+    def _mount_visible_messages(self) -> None:
+        if not self._topics:
+            return
+        start = self._mounted_start
+        while start < self._mounted_end:
+            message = self._messages[start]
+            if self._message_hidden(start) or message.id in self._message_views:
+                start += 1
+                continue
+            stop = start
+            while stop < self._mounted_end:
+                item = self._messages[stop]
+                if self._message_hidden(stop) or item.id in self._message_views:
+                    break
+                stop += 1
+            self._mount_built(self._build_views(start, stop), stop - 1)
+            start = stop
+
+    def _mount_built(self, widgets: list[Widget], last_index: int) -> None:
+        """把一批建好的组件插到 `last_index` 那条消息之后。
+
+        锚点要取已经挂上的那一个：刚建好的视图还没进树，拿它当锚点会直接抛出。
+        """
+        if not widgets:
+            return
+        for later in range(last_index + 1, len(self._messages)):
+            view = self._message_views.get(self._messages[later].id)
+            if view is not None and view.is_mounted:
+                self.mount_all(widgets, before=view)
+                return
+        self.mount_all(widgets)
+
+    def _change_height(self, mutate: Callable[[], None]) -> None:
+        """改完可见性之后把视口留在原处。
+
+        收起或展开一次能改掉上百行，不做补偿的话画面会跳到另一个主题上去。
+        等布局停稳再读高度差，理由与向上补挂那段相同。
+
+        停在底部时（跟随中）走另一条路：补偿算的是「原来那段内容别动」，
+        而用户要看的是最新的结果，改动完重新贴回底部才对。
+        """
+        self._loading = True
+        scroll_before = self.scroll_y
+        height_before = self.virtual_size.height
+        mutate()
+        if self._follow:
+            self._loading = False
+            self.call_after_refresh(self.scroll_end, animate=False)
+            return
+        self.call_after_refresh(self._restore_after_layout, scroll_before, height_before)
+
+    def _restore_after_layout(
+        self, scroll_before: float, height_before: int, last_height: int = -1, attempts: int = 0
+    ) -> None:
+        self._restore_scroll(
+            scroll_before, height_before, self._after_layout_change, last_height, attempts
+        )
+
+    def _after_layout_change(self) -> None:
+        self._fill_viewport()
+        self._maintain_window_down()
+
     def add_message(self, message: Message) -> MessageView:
         """添加一条消息到列表末尾。
 
         流式生成时新消息总是接在会话末尾，调用方已把它放进 `session.messages`（也就是
         `self._messages`）。这里建出视图挂到末尾，并把窗口下沿推进到包含这条新消息。
         """
-        view = MessageView(message, self)
+        index = len(self._messages) - 1
+        # 新的一条用户消息会开一个新主题：先把视图模型算出来，标题行才挂得上。
+        self.refresh_topics()
+        view = MessageView(message, self, index)
         self._message_views[message.id] = view
-        self.mount(view)
+        if message.role == "user":
+            # 提问在前，这一轮的主题头挂在它下面。
+            self.mount(view)
+            for row in self._rows_before(index, 0):
+                self.mount(row)
+        else:
+            for row in self._rows_before(index, 0):
+                self.mount(row)
+            self.mount(view)
         # 窗口下沿贴着会话末尾：流式追加时用户正在底部，新消息进来窗口就跟着延长。
         self._mounted_end = len(self._messages)
         for part in message.parts:
@@ -699,7 +1185,11 @@ class MessagesPane(ScrollableContainer):
         if box is None or not box.is_attached:
             self._pending_parts.append((message_id, part))
             return None
-        widget = self._build_and_register(part)
+        index = _part_index(view.message, part)
+        if index:
+            for row in self._rows_before(view.index, index):
+                box.mount(row)
+        widget = self._build_and_register(part, view.index, index)
         box.mount(widget)
         self._auto_scroll()
         return widget
@@ -722,14 +1212,22 @@ class MessagesPane(ScrollableContainer):
             if isinstance(widget, CoalescedText):
                 widget.flush_text()
 
-    def rebuild(self, messages: list[Message]) -> None:
+    def rebuild(
+        self,
+        messages: list[Message],
+        session: Session | None = None,
+        running: bool = False,
+    ) -> None:
         """按会话内容重建列表（切换会话时使用）。
 
         只建出最后一段，更早的那些留到用户滚到顶端时再补一批。一段几百条消息的会话
         全建出来要几千个组件，建完还要等布局算完，打开会话的那几秒就停在这里。
         """
         self.clear_messages()
+        self._session = session
+        self._running = running
         self._messages = messages
+        self.refresh_topics(reset=True)
         total = len(messages)
         self._mounted_start = max(0, total - HISTORY_PAGE)
         self._mounted_end = total
@@ -753,11 +1251,22 @@ class MessagesPane(ScrollableContainer):
         if self._history_hint is not None:
             self._history_hint.remove()
             self._history_hint = None
+        for header in list(self._header_views.values()):
+            if header.parent is self:
+                header.remove()
         self._message_views.clear()
         self._part_views.clear()
         self._tool_cards.clear()
         self._reasoning_views.clear()
         self._pending_parts.clear()
+        self._header_views.clear()
+        self._step_rows.clear()
+        self._topics = []
+        self._topic_by_key = {}
+        self._step_spans = []
+        self._open.clear()
+        self._manual_open.clear()
+        self._step_open.clear()
         self._messages = []
         self._mounted_start = 0
         self._mounted_end = 0
@@ -833,20 +1342,43 @@ class MessagesPane(ScrollableContainer):
         """顶端那条提示的文字，写明还剩多少条没建出来。"""
         return f"↑ 上方还有 {self._mounted_start} 条更早的消息"
 
-    def _build_views(self, start: int, end: int) -> list[MessageView]:
-        """为 `[start, end)` 这一段消息建出视图并登记，挂载由调用方决定。"""
-        views: list[MessageView] = []
-        for message in self._messages[start:end]:
-            view = MessageView(message, self)
-            self._message_views[message.id] = view
-            views.append(view)
-        return views
+    def _build_views(self, start: int, end: int) -> list[Widget]:
+        """为 `[start, end)` 这一段消息建出视图并登记，挂载由调用方决定。
 
-    def _unmount_range(self, start: int, end: int) -> None:
+        返回的列表里还夹着主题头：它在消息之间，挂载顺序必须与滚动顺序一致。
+        完全属于收起主题的消息不建视图，只留下那个主题的标题行——这就是折叠
+        省下来的那部分高度。
+
+        用户消息是任务的头，主题头排在它下面：提问在上、这一轮做了哪几件事在下。
+        其余消息仍是主题头在前，从消息中间起的主题（`close_topic` 的切点）就在
+        它真正开始的那一格上。
+        """
+        views: list[Widget] = []
+        for index in range(start, end):
+            message = self._messages[index]
+            if self._message_hidden(index):
+                topic = self._topic_starting_at((index, 0))
+                if topic is not None:
+                    views.append(self._header_for(topic))
+                continue
+            view = MessageView(message, self, index)
+            self._message_views[message.id] = view
+            if message.role == "user":
+                views.append(view)
+                views.extend(self._rows_before(index, 0))
+            else:
+                views.extend(self._rows_before(index, 0))
+                views.append(view)
+        return [widget for widget in views if not widget.is_mounted]
+
+    def _unmount_range(self, start: int, end: int, drop_headers: bool = True) -> None:
         """把 `[start, end)` 这一段消息的视图摘掉，并从索引表里清掉。
 
         消息本身留在 `_messages` 里不丢，摘掉的只是界面上那棵组件树。摘掉之后
         `_arrange_root` 遍历的组件就少了，滚动一帧的成本跟着降下来。
+
+        `drop_headers=False` 用于折叠：那一段消息收起来，主题头是再打开的入口，
+        跟着摘掉的话这个主题就从画面上消失了，再没有地方点开它。
         """
         for message in self._messages[start:end]:
             view = self._message_views.pop(message.id, None)
@@ -863,6 +1395,17 @@ class MessagesPane(ScrollableContainer):
                     if widget in self._reasoning_views:
                         self._reasoning_views.remove(widget)
             view.remove()
+        # 标题行与步行跟着起点所在的这批消息一起清掉。标题行如果挂在消息区上（主题
+        # 从消息开头起），它不在这棵子树里，要单独摘。
+        if drop_headers:
+            for key, header in list(self._header_views.items()):
+                if start <= header.topic.start[0] < end:
+                    if header.parent is self:
+                        header.remove()
+                    self._header_views.pop(key, None)
+        for key, row in list(self._step_rows.items()):
+            if start <= key[0] < end:
+                self._step_rows.pop(key, None)
 
     def _maintain_window_up(self) -> None:
         """向上滚动：接近窗口顶就补上端，挂载超上限就裁下端。
@@ -927,18 +1470,44 @@ class MessagesPane(ScrollableContainer):
         中间会经过好几帧。这一帧的高度与上一帧相同，才算布局停稳，那时读到的差值
         才是这批真正推进来的行数；早一帧去滚会少算一截，画面停在上一批中间。
         """
-        height_after = self.virtual_size.height
-        if (height_after != last_height or height_after == height_before) and attempts < 8:
-            self.call_after_refresh(
-                self._restore_after_grow_up, scroll_before, height_before, height_after, attempts + 1
-            )
-            return
-        self.scroll_to(y=scroll_before + height_after - height_before, animate=False, immediate=True)
+        self._restore_scroll(
+            scroll_before, height_before, self._after_grow_up, last_height, attempts
+        )
+
+    def _after_grow_up(self) -> None:
         self._update_history_hint()
-        self._loading = False
         self._fill_viewport()
         # 补上端是向上翻的动作，超上限时裁的是下端（用户在上方，下端远离视口）。
         self._maintain_window_up()
+
+    def _restore_scroll(
+        self,
+        scroll_before: float,
+        height_before: int,
+        after: Callable[[], None],
+        last_height: int = -1,
+        attempts: int = 0,
+    ) -> None:
+        """等布局停稳，把滚动量补上高度差，然后交给调用方收尾。
+
+        向上补挂、向上裁剪、折叠展开都会改内容高度，等待的理由是同一个：
+        这一帧的高度与上一帧相同，布局才算停稳；早一帧读到的差值不是这批内容
+        真正推进来的行数。
+        """
+        height_after = self.virtual_size.height
+        if (height_after != last_height or height_after == height_before) and attempts < 8:
+            self.call_after_refresh(
+                self._restore_scroll,
+                scroll_before,
+                height_before,
+                after,
+                height_after,
+                attempts + 1,
+            )
+            return
+        self.scroll_to(y=scroll_before + height_after - height_before, animate=False, immediate=True)
+        self._loading = False
+        after()
 
     def _grow_down(self) -> None:
         """在窗口最后面补一批更晚的消息。
@@ -995,15 +1564,12 @@ class MessagesPane(ScrollableContainer):
 
         裁掉的内容摘掉之后虚拟高度变小，同样要等布局停稳再读差值。
         """
-        height_after = self.virtual_size.height
-        if (height_after != last_height or height_after == height_before) and attempts < 8:
-            self.call_after_refresh(
-                self._restore_after_trim_up, scroll_before, height_before, height_after, attempts + 1
-            )
-            return
-        self.scroll_to(y=scroll_before + height_after - height_before, animate=False, immediate=True)
+        self._restore_scroll(
+            scroll_before, height_before, self._after_trim_up, last_height, attempts
+        )
+
+    def _after_trim_up(self) -> None:
         self._update_history_hint()
-        self._loading = False
         self._fill_viewport()
         # 裁上端让下方内容上移、视口跟着上移，接下来朝下维护：接近底就补下端。
         self._maintain_window_down()
@@ -1088,12 +1654,17 @@ class MessagesPane(ScrollableContainer):
             return PatchPartView(part)
         return SimplePartView(part)
 
-    def _build_and_register(self, part: Part) -> Widget:
+    def _build_and_register(
+        self, part: Part, message_index: int = -1, part_index: int = 0
+    ) -> Widget:
         """创建 Part 组件，登记到索引，并按当前显示开关设好可见性。
 
         组件的创建有两条路：流式追加走 `add_part`，会话重建时由 `MessageView.compose` 直接调用。
         两张表在这里填，两条路才都填得上；只填一条路的后果是另一张表空着，
         `/thinking` 或 `/details` 只改了数据与提示，画面不会有任何变化。
+
+        位置也在这里判一次：属于收起主题或收起步的组件建出来就是隐藏的，
+        不必等折叠那一刻再去找它。
         """
         widget = self._build_part(part)
         self._part_views[part.id] = widget
@@ -1103,6 +1674,8 @@ class MessagesPane(ScrollableContainer):
         if isinstance(widget, ReasoningPartView):
             widget.set_class(not self._show_thinking, "-hidden")
             self._reasoning_views.append(widget)
+        if message_index >= 0 and self._topics:
+            self._apply_classes(widget, (message_index, part_index), part)
         return widget
 
     def _flush_pending(self) -> None:

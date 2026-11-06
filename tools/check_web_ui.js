@@ -20,6 +20,7 @@ const PYTHON = process.env.VSA_PYTHON || (process.platform === "win32"
   : path.join(ROOT, ".venv", "bin", "python"));
 const FIXTURE = path.join(ROOT, ".probe", "web-ui-runs");
 const SURVEY_FIXTURE = path.join(ROOT, ".probe", "web-ui-surveys");
+const LEDGER_FIXTURE = path.join(ROOT, ".probe", "web-ui-ledgers");
 const STATE_DIR = path.join(ROOT, ".probe", "web-ui-state");
 const STATE_PATH = path.join(STATE_DIR, "state.toml");
 const SURVEY_ID = "Q15858-survey-ui000001";
@@ -59,6 +60,15 @@ const TOPIC_STATUS_TEXT = {
   running: "进行中",
 };
 
+// 首页任务状态。与 `web/pages/home.js` 的 STATUS_TEXT 同一套词。
+const TASK_STATUS_TEXT = {
+  idle: "待开始",
+  running: "运行中",
+  done: "已完成",
+  failed: "失败",
+  cancelled: "已中断",
+};
+
 // 口袋来源徽标的三态与结构页里的文字一致。核对「有没有挂」与「挂的是不是这一个」，
 // 光看页面有没有出现某个字认不出「配体来源的写了预测」这一类错配。
 const POCKET_SOURCE_TEXT = {
@@ -79,6 +89,18 @@ async function getJson(route) {
   const payload = await response.json();
   if (!response.ok) throw new Error(`${route} 返回 ${response.status}：${payload.error || ""}`);
   return payload;
+}
+
+// 打开一个页面并等到它画完。只等某个元素出现不够：地址从 `#/history/<id>`
+// 换成 `#/history` 是同一份文档内的跳转，旧页面的元素还在，等到的可能是上一页。
+// 外壳在挂载结束时给 `#app-view` 打上 `data-ready`，这里等它。
+async function openView(page, hash, timeout = 30000) {
+  await page.goto(`${BASE}/${hash}`, { waitUntil: "networkidle" });
+  await page.waitForFunction(
+    () => document.getElementById("app-view")?.dataset.ready === "1",
+    undefined,
+    { timeout }
+  );
 }
 
 async function waitReady() {
@@ -211,6 +233,8 @@ function prepareState() {
   ).trim();
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.rmSync(path.join(STATE_DIR, "live"), { recursive: true, force: true });
+  // 登记表也清空：上一轮留下的那几份会让首页的产物数不是 0，与接口对不上。
+  fs.rmSync(LEDGER_FIXTURE, { recursive: true, force: true });
   fs.copyFileSync(source, STATE_PATH);
   // 真实会话里几乎只有「完成」一种主题，失败与中断很难等到。追加一条三态会话，
   // 三种状态的颜色与文案就都能在浏览器里核对。
@@ -231,6 +255,7 @@ function startServer() {
       "--state", STATE_PATH,
       "--runs", FIXTURE,
       "--surveys", SURVEY_FIXTURE,
+      "--ledgers", LEDGER_FIXTURE,
       "--port", String(PORT),
     ],
     { stdio: ["ignore", out, out] }
@@ -435,7 +460,7 @@ async function readCanvasCoverage(page) {
 }
 
 async function checkHistoryPage(page, listing, biggestId) {
-  await page.goto(`${BASE}/#/history`, { waitUntil: "networkidle" });
+  await openView(page, "#/history");
   await page.waitForFunction(
     (count) => document.querySelectorAll("#session-list li[data-session-id]").length === count,
     listing.sessions.length,
@@ -1218,8 +1243,8 @@ async function checkLiveCard(page, sessionId) {
   fs.writeFileSync(target, JSON.stringify(payload), "utf8");
 
   // 先离开再回来：同一个地址的 hash 导航不会重新挂载页面。
-  await page.goto(`${BASE}/#/history`, { waitUntil: "networkidle" });
-  await page.goto(`${BASE}/#/history/${sessionId}`, { waitUntil: "networkidle" });
+  await openView(page, "#/history");
+  await openView(page, `#/history/${sessionId}`);
   await page.waitForSelector("#conversation .topic-card.is-live", { timeout: 30000 });
   const text = await page.locator("#conversation .topic-card.is-live").innerText();
   check(
@@ -1250,10 +1275,491 @@ async function checkLiveCard(page, sessionId) {
   fs.unlinkSync(target);
 }
 
+async function checkHomePage(page, listing) {
+  // 地址不带哈希：默认页就是工作空间。这一条同时盯着「默认页改回 history」
+  // 这种回退——导航高亮与表格都得在这一页上。
+  await openView(page, "");
+  await page.waitForSelector(".home", { timeout: 30000 });
+
+  const active = await page.locator(".nav-link.is-active").innerText();
+  check("默认页是工作空间", active.includes("工作空间"), `高亮的是「${active}」`);
+
+  const roots = listing.sessions.filter((item) => !item.parentId);
+  const rows = page.locator(".home-table tbody tr");
+  const count = await rows.count();
+  check(
+    "最近任务表的行数与根会话数一致",
+    count === Math.min(10, roots.length),
+    `页面 ${count} 行，根会话 ${roots.length} 条，上限 10`
+  );
+
+  const taskId = await rows.first().getAttribute("data-task");
+  const target = listing.sessions.find((item) => item.id === taskId);
+  const firstText = await rows.first().innerText();
+  check(
+    "首行的标题与接口一致",
+    Boolean(target) && firstText.includes(target.title),
+    `首行 ${firstText.split("\n")[0]}，接口 ${target && target.title}`
+  );
+  check(
+    "首行的状态与接口一致",
+    Boolean(target) && firstText.includes(TASK_STATUS_TEXT[target.status] || "待开始"),
+    `首行状态应是「${target && (TASK_STATUS_TEXT[target.status] || "待开始")}」`
+  );
+
+  // 左栏与表格用的是同一份数据：根会话在左栏各占一行（运行中的另外一组）。
+  const sideRows = page.locator(".home-side-row");
+  check(
+    "左栏的任务行数与根会话数一致",
+    (await sideRows.count()) === roots.length,
+    `左栏 ${await sideRows.count()} 行，根会话 ${roots.length} 条`
+  );
+
+  await rows.first().click();
+  await page.waitForFunction(() => window.location.hash.startsWith("#/history/"), undefined, {
+    timeout: 30000,
+  });
+  const hash = await page.evaluate(() => window.location.hash);
+  check(
+    "点一行进入这个任务",
+    hash.startsWith(`#/history/${taskId}`),
+    `跳到 ${hash}`
+  );
+
+  await openView(page, "#/history");
+  await page.waitForSelector("#session-list li", { timeout: 30000 });
+  check("会话历史仍能直接打开", true, "左栏会话列表画出来了");
+}
+
+async function checkScrollKeeper(page, sessionId) {
+  // 轮末刷新与运行中接上新主题都会整栏重建。判据用「刷新」按钮触发同一条路径：
+  // 它走 refreshSession → loadDetail → renderConversation，比等两秒轮询确定。
+  await openView(page, `#/history/${sessionId}`, 60000);
+  await page.waitForSelector("#conversation .topic-card", { timeout: 60000 });
+  // 等默认展开的那一段正文到位再量：占位行与正文的高度差会把位置读偏。
+  await page.waitForSelector("#conversation .topic-card.is-open .run-block", { timeout: 60000 });
+
+  const before = await page.evaluate(() => {
+    const box = document.querySelector("#conversation");
+    box.scrollTop = Math.floor((box.scrollHeight - box.clientHeight) / 2);
+    return box.scrollTop;
+  });
+  check("长会话可以滚动到中间", before > 0, `scrollTop=${before}`);
+
+  await page.click("#session-refresh");
+  await page.waitForTimeout(1500);
+  const after = await page.evaluate(
+    () => document.querySelector("#conversation").scrollTop
+  );
+  check("刷新之后阅读位置不变", Math.abs(after - before) <= 4, `${before} → ${after}`);
+
+  await page.evaluate(() => {
+    const box = document.querySelector("#conversation");
+    box.scrollTop = box.scrollHeight;
+  });
+  await page.click("#session-refresh");
+  await page.waitForTimeout(1500);
+  const gap = await page.evaluate(() => {
+    const box = document.querySelector("#conversation");
+    return box.scrollHeight - box.scrollTop - box.clientHeight;
+  });
+  check("贴着底部时刷新继续跟到底部", gap <= 4, `底部还剩 ${gap}px`);
+}
+
+async function checkOpenStatePersist(page, sessionId) {
+  // 工具块与单步的展开状态要活过刷新。主题级的状态早就在存，这里补的是另外两层：
+  // 用户翻到某一步的原始输出之后刷新，回来应当还在那一步。
+  await openView(page, `#/history/${sessionId}`, 60000);
+  await page.waitForSelector("#conversation .topic-card", { timeout: 60000 });
+
+  const first = page.locator("#conversation .topic-card").first();
+  const name = first.locator(".topic-name");
+  if (!(await first.evaluate((node) => node.classList.contains("is-open")))) {
+    await name.click();
+  }
+  const runHead = first.locator(".run-head");
+  if (!(await first.locator(".run-block").evaluate((node) => node.classList.contains("is-open")))) {
+    await runHead.click();
+  }
+  const step = first.locator(".step-row").first();
+  if (!(await step.evaluate((node) => node.classList.contains("is-open")))) {
+    await step.locator(".step-head").click();
+  }
+
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForSelector("#conversation .topic-card", { timeout: 60000 });
+  await page.waitForTimeout(600);
+
+  const state = await page.evaluate(() => {
+    const card = document.querySelector("#conversation .topic-card");
+    const block = card.querySelector(".run-block");
+    const row = card.querySelector(".step-row");
+    return {
+      topic: card.classList.contains("is-open"),
+      run: Boolean(block && block.classList.contains("is-open")),
+      step: Boolean(row && row.classList.contains("is-open")),
+    };
+  });
+  check(
+    "刷新之后主题、工具块与单步都还是展开的",
+    state.topic && state.run && state.step,
+    `主题 ${state.topic}，工具块 ${state.run}，单步 ${state.step}`
+  );
+}
+
+async function checkComposer(page, sessionId, consoleErrors) {
+  // `serve_web.py` 起的服务没有提交回调，页面必须把服务端的 503 原文显示出来，
+  // 而不是自己编一句「提交失败」，也不能假装成功跳走。
+  await openView(page, "");
+  await page.waitForSelector(".home .composer-input", { timeout: 30000 });
+
+  await page.click(".home .composer-chip");
+  const filled = await page.locator(".home .composer-input").inputValue();
+  check("快捷入口只往输入框里填模板", filled.includes("<"), `填进去的是「${filled.slice(0, 20)}…」`);
+
+  const before = await page.evaluate(() => window.location.hash);
+  const errorsBefore = consoleErrors.length;
+  await page.fill(".home .composer-input", "列出 P00533 的 UniProt 记录");
+  await page.click(".home .composer-send");
+  await page.waitForSelector(".home .composer-error:not(.is-hidden)", { timeout: 30000 });
+  const text = await page.locator(".home .composer-error").innerText();
+  check(
+    "没有回调的服务：提交后显示 503 的原文",
+    text.includes("503") && text.includes("不负责跑任务"),
+    text
+  );
+  check(
+    "提交失败时页面不跳转",
+    (await page.evaluate(() => window.location.hash)) === before,
+    `提交前 ${before || "（空）"}，提交后 ${(await page.evaluate(() => window.location.hash)) || "（空）"}`
+  );
+  // 这一条 503 是判据自己发出来的，浏览器会把它记成一条资源错误；
+  // 只摘掉这一次请求期间新增的那几条，别处的报错照旧算。
+  await page.waitForTimeout(200);
+  consoleErrors.splice(errorsBefore, consoleErrors.length - errorsBefore);
+
+  // 会话页底部是同一个组件，换的只是它认的会话编号。
+  await openView(page, `#/history/${sessionId}`, 60000);
+  await page.waitForSelector("#chat-composer .composer-input", { timeout: 30000 });
+  check(
+    "会话页底部也有输入框",
+    await page.locator("#chat-composer .composer-send").isVisible(),
+    "输入框与发送按钮都在"
+  );
+}
+
+async function checkArtifactPaneWidths(page, sessionId) {
+  // 产物面板默认收起。按钮一次点开一档：240 → 300 → 380 → 收起，
+  // 第四下回到收起，宽度同时记在 localStorage 里。
+  await openView(page, `#/history/${sessionId}`, 60000);
+  await page.waitForSelector("#artifact-toggle", { timeout: 30000 });
+  check(
+    "产物面板默认收起",
+    !(await page.locator("#artifact-pane").isVisible()),
+    "面板不可见"
+  );
+
+  const widths = [];
+  for (let index = 0; index < 3; index += 1) {
+    await page.click("#artifact-toggle");
+    await page.waitForTimeout(200);
+    widths.push(
+      Math.round(
+        await page.locator("#artifact-pane").evaluate((node) => node.getBoundingClientRect().width)
+      )
+    );
+  }
+  check(
+    "产物面板按 240 / 300 / 380 三档循环",
+    JSON.stringify(widths) === JSON.stringify([240, 300, 380]),
+    `依次是 ${widths.join(" / ")}`
+  );
+  const label = await page.locator("#artifact-toggle").innerText();
+  check("按钮上写着当前宽度", label.includes("380"), `按钮是「${label}」`);
+
+  await page.click("#artifact-toggle");
+  await page.waitForTimeout(200);
+  check(
+    "第四下回到收起",
+    !(await page.locator("#artifact-pane").isVisible()),
+    "面板不可见"
+  );
+
+  // 换一个会话不该把宽度复位：这是屏幕的事，不是这个任务的事。
+  await page.click("#artifact-toggle");
+  await page.waitForTimeout(200);
+  const saved = await page.evaluate(() => window.localStorage.getItem("vsa.history.artifacts"));
+  check("宽度写进本地存储", saved === "240", `存的是 ${saved}`);
+  await page.click("#artifact-toggle");
+  await page.click("#artifact-toggle");
+  await page.click("#artifact-toggle");
+  await page.waitForTimeout(200);
+}
+
+async function checkFocusMode(page, sessionId) {
+  await openView(page, `#/history/${sessionId}`, 60000);
+  await page.waitForSelector("#focus-toggle", { timeout: 30000 });
+  // 先打开产物面板：退出专注之后它应当回到打开的样子，而不是被顺手关掉。
+  await page.click("#artifact-toggle");
+  await page.waitForTimeout(200);
+
+  await page.click("#focus-toggle");
+  await page.waitForTimeout(200);
+  const hidden = await page.evaluate(() => {
+    const display = (selector) => getComputedStyle(document.querySelector(selector)).display;
+    return {
+      list: display(".history-list"),
+      rail: display("#topic-rail"),
+      artifacts: display("#artifact-pane"),
+    };
+  });
+  check(
+    "专注模式下三栏都不显示",
+    hidden.list === "none" && hidden.rail === "none" && hidden.artifacts === "none",
+    JSON.stringify(hidden)
+  );
+  check(
+    "专注模式下抽屉按钮不可用",
+    (await page.locator(".pane-toggle").first().isDisabled()) &&
+      (await page.locator("#artifact-toggle").isDisabled()),
+    "两个按钮都禁用"
+  );
+
+  // 刷新之后仍是专注：这一项跟着人走，不跟着会话走。
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForSelector("#focus-toggle", { timeout: 60000 });
+  const stored = await page.evaluate(() => window.localStorage.getItem("vsa.history.focus"));
+  check("专注状态写进本地存储", stored === "1", `存的是 ${stored}`);
+
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(200);
+  const back = await page.evaluate(() => ({
+    focus: document.body.classList.contains("focus-mode"),
+    list: getComputedStyle(document.querySelector(".history-list")).display,
+    artifacts: getComputedStyle(document.querySelector("#artifact-pane")).display,
+  }));
+  check(
+    "Esc 退出专注并回到进入前的样子",
+    !back.focus && back.list !== "none" && back.artifacts !== "none",
+    JSON.stringify(back)
+  );
+
+  // 收尾：把产物面板关掉，后面的截图与检查用默认的样子。
+  for (let index = 0; index < 4; index += 1) {
+    if (!(await page.locator("#artifact-pane").isVisible())) break;
+    await page.click("#artifact-toggle");
+    await page.waitForTimeout(150);
+  }
+}
+
+async function checkNarrowDrawer(page, sessionId) {
+  // 1200px 以下不挤正文：产物面板改成盖在右边的一层，宽度固定。
+  await page.setViewportSize({ width: 1180, height: 900 });
+  await openView(page, `#/history/${sessionId}`, 60000);
+  await page.waitForSelector("#artifact-toggle", { timeout: 30000 });
+  await page.click("#artifact-toggle");
+  await page.waitForTimeout(250);
+  const box = await page.evaluate(() => {
+    const pane = document.querySelector("#artifact-pane");
+    const conversation = document.querySelector("#conversation");
+    return {
+      visible: pane.getBoundingClientRect().width > 0,
+      position: getComputedStyle(pane).position,
+      left: pane.getBoundingClientRect().left,
+      conversationRight: conversation.getBoundingClientRect().right,
+      width: Math.round(pane.getBoundingClientRect().width),
+    };
+  });
+  check(
+    "窄屏下产物面板盖在正文上",
+    box.visible && box.position === "absolute" && box.left < box.conversationRight,
+    `position=${box.position}，宽 ${box.width}，左边界 ${Math.round(box.left)}`
+  );
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(150);
+}
+
+async function checkNarrowLayouts(page, sessionId) {
+  // 两档窄屏各自的行为：
+  //   1000px —— 会话历史的主题导航收成抽屉，点按钮盖在正文上；
+  //    640px —— 导航折成两行、搜索独占一行，输入框的按钮不许折字；
+  //    480px —— 工作空间的左栏让出一截，表里收掉两列。
+  // 每一档都断言整页没有横向滚动：溢出会被外层裁掉，看上去只是「右边少了点东西」。
+  await page.setViewportSize({ width: 1000, height: 900 });
+  await openView(page, `#/history/${sessionId}`, 60000);
+  await page.waitForSelector("#conversation .topic-card", { timeout: 30000 });
+
+  const railClosed = await page.evaluate(() => ({
+    rail: getComputedStyle(document.querySelector("#topic-rail")).display,
+    toggle: getComputedStyle(document.querySelector('.pane-toggle[data-pane="topics"]')).display,
+    overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  }));
+  check(
+    "1000px：主题导航收成抽屉",
+    railClosed.rail === "none" && railClosed.toggle !== "none" && railClosed.overflow === 0,
+    JSON.stringify(railClosed)
+  );
+
+  await page.click('.pane-toggle[data-pane="topics"]');
+  await page.waitForTimeout(250);
+  const railOpen = await page.evaluate(() => {
+    const rail = document.querySelector("#topic-rail");
+    const conversation = document.querySelector("#conversation");
+    return {
+      display: getComputedStyle(rail).display,
+      position: getComputedStyle(rail).position,
+      right: Math.round(rail.getBoundingClientRect().right),
+      conversationLeft: Math.round(conversation.getBoundingClientRect().left),
+    };
+  });
+  check(
+    "1000px：主题抽屉盖在正文左侧",
+    railOpen.display !== "none"
+      && railOpen.position === "absolute"
+      && railOpen.right > railOpen.conversationLeft,
+    JSON.stringify(railOpen)
+  );
+  await page.click('.pane-toggle[data-pane="topics"]');
+
+  await page.setViewportSize({ width: 640, height: 900 });
+  await page.waitForTimeout(200);
+  const narrow = await page.evaluate(() => {
+    const nav = document.querySelector("#app-nav");
+    const search = document.querySelector("#app-search");
+    const links = [...document.querySelectorAll(".nav-link")].map((node) =>
+      Math.round(node.getBoundingClientRect().height)
+    );
+    const send = document.querySelector(".composer-send").getBoundingClientRect();
+    return {
+      navHeight: Math.round(nav.getBoundingClientRect().height),
+      searchTop: Math.round(search.getBoundingClientRect().top),
+      links,
+      send: { w: Math.round(send.width), h: Math.round(send.height) },
+      overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    };
+  });
+  check(
+    "640px：整页没有横向滚动",
+    narrow.overflow === 0,
+    `溢出 ${narrow.overflow}px`
+  );
+  check(
+    "640px：导航折成两行，搜索独占一行",
+    narrow.navHeight > 52 && narrow.searchTop > 20,
+    `导航高 ${narrow.navHeight}，搜索在 y=${narrow.searchTop}`
+  );
+  check(
+    "640px：导航链接不折字",
+    narrow.links.every((height) => height <= 36),
+    `各链接高度 ${narrow.links.join("/")}`
+  );
+  check(
+    "640px：发送按钮不折字",
+    narrow.send.h <= 40 && narrow.send.w <= 80,
+    `按钮 ${narrow.send.w}x${narrow.send.h}`
+  );
+
+  await page.setViewportSize({ width: 480, height: 900 });
+  await openView(page, "", 60000);
+  await page.waitForSelector(".home .composer", { timeout: 30000 });
+  const home = await page.evaluate(() => {
+    const table = document.querySelector(".home-table").getBoundingClientRect();
+    const main = document.querySelector(".home-main").getBoundingClientRect();
+    return {
+      table: Math.round(table.width),
+      main: Math.round(main.width),
+      topics: getComputedStyle(document.querySelector(".home-col-topics")).display,
+      side: Math.round(document.querySelector(".home-side").getBoundingClientRect().width),
+      overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    };
+  });
+  check(
+    "480px：任务表放得进主区",
+    home.table <= home.main && home.overflow === 0,
+    `表 ${home.table}，主区 ${home.main}，溢出 ${home.overflow}`
+  );
+  check(
+    "480px：工作空间先收掉主题与产物两列",
+    home.topics === "none" && home.side <= 180,
+    `主题列 ${home.topics}，左栏 ${home.side}`
+  );
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(200);
+}
+
+async function prepareArtifactLedger(listing) {
+  // 找一个事件里带 handle 的会话，给那些 handle 写一份临时登记表。
+  // 判据不读用户家目录里的真实产物，也不断言它们的字节数。
+  for (const item of listing.sessions) {
+    if (item.parentId) continue;
+    const payload = await getJson(`/api/sessions/${item.id}/events`);
+    for (const event of payload.events || []) {
+      const handles = (event.artifacts || []).filter((name) =>
+        /^(receptor|ligandset|artifact)#\d+$/.test(name)
+      );
+      if (!handles.length) continue;
+      fs.mkdirSync(LEDGER_FIXTURE, { recursive: true });
+      const entries = [];
+      for (const handle of handles) {
+        const [kind, seq] = handle.split("#");
+        const target = path.join(LEDGER_FIXTURE, `${kind}-${seq}.json`);
+        fs.writeFileSync(target, JSON.stringify({ handle }), "utf8");
+        entries.push({
+          handle: { kind, seq: Number(seq) },
+          path: target,
+          summary: `${handle} 的判据产物`,
+          fingerprint: "",
+          file_state: "ok",
+          parents: [],
+          meta: { source: "check_web_ui" },
+          created_at: 1700000000.0,
+        });
+      }
+      fs.writeFileSync(
+        path.join(LEDGER_FIXTURE, `${item.id}.json`),
+        JSON.stringify({ version: 1, session_id: item.id, entries }, null, 2),
+        "utf8"
+      );
+      return { sessionId: item.id, eventId: event.id, handles };
+    }
+  }
+  return null;
+}
+
+async function checkArtifactLinks(page, target) {
+  if (!target) {
+    check("主题尾部列出本主题产物并给下载链接", false, "没有找到带 handle 的事件");
+    return;
+  }
+  await openView(
+    page,
+    `#/history/${target.sessionId}?event=${encodeURIComponent(target.eventId)}`
+  );
+  await page.waitForSelector("#conversation .topic-card.is-open .topic-artifacts", {
+    timeout: 30000,
+  });
+  const links = await page
+    .locator("#conversation .topic-card.is-open .topic-artifact a")
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("href")));
+  check(
+    "主题尾部列出本主题产物并给下载链接",
+    links.length === target.handles.length,
+    `链接 ${links.length} 个，handle ${target.handles.length} 个`
+  );
+  check(
+    "下载链接指向登记表里的 handle",
+    target.handles.every((handle) =>
+      links.some((href) => href.includes(encodeURIComponent(handle)))
+    ),
+    `链接 ${links.join("，")}`
+  );
+}
+
 async function checkThreeStates(page, sessionId) {
   // 那条会话由 `tools/seed_three_states.py` 追加：完成 / 失败 / 中断各一个主题，
   // 外加一份运行中的快照。核对的是「哪种状态画成哪样」，不是数字。
-  await page.goto(`${BASE}/#/history/${sessionId}`, { waitUntil: "networkidle" });
+  await openView(page, `#/history/${sessionId}`);
   await page.waitForFunction(
     () => document.querySelectorAll("#conversation .topic-card").length >= 4,
     undefined,
@@ -1354,7 +1860,7 @@ async function checkSearchBox(page, sessionId) {
   const source = shelf.events.length ? shelf.events[0].title : shelf.title;
   const term = source.slice(0, 4);
 
-  await page.goto(`${BASE}/#/history/${sessionId}`, { waitUntil: "networkidle" });
+  await openView(page, `#/history/${sessionId}`);
   await page.fill("#global-search", term);
   await page.waitForSelector("#search-results .search-item", { timeout: 30000 });
 
@@ -1417,8 +1923,16 @@ async function main() {
     });
     page.on("pageerror", (error) => consoleErrors.push(String(error)));
 
+    await checkHomePage(page, listing);
+    await checkComposer(page, biggest.id, consoleErrors);
     await checkHistoryPage(page, listing, biggest.id);
     await checkLiveCard(page, biggest.id);
+    await checkScrollKeeper(page, biggest.id);
+    await checkOpenStatePersist(page, biggest.id);
+    await checkArtifactPaneWidths(page, biggest.id);
+    await checkFocusMode(page, biggest.id);
+    await checkNarrowDrawer(page, biggest.id);
+    await checkNarrowLayouts(page, biggest.id);
     await checkThreeStates(page, threeStateId);
     await checkSearchBox(page, biggest.id);
     await checkStructurePage(page, session.runId, biggest.id);
@@ -1439,6 +1953,11 @@ async function main() {
     await checkDockingOrder(page);
     await checkSurveyPage(page);
 
+    // 放在最后：写进临时登记表之后，首页的产物数会变，前面那些核对
+    // 都拿的是写入之前的那份列表。
+    const artifactTarget = await prepareArtifactLedger(listing);
+    await checkArtifactLinks(page, artifactTarget);
+
     check(
       "全程没有页面报错",
       consoleErrors.length === 0,
@@ -1447,7 +1966,7 @@ async function main() {
 
     const output = path.join(ROOT, "tests", "output");
     fs.mkdirSync(output, { recursive: true });
-    await page.goto(`${BASE}/#/history/${biggest.id}`, { waitUntil: "networkidle" });
+    await openView(page, `#/history/${biggest.id}`, 60000);
     // 等第一段正文画出来再截：只等 networkidle 会拍到「正在读取会话…」那一帧，
     // 截图就失去了对照的价值。
     await page.waitForSelector("#conversation .topic-card", {

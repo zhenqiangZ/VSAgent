@@ -27,7 +27,10 @@
         <header id="session-head" class="is-hidden"></header>
         <div class="workbench">
           <nav id="topic-rail" aria-label="主题导航"></nav>
-          <div id="conversation"></div>
+          <div class="conversation-column">
+            <div id="conversation"></div>
+            <div id="chat-composer" class="chat-composer is-hidden"></div>
+          </div>
           <aside id="artifact-pane" aria-label="任务产物"></aside>
         </div>
       </section>
@@ -102,9 +105,10 @@
   // 没碰过的主题按「最后一个自动展开」处理，新主题出现时上一条自然收起。
   let manualOpen = new Set();
   let manualClosed = new Set();
-  // 主题里的「工具执行」块与单个步，只在本次页面里记，不写本地存储。
-  const runOpen = new Set();
-  const stepOpen = new Set();
+  // 主题里的「工具执行」块与单个步。与主题的展开状态一起写进本地存储：
+  // 用户翻到某一步的原始输出之后，刷新页面回来还在原地。
+  let runOpen = new Set();
+  let stepOpen = new Set();
   // 左栏主题条下面挂着的步。与正文的展开状态彼此独立：左栏是导航，正文是阅读。
   const railOpen = new Set();
   let activeTopic = "";
@@ -114,6 +118,17 @@
   // 换会话时旧请求可能还在路上；回来时页码对不上就不画，免得把上一个会话的
   // 内容画到这一个上。
   let loadToken = 0;
+
+  // 产物面板与专注模式。这两项跟着人走、不跟着会话走：宽度是屏幕的事，
+  // 专注是此刻要不要被打扰的事，换一个任务不该把它们复位。
+  const ARTIFACT_KEY = "vsa.history.artifacts";
+  const FOCUS_KEY = "vsa.history.focus";
+  // 0 表示收起。按钮按这个顺序循环，所以点三次依次是 240 / 300 / 380。
+  const ARTIFACT_STEPS = [0, 240, 300, 380];
+  let artifactWidth = 0;
+  let focusMode = false;
+  // 底部输入框。整页只建一次，换会话时只换它认的会话编号。
+  let chatComposer = null;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -167,16 +182,22 @@
   function loadOpenState() {
     manualOpen = new Set();
     manualClosed = new Set();
+    runOpen = new Set();
+    stepOpen = new Set();
     try {
       const raw = window.localStorage.getItem(storageKey());
       if (!raw) return;
       const data = JSON.parse(raw);
       manualOpen = new Set(Array.isArray(data.open) ? data.open : []);
       manualClosed = new Set(Array.isArray(data.closed) ? data.closed : []);
+      runOpen = new Set(Array.isArray(data.runs) ? data.runs : []);
+      stepOpen = new Set(Array.isArray(data.steps) ? data.steps : []);
     } catch (error) {
       // 存坏了就当没存过：一条读不出来的偏好不该让整页打不开。
       manualOpen = new Set();
       manualClosed = new Set();
+      runOpen = new Set();
+      stepOpen = new Set();
     }
   }
 
@@ -185,11 +206,75 @@
     try {
       window.localStorage.setItem(
         storageKey(),
-        JSON.stringify({ open: [...manualOpen], closed: [...manualClosed] })
+        JSON.stringify({
+          open: [...manualOpen],
+          closed: [...manualClosed],
+          runs: [...runOpen],
+          steps: [...stepOpen],
+        })
       );
     } catch (error) {
       // 无痕模式禁用本地存储：这一页里照样能展开，只是刷新之后不记得。
     }
+  }
+
+  // ------------------------------------------------------------------
+  // 产物面板与专注模式
+  // ------------------------------------------------------------------
+
+  function loadChrome() {
+    const saved = Number(window.localStorage.getItem(ARTIFACT_KEY) || 0);
+    artifactWidth = ARTIFACT_STEPS.includes(saved) ? saved : 0;
+    focusMode = window.localStorage.getItem(FOCUS_KEY) === "1";
+  }
+
+  function saveChrome() {
+    try {
+      window.localStorage.setItem(ARTIFACT_KEY, String(artifactWidth));
+      window.localStorage.setItem(FOCUS_KEY, focusMode ? "1" : "0");
+    } catch (error) {
+      // 同上：存不下就不记，页面里的状态仍然生效。
+    }
+  }
+
+  // 三栏的显隐全部挂在 body 的类上，宽度也一样。集中在这一处改，
+  // 免得按钮文案、类名与 CSS 三处各说一套。
+  function applyChrome() {
+    const body = document.body;
+    body.classList.toggle("artifacts-open", artifactWidth > 0);
+    body.classList.toggle("artifacts-w-240", artifactWidth === 240);
+    body.classList.toggle("artifacts-w-380", artifactWidth === 380);
+    body.classList.toggle("focus-mode", focusMode);
+
+    if (!root) return;
+    const toggle = root.querySelector("#artifact-toggle");
+    if (toggle) {
+      toggle.textContent = artifactWidth ? `产物 ${artifactWidth}` : "产物";
+      toggle.setAttribute("aria-expanded", artifactWidth ? "true" : "false");
+    }
+    for (const button of root.querySelectorAll(".pane-toggle, #artifact-toggle")) {
+      // 专注模式下两个抽屉按钮都不能用：打开抽屉就等于退出专注，
+      // 而退出专注有专门的按钮与 Esc。
+      button.disabled = focusMode;
+    }
+    const focus = root.querySelector("#focus-toggle");
+    if (focus) {
+      focus.textContent = focusMode ? "退出专注" : "专注";
+      focus.setAttribute("aria-pressed", focusMode ? "true" : "false");
+    }
+  }
+
+  function cycleArtifacts() {
+    const next = (ARTIFACT_STEPS.indexOf(artifactWidth) + 1) % ARTIFACT_STEPS.length;
+    artifactWidth = ARTIFACT_STEPS[next];
+    saveChrome();
+    applyChrome();
+  }
+
+  function setFocusMode(value) {
+    focusMode = value;
+    saveChrome();
+    applyChrome();
   }
 
   function topicOpen(eventId) {
@@ -405,18 +490,30 @@
       link.href = `#/structure/${encodeURIComponent(session.runId)}`;
       actions.appendChild(link);
     }
-    // 窄屏上这两栏收起来，按钮放在头部；宽屏上由 CSS 藏掉这两个按钮。
-    for (const [pane, label] of [["topics", "主题"], ["artifacts", "产物"]]) {
-      const toggle = el("button", "pane-toggle", label);
-      toggle.type = "button";
-      toggle.dataset.pane = pane;
-      toggle.addEventListener("click", () => {
-        const box = root.querySelector(".history-detail");
-        box.classList.toggle(`show-${pane}`);
-      });
-      actions.appendChild(toggle);
-    }
+    // 产物面板在宽屏上也是一份按需打开的索引，按钮因此常显；
+    // 主题栏只有窄屏才收成抽屉，它的按钮跟着 CSS 的断点走。
+    const artifactToggle = el("button", "head-toggle", "产物");
+    artifactToggle.type = "button";
+    artifactToggle.id = "artifact-toggle";
+    artifactToggle.addEventListener("click", cycleArtifacts);
+    actions.appendChild(artifactToggle);
+
+    const topicToggle = el("button", "pane-toggle", "主题");
+    topicToggle.type = "button";
+    topicToggle.dataset.pane = "topics";
+    topicToggle.addEventListener("click", () => {
+      root.querySelector(".history-detail").classList.toggle("show-topics");
+    });
+    actions.appendChild(topicToggle);
+
+    const focusToggle = el("button", "head-toggle", "专注");
+    focusToggle.type = "button";
+    focusToggle.id = "focus-toggle";
+    focusToggle.addEventListener("click", () => setFocusMode(!focusMode));
+    actions.appendChild(focusToggle);
     if (actions.childNodes.length) head.appendChild(actions);
+    // 头部是整块重建的，按钮文案与禁用状态得跟着当前的面板状态再写一遍。
+    applyChrome();
   }
 
   // ------------------------------------------------------------------
@@ -734,6 +831,7 @@
       }
       row.classList.toggle("is-open", expanded);
       head.setAttribute("aria-expanded", String(expanded));
+      saveOpenState();
     });
     head.setAttribute("aria-expanded", String(open));
     return row;
@@ -784,6 +882,7 @@
       runOpen.add(event.id);
       fillTopicBody(event);
       renderTopicRail();
+      saveOpenState();
     });
     const closeAll = el("button", "link-button", "收起全部步");
     closeAll.type = "button";
@@ -794,6 +893,7 @@
       }
       fillTopicBody(event);
       renderTopicRail();
+      saveOpenState();
     });
     const hint = el("span", "run-hint", "时长是这一轮的全部时间，含模型生成与工具执行");
     toolbar.append(openAll, closeAll, hint);
@@ -823,6 +923,7 @@
       else runOpen.add(event.id);
       block.classList.toggle("is-open", runOpen.has(event.id));
       head.querySelector(".run-toggle").textContent = runOpen.has(event.id) ? "收起" : "展开";
+      saveOpenState();
     });
     return block;
   }
@@ -929,6 +1030,8 @@
     }
     body.appendChild(narrativeNode(payload, span.from, span.to));
     body.appendChild(runBlock(event, payload));
+    const produced = topicArtifactEntries(event);
+    if (produced.length) body.appendChild(artifactList(produced));
 
     if (event.handoff) {
       const box = el("div", "event-handoff");
@@ -943,6 +1046,47 @@
       }
       body.appendChild(box);
     }
+  }
+
+  // 主题产出的 handle 落在登记表里才有下载地址。`event.artifacts` 里还混着
+  // 文件路径与补丁文字，那几类按原样显示，不给链接。
+  const ARTIFACT_HANDLE = /^(receptor|ligandset|artifact)#\d+$/;
+
+  function topicArtifactEntries(event) {
+    const items = (artifacts && artifacts.items) || [];
+    const byHandle = new Map(items.map((item) => [item.handle, item]));
+    const found = [];
+    for (const name of event.artifacts) {
+      if (!ARTIFACT_HANDLE.test(name)) continue;
+      const entry = byHandle.get(name);
+      if (entry) found.push(entry);
+    }
+    return found;
+  }
+
+  function artifactList(entries) {
+    const box = el("div", "topic-artifacts");
+    box.appendChild(el("div", "tool-label", `本主题产物（${entries.length}）`));
+    for (const entry of entries) {
+      const row = el("div", "topic-artifact");
+      const label = entry.summary || entry.name || entry.handle;
+      if (entry.download) {
+        const link = el("a", "topic-artifact-name", label);
+        link.href = entry.download;
+        link.title = entry.path || entry.handle;
+        row.appendChild(link);
+      } else {
+        const name = el("span", "topic-artifact-name", label);
+        name.title = entry.path || entry.handle;
+        row.appendChild(name);
+        // 目录没有可下载的字节，只能列出名字。
+        row.appendChild(el("span", "topic-artifact-kind", "目录"));
+      }
+      row.appendChild(el("span", "topic-artifact-kind", ARTIFACT_KIND[entry.kind] || entry.kind));
+      if (entry.bytes) row.appendChild(el("span", "topic-artifact-size", formatBytes(entry.bytes)));
+      box.appendChild(row);
+    }
+    return box;
   }
 
   function toggleTopic(eventId, byUser) {
@@ -996,12 +1140,30 @@
     return promise;
   }
 
+  // 重画之前记住阅读位置。轮末刷新与运行中接上新主题都会整栏重建，
+  // 不记的话页面跳回顶部，读到一半的地方找不到。
+  function captureScroll(box) {
+    if (!box) return null;
+    return {
+      top: box.scrollTop,
+      // 差 80px 以内算「贴着底部」：原来在跟新内容，重画之后继续跟。
+      atBottom: box.scrollHeight - box.scrollTop - box.clientHeight < 80,
+    };
+  }
+
+  function restoreScroll(box, state) {
+    if (!box || !state) return;
+    box.scrollTop = state.atBottom ? box.scrollHeight : state.top;
+  }
+
   function renderConversation() {
     const box = root.querySelector("#conversation");
+    const scroll = captureScroll(box);
     box.innerHTML = "";
     box.appendChild(taskCard());
     if (!events.length && !(live && live.running)) {
       box.appendChild(el("p", "empty-hint", "这个会话还没有封存的主题。"));
+      restoreScroll(box, scroll);
       return;
     }
     for (const event of events) {
@@ -1009,6 +1171,7 @@
       fillTopicBody(event);
     }
     if (live && live.running) box.appendChild(liveCard());
+    restoreScroll(box, scroll);
   }
 
   function taskCard() {
@@ -1229,6 +1392,8 @@
     const wasRunning = Boolean(live && live.running);
     const wasCount = live ? live.eventCount : 0;
     live = next;
+    // 这一轮没结束就不让再交一件：服务端也会回 409，按钮上先说清楚更省一次往返。
+    if (chatComposer) chatComposer.setBusy(Boolean(live && live.running));
 
     if (live && live.running) {
       if (wasRunning && wasCount !== live.eventCount) {
@@ -1465,6 +1630,9 @@
     startLive();
     loadOpenState();
     renderList();
+    chatComposer.setSession(sessionId);
+    chatComposer.setBusy(false);
+    root.querySelector("#chat-composer").classList.remove("is-hidden");
 
     root.querySelector("#session-head").classList.add("is-hidden");
     const box = root.querySelector("#conversation");
@@ -1481,7 +1649,8 @@
     }
 
     try {
-      if (!(await loadDetail(sessionId, token))) return;
+      const ok = await loadDetail(sessionId, token);
+      if (!ok) return;
       // 先问一次实时快照：正在跑的时候会整块重画，重画之后再定位深链接，
       // 滚动位置才留得住。
       await pollLive();
@@ -1543,6 +1712,7 @@
     segments.clear();
     live = null;
     loadToken = 0;
+    loadChrome();
 
     container.querySelector("#session-search").addEventListener("input", (event) => {
       keyword = event.target.value;
@@ -1558,6 +1728,28 @@
     };
     document.addEventListener("visibilitychange", onVisible);
 
+    // Esc 退出专注。输入框里按 Esc 只清输入，不该顺手把专注模式也关掉。
+    const onKeydown = (event) => {
+      if (event.key !== "Escape" || !focusMode) return;
+      const tag = (event.target && event.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      setFocusMode(false);
+    };
+    document.addEventListener("keydown", onKeydown);
+    applyChrome();
+
+    chatComposer = window.vsComposer.createComposer({
+      placeholder: "接着这个任务说一句……",
+      minHeight: 64,
+      onSubmitted: async () => {
+        // 新的一轮已经开始，状态文件里的消息还没到齐：先重取列表与这一段，
+        // 再让两秒一次的实时轮询把运行中的主题接上来。
+        await loadSessions();
+        await refreshSession();
+      },
+    });
+    container.querySelector("#chat-composer").appendChild(chatComposer.element);
+
     await loadSessions();
     if (param) {
       const wanted = query && query.get("event");
@@ -1567,7 +1759,15 @@
     return {
       unmount() {
         document.removeEventListener("visibilitychange", onVisible);
+        document.removeEventListener("keydown", onKeydown);
         stopLive();
+        // 这几项挂在 body 上，离开这一页必须摘掉：否则工作空间也会少一栏。
+        document.body.classList.remove(
+          "artifacts-open",
+          "artifacts-w-240",
+          "artifacts-w-380",
+          "focus-mode"
+        );
         root = null;
         loadToken += 1;
       },

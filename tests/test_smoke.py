@@ -8,6 +8,7 @@ import pkgutil
 import shutil
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 import vsagent  # noqa: E402
 import re  # noqa: E402
+from rich.cells import cell_len  # noqa: E402
 from textual import events  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.css.stylesheet import Stylesheet  # noqa: E402
@@ -45,12 +47,17 @@ from vsagent.core.external_editor import (  # noqa: E402
 from vsagent.core.file_refs import resolve_file_refs  # noqa: E402
 from vsagent.core.models import EFFORTS, Message, Part, PartType, ToolStatus  # noqa: E402
 from vsagent.core.project_scan import BEGIN_MARK, END_MARK  # noqa: E402
-from vsagent.core.session_manager import SessionManager  # noqa: E402
+from vsagent.core.session_manager import (  # noqa: E402
+    HOME_MIN,
+    RAIL_MIN,
+    SIDE_MIN,
+    SessionManager,
+)
 from vsagent.screens.chat import ChatScreen, SidePanel  # noqa: E402
 from vsagent.screens.connection_form import ConnectionFormScreen  # noqa: E402
 from vsagent.screens.context_usage import ContextUsageScreen  # noqa: E402
 from vsagent.screens.help import HelpScreen  # noqa: E402
-from vsagent.screens.home import HomeInput, HomeScreen  # noqa: E402
+from vsagent.screens.home import HomeAction, HomeInput, HomeScreen  # noqa: E402
 from vsagent.screens.message import MessageScreen  # noqa: E402
 from vsagent.screens.permission import PermissionDialog  # noqa: E402
 from vsagent.screens.session_picker import (  # noqa: E402
@@ -76,6 +83,9 @@ from vsagent.widgets.messages_pane import (  # noqa: E402
     TextPartView,
     ToolCard,
 )
+from vsagent.widgets.session_list import SessionList, SessionRow  # noqa: E402
+from vsagent.widgets.splitter import Splitter  # noqa: E402
+from vsagent.widgets.topic_list import TopicList, TopicRow  # noqa: E402
 from vsagent.widgets.status_bar import (  # noqa: E402
     SidebarToggle,
     StatusBar,
@@ -450,6 +460,429 @@ async def run_tools_panel_checks() -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
+async def run_rail_checks() -> None:
+    """左栏：主界面的任务列表与聊天界面的会话树 / 主题列表。
+
+    单独开一个应用、单独一份状态文件：这一组会造两个会话并点着切，塞进主流程
+    会把后面那些「当前会话是哪一条」的断言搅乱。
+    """
+    path = ROOT / ".probe" / "rail_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    app = build_app(path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.4)
+        manager = app.session_manager
+        first = manager.current
+        first.title = "第一条任务"
+        manager.create_session("第二条任务")
+
+        home = app.screen
+        side = home.query_one("#home-side", SessionList)
+        home.refresh_tasks()
+        await pilot.pause()
+        rows = list(side.query(SessionRow))
+        check(
+            len(rows) == len(manager.root_sessions()),
+            f"主界面左栏一条会话一行：{len(rows)} 行，会话 {len(manager.root_sessions())} 条",
+        )
+        check(
+            sum(1 for row in rows if row.has_class("-current")) == 1,
+            "左栏把当前会话标出来，且只标一条",
+        )
+        recent = list(home.query_one("#home-recent").query(SessionRow))
+        check(len(recent) == len(manager.root_sessions()), "输入框下面也列出最近任务")
+
+        target = next(row for row in rows if row.session_id == first.id)
+        await pilot.click(target)
+        await pilot.pause(0.4)
+        check(isinstance(app.screen, ChatScreen), "点左栏一行进入聊天界面")
+        check(
+            manager.current_session_id == first.id,
+            f"点左栏一行切到那个会话：现在是 {manager.current_session_id}",
+        )
+
+        chat = app.screen
+        rail = chat.query_one("#chat-rail")
+        pane = chat.query_one("#messages-pane").region
+        check(rail.region.width == 30, f"聊天左栏 30 列：{rail.region.width}")
+        check(pane.x == rail.region.right + 1, "消息区隔着一条分栏界线紧挨左栏")
+
+        sessions = list(chat.query_one("#chat-sessions").query(SessionRow))
+        check(len(sessions) == len(manager.root_sessions()), "聊天左栏同样列出全部会话")
+        topics = list(chat.query_one("#chat-topics").query(TopicRow))
+        check(topics == [], "还没有主题时主题列表是空的")
+
+        # 一条带主题的消息进来：左栏多一行主题，点它把那一章打开。
+        user = Message(role="user")
+        user.add_part(Part(type=PartType.TEXT, text="看看 EGFR 的口袋"))
+        first.messages.append(user)
+        assistant = Message(role="assistant")
+        assistant.add_part(Part(type=PartType.TEXT, text="先取 4HJO 的结构。"))
+        first.messages.append(assistant)
+        chat.rebuild()
+        await pilot.pause()
+        topics = list(chat.query_one("#chat-topics").query(TopicRow))
+        check(len(topics) == 1, f"主题列表跟着会话长出主题：{len(topics)} 行")
+        views = chat.messages.topics
+        check(
+            bool(views) and topics[0].key == views[0].key,
+            "左栏的主题与消息区算出来的是同一份",
+        )
+        # 分节标题带条数：栏拖窄之后标题只剩几个字，数字是这一段唯一还读得出来的信息。
+        headers = [str(item.content) for item in chat.query(".rail-section")]
+        check(
+            any(text.startswith("全部任务 ") for text in headers)
+            and any(text.startswith("主题 ") for text in headers),
+            f"会话与主题的分节标题都带条数：{headers}",
+        )
+        # 短标题补空格，状态字形一律停在最右边那一列：一列竖着扫下去才看得出哪条还在跑。
+        check(
+            all(
+                cell_len(str(row.render())) == row.content_size.width
+                for row in topics
+            ),
+            "主题行补齐到栏宽："
+            f"{[(str(row.render()), row.content_size.width) for row in topics]}",
+        )
+        # 每一步都会刷新左栏，内容没变就不要再建一遍：重建一次等于把滚动位置推回顶部。
+        session_rows = list(chat.query_one("#chat-sessions").query(SessionRow))
+        chat.refresh_rail()
+        await pilot.pause()
+        check(
+            list(chat.query_one("#chat-sessions").query(SessionRow)) == session_rows,
+            "会话没有变化时不重建左栏",
+        )
+        check(
+            chat.query_one("#chat-topics").query(TopicRow).first() is topics[0],
+            "主题没有变化时不重建主题列表",
+        )
+        await pilot.click(topics[0])
+        await pilot.pause()
+        check(views[0].key in chat.messages._manual_open, "点主题列表把那一章打开")
+
+        # 窄终端里左栏让位：80 列时消息区要能放下正文。
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.3)
+        check(
+            chat.query_one("#chat-rail").styles.display == "none",
+            "80 列时聊天左栏收起",
+        )
+
+    path.unlink(missing_ok=True)
+
+
+async def run_narrow_checks() -> None:
+    """窄终端：两屏的左栏在 92 列处收起，字标与正文不被挤坏。
+
+    阈值两侧各量一次（92 与 91），只测「宽的时候在、窄的时候不在」抓不到把阈值
+    写反或写成 80 这类错误。80 列再验一次字标不折行：那是左栏收起的理由。
+    """
+    path = ROOT / ".probe" / "narrow_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    app = build_app(path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.4)
+        manager = app.session_manager
+        manager.current.title = "主任务"
+        for index in range(4):
+            manager.create_session(f"窄屏测试任务 {index}")
+        # 一条长标题：窄屏里只能压成一行，折行会把列表撑乱。
+        manager.create_session("很长的一条任务标题" * 8)
+
+        home = app.screen
+        home.refresh_tasks()
+        await pilot.pause()
+
+        side = home.query_one("#home-side")
+        center = home.query_one("#home-center")
+        check(side.region.width == 34, f"宽屏主界面左栏 34 列：{side.region.width}")
+        check(side.styles.display != "none", "120 列时主界面左栏在")
+        check(
+            center.region.x == side.region.right + 1,
+            f"中间栏隔着一条分栏界线紧挨左栏：{center.region.x} / {side.region.right}",
+        )
+
+        await pilot.resize_terminal(92, 36)
+        await pilot.pause(0.3)
+        check(side.styles.display != "none", "92 列时主界面左栏还在")
+
+        await pilot.resize_terminal(91, 36)
+        await pilot.pause(0.3)
+        check(side.styles.display == "none", "91 列时主界面左栏收起")
+        check(
+            home.query_one("#home-split").styles.display == "none",
+            "左栏收起后分栏界线一起收起",
+        )
+        check(
+            center.region.x == 0 and center.region.width == 91,
+            f"左栏收起后中间栏占满整屏：{center.region.x}+{center.region.width}",
+        )
+        rows = list(home.query_one("#home-recent").query(SessionRow))
+        check(
+            bool(rows) and all(row.region.height == 1 for row in rows),
+            "最近任务在窄屏里仍然一行一条",
+        )
+
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.3)
+        logo = home.query_one("#home-logo")
+        check(logo.region.height == 5, f"80 列时字标仍是 5 行、没有折行：{logo.region.height}")
+        check(
+            home.query_one("#home-help").region.height == 1,
+            "80 列时提示行仍占一行",
+        )
+
+        await pilot.resize_terminal(120, 40)
+        await pilot.pause(0.3)
+        check(
+            side.styles.display != "none" and center.region.x == 35,
+            f"放大回 120 列左栏回来：{center.region.x}",
+        )
+
+        # 聊天界面同一套阈值。
+        first = manager.root_sessions()[0]
+        app.open_session(first.id)
+        await pilot.pause(0.4)
+        chat = app.screen
+        rail = chat.query_one("#chat-rail")
+        pane = chat.query_one("#messages-pane")
+        check(rail.region.width == 30, f"宽屏聊天左栏 30 列：{rail.region.width}")
+        check(pane.region.x == rail.region.right + 1, "消息区隔着一条分栏界线紧挨左栏")
+        check(
+            pane.region.width == app.size.width - 31,
+            f"消息区用掉左栏与界线以外的全部宽度：{pane.region.width}",
+        )
+
+        chat.set_sidebar(True)
+        await pilot.pause(0.3)
+        check(
+            pane.region.width == app.size.width - 62,
+            f"侧栏打开时消息区再让 30 列与两条界线：{pane.region.width}",
+        )
+        chat.set_sidebar(False)
+        await pilot.pause(0.2)
+
+        user = Message(role="user")
+        user.add_part(Part(type=PartType.TEXT, text="窄屏里也要有主题"))
+        first.messages.append(user)
+        chat.rebuild()
+        await pilot.pause(0.3)
+        topic_rows = list(chat.query_one("#chat-topics").query(TopicRow))
+        check(
+            bool(topic_rows) and all(row.region.height == 1 for row in topic_rows),
+            "宽屏里主题列表一行一条",
+        )
+
+        await pilot.resize_terminal(91, 36)
+        await pilot.pause(0.3)
+        check(rail.styles.display == "none", "91 列时聊天左栏收起")
+        check(
+            chat.query_one("#rail-split").styles.display == "none",
+            "聊天左栏收起后它的界线一起收起",
+        )
+        check(
+            pane.region.x == 0 and pane.region.width == 91,
+            f"左栏收起后消息区占满整屏：{pane.region.x}+{pane.region.width}",
+        )
+
+        await pilot.resize_terminal(92, 36)
+        await pilot.pause(0.3)
+        check(rail.styles.display != "none", "回到 92 列聊天左栏又出现")
+
+    path.unlink(missing_ok=True)
+
+
+async def run_splitter_checks() -> None:
+    """三栏宽度：方向键、拖动、夹取区间、写进状态文件、终端缩窄后还原。"""
+    path = ROOT / ".probe" / "splitter_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    app = build_app(path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.4)
+        manager = app.session_manager
+        home = app.screen
+        side = home.query_one("#home-side")
+        center = home.query_one("#home-center")
+        check(side.region.width == 34, f"主界面左栏初始 34 列：{side.region.width}")
+
+        # 方向键：界线有焦点时左右各调一格，中间栏跟着让。
+        split = home.query_one("#home-split", Splitter)
+        split.focus()
+        await pilot.press("right", "right")
+        await pilot.pause()
+        check(side.region.width == 36, f"按两次右键左栏加宽两列：{side.region.width}")
+        check(center.region.x == side.region.right + 1, "中间栏跟着界线右移")
+        check(manager.home_rail_width == 36, f"宽度记进会话管理器：{manager.home_rail_width}")
+
+        # 拖动：按住界线往右拖六格。移动事件按相邻两次的位置差累加。
+        start = split.region.x
+        await pilot.mouse_down(split)
+        await pilot.hover(None, offset=(start + 6, 2))
+        await pilot.mouse_up(offset=(start + 6, 2))
+        await pilot.pause()
+        check(side.region.width == 42, f"拖动六格之后左栏 42 列：{side.region.width}")
+        check(
+            tomllib.loads(path.read_text(encoding="utf-8"))["home_rail_width"] == 42,
+            "松手之后宽度写进状态文件",
+        )
+
+        # 夹取：一直往左按，停在最小值，中间栏不会被挤没。
+        for _ in range(30):
+            await pilot.press("left")
+        await pilot.pause()
+        check(side.region.width == HOME_MIN, f"左栏最窄夹到 {HOME_MIN} 列：{side.region.width}")
+        check(center.region.width > 0, f"夹取之后中间栏仍然有宽度：{center.region.width}")
+
+        # 聊天界面：左栏、右栏各一条界线，消息区与输入框一起变窄。
+        manager.create_session("分栏测试")
+        app.open_session(manager.current.id)
+        await pilot.pause(0.4)
+        chat = app.screen
+        rail = chat.query_one("#chat-rail")
+        pane = chat.query_one("#messages-pane")
+        editor = chat.query_one(EditorPane)
+        check(rail.region.width == 30, f"聊天左栏初始 30 列：{rail.region.width}")
+        chat.query_one("#rail-split", Splitter).focus()
+        await pilot.press("right")
+        await pilot.pause()
+        check(rail.region.width == 31, f"右键把聊天左栏加到 31 列：{rail.region.width}")
+        check(
+            pane.region.width == editor.region.width,
+            f"左栏加宽后消息区与输入框仍同宽：{pane.region.width} / {editor.region.width}",
+        )
+
+        for _ in range(30):
+            await pilot.press("left")
+        await pilot.pause()
+        check(rail.region.width == RAIL_MIN, f"聊天左栏最窄夹到 {RAIL_MIN} 列：{rail.region.width}")
+
+        chat.set_sidebar(True)
+        await pilot.pause(0.2)
+        panel = chat.query_one(SidePanel)
+        check(panel.region.width == 30, f"右栏初始 30 列：{panel.region.width}")
+        # 界线在右栏左边：按左键把界线往左推，右栏变宽。
+        chat.query_one("#side-split", Splitter).focus()
+        await pilot.press("left")
+        await pilot.pause()
+        check(panel.region.width == 31, f"左键把右栏加到 31 列：{panel.region.width}")
+        check(
+            pane.region.width == editor.region.width,
+            "右栏加宽后消息区与输入框仍同宽",
+        )
+        state = tomllib.loads(path.read_text(encoding="utf-8"))
+        check(
+            state["rail_width"] == RAIL_MIN and state["side_width"] == 31,
+            f"两条界线各自的宽度都落了盘：{state['rail_width']} / {state['side_width']}",
+        )
+
+        # 终端临时变窄：画面上收一档，状态文件里那份不动；宽回来之后还原。
+        await pilot.resize_terminal(90, 36)
+        await pilot.pause(0.3)
+        check(rail.styles.display == "none", "90 列时聊天左栏收起")
+        check(
+            tomllib.loads(path.read_text(encoding="utf-8"))["side_width"] == 31,
+            "终端变窄不改状态文件里的宽度",
+        )
+        await pilot.resize_terminal(120, 40)
+        await pilot.pause(0.3)
+        check(
+            rail.region.width == RAIL_MIN and panel.region.width == 31,
+            f"宽回来之后两栏恢复用户设定：{rail.region.width} / {panel.region.width}",
+        )
+
+        chat.set_sidebar(False)
+        await pilot.pause(0.2)
+        check(
+            chat.query_one("#side-split").styles.display == "none",
+            "右栏收起后它的界线一起收起",
+        )
+
+    # 下次启动按同一份状态文件摆回来。
+    reloaded = SessionManager(path)
+    check(reloaded.load_from_toml(), "重新读回状态文件")
+    check(
+        (reloaded.home_rail_width, reloaded.rail_width, reloaded.side_width)
+        == (HOME_MIN, RAIL_MIN, 31),
+        f"重启后三栏宽度是上次拖出来的那一份："
+        f"{reloaded.home_rail_width} / {reloaded.rail_width} / {reloaded.side_width}",
+    )
+
+    path.unlink(missing_ok=True)
+
+
+async def run_home_action_checks(server: FakeModelServer) -> None:
+    """输入框底部的操作提示：四格字、附件前缀、模型与工具面板、发送。"""
+    path = ROOT / ".probe" / "home_action_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    script_reply(server)
+    app = build_app(path)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause(0.4)
+        home = app.screen
+        actions = home.query_one("#home-actions")
+        labels = [str(item.content) for item in actions.query(HomeAction)]
+        check(
+            labels == ["@ 文件", "/model 模型", "/tools 工具", "Enter 发送"],
+            f"输入框底部四格提示按顺序排列：{labels}",
+        )
+        box = home.query_one("#home-box")
+        check(
+            actions.region.y > home.input.region.y
+            and actions.region.bottom < box.region.bottom,
+            f"提示行在输入框内部的最下面：{actions.region}，输入框 {box.region}",
+        )
+        send = home.query_one("#home-send-hint")
+        check(
+            send.region.right == home.query_one("#home-box-main").content_region.right,
+            f"发送提示贴在输入框右端：{send.region.right}",
+        )
+
+        # 附件：插入引用前缀，光标留在输入框里接着打字。
+        await pilot.click(home.query_one("#home-action-file"))
+        await pilot.pause()
+        check(home.input.text == "@", f"点附件插入引用前缀：{home.input.text!r}")
+        check(home.input.has_focus, "插入之后焦点仍在输入框")
+
+        # 模型与工具：各自打开面板，输入框里的草稿留着。
+        home.input.text = "草稿"
+        await pilot.click(home.query_one("#home-action-model"))
+        await pilot.pause()
+        check(isinstance(app.screen, ConnectionFormScreen), "点模型打开接口表单")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, HomeScreen), "esc 关掉表单回到主界面")
+        check(home.input.text == "草稿", f"开面板不动输入框里的草稿：{home.input.text!r}")
+
+        await pilot.click(home.query_one("#home-action-tools"))
+        await pilot.pause()
+        check(isinstance(app.screen, ToolsPanelScreen), "点工具打开工具面板")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, HomeScreen), "esc 关掉面板回到主界面")
+
+        # 发送：与回车同一条路，建任务并进入聊天界面。
+        home.input.text = "从发送提示进来"
+        await pilot.pause()
+        await pilot.click(home.query_one("#home-send-hint"))
+        await pilot.pause(0.5)
+        check(isinstance(app.screen, ChatScreen), "点发送进入聊天界面")
+        check(
+            app.session_manager.current.messages[0].parts[0].text == "从发送提示进来",
+            "发送的是输入框里那段文字",
+        )
+        await wait_idle(app, pilot)
+
+    path.unlink(missing_ok=True)
+
+
 async def run() -> None:
     server = FakeModelServer()
     server.start()
@@ -461,8 +894,13 @@ async def run() -> None:
     )
     try:
         await run_tool_card_checks()
+        await run_topic_card_checks()
         await run_coalesce_checks()
         await run_tools_panel_checks()
+        await run_rail_checks()
+        await run_narrow_checks()
+        await run_splitter_checks()
+        await run_home_action_checks(server)
         await run_interface_checks(server)
     finally:
         server.stop()
@@ -507,18 +945,28 @@ async def run_tool_card_checks() -> None:
         output = card.query_one(".tool-output")
         tail = card.query_one(".tool-tail")
         more = card.query_one(".tool-more")
+        # 默认收起：卡上只剩一行标题，输入与输出都不占位置。一轮跑十几步，
+        # 每张卡都摊开的话消息区全被工具正文占满。
+        check(str(output.styles.display) == "none", "工具输入输出默认收起")
+        check(str(tail.styles.display) == "none", "默认收起时末尾几行也不显示")
+        check(str(more.styles.display) == "none", "默认收起时省略行也不显示")
+        check(header.startswith("▸"), f"收起时标题行是合上的箭头：{header}")
+
+        # 点标题行展开：开头三行、末尾三行、中间折成一行。
+        await pilot.click(card.query_one(".tool-header"))
+        await pilot.pause()
         check(
             str(output.render()).splitlines() == ["line 00", "line 01", "line 02"],
-            f"折叠时只留开头三行：{str(output.render()).splitlines()[:4]}",
+            f"展开之后只留开头三行：{str(output.render()).splitlines()[:4]}",
         )
         check(
             str(tail.render()).splitlines() == ["line 37", "line 38", "line 39"],
-            f"折叠时末尾三行还在：{str(tail.render()).splitlines()}",
+            f"展开之后末尾三行还在：{str(tail.render()).splitlines()}",
         )
         check("省略 34 行" in str(more.render()), f"省略行写明折了多少行：{more.render()}")
 
-        # 点省略行展开：省略行留在原地（不然展开几百行之后「收起」就滚出屏幕了），
-        # 中间那一段接在它后面。
+        # 点省略行展开中间那一段：省略行留在原地（不然展开几百行之后「收起」
+        # 就滚出屏幕了），中间那一段接在它后面。
         await pilot.click(more)
         await pilot.pause()
         check("收起" in str(more.render()), f"展开之后省略行变成「收起」：{more.render()}")
@@ -572,6 +1020,209 @@ async def run_tool_card_checks() -> None:
         check(
             re.search(r"\d+(\.\d+)?s", header) is None,
             f"没亲眼看到执行中的卡片不显示耗时：{header}",
+        )
+
+
+async def run_topic_card_checks() -> None:
+    """主题卡：三层的位置、默认展开状态、收起之后的位置与恢复。
+
+    单独开一个小应用，不经过模型服务：这里验的是「位置」与「可见性」，
+    与一轮怎么跑无关。
+    """
+    from vsagent.core.agent.event_log import record_step, seal_topic
+    from vsagent.core.models import Session
+    from vsagent.widgets.topic_card import StepRow, TopicHeader
+
+    session = Session(id="ses_topic_ui", title="主题卡")
+    user = session.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="准备受体"))
+    assistant = session.add_message(Message(role="assistant"))
+    assistant.add_part(Part(type=PartType.STEP_START, text="1 · fake"))
+    first_call = Part(
+        type=PartType.TOOL,
+        tool_name="bash",
+        tool_status=ToolStatus.COMPLETED,
+        tool_input={"command": "ls"},
+        tool_output="a.pdb",
+    )
+    assistant.add_part(first_call)
+    second_call = Part(
+        type=PartType.TOOL,
+        tool_name="bash",
+        tool_status=ToolStatus.COMPLETED,
+        tool_input={"command": "wc -l a.pdb"},
+        tool_output="42",
+    )
+    assistant.add_part(second_call)
+    # 第一个主题切在同一条助手消息的中间：第二个主题的头必须落在那一格上。
+    seal_topic(session, cut=(1, 2))
+    user2 = session.add_message(Message(role="user"))
+    user2.add_part(Part(type=PartType.TEXT, text="跑对接"))
+    assistant2 = session.add_message(Message(role="assistant"))
+    assistant2.add_part(Part(type=PartType.STEP_START, text="2 · fake"))
+    assistant2.add_part(
+        Part(
+            type=PartType.TOOL,
+            tool_name="dock",
+            tool_status=ToolStatus.RUNNING,
+            tool_input={"receptor": "receptor#1"},
+            tool_output="",
+        )
+    )
+    record_step(
+        session,
+        step_no=1,
+        parts=[second_call],
+        message_index=1,
+        part_start=2,
+        part_end=3,
+    )
+
+    class Demo(App):
+        def compose(self) -> ComposeResult:
+            self.pane = MessagesPane()
+            yield self.pane
+
+        def on_mount(self) -> None:
+            self.pane.rebuild(session.messages, session, running=True)
+
+    app = Demo()
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        pane = app.pane
+        headers = list(pane.query(TopicHeader))
+        check(len(headers) == 2, f"两个主题两个头：{len(headers)}")
+        head1, head2 = headers[0], headers[1]
+        check(head1.topic.sealed and not head2.topic.sealed, "两个头的状态分得清")
+        check(head1.parent is pane, "从消息开头起的主题，头挂在消息区这一层")
+        check(
+            head2.parent is not pane,
+            "从消息中间起的主题，头跟在它所属的那条消息里",
+        )
+        check(
+            str(head2.render()).find("正在运行 dock") >= 0,
+            f"进行中的主题写当前工具：{str(head2.render())}",
+        )
+
+        # 默认只展开最后一个：更早的主题收起，它的工具卡不占位置，但提问还在。
+        check(not pane._is_open(head1.topic.key), "更早的主题默认收起")
+        check(pane._is_open(head2.topic.key), "最后一个主题默认展开")
+        check(user.id in pane._message_views, "用户消息是任务的头，不随主题收起")
+        check(
+            pane._message_views[user.id].region.y < head1.region.y,
+            "主题头排在用户消息下面",
+        )
+        check(
+            pane._part_views[first_call.id].has_class("-topic-hidden"),
+            "收起主题里的工具卡不占位置",
+        )
+
+        rows = list(pane.query(StepRow))
+        check(len(rows) == 2, f"两条主题各一步：{len(rows)}")
+        row2 = next(row for row in rows if row.step.part_start == 2)
+        check(
+            "bash" in str(row2.render()),
+            f"行上写着这一步做了什么：{str(row2.render())}",
+        )
+        older_row = next(row for row in rows if row.step.part_start == 1)
+        check(older_row.has_class("-topic-hidden"), "收起主题里的步行跟着不占位置")
+
+        # 点一下展开：整段回来，位置仍在头后面。
+        await pilot.click(head1)
+        await pilot.pause()
+        await pilot.pause()
+        check(pane._is_open(head1.topic.key), "点一下展开这个主题")
+        check(
+            not pane._part_views[first_call.id].has_class("-topic-hidden"),
+            "展开之后工具卡回来",
+        )
+        check(
+            pane._message_views[user.id].region.y < head1.region.y < head2.region.y,
+            "提问、第一个主题、第二个主题的先后不乱",
+        )
+
+        # 再点一下收起，位置不变。
+        await pilot.click(head1)
+        await pilot.pause()
+        await pilot.pause()
+        check(
+            pane._part_views[first_call.id].has_class("-topic-hidden"),
+            "再点一下又收起",
+        )
+
+        # 整条消息都落在收起的主题里时，它连视图都不建。
+        pane.toggle_topic(head2.topic.key)
+        await pilot.pause()
+        check(assistant2.id not in pane._message_views, "收起主题里的整条消息不建视图")
+        pane.toggle_topic(head2.topic.key)
+        await pilot.pause()
+
+        # 自动折叠不动用户手动打开的：先打开，再走一遍折叠。
+        # 这里直接调消息区的入口，点击路径上面两条已经验过，不再依赖屏幕坐标。
+        if not pane._is_open(head1.topic.key):
+            pane.toggle_topic(head1.topic.key)
+        await pilot.pause()
+        check(pane._is_open(head1.topic.key), "准备状态：这条主题是打开的")
+        pane.fold_sealed_topics()
+        await pilot.pause()
+        check(pane._is_open(head1.topic.key), "用户打开过的主题不被自动折叠收走")
+
+        # 点步行：这一步的工具卡跟着收起，行本身仍在。
+        row = pane._step_rows[(1, 2)]
+        await pilot.click(row)
+        await pilot.pause()
+        card = pane._part_views[second_call.id]
+        check(card.has_class("-step-hidden"), "收起一步之后它的工具卡不占位置")
+        check(not row.has_class("-topic-hidden"), "步行自己留在原处当入口")
+
+    # 主题从助手消息的开头起时，标题行挂在消息外面。收起它之后标题行必须还在，
+    # 跟着消息一起摘掉的话这个主题就从画面上消失，再没有地方点开。
+    session2 = Session(id="ses_topic_head", title="头留在画面上")
+    user3 = session2.add_message(Message(role="user"))
+    user3.add_part(Part(type=PartType.TEXT, text="问"))
+    assistant3 = session2.add_message(Message(role="assistant"))
+    assistant3.add_part(Part(type=PartType.TEXT, text="先说一句"))
+    assistant3.add_part(Part(type=PartType.STEP_START, text="1 · fake"))
+    call3 = Part(
+        type=PartType.TOOL,
+        tool_name="bash",
+        tool_status=ToolStatus.COMPLETED,
+        tool_input={"command": "ls"},
+        tool_output="ok",
+    )
+    assistant3.add_part(call3)
+    assistant3.add_part(Part(type=PartType.TEXT, text="答完了"))
+    seal_topic(session2, cut=(1, 0), title="第一段")
+    record_step(
+        session2, step_no=1, parts=[call3], message_index=1, part_start=2, part_end=3
+    )
+
+    class Demo2(App):
+        def compose(self) -> ComposeResult:
+            self.pane = MessagesPane()
+            yield self.pane
+
+        def on_mount(self) -> None:
+            self.pane.rebuild(session2.messages, session2, running=False)
+
+    app2 = Demo2()
+    async with app2.run_test(size=(90, 30)) as pilot2:
+        await pilot2.pause()
+        pane2 = app2.pane
+        second = pane2._topics[-1]
+        pane2.toggle_topic(second.key)
+        await pilot2.pause()
+        await pilot2.pause()
+        head = pane2._header_views.get(second.key)
+        check(head is not None and head.is_mounted, "收起主题之后标题行还在，还有地方点开")
+        check(assistant3.id not in pane2._message_views, "收起的主题里整条消息不建视图")
+        pane2.toggle_topic(second.key)
+        await pilot2.pause()
+        await pilot2.pause()
+        check(
+            pane2._header_views[second.key].region.y
+            < pane2._message_views[assistant3.id].region.y,
+            "展开之后消息排在标题行下面",
         )
 
 
@@ -743,12 +1394,17 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(logo.rstrip("\n").splitlines()[-1].strip() != "", "标题最后一行不是空行")
 
         home = app.screen
+        center = home.query_one("#home-center").region
         box = home.query_one("#home-box").region
         help_line = home.query_one("#home-help").region
         footer = home.query_one("#home-footer").region
         version = home.query_one("#home-footer-right").region
         path_label = home.query_one("#home-footer-left").content
-        check(2 * box.x + box.width == app.size.width, "核心文本框在屏幕内水平居中")
+        # 中间栏的宽度可能是奇数，82 格宽的文本框两边各差一列是居中能做到的最接近结果。
+        check(
+            abs(2 * (box.x - center.x) + box.width - center.width) <= 1,
+            "核心文本框在中间那一栏里水平居中",
+        )
         check(help_line.right == box.right, "帮助行与文本框右边缘位置相同")
         check(footer.bottom == app.size.height, "底部状态栏贴在屏幕最底")
         check(version.right == app.size.width - 2, "版本号靠右显示")
@@ -857,6 +1513,13 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         chat = app.screen
         editor = chat.query_one(EditorPane)
         pane = chat.query_one(MessagesPane)
+        # 输入框与消息区同在一栏里：宽度与左边界必须一致，否则上下两段对不齐。
+        check(
+            editor.region.x == pane.region.x
+            and editor.region.width == pane.region.width,
+            f"输入框与消息区同宽同左边界：输入 {editor.region.x}+{editor.region.width}，"
+            f"消息 {pane.region.x}+{pane.region.width}",
+        )
 
         # 刚进来还没在编辑器里提交过任何输入，历史是空的：往上往下翻都要什么都不做。
         # 上一条消息是从启动界面发出去的，走的是另一个组件，不会进这里的历史。
@@ -953,10 +1616,13 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         )
         check(
             chat.query_one("#chat-body").region.height
-            == app.size.height
-            - editor.region.height
-            - chat.query_one(StatusBar).region.height,
-            "消息区占满剩下的整个高度：区块与状态栏之外的全部",
+            == app.size.height - chat.query_one(StatusBar).region.height,
+            "对话区与输入框合起来占满状态栏以外的整个高度",
+        )
+        check(
+            pane.region.height
+            == chat.query_one("#chat-main").region.height - editor.region.height,
+            "消息区占满输入框以外的全部高度",
         )
         pane_bottom = editor.region.bottom
         status_bar = app.screen.query_one("#status-bar")
@@ -1287,7 +1953,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             # 纵向滚动条出现的那一帧与子视图重新排布的那一帧不是同一帧，
             # 中间读到的宽度会差滚动条的那两列。
             await wait_idle(app, pilot)
-            user_view = pane.query(".message-user").first()
+            # 新的用户消息一进来，上一个主题就收起了（标题行留在原处），
+            # 所以这里量的是刚发出去的那一条，不是会话里的第一条。
+            user_view = pane.query(".message-user").last()
             check(
                 user_view.styles.background.hex.lower() == "#1a1a1a",
                 f"用户消息带浅灰底色：{user_view.styles.background}",
@@ -1311,7 +1979,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
                 f"正文不贴着气泡顶边：气泡 {user_view.region.y} 正文 {user_text.region.y}",
             )
             user_lines = rendered_lines(user_text)
-            check(user_lines == ["from home"], f"用户消息只显示提问本身：{user_lines}")
+            check(user_lines == ["hello"], f"用户消息只显示提问本身：{user_lines}")
 
             await wait_idle(app, pilot)
             check(
@@ -1375,6 +2043,13 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             user_text.content_region.x == reply_text.content_region.x,
             f"用户提问与回复正文的文字起始列相同：{user_text.content_region.x}，{reply_text.content_region.x}",
         )
+        # 输入框与消息区同宽之后，两边的文字也从同一列起：输入框 3 列内边距 + 竖线 + 1 列，
+        # 正文 1 列窗格内边距 + 2 列消息内边距 + 2 列 Markdown 内边距，都是 5 列。
+        check(
+            editor.input.content_region.x == reply_text.content_region.x,
+            f"输入框文字与正文同一列：{editor.input.content_region.x}，"
+            f"{reply_text.content_region.x}",
+        )
         # 走 SimplePartView 的那几类（引用文件、补丁摘要）自己补上与正文同一档的
         # 两列内边距，否则它们的文字会比同一条消息里别的行左移两列。
         # 步骤分隔线不再画出来：它是内部计数，卡片之间的留白已经把每一步分开。
@@ -1402,6 +2077,16 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(
             str(fold._body.styles.display) == "none",
             f"折叠时正文不显示：display={fold._body.styles.display}",
+        )
+        # 思考块是某一步里的内容，缩进要和步行一致：左边那条竖线落在步行的「▸」那一列，
+        # 正文与步行的文字同一列。与回复正文取齐时看不出它属于哪一步。
+        from vsagent.widgets.topic_card import StepRow
+
+        step_row = pane.query(StepRow).first()
+        check(
+            fold.content_region.x == step_row.content_region.x,
+            f"思考块与步行的文字起始列相同：思考 {fold.content_region.x}，"
+            f"步行 {step_row.content_region.x}",
         )
         # 消息区这时是滚到底的，靠前的标题可能已经在可视区之上。点的是屏幕坐标，
         # 先等画面稳住再把它滚进视野：生成结束时 `_on_turn_done` 排过一次"滚到底并
@@ -1524,8 +2209,15 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         card._part.tool_output = original_output
         card.sync(card._part)
 
-        # 点标题行可以把这一条输出单独收起，再点一下展开。点的是屏幕坐标，先把头部滚进视野。
-        # 这时思考块刚被点过，焦点在消息区里，点完要把焦点交还输入框。
+        # 工具输入输出默认收起：先点开，再点标题行把这一条单独收起、点回来。
+        # 点的是屏幕坐标，先把头部滚进视野。这时思考块刚被点过，焦点在消息区里，
+        # 点完要把焦点交还输入框。
+        check(
+            all(str(item._output.styles.display) == "none" for item in tool_cards),
+            "工具输入输出默认收起",
+        )
+        card.set_output_visible(True)
+        await pilot.pause()
         window = pane.region
         card.scroll_visible(animate=False)
         await pilot.pause()
@@ -1874,15 +2566,20 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(app.session_manager.show_details is not details_before, "/details 切换工具详情")
         card_output = pane.query(ToolCard)[0].query_one(".tool-output")
-        expected = "block" if app.session_manager.show_details else "none"
+        first = "block" if app.session_manager.show_details else "none"
         check(
-            str(card_output.styles.display) == expected,
+            str(card_output.styles.display) == first,
             f"工具详情开关作用到画面上：开关 {app.session_manager.show_details}，输出 display={card_output.styles.display}",
         )
         await type_text(pilot, "/details")
         await pilot.press("enter")
         await pilot.pause()
-        check(str(card_output.styles.display) == "block", "再执行一次工具输出回到画面")
+        second = "block" if app.session_manager.show_details else "none"
+        check(second != first, "再执行一次开关回到另一档")
+        check(
+            str(card_output.styles.display) == second,
+            f"两次切换都作用到画面上：输出 display={card_output.styles.display}",
+        )
 
         panel = chat.query_one(SidePanel)
         pane_width = pane.region.width
@@ -1901,7 +2598,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(panel.has_class("-visible"), "点开关打开侧栏")
         check("收起" in str(toggle.render()), f"侧栏开着时开关写「收起」：{toggle.render()}")
-        check(pane.region.width == pane_width - 30, "点开关打开时消息区同样让出宽度")
+        check(pane.region.width == pane_width - 31, "点开关打开时消息区让出侧栏与界线")
         await pilot.click(toggle)
         await pilot.pause()
         check(not panel.has_class("-visible"), "再点一下把侧栏收起来")
@@ -1918,13 +2615,14 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(str(panel.styles.display) == "block", "侧栏打开后参与布局")
         check(panel.region.width == 30, "侧栏宽 30 列")
         check(panel.region.right == app.size.width, "侧栏贴在屏幕右边缘")
-        check(pane.region.width == pane_width - 30, "消息区让出侧栏占用的宽度")
+        check(pane.region.width == pane_width - 31, "消息区让出侧栏与界线的宽度")
         check(
             len(chat.query("#side-session")) == 0,
             "侧栏不重复显示会话标题（它已经在底部状态栏最左端）",
         )
         check(
-            sorted(panel._written) == ["#side-files", "#side-stats", "#side-tools"],
+            sorted(panel._written)
+            == ["#side-artifacts", "#side-files", "#side-stats", "#side-tools"],
             f"打开侧栏时把内容补齐：{sorted(panel._written)}",
         )
         check(
@@ -2651,6 +3349,14 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         check(isinstance(app.screen, ChatScreen), "escape 回到聊天界面")
 
+        # 主题默认只展开最后一个，收起之后整段只剩标题行，内容可能不足一屏。
+        # 下面几条验的是滚动本身，先把每个主题都打开。
+        for topic in pane._topics:
+            if not pane._is_open(topic.key):
+                pane.toggle_topic(topic.key)
+        await pilot.pause()
+        await pilot.pause()
+
         pane.focus()
         await pilot.pause()
         check(pane.max_scroll_y > 0, "消息列表内容超过一屏")
@@ -2935,10 +3641,16 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             bool(expected_order),
             f"切换过去的会话本来有消息，这条检查才说明得了问题：{len(expected_order)} 条",
         )
+        # 更早的主题是收起的：收起的只留提问，过程不建视图。所以画面是当前会话的
+        # 一段子序列，顺序不变、末尾对得上，而不是一整段尾巴。
         check(
-            drawn == expected_order[-len(drawn) :],
-            f"画出来的是当前会话最后那一段：画面 {len(drawn)} 条，当前会话 {len(expected_order)} 条，"
-            f"删掉的是 {doomed}",
+            drawn == [message_id for message_id in expected_order if message_id in set(drawn)],
+            f"画出来的是当前会话里的消息，顺序不变：画面 {len(drawn)} 条，"
+            f"当前会话 {len(expected_order)} 条，删掉的是 {doomed}",
+        )
+        check(
+            drawn and drawn[-1] == expected_order[-1],
+            f"画面最后一条就是当前会话最后一条：{drawn[-1:]} 对 {expected_order[-1:]}",
         )
 
         # 聊天界面用 /new 新建会话；启动界面那一次在文件末尾单独开的会话里验。

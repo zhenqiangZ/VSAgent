@@ -45,7 +45,6 @@ class SessionManager:
         self.theme: str = "textual-dark"
         self.last_model_id: str = ""
         self.last_agent: str = "Build"
-        self.show_details: bool = False
         self.show_thinking: bool = True
         # 三栏的宽度由用户拖动分栏界线决定，启动时按状态文件里那一份摆回来。
         self.rail_width: int = 30
@@ -177,7 +176,6 @@ class SessionManager:
             "current_session_id": self.current_session_id,
             "last_model_id": self.last_model_id,
             "last_agent": self.last_agent,
-            "show_details": self.show_details,
             "show_thinking": self.show_thinking,
             "rail_width": self.rail_width,
             "side_width": self.side_width,
@@ -247,7 +245,6 @@ class SessionManager:
         self.theme = str(state.get("theme", self.theme))
         self.last_model_id = str(state.get("last_model_id", ""))
         self.last_agent = str(state.get("last_agent", self.last_agent))
-        self.show_details = bool(state.get("show_details", False))
         self.show_thinking = bool(state.get("show_thinking", True))
         self.rail_width = width_from(state, "rail_width", 30, RAIL_MIN, RAIL_MAX)
         self.side_width = width_from(state, "side_width", 30, SIDE_MIN, SIDE_MAX)

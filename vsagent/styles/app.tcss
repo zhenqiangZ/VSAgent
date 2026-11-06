@@ -71,6 +71,33 @@ ModalScreen {
     margin-top: 1;
 }
 
+/* 输入框下方的快捷入口：三个任务模板，点一下填进输入框，不提交。
+   矮终端里整行收起（见 `HomeScreen.apply_quick_visibility`），这里只管常态。 */
+#home-quick {
+    width: 82;
+    max-width: 100%;
+    height: 1;
+    margin-top: 1;
+}
+
+.quick-label {
+    width: auto;
+    height: 1;
+    margin-right: 2;
+    color: #4A4A4A;
+}
+
+.quick-task {
+    width: auto;
+    height: 1;
+    margin-right: 2;
+    color: #8B949E;
+}
+
+.quick-task:hover {
+    color: #4A9EFF;
+}
+
 /* 左栏的分节标题：与上面那段留一行空白，第一段不留（列表顶部本来就贴着栏边）。
    列表行的高度写在组件自己的 DEFAULT_CSS 里（一行一条）。行用的类名是 `rail-row`：
    会话选择器那一屏的 `.session-row` 是两行条目，同名会把高度覆盖掉。 */
@@ -318,6 +345,11 @@ ModalScreen {
        亮蓝留给当前选中的条目。 */
     color: #8B949E;
     text-style: bold;
+}
+
+/* 第一段顶着上边缘：整栏只有二十来行，白空一行就是一条产物的位置。 */
+#side-panel .side-section.-first {
+    margin-top: 0;
 }
 
 #side-panel .side-line {
@@ -992,6 +1024,31 @@ ContextUsageScreen {
 /* ------------------------------------------------------------------ */
 /* 子 agent                                                            */
 /* ------------------------------------------------------------------ */
+
+/* 右栏的产物列表。一行一条，宽度沿用 #side-panel：handle 只有十来个字符，
+   真正的路径在运行目录里，列在这里反而不像能把名字抄走的东西。 */
+#side-artifacts {
+    height: auto;
+    max-height: 7;
+    background: #0A0A0A;
+    border: none;
+    padding: 0;
+}
+
+#side-artifacts > .option-list--option {
+    height: 1;
+    padding: 0;
+    color: #4A9EFF;
+}
+
+#side-artifacts > .option-list--option-highlighted {
+    background: #1A1A1A;
+    color: #E0E0E0;
+}
+
+#side-artifacts > .option-list--option-disabled {
+    color: #5A5A5A;
+}
 
 /* 右栏的子 agent 列表。宽度沿用 #side-panel 的 30 列：
    再宽会吃掉消息区，而标题已经按 12 格截过。 */

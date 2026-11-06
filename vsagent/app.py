@@ -15,12 +15,17 @@ from .core.agent.domain.survey import SurveyStructuresTool
 from .core.agent.event_log import domain_tools as event_tools
 from .core.agent.event_log import render_event_detail
 from .core.agent.domain.corpus import ingest_files
-from .core.agent.domain.export import OpenViewerTool, WriteRunTool, runs_dir
+from .core.agent.domain.export import (
+    OpenViewerTool,
+    WriteRunTool,
+    runs_dir,
+    viewer_address,
+)
 from .core.web.service import WebService, web_root
 from .core.agent.hooks import HookRunner, default_hooks_paths, load_hooks
 from .core.agent.host import AgentHost
 from .core.agent.hypothesis import HypothesisTool
-from .core.agent.ledger import SessionLedger
+from .core.agent.ledger import LedgerError, SessionLedger
 from .core.agent.loop import AgentLoop, max_steps_from_env
 from .core.agent.memory import MemoryStore, RecallTool, RememberTool
 from .core.agent.spawn import AgentStatusTool, SpawnAgentTool
@@ -1007,11 +1012,22 @@ class VSAgentApp(App[None]):
         top.editor.text = read_buffer(buffer).rstrip("\n")
 
     def _command_details(self) -> None:
-        """切换工具执行详情。"""
-        self.session_manager.show_details = not self.session_manager.show_details
-        self._apply_display_toggles()
-        state = "显示" if self.session_manager.show_details else "隐藏"
-        self.show_toast(f"工具详情：{state}", "info")
+        """展开或收起当前（最后一个）主题的全部工具输出。
+
+        不做全局开关：一次翻开所有已建出的卡片，滚动长度与每帧重排的代价一起涨，
+        而且下一次打开会话还是展开的。按主题控制，作用范围与读者眼前那一段一致。
+        """
+        top = self.screen
+        if not isinstance(top, ChatScreen):
+            self.show_toast("请先进入聊天界面", "warning")
+            return
+        topics = top.messages.topics
+        if not topics:
+            self.show_toast("这一轮还没有主题", "info")
+            return
+        visible = top.messages.toggle_topic_tools(topics[-1].key)
+        state = "展开" if visible else "收起"
+        self.show_toast(f"当前主题的工具输出：{state}", "info")
 
     def _command_effort(self) -> None:
         """按 low → medium → high 轮换推理强度。"""
@@ -1382,11 +1398,33 @@ class VSAgentApp(App[None]):
                 screen.rebuild()
                 return
 
+    def _chat_screen(self) -> ChatScreen | None:
+        """沿屏幕层级往下找聊天界面。当前最上面可能是弹窗。"""
+        for screen in reversed(self.screen_stack):
+            if isinstance(screen, ChatScreen):
+                return screen
+        return None
+
+    def open_artifact(self, handle: str) -> None:
+        """在浏览器里打开一个产物的网页视图。
+
+        地址由 `export.viewer_address` 算，与模型调 `open_viewer` 拿到的是同一个：
+        界面上点一下与工具返回的链接必须指向同一页。
+        """
+        chat = self._chat_screen()
+        session = chat.session if chat is not None else self.active_session
+        try:
+            url = viewer_address(self.host.ledger_for(session), handle, self.web_service)
+        except (LedgerError, LookupError, ValueError) as error:
+            # 登记表里没有、服务没起来、这个产物没有网页视图。三种都要说清是哪种。
+            self.show_toast(str(error), "warning")
+            return
+        self.open_url(url)
+
     def _apply_display_toggles(self) -> None:
         """把显示开关应用到消息列表。"""
         top = self.screen
         if isinstance(top, ChatScreen):
-            top.messages.set_details(self.session_manager.show_details)
             top.messages.set_thinking(self.session_manager.show_thinking)
 
     def show_diff(self, diff_text: str | None = None) -> None:

@@ -20,7 +20,7 @@ from ..core.models import Message, Part, PartType, Session, ToolStatus
 from ..core.session_manager import RAIL_MAX, RAIL_MIN, SIDE_MAX, SIDE_MIN
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import EditorPane
-from ..widgets.messages_pane import SESSION_STATUS_TEXT, STATUS_ICON, MessagesPane
+from ..widgets.messages_pane import SESSION_STATUS_TEXT, MessagesPane
 from ..widgets.session_list import SessionList, SessionRow
 from ..widgets.splitter import Splitter
 from ..widgets.status_bar import (
@@ -29,11 +29,14 @@ from ..widgets.status_bar import (
     StatusBar,
     format_tokens,
 )
+from ..widgets.topic_card import ArtifactChip
 from ..widgets.topic_list import TopicList, TopicRow
 from .context_usage import ContextUsageScreen
 
 # 中间那一栏至少要留这么多列。拖动分栏界线时宽度夹在这里，终端变窄时按同一档重算。
 MIN_MAIN_WIDTH = 40
+# 右栏最多列这么多条产物。再多就要滚动，而它是一份索引，不是正文。
+ARTIFACT_ROWS = 6
 
 
 def _short(text: str, width: int) -> str:
@@ -50,8 +53,8 @@ def _short(text: str, width: int) -> str:
     return text + "…"
 
 
-class AgentOptionList(OptionList):
-    """右栏的子 agent 列表。
+class SideOptionList(OptionList):
+    """右栏的可点列表（产物、子 agent 各一个）。
 
     单独一个类是为了给 esc 一个出口：列表拿到焦点之后，按 esc 要能回到
     输入框。否则键盘用户只能靠鼠标点回去，而 `/agents` 的意义正是给不摸鼠标的人用。
@@ -68,13 +71,16 @@ class AgentOptionList(OptionList):
 
 
 class SidePanel(Vertical):
-    """会话右栏：子 agent 列表在上，上下文信息在下。
+    """会话右栏：产物在上，子 agent 与用量在下。
 
+    产物排第一：这一栏最常被打开的时刻是「这一段做出了什么」。
     子 agent 段只在有子会话时出现；没有时不占任何高度，/sidebar 的行为与以前一致。
     列表用 `OptionList` 而不是 `Static`：它要能点。
 
     这一段不写会话名与模型名：会话名在底部状态栏，模型名也在那里。
     同一个名字在两处出现，读的人要自己判断哪一个才是真的。
+    引用文件与工具调用两份清单不再列：消息区里的文件 Part 与步行已经各写了一遍，
+    30 列的面板里再抄一份，占掉的正是产物要用的高度。
     """
 
     class AgentPicked(TextualMessage):
@@ -84,27 +90,33 @@ class SidePanel(Vertical):
             super().__init__()
             self.session_id = session_id
 
+    class ArtifactPicked(TextualMessage):
+        """用户点了右栏里的一个产物。"""
+
+        def __init__(self, handle: str) -> None:
+            super().__init__()
+            self.handle = handle
+
     def __init__(self, id: str | None = None) -> None:
         super().__init__(id=id)
         self._written: dict[str, str] = {}
+        # None 表示还没画过：空名单与「还没算过」要分开，否则第一次打开侧栏时
+        # 那行「还没有产物」会被当成「名单没变」跳过。
+        self._artifacts: list[str] | None = None
 
     def compose(self) -> ComposeResult:
+        yield Static("产物", classes="side-section -first")
+        yield SideOptionList(id="side-artifacts")
         yield Static("子 AGENT", id="side-agents-title", classes="side-section")
-        yield AgentOptionList(id="side-agents")
+        yield SideOptionList(id="side-agents")
         yield Static("用量", id="side-context-title", classes="side-section")
         yield Static("", id="side-stats", classes="side-line", markup=False)
-        yield Static("引用文件", classes="side-section")
-        yield Static("", id="side-files", classes="side-body", markup=False)
-        yield Static("工具调用", classes="side-section")
-        yield Static("", id="side-tools", classes="side-body", markup=False)
-        yield Static("产物", classes="side-section")
-        yield Static("", id="side-artifacts", classes="side-body", markup=False)
 
     def update_context(self, session: Session) -> None:
-        """按当前会话刷新用量、引用文件与工具清单。
+        """按当前会话刷新产物与用量。
 
-        侧栏没打开时整个跳过：底下这两份清单要把会话里全部 Part 走一遍，
-        而它们算出来只会写进一个不显示的组件。打开侧栏的那一处会重新调一次。
+        侧栏没打开时整个跳过：产物清单要把会话里全部事件走一遍，
+        而它算出来只会写进一个不显示的组件。打开侧栏的那一处会重新调一次。
         """
         if not self.has_class("-visible"):
             return
@@ -118,25 +130,46 @@ class SidePanel(Vertical):
         stats += f"\n未命中 {format_tokens(session.total_uncached())}"
         stats += f"\n输出 {format_tokens(session.total_output())} · ${session.total_cost():.2f}"
         self._write("#side-stats", stats)
-        self._write("#side-files", self._files_text(session))
-        self._write("#side-tools", self._tools_text(session))
-        self._write("#side-artifacts", self._artifacts_text(session))
+        self._refresh_artifacts(session)
 
     @staticmethod
-    def _artifacts_text(session: Session) -> str:
+    def _artifact_handles(session: Session) -> list[str]:
         """这一轮产出的 handle，按主题倒序取最近几条。
 
+        未封存那一段也算：一轮跑完才封存，只看 `session.events` 的话，
+        刚刚写出来的运行目录要等这一轮结束才出现在栏里。
         handle 只在产出它的那次会话里有效，所以这里只列名字，不给路径：
-        要看文件去运行目录，要把 handle 交给工具就照抄整行。
+        要点开就去网页端，要交给工具就照抄整行。
         """
         names: list[str] = []
+
+        def remember(handle: str) -> None:
+            if handle and handle not in names and len(names) < ARTIFACT_ROWS:
+                names.append(handle)
+
+        for step in reversed(session.pending_steps):
+            for handle in step.artifacts:
+                remember(handle)
         for event in reversed(session.events):
-            for name in event.artifacts:
-                if name not in names:
-                    names.append(name)
-            if len(names) >= 6:
+            if len(names) >= ARTIFACT_ROWS:
                 break
-        return "\n".join(names[:6]) if names else "还没有产物"
+            for handle in event.artifacts:
+                remember(handle)
+        return names
+
+    def _refresh_artifacts(self, session: Session) -> None:
+        """重画产物清单。名单没变就不动，省掉一遍组件的重建。"""
+        listing = self.query_one("#side-artifacts", SideOptionList)
+        handles = self._artifact_handles(session)
+        if handles == self._artifacts:
+            return
+        self._artifacts = handles
+        listing.clear_options()
+        if not handles:
+            listing.add_option(Option("还没有产物", disabled=True))
+            return
+        for handle in handles:
+            listing.add_option(Option(handle, id=handle))
 
     def refresh_agents(self, children: list[Session], current_id: str) -> None:
         """重画子 agent 列表。
@@ -150,7 +183,7 @@ class SidePanel(Vertical):
         if not self.has_class("-visible"):
             return
         title = self.query_one("#side-agents-title", Static)
-        listing = self.query_one("#side-agents", AgentOptionList)
+        listing = self.query_one("#side-agents", SideOptionList)
         visible = bool(children)
         title.styles.display = "block" if visible else "none"
         listing.styles.display = "block" if visible else "none"
@@ -192,8 +225,12 @@ class SidePanel(Vertical):
             )
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        """点中一行：交给聊天界面去压栈。"""
-        if event.option.id:
+        """点中一行：产物交给应用去打开页面，子 agent 交给聊天界面去压栈。"""
+        if not event.option.id:
+            return
+        if event.option_list.id == "side-artifacts":
+            self.post_message(self.ArtifactPicked(event.option.id))
+        else:
             self.post_message(self.AgentPicked(event.option.id))
 
     def focus_agents(self) -> bool:
@@ -201,7 +238,7 @@ class SidePanel(Vertical):
 
         `/agents` 走这里：命令才是这个项目里稳定的入口，键位只留给最常按的几个。
         """
-        listing = self.query_one("#side-agents", AgentOptionList)
+        listing = self.query_one("#side-agents", SideOptionList)
         if not listing.options:
             return False
         listing.focus()
@@ -213,27 +250,6 @@ class SidePanel(Vertical):
             return
         self._written[selector] = text
         self.query_one(selector, Static).update(text)
-
-    @staticmethod
-    def _files_text(session: Session) -> str:
-        """列出会话里引用过的文件，按首次出现的顺序排列。"""
-        paths: list[str] = []
-        for message in session.messages:
-            for part in message.parts:
-                if part.type is PartType.FILE and part.file_path not in paths:
-                    paths.append(part.file_path)
-        return "\n".join(paths) if paths else "（暂无）"
-
-    @staticmethod
-    def _tools_text(session: Session) -> str:
-        """列出会话里调用过的工具与它最后一次的状态。"""
-        tools: dict[str, ToolStatus] = {}
-        for message in session.messages:
-            for part in message.parts:
-                if part.type is PartType.TOOL and part.tool_name:
-                    tools[part.tool_name] = part.tool_status or ToolStatus.PENDING
-        lines = [f"{STATUS_ICON[status]} {name}" for name, status in tools.items()]
-        return "\n".join(lines) if lines else "（暂无）"
 
 
 class ChatScreen(Screen):
@@ -490,7 +506,6 @@ class ChatScreen(Screen):
         self.messages.rebuild(
             session.messages, session, running=self.app.host.is_running(session.id)
         )
-        self.messages.set_details(self.app.session_manager.show_details)
         self.messages.set_thinking(self.app.session_manager.show_thinking)
         self.refresh_rail()
         self.refresh_status()
@@ -513,6 +528,11 @@ class ChatScreen(Screen):
         """点左栏的主题：打开它并滚到那一章。"""
         message.stop()
         self.messages.focus_topic(message.key)
+
+    def on_artifact_chip_picked(self, message: ArtifactChip.Picked) -> None:
+        """点主题下面的产物名：在浏览器里打开它的网页视图。"""
+        message.stop()
+        self.app.open_artifact(message.handle)
 
     def _context_metrics(self) -> dict[str, object] | None:
         """最近一步的上下文度量；还没有发过请求时返回 None。
@@ -652,6 +672,9 @@ class ChatScreen(Screen):
             part.tool_status = ToolStatus.FAILED
             part.tool_output = "interrupted"
             self.messages.update_part(part)
+        # 取消这一条不走 `turn.done`（循环层明确跳过收尾），消息区不会自己知道已经停下：
+        # 不收回来，主题头会一直写着「进行中」。
+        self.messages.set_running(False)
         self._busy = False
         self.refresh_status()
         self.app.save_state()
@@ -682,6 +705,11 @@ class ChatScreen(Screen):
     def on_side_panel_agent_picked(self, event: SidePanel.AgentPicked) -> None:
         """右栏点了一个子 agent：压栈进入它的界面。"""
         self.app.open_subagent(event.session_id)
+
+    def on_side_panel_artifact_picked(self, event: SidePanel.ArtifactPicked) -> None:
+        """右栏点了一个产物：在浏览器里打开它的网页视图。"""
+        event.stop()
+        self.app.open_artifact(event.handle)
 
     def _on_palette_result(self, command_name: str | None) -> None:
         """命令面板选中的命令。"""

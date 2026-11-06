@@ -2116,7 +2116,7 @@ class OpenViewerTool(Tool):
             except Exception as error:
                 return ToolResult(output=str(error), failed=True)
             meta = entry.meta or {}
-            run_id = str(meta.get("run_id") or entry.path.name if entry.path else "")
+            run_id = str(meta.get("run_id") or (entry.path.name if entry.path else ""))
             # 结构全景是另一种产物（`survey_structures` 写的），页面地址也不同：
             # 它没有运行目录，只有一份 survey.json 与它的目录名。
             survey_id = str(meta.get("survey_id") or "")
@@ -2147,18 +2147,11 @@ class OpenViewerTool(Tool):
         if survey_id:
             url += f"#/survey/{quote(survey_id, safe='')}"
         elif run_id:
+            url = viewer_address(ledger, str(raw).strip(), viewer, port)
             if molecule:
-                url += (
-                    f"#/structure/{quote(run_id, safe='')}"
-                    f"?molecule={quote(molecule, safe='')}"
-                )
+                url += f"?molecule={quote(molecule, safe='')}"
             elif pocket:
-                url += (
-                    f"#/structure/{quote(run_id, safe='')}"
-                    f"?pocket={quote(pocket, safe='')}&view={view}"
-                )
-            else:
-                url += f"#/structure/{quote(run_id, safe='')}"
+                url += f"?pocket={quote(pocket, safe='')}&view={view}"
 
         opened = False
         if arguments.get("open_browser"):
@@ -2190,6 +2183,31 @@ class OpenViewerTool(Tool):
                 "view": view,
             },
         )
+
+
+def viewer_address(
+    ledger: SessionLedger, handle: str, viewer: Any, port: int | None = None
+) -> str:
+    """把一个产物条目换成它在本地网页上的地址。
+
+    只认 `ArtifactHandle`：登记表里还有受体、配体集这些条目，它们没有页面。
+    地址拼装留在这里，工具与界面共用一份——两处各写一遍，一处加了口袋参数、
+    另一处没加，同一个产物会打开两个不同的页面。
+    """
+    entry = ledger.get(handle)
+    expect_handle(entry, ArtifactHandle, "run")
+    meta = entry.meta or {}
+    run_id = str(meta.get("run_id") or (entry.path.name if entry.path else ""))
+    survey_id = str(meta.get("survey_id") or "")
+    resolved = port or _resolve_port(viewer)
+    if not resolved:
+        raise LookupError("本地结构服务没有在监听")
+    url = f"http://127.0.0.1:{resolved}/"
+    if survey_id:
+        return url + f"#/survey/{quote(survey_id, safe='')}"
+    if run_id:
+        return url + f"#/structure/{quote(run_id, safe='')}"
+    raise ValueError(f"{handle} 没有网页视图")
 
 
 def _resolve_port(viewer: Any) -> int:

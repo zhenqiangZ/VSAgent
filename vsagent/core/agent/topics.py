@@ -130,6 +130,22 @@ def _has_parts(messages: list[Message], start: Position, end: Position) -> bool:
     return False
 
 
+def _stopped_status(session: Session, steps: list[Step]) -> str:
+    """一轮停下来之后这一段的结局。
+
+    会话状态先说：用户按停的那一轮写的是 `cancelled`，它在封存之前也要画成中断，
+    否则界面上只剩一个「未封存」，事后分不出这是被停下的还是进程断掉的。
+    其次看最后一步：停在失败上就算这一段没有做成，与 `Event.status` 同一口径。
+    """
+    if session.status == "cancelled":
+        return "interrupted"
+    if session.status == "failed":
+        return "failed"
+    if steps and steps[-1].issues:
+        return "failed"
+    return "unsealed" if steps else "completed"
+
+
 def _tail_view(session: Session, start: Position, end: Position, *, running: bool) -> TopicView:
     """还没封存的那一段。
 
@@ -171,7 +187,7 @@ def _tail_view(session: Session, start: Position, end: Position, *, running: boo
         title=session.topic_title,
         # 纯聊天的一轮没有流水，轮末也不封存；它已经说完了，画成「未封存」会让人
         # 去找一个不存在的记录。有步却没在跑的，才是进程断在一轮中间。
-        status="running" if running else ("unsealed" if steps else "completed"),
+        status="running" if running else _stopped_status(session, steps),
         start=start,
         end=end,
         steps=steps,

@@ -147,6 +147,25 @@ def _tool_list(actions: list[str]) -> str:
     return head + (f" 等 {len(actions)} 个" if len(actions) > 3 else "")
 
 
+# 工具返回的读数里，这三个键装的是产物引用。步的流水与工具卡上的产物行
+# 都从这里取：各写一份的话，一处认 `run_id`、另一处只认 `handle`，
+# 同一张卡与它那一步会给出不同的产物。
+ARTIFACT_META_KEYS = ("handle", "ref", "run_id")
+
+
+def artifact_refs(meta: Any) -> list[str]:
+    """工具返回的结构化读数里的产物引用，去重且保序。"""
+    if not isinstance(meta, dict):
+        return []
+    refs: list[str] = []
+    for key in ARTIFACT_META_KEYS:
+        value = meta.get(key)
+        text = value.strip() if isinstance(value, str) else ""
+        if text and text not in refs:
+            refs.append(text)
+    return refs
+
+
 def _arg_text(value: Any) -> str:
     """把一个参数压成一句可读的短文本。
 
@@ -206,10 +225,8 @@ def step_from_parts(
         rendered = "、".join(f"{key}={_arg_text(item)}" for key, item in list(given.items())[:3])
         args.append(f"{part.tool_name}({rendered})" if rendered else part.tool_name)
         meta = part.tool_meta if isinstance(part.tool_meta, dict) else {}
-        for key in ("handle", "ref", "run_id"):
-            value = meta.get(key)
-            if isinstance(value, str) and value.strip():
-                remember(value.strip())
+        for value in artifact_refs(meta):
+            remember(value)
         head = _short(part.tool_output, STEP_RESULT_MAX)
         if part.tool_status is ToolStatus.FAILED:
             issues.append(head or "没有写明原因")

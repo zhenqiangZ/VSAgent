@@ -14,7 +14,7 @@ COMMANDS: dict[str, dict[str, object]] = {
     "connect": {"desc": "添加提供商", "aliases": []},
     "context": {"desc": "查看上下文用量", "aliases": []},
     "delete": {"desc": "删除当前会话", "aliases": ["remove"]},
-    "details": {"desc": "切换工具执行详情", "aliases": []},
+    "details": {"desc": "展开或收起当前主题的工具输出", "aliases": []},
     "editor": {"desc": "打开外部编辑器", "aliases": []},
     "effort": {"desc": "轮换推理强度", "aliases": []},
     "events": {"desc": "查看会话事件", "aliases": []},

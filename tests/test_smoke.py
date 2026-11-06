@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 import vsagent  # noqa: E402
 import re  # noqa: E402
 from rich.cells import cell_len  # noqa: E402
+from rich.text import Text  # noqa: E402
 from textual import events  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.css.stylesheet import Stylesheet  # noqa: E402
@@ -45,7 +46,16 @@ from vsagent.core.external_editor import (  # noqa: E402
     write_buffer,
 )
 from vsagent.core.file_refs import resolve_file_refs  # noqa: E402
-from vsagent.core.models import EFFORTS, Message, Part, PartType, ToolStatus  # noqa: E402
+from vsagent.core.models import (  # noqa: E402
+    EFFORTS,
+    Event,
+    Message,
+    Part,
+    PartType,
+    Session,
+    Step,
+    ToolStatus,
+)
 from vsagent.core.project_scan import BEGIN_MARK, END_MARK  # noqa: E402
 from vsagent.core.session_manager import (  # noqa: E402
     HOME_MIN,
@@ -53,11 +63,17 @@ from vsagent.core.session_manager import (  # noqa: E402
     SIDE_MIN,
     SessionManager,
 )
-from vsagent.screens.chat import ChatScreen, SidePanel  # noqa: E402
+from vsagent.screens.chat import ChatScreen, SideOptionList, SidePanel  # noqa: E402
 from vsagent.screens.connection_form import ConnectionFormScreen  # noqa: E402
 from vsagent.screens.context_usage import ContextUsageScreen  # noqa: E402
 from vsagent.screens.help import HelpScreen  # noqa: E402
-from vsagent.screens.home import HomeAction, HomeInput, HomeScreen  # noqa: E402
+from vsagent.screens.home import (  # noqa: E402
+    QUICK_TEMPLATES,
+    HomeAction,
+    HomeInput,
+    HomeScreen,
+    QuickTask,
+)
 from vsagent.screens.message import MessageScreen  # noqa: E402
 from vsagent.screens.permission import PermissionDialog  # noqa: E402
 from vsagent.screens.session_picker import (  # noqa: E402
@@ -83,7 +99,11 @@ from vsagent.widgets.messages_pane import (  # noqa: E402
     TextPartView,
     ToolCard,
 )
-from vsagent.widgets.session_list import SessionList, SessionRow  # noqa: E402
+from vsagent.widgets.session_list import (  # noqa: E402
+    NewTaskRow,
+    SessionList,
+    SessionRow,
+)
 from vsagent.widgets.splitter import Splitter  # noqa: E402
 from vsagent.widgets.topic_list import TopicList, TopicRow  # noqa: E402
 from vsagent.widgets.status_bar import (  # noqa: E402
@@ -94,6 +114,7 @@ from vsagent.widgets.status_bar import (  # noqa: E402
     shorten_path,
 )
 from vsagent.widgets.toast import ToastNotification, ToastRack  # noqa: E402
+from vsagent.widgets.top_bar import TopBar, TopLink  # noqa: E402
 
 import vsagent.widgets.status_bar as status_bar_module  # noqa: E402
 
@@ -185,6 +206,18 @@ def check(condition: bool, label: str) -> None:
     if not condition:
         raise AssertionError(label)
     CHECKS.append(label)
+
+
+def span_style(text: Text, needle: str) -> str:
+    """渲染结果里某一段文字用的样式字符串。
+
+    `render()` 返回的是 Rich `Text`，颜色存在 span 上；按文字找那一段，
+    比按位置切更稳——前面几段的宽度会随栏宽变。
+    """
+    for span in text.spans:
+        if text.plain[span.start : span.end] == needle:
+            return str(span.style)
+    return ""
 
 
 def rendered_lines(widget: Widget) -> list[str]:
@@ -494,6 +527,26 @@ async def run_rail_checks() -> None:
         recent = list(home.query_one("#home-recent").query(SessionRow))
         check(len(recent) == len(manager.root_sessions()), "输入框下面也列出最近任务")
 
+        # 左栏顶部是「新建任务」入口：清空输入框、把焦点放回去，不建空会话。
+        new_task = home.query_one(NewTaskRow)
+        check(
+            str(new_task.content) == "+ 新建任务",
+            f"左栏顶部是新建任务入口：{str(new_task.content)!r}",
+        )
+        headers = [str(item.content) for item in side.query(".rail-section")]
+        check(
+            any(text.startswith("最近任务 ") for text in headers),
+            f"主界面左栏第二段叫最近任务：{headers}",
+        )
+        home.input.text = "打了一半的草稿"
+        before = len(manager.root_sessions())
+        await pilot.click(new_task)
+        await pilot.pause()
+        check(home.input.text == "", "点新建任务清空输入框")
+        check(home.input.has_focus, "点新建任务后焦点回到输入框")
+        check(len(manager.root_sessions()) == before, "点新建任务不建空会话")
+        check(isinstance(app.screen, HomeScreen), "点新建任务留在主界面")
+
         target = next(row for row in rows if row.session_id == first.id)
         await pilot.click(target)
         await pilot.pause(0.4)
@@ -511,6 +564,12 @@ async def run_rail_checks() -> None:
 
         sessions = list(chat.query_one("#chat-sessions").query(SessionRow))
         check(len(sessions) == len(manager.root_sessions()), "聊天左栏同样列出全部会话")
+        check(len(chat.query(NewTaskRow)) == 0, "聊天左栏没有新建任务行")
+        chat_headers = [str(item.content) for item in chat.query(".rail-section")]
+        check(
+            any(text.startswith("全部任务 ") for text in chat_headers),
+            f"聊天左栏第二段仍叫全部任务：{chat_headers}",
+        )
         topics = list(chat.query_one("#chat-topics").query(TopicRow))
         check(topics == [], "还没有主题时主题列表是空的")
 
@@ -545,6 +604,10 @@ async def run_rail_checks() -> None:
             ),
             "主题行补齐到栏宽："
             f"{[(str(row.render()), row.content_size.width) for row in topics]}",
+        )
+        check(
+            span_style(topics[0].render(), " ✓").lower() == "#4caf50",
+            f"主题的完成标记用绿色：{span_style(topics[0].render(), ' ✓')}",
         )
         # 每一步都会刷新左栏，内容没变就不要再建一遍：重建一次等于把滚动位置推回顶部。
         session_rows = list(chat.query_one("#chat-sessions").query(SessionRow))
@@ -845,11 +908,47 @@ async def run_home_action_checks(server: FakeModelServer) -> None:
             f"发送提示贴在输入框右端：{send.region.right}",
         )
 
-        # 附件：插入引用前缀，光标留在输入框里接着打字。
+        # 附件：插入引用前缀，光标留在输入框里接着打字；候选列表同时打开。
         await pilot.click(home.query_one("#home-action-file"))
         await pilot.pause()
         check(home.input.text == "@", f"点附件插入引用前缀：{home.input.text!r}")
         check(home.input.has_focus, "插入之后焦点仍在输入框")
+        check(home.file_popup.is_open, "插入 @ 之后文件补全弹窗打开")
+        candidates = home.file_popup.visible_items
+        check(bool(candidates), f"文件补全给出候选：{candidates}")
+        check(
+            candidates == search_files(ROOT, ""),
+            "候选与 search_files 是同一份",
+        )
+
+        # 上下键挪高亮，回车采纳。
+        first_index = home.file_popup.index
+        await pilot.press("down")
+        await pilot.pause()
+        check(
+            home.file_popup.index == (first_index + 1) % len(candidates),
+            f"down 把高亮往后挪一格：{first_index} -> {home.file_popup.index}",
+        )
+        await pilot.press("up")
+        await pilot.pause()
+        check(home.file_popup.index == first_index, "up 把高亮挪回原来那一格")
+        await pilot.press("enter")
+        await pilot.pause()
+        check(not home.file_popup.is_open, "回车采纳之后文件补全收起")
+        check(
+            home.input.text == f"@{candidates[first_index]} ",
+            f"采纳之后填的是 @路径 加一个空格：{home.input.text!r}",
+        )
+        check(isinstance(app.screen, HomeScreen), "采纳文件不提交任务")
+
+        # esc 收起候选，输入内容留着。
+        home.input.text = "@"
+        await pilot.pause()
+        check(home.file_popup.is_open, "再输入 @ 候选又打开")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(not home.file_popup.is_open, "esc 收起文件补全")
+        check(home.input.text == "@", f"收起候选不动输入内容：{home.input.text!r}")
 
         # 模型与工具：各自打开面板，输入框里的草稿留着。
         home.input.text = "草稿"
@@ -883,6 +982,239 @@ async def run_home_action_checks(server: FakeModelServer) -> None:
     path.unlink(missing_ok=True)
 
 
+async def run_home_recent_checks() -> None:
+    """最近任务：主题数、产物数、时间与最近一次结果。"""
+    path = ROOT / ".probe" / "home_recent_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    app = build_app(path)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause(0.4)
+        manager = app.session_manager
+        home = app.screen
+
+        done = manager.current
+        done.title = "靶点与口袋核对"
+        done.status = "done"
+        sealed = Event(
+            id="evt_1",
+            title="取结构",
+            summary="4HJO 的 ATP 口袋在 A 链",
+            cut_message=1,
+        )
+        sealed.steps.append(
+            Step(
+                seq=1,
+                tools=["dock"],
+                artifacts=["docking#1", "docking#2"],
+                result="成功：2 个位姿",
+            )
+        )
+        done.events.append(sealed)
+
+        failed = manager.create_session("失败的一条")
+        failed.status = "failed"
+        failed.status_note = "状态说明不该盖过失败原因"
+        broken = Event(id="evt_2", title="取结构", cut_message=1, exit_reason="error")
+        broken.steps.append(
+            Step(seq=1, tools=["fetch_structure"], issues=["结构下载失败"])
+        )
+        failed.events.append(broken)
+
+        empty = manager.create_session("还没有跑过的")
+
+        running = manager.create_session("正在跑的")
+        running.status = "running"
+        running.status_note = "正在准备受体"
+
+        home.refresh_tasks()
+        await pilot.pause(0.3)
+        rows = {
+            row.session_id: row
+            for row in home.query_one("#home-recent").query(SessionRow)
+        }
+        check(len(rows) == 4, f"最近任务列出四条：{len(rows)}")
+        # 完成是低饱和绿；失败、运行中、空闲各自保持原来的颜色。
+        check(
+            span_style(rows[done.id].render(), "完成").lower() == "#4caf50",
+            f"完成态用绿色：{span_style(rows[done.id].render(), '完成')}",
+        )
+        check(
+            span_style(rows[failed.id].render(), "失败").lower() == "#c62828",
+            f"失败仍是红色：{span_style(rows[failed.id].render(), '失败')}",
+        )
+        check(
+            span_style(rows[running.id].render(), "运行中").lower() == "#4a9eff",
+            f"运行中仍是蓝色：{span_style(rows[running.id].render(), '运行中')}",
+        )
+        check(
+            span_style(rows[empty.id].render(), "空闲").lower() == "#5a5a5a",
+            f"空闲仍是灰色：{span_style(rows[empty.id].render(), '空闲')}",
+        )
+
+        text = str(rows[done.id].render())
+        check("1 主题 · 2 产物" in text, f"完成的任务写出主题数与产物数：{text!r}")
+        check("4HJO" in text, f"最近结果取最后一条主题的结论：{text!r}")
+        head = text.split("  ")[0]
+        check(
+            head.startswith("靶点") and cell_len(head) >= 8,
+            f"标题保留开头，没有被结果挤成空串：{head!r}",
+        )
+        check(
+            cell_len(text) <= rows[done.id].content_size.width,
+            f"一行不超出内容宽度：{cell_len(text)} / {rows[done.id].content_size.width}",
+        )
+
+        text = str(rows[failed.id].render())
+        check("1 主题 · 0 产物" in text, f"失败的一次同样数产物：{text!r}")
+        check("结构下载失败" in text, f"没有结论时取失败原因：{text!r}")
+        check(
+            "状态说明不该盖过失败原因" not in text,
+            f"失败原因排在状态说明前面：{text!r}",
+        )
+
+        text = str(rows[empty.id].render())
+        check("0 主题 · 0 产物" in text, f"没跑过的任务写 0：{text!r}")
+        check(
+            home._recent_meta(empty, 63).count("·") == 2,
+            f"没有结果时只有主题、产物、时间两处分隔：{home._recent_meta(empty, 63)!r}",
+        )
+
+        text = str(rows[running.id].render())
+        check("0 主题 · 0 产物" in text, f"正在跑的任务也写计数：{text!r}")
+        check("正在准备受体" in text, f"没有结论与失败原因时取状态说明：{text!r}")
+
+        # 窄一些的行宽：标题至少留 12 格，结果按剩余宽度截断。
+        narrow = home._recent_meta(done, 57)
+        check("…" in narrow, f"宽度不够时结果截断：{narrow!r}")
+        check(
+            "4HJO" in narrow,
+            f"截断保留结果的开头：{narrow!r}",
+        )
+        check(
+            home._recent_meta(done, 50).count("·") == 2,
+            f"宽度再窄就不写结果：{home._recent_meta(done, 50)!r}",
+        )
+
+    path.unlink(missing_ok=True)
+
+
+async def run_home_quick_checks() -> None:
+    """快捷入口：三个模板填进输入框，不提交；矮终端里整行收起。"""
+    path = ROOT / ".probe" / "home_quick_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    app = build_app(path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.4)
+        home = app.screen
+        quick = home.query_one("#home-quick")
+        check(quick.styles.display == "block", "40 行终端里快捷入口在")
+        chips = list(quick.query(QuickTask))
+        check(
+            [str(chip.content) for chip in chips] == ["研究", "结构", "知识"],
+            f"三个模板按顺序排列：{[str(chip.content) for chip in chips]}",
+        )
+        check(
+            quick.region.y > home.query_one("#home-box").region.bottom,
+            "快捷入口在输入框下方",
+        )
+        check(
+            quick.region.y < home.query_one("#home-recent").region.y,
+            "快捷入口在最近任务上方",
+        )
+
+        # 点一个模板：文字填进输入框，光标放到末尾，任务不提交。
+        template = QUICK_TEMPLATES["structure"][1]
+        await pilot.click(home.query_one("#quick-structure"))
+        await pilot.pause()
+        check(home.input.text == template, f"点结构填入对应模板：{home.input.text!r}")
+        check(isinstance(app.screen, HomeScreen), "点模板不跳界面")
+        check(home.input.has_focus, "填完焦点回到输入框")
+        check(
+            home.input.cursor_location == (0, len(template)),
+            f"光标停在模板末尾：{home.input.cursor_location}",
+        )
+
+        # 再点另一个：整段换成新模板，与前一段不拼接。
+        await pilot.click(home.query_one("#quick-research"))
+        await pilot.pause()
+        check(
+            home.input.text == QUICK_TEMPLATES["research"][1],
+            f"再点研究换成另一段模板：{home.input.text!r}",
+        )
+
+        # 24 行终端里这一行收起，字标与提示行才放得下。
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause(0.3)
+        check(quick.styles.display == "none", "24 行终端里快捷入口收起")
+        check(
+            home.query_one("#home-help").region.height == 1,
+            "收起后提示行仍占一行",
+        )
+        await pilot.resize_terminal(120, 40)
+        await pilot.pause(0.3)
+        check(quick.styles.display == "block", "放大回 40 行快捷入口回来")
+
+    path.unlink(missing_ok=True)
+
+
+async def run_home_top_bar_checks() -> None:
+    """顶栏：应用名、四格入口、位置，以及入口走的是命令那条路。"""
+    path = ROOT / ".probe" / "home_top_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    app = build_app(path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.4)
+        home = app.screen
+        bar = home.query_one(TopBar)
+        check(bar.region.y == 0 and bar.region.height == 1, f"顶栏贴在最上面一行：{bar.region}")
+        check(
+            home.query_one("#home-body").region.y == bar.region.bottom,
+            "顶栏下面紧接着正文",
+        )
+        brand = home.query_one(".top-brand")
+        check(str(brand.content) == "VSAgent", f"顶栏左边是应用名：{str(brand.content)!r}")
+        links = list(bar.query(TopLink))
+        check(
+            [str(item.content) for item in links] == ["模型", "工具", "主题", "帮助"],
+            f"右侧四格按顺序排列：{[str(item.content) for item in links]}",
+        )
+        check(
+            brand.region.right <= links[0].region.x,
+            f"四格排在应用名右边：{brand.region.right} / {links[0].region.x}",
+        )
+        check(
+            links[-1].region.right == bar.region.right,
+            f"最后一格贴右边缘：{links[-1].region.right} / {bar.region.right}",
+        )
+
+        # 入口走的是斜杠命令那条路：帮助与工具各开一次面板，esc 回来。
+        await pilot.click(next(item for item in links if item.command == "help"))
+        await pilot.pause()
+        check(isinstance(app.screen, HelpScreen), "点帮助打开帮助界面")
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, HomeScreen), "esc 从帮助回到主界面")
+
+        await pilot.click(next(item for item in links if item.command == "tools"))
+        await pilot.pause()
+        check(isinstance(app.screen, ToolsPanelScreen), "点工具打开工具面板")
+        await pilot.press("escape")
+        await pilot.pause()
+
+        # 顶栏只在主界面；聊天界面顶部直接是消息区。
+        app.open_session(app.session_manager.current.id)
+        await pilot.pause(0.4)
+        check(len(app.screen.query(TopBar)) == 0, "聊天界面没有顶栏")
+
+    path.unlink(missing_ok=True)
+
+
 async def run() -> None:
     server = FakeModelServer()
     server.start()
@@ -895,11 +1227,17 @@ async def run() -> None:
     try:
         await run_tool_card_checks()
         await run_topic_card_checks()
+        run_topic_state_checks()
+        await run_artifact_row_checks()
+        run_viewer_address_checks()
         await run_coalesce_checks()
         await run_tools_panel_checks()
         await run_rail_checks()
         await run_narrow_checks()
         await run_splitter_checks()
+        await run_home_recent_checks()
+        await run_home_quick_checks()
+        await run_home_top_bar_checks()
         await run_home_action_checks(server)
         await run_interface_checks(server)
     finally:
@@ -948,6 +1286,10 @@ async def run_tool_card_checks() -> None:
         # 默认收起：卡上只剩一行标题，输入与输出都不占位置。一轮跑十几步，
         # 每张卡都摊开的话消息区全被工具正文占满。
         check(str(output.styles.display) == "none", "工具输入输出默认收起")
+        check(
+            str(card.query_one(".tool-params").styles.display) == "none",
+            "默认收起时参数段也不显示",
+        )
         check(str(tail.styles.display) == "none", "默认收起时末尾几行也不显示")
         check(str(more.styles.display) == "none", "默认收起时省略行也不显示")
         check(header.startswith("▸"), f"收起时标题行是合上的箭头：{header}")
@@ -998,6 +1340,59 @@ async def run_tool_card_checks() -> None:
         await pilot.click(card.query_one(".tool-header"))
         await pilot.pause()
         check(str(output.styles.display) == "block", "再点标题行展开整段输出")
+
+        # 展开之后参数全列出来：标题行只装得下第一个键，盒子与力场都在这里。
+        detailed = Part(
+            type=PartType.TOOL,
+            tool_name="dock",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"receptor": "receptor#1", "box": [20, 20, 20], "scoring": "vina"},
+            tool_output="最佳 -7.2",
+            tool_meta={"handle": "docking#2"},
+            timestamp=time.time(),
+        )
+        card.sync(detailed)
+        await pilot.pause()
+        params = card.query_one(".tool-params")
+        files = card.query_one(".tool-files")
+        params_text = str(params.render())
+        check(str(params.styles.display) == "block", "展开之后参数段占位置")
+        check(
+            "receptor: receptor#1" in params_text and "scoring: vina" in params_text,
+            f"参数全列出来：{params_text}",
+        )
+        check("box: [20, 20, 20]" in params_text, f"非字符串按 JSON 写：{params_text}")
+        check(params_text.startswith("参数"), f"参数段带标题：{params_text.splitlines()[:1]}")
+        check(str(files.render()) == "产物 docking#2", f"产物从 tool_meta 取：{files.render()}")
+
+        # 失败那一刻卡片自己展开：标题行变红只说明出事了，错误原文才可用。
+        card.set_output_visible(False)
+        card.sync(
+            Part(
+                type=PartType.TOOL,
+                tool_name="dock",
+                tool_status=ToolStatus.RUNNING,
+                tool_output="",
+                timestamp=time.time(),
+            )
+        )
+        await pilot.pause()
+        check(not card._show_output, "执行中仍然收起")
+        card.sync(
+            Part(
+                type=PartType.TOOL,
+                tool_name="dock",
+                tool_status=ToolStatus.FAILED,
+                tool_output="受体坐标缺失",
+                timestamp=time.time(),
+            )
+        )
+        await pilot.pause()
+        check(card._show_output, "失败时卡片自己展开")
+        check(
+            str(card.query_one(".tool-output").render()) == "受体坐标缺失",
+            "错误原文就在展开的输出里",
+        )
 
         # 执行计时：看到「●」才开始计时，完成后停在最终值。
         card.sync(make_part(ToolStatus.RUNNING, age=5))
@@ -1060,15 +1455,14 @@ async def run_topic_card_checks() -> None:
     user2.add_part(Part(type=PartType.TEXT, text="跑对接"))
     assistant2 = session.add_message(Message(role="assistant"))
     assistant2.add_part(Part(type=PartType.STEP_START, text="2 · fake"))
-    assistant2.add_part(
-        Part(
-            type=PartType.TOOL,
-            tool_name="dock",
-            tool_status=ToolStatus.RUNNING,
-            tool_input={"receptor": "receptor#1"},
-            tool_output="",
-        )
+    dock_call = Part(
+        type=PartType.TOOL,
+        tool_name="dock",
+        tool_status=ToolStatus.RUNNING,
+        tool_input={"receptor": "receptor#1"},
+        tool_output="",
     )
+    assistant2.add_part(dock_call)
     record_step(
         session,
         step_no=1,
@@ -1100,8 +1494,8 @@ async def run_topic_card_checks() -> None:
             "从消息中间起的主题，头跟在它所属的那条消息里",
         )
         check(
-            str(head2.render()).find("正在运行 dock") >= 0,
-            f"进行中的主题写当前工具：{str(head2.render())}",
+            str(head2.plain()).find("正在运行 dock") >= 0,
+            f"进行中的主题写当前工具：{str(head2.plain())}",
         )
 
         # 默认只展开最后一个：更早的主题收起，它的工具卡不占位置，但提问还在。
@@ -1149,6 +1543,15 @@ async def run_topic_card_checks() -> None:
             pane._part_views[first_call.id].has_class("-topic-hidden"),
             "再点一下又收起",
         )
+        # 收起之后仍要看出这一段调过什么：说明行列出工具名，标题行写调用次数。
+        check(
+            "工具 bash" in head1.plain(),
+            f"收起的主题在说明行列出工具：{head1.plain()}",
+        )
+        check(
+            "次调用" in head1.plain(),
+            f"标题行写调用次数而不是工具种类：{head1.plain()}",
+        )
 
         # 整条消息都落在收起的主题里时，它连视图都不建。
         pane.toggle_topic(head2.topic.key)
@@ -1174,6 +1577,30 @@ async def run_topic_card_checks() -> None:
         card = pane._part_views[second_call.id]
         check(card.has_class("-step-hidden"), "收起一步之后它的工具卡不占位置")
         check(not row.has_class("-topic-hidden"), "步行自己留在原处当入口")
+
+        # 主题级开关：一次展开这个主题里全部工具的输出，别的主题不跟着动。
+        # 步行先展开，工具卡才回到画面上。
+        await pilot.click(row)
+        await pilot.pause()
+        header = pane._header_views[head1.topic.key]
+        check(
+            "展开全部工具" in str(header._tools.render()),
+            f"主题展开时出现工具开关：{header._tools.render()}",
+        )
+        await pilot.click(header._tools)
+        await pilot.pause()
+        check(card._show_output, "点主题里的开关展开这一步的工具输出")
+        check(
+            not pane._part_views[dock_call.id]._show_output,
+            "另一个主题的工具不跟着展开",
+        )
+        check(
+            "收起全部工具" in str(header._tools.render()),
+            f"展开之后开关换成「收起」：{header._tools.render()}",
+        )
+        await pilot.click(header._tools)
+        await pilot.pause()
+        check(not card._show_output, "再点一次把这一主题的工具收回去")
 
     # 主题从助手消息的开头起时，标题行挂在消息外面。收起它之后标题行必须还在，
     # 跟着消息一起摘掉的话这个主题就从画面上消失，再没有地方点开。
@@ -1224,6 +1651,165 @@ async def run_topic_card_checks() -> None:
             < pane2._message_views[assistant3.id].region.y,
             "展开之后消息排在标题行下面",
         )
+
+
+def run_topic_state_checks() -> None:
+    """主题的结局在封存之前就要对。
+
+    失败与中断全靠轮末封存才显示的话，用户按停那一刻与真出错那一刻看到的
+    都是同一副「进行中」的样子，事后也分不出谁是谁。
+    """
+    from vsagent.core.agent.event_log import record_step
+    from vsagent.core.agent.topics import topic_views
+    from vsagent.widgets.topic_card import detail_color, detail_text
+
+    def build(status: str, tool_status: ToolStatus, output: str) -> Session:
+        session = Session(id=f"ses_state_{status}_{tool_status.value}", title="状态")
+        user = session.add_message(Message(role="user"))
+        user.add_part(Part(type=PartType.TEXT, text="问一句"))
+        assistant = session.add_message(Message(role="assistant"))
+        assistant.add_part(Part(type=PartType.STEP_START, text="1 · fake"))
+        part = Part(
+            type=PartType.TOOL,
+            tool_name="dock",
+            tool_status=tool_status,
+            tool_input={"receptor": "receptor#1"},
+            tool_output=output,
+        )
+        assistant.add_part(part)
+        session.status = status
+        record_step(
+            session, step_no=1, parts=[part], message_index=1, part_start=1, part_end=2
+        )
+        return session
+
+    cancelled = topic_views(build("cancelled", ToolStatus.FAILED, "interrupted"), running=False)[-1]
+    check(cancelled.status == "interrupted", f"取消的那一轮画成中断：{cancelled.status}")
+
+    failed = topic_views(build("done", ToolStatus.FAILED, "受体坐标缺失"), running=False)[-1]
+    check(failed.status == "failed", f"停在失败上的一段画成失败：{failed.status}")
+
+    unsealed = topic_views(
+        build("done", ToolStatus.COMPLETED, "ok"), running=False
+    )[-1]
+    check(unsealed.status == "unsealed", f"进程断在一轮中间画成未封存：{unsealed.status}")
+
+    # 一轮还在跑、中间某步失败过：标题仍是进行中，说明行的第一句必须是失败。
+    running = topic_views(
+        build("running", ToolStatus.FAILED, "受体坐标缺失"), running=True
+    )[-1]
+    check(running.status == "running", "还在一轮里时标题写进行中")
+    detail = detail_text(running, True)
+    check(detail.startswith("失败："), f"说明行先写失败再写当前动作：{detail}")
+    check(detail_color(running) == "#C62828", f"失败过的说明行是红色：{detail_color(running)}")
+
+    running_ok = topic_views(
+        build("running", ToolStatus.COMPLETED, "ok"), running=True
+    )[-1]
+    check(
+        detail_color(running_ok) == "#4A9EFF",
+        f"正常进行中的说明行是蓝色：{detail_color(running_ok)}",
+    )
+    check(
+        detail_color(unsealed) == "#8B949E",
+        f"停下来的主题说明行用次要文字色：{detail_color(unsealed)}",
+    )
+
+
+async def run_artifact_row_checks() -> None:
+    """主题下面那一行产物：收起时也在，名字点得动。"""
+    from vsagent.core.agent.event_log import seal_topic
+    from vsagent.widgets.topic_card import ArtifactRow
+
+    session = Session(id="ses_artifact_row", title="产物行")
+    user = session.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="写一份运行目录"))
+    assistant = session.add_message(Message(role="assistant"))
+    assistant.add_part(Part(type=PartType.STEP_START, text="1 · fake"))
+    assistant.add_part(
+        Part(
+            type=PartType.TOOL,
+            tool_name="write_run",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"receptor": "receptor#1"},
+            tool_output="写出 runs/1iep",
+            tool_meta={"handle": "run#1"},
+        )
+    )
+    seal_topic(session, cut=(2, 0), title="写出一份运行目录")
+
+    opened: list[str] = []
+
+    class Demo(App):
+        def compose(self) -> ComposeResult:
+            self.pane = MessagesPane()
+            yield self.pane
+
+        def on_mount(self) -> None:
+            self.pane.rebuild(session.messages, session, running=False)
+
+        def on_artifact_chip_picked(self, message) -> None:
+            opened.append(message.handle)
+
+    app = Demo()
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        pane = app.pane
+        topic = pane.topics[-1]
+        check(topic.artifacts == ["run#1"], f"主题的产物来自工具的结构化读数：{topic.artifacts}")
+
+        rows = list(pane.query(ArtifactRow))
+        check(len(rows) == 1, f"有产物的主题带一行产物：{len(rows)}")
+        row = rows[0]
+        check(row._handles == ("run#1",), f"行上列出 handle：{row._handles}")
+        check(not row.has_class("-hidden"), "有产物时这一行不藏")
+
+        # 收起主题：过程没了，产物那一行必须还在。
+        pane.toggle_topic(topic.key)
+        await pilot.pause()
+        await pilot.pause()
+        check(row.is_mounted and not row.has_class("-hidden"), "收起主题后产物行还在")
+
+        chip = row.query_one("ArtifactChip")
+        await pilot.click(chip)
+        await pilot.pause()
+        check(opened == ["run#1"], f"点名字把 handle 交上去：{opened}")
+
+
+def run_viewer_address_checks() -> None:
+    """产物地址：工具与界面共用一份拼装。
+
+    地址写错的表现是「点一下打开首页」或打开另一份运行目录，而界面上看起来一切正常，
+    所以两条分支各验一次。
+    """
+    from vsagent.core.agent.domain.export import viewer_address
+    from vsagent.core.agent.ledger import LedgerError, SessionLedger
+
+    ledger = SessionLedger(snapshot_path=ROOT / ".probe" / "ledger_viewer.json")
+    ledger.reset()
+
+    class Viewer:
+        port = 8123
+
+    run_entry = ledger.add("artifact", meta={"run_id": "1iep"})
+    check(
+        viewer_address(ledger, str(run_entry.handle), Viewer())
+        == "http://127.0.0.1:8123/#/structure/1iep",
+        "运行目录的地址指向结构页",
+    )
+    survey_entry = ledger.add("artifact", meta={"survey_id": "P00533"})
+    check(
+        viewer_address(ledger, str(survey_entry.handle), Viewer())
+        == "http://127.0.0.1:8123/#/survey/P00533",
+        "结构全景的地址指向全景页",
+    )
+    receptor_entry = ledger.add("receptor", path=ROOT / "runs" / "x.pdb")
+    try:
+        viewer_address(ledger, str(receptor_entry.handle), Viewer())
+    except LedgerError as error:
+        check("receptor" in str(error), f"拿受体当产物时说明它是什么：{error}")
+    else:
+        check(False, "拿受体当产物应当被拦下来")
 
 
 PERMISSION_STATE_PATH = ROOT / ".probe" / "state_permission.toml"
@@ -2164,7 +2750,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
 
         # 两张"登记表"必须与画面上真实存在的视图对得上。组件有两条创建路径：
         # 流式追加走 add_part，会话重建时由 MessageView.compose 直接建；
-        # 只在一条路里登记，另一条路建出来的视图就进不了表，`/thinking` 与 `/details`
+        # 只在一条路里登记，另一条路建出来的视图就进不了表，`/thinking`
         # 只会改数据与提示，画面一动不动。
         reasoning_views = pane.query(ReasoningPartView)
         tool_cards = pane.query(ToolCard)
@@ -2559,26 +3145,24 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         editor.text = ""
         await pilot.pause()
 
-        # /details：切换工具详情。原先是前导键第二击，现在只有斜杠命令这一条路。
-        details_before = app.session_manager.show_details
+        # /details：展开或收起当前（最后一个）主题的全部工具输出。
+        # 全局开关没有了：展开范围就是眼前这一段，下次打开会话也不再是全展开。
+        check(not any(card._show_output for card in pane.query(ToolCard)), "工具卡默认收起")
         await type_text(pilot, "/details")
         await pilot.press("enter")
         await pilot.pause()
-        check(app.session_manager.show_details is not details_before, "/details 切换工具详情")
-        card_output = pane.query(ToolCard)[0].query_one(".tool-output")
-        first = "block" if app.session_manager.show_details else "none"
+        opened = [card for card in pane.query(ToolCard) if card._show_output]
+        check(bool(opened), "/details 展开当前主题的工具卡")
         check(
-            str(card_output.styles.display) == first,
-            f"工具详情开关作用到画面上：开关 {app.session_manager.show_details}，输出 display={card_output.styles.display}",
+            str(opened[0].query_one(".tool-output").styles.display) == "block",
+            f"展开的卡片把输出画出来：{opened[0].query_one('.tool-output').styles.display}",
         )
         await type_text(pilot, "/details")
         await pilot.press("enter")
         await pilot.pause()
-        second = "block" if app.session_manager.show_details else "none"
-        check(second != first, "再执行一次开关回到另一档")
         check(
-            str(card_output.styles.display) == second,
-            f"两次切换都作用到画面上：输出 display={card_output.styles.display}",
+            not any(card._show_output for card in pane.query(ToolCard)),
+            "再执行一次把当前主题的工具卡收回去",
         )
 
         panel = chat.query_one(SidePanel)
@@ -2621,9 +3205,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             "侧栏不重复显示会话标题（它已经在底部状态栏最左端）",
         )
         check(
-            sorted(panel._written)
-            == ["#side-artifacts", "#side-files", "#side-stats", "#side-tools"],
-            f"打开侧栏时把内容补齐：{sorted(panel._written)}",
+            sorted(panel._written) == ["#side-stats"],
+            f"打开侧栏时把用量补齐：{sorted(panel._written)}",
         )
         check(
             len(panel.query("#side-meta")) == 0,
@@ -2644,10 +3227,16 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             "缓存命中" in stats_now and "未命中" in stats_now and "输出" in stats_now,
             f"侧栏把累计用量分成命中、未命中与输出：{stats_now}",
         )
-        check("✓ bash" in str(chat.query_one("#side-tools").content), "侧栏列出调用过的工具与状态")
+        # 产物排在第一位：这一栏最常被打开的时刻是「这一段做出了什么」。
+        # 这一轮的工具没有登记产物，列表应给一条不能选的提示，而不是空白。
+        artifacts = chat.query_one("#side-artifacts", SideOptionList)
+        labels = [str(option.prompt) for option in artifacts.options]
+        check(labels == ["还没有产物"], f"没有产物时给一行提示：{labels}")
+        children = list(panel.children)
         check(
-            str(accepted) in str(chat.query_one("#side-files").content),
-            f"侧栏列出引用过的文件：{accepted}",
+            children.index(artifacts)
+            < children.index(panel.query_one("#side-agents-title")),
+            "产物排在子 agent 上面",
         )
         await type_text(pilot, "/sidebar")
         await pilot.press("enter")

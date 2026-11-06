@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
@@ -15,13 +16,16 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 from .. import __version__
+from ..core.models import Session
 from ..core.session_manager import HOME_MAX, HOME_MIN
 from ..widgets.agent_autocomplete import AGENTS
 from ..widgets.command_autocomplete import CommandAutocomplete
 from ..widgets.command_palette import CommandPalette
-from ..widgets.editor_pane import COMMAND_TOKEN, ScrollingTextArea
-from ..widgets.session_list import SessionList, SessionRow
+from ..widgets.editor_pane import COMMAND_TOKEN, FILE_TOKEN, ScrollingTextArea, search_files
+from ..widgets.file_autocomplete import AutocompletePopup, FileAutocomplete
+from ..widgets.session_list import NewTaskRow, SessionList, SessionRow, fit
 from ..widgets.splitter import Splitter
+from ..widgets.top_bar import TopBar, TopLink
 
 # 中间那一栏至少留这么多列：字标一行 60 格，再窄就放不下了。
 MIN_CENTER_WIDTH = 40
@@ -42,6 +46,23 @@ TAGLINE = "虚拟筛选 Agent　·　查靶点 · 取结构 · 定口袋 · 对�
 PLACEHOLDER = "说一件事，例如「EGFR 的 ATP 口袋在哪」"
 HELP_TEXT = "tab 切换 Agent    ctrl+p 命令面板    / 列出命令"
 
+# 输入框下方的快捷入口。它们只是任务模板：点一下把这段话填进输入框，交不交、
+# 怎么改由用户自己决定。模板里的靶点写成具体例子，用户改一个词就能用。
+QUICK_TEMPLATES: dict[str, tuple[str, str]] = {
+    "research": (
+        "研究",
+        "调研 EGFR 的已知抑制剂与耐药突变，列出关键文献与结论。",
+    ),
+    "structure": (
+        "结构",
+        "分析 PDB 4HJO 的结构：共晶配体、口袋位置与分辨率。",
+    ),
+    "knowledge": (
+        "知识",
+        "在本机语料库里查 EGFR 抑制剂的选择性数据。",
+    ),
+}
+
 
 def _clock(seconds: float) -> str:
     """列表里的时间：当天的只写时分，更早的带上月日。"""
@@ -50,6 +71,29 @@ def _clock(seconds: float) -> str:
     if time.time() - seconds < 86400:
         return time.strftime("%H:%M", time.localtime(seconds))
     return time.strftime("%m-%d", time.localtime(seconds))
+
+
+def _artifact_count(session: Session) -> int:
+    """这条任务产出过多少个产物：各主题的 handle 去重之后数一遍。"""
+    names: set[str] = set()
+    for event in session.events:
+        names.update(event.artifacts)
+    return len(names)
+
+
+def _latest_result(session: Session) -> str:
+    """最近一次执行结果：最后一个封存主题的结论，没有就取失败原因或状态说明。
+
+    只看最后一条事件：更早的结论不是「最近一次」的结果，拿它顶上来会读成这一轮
+    已经做完了。
+    """
+    if session.events:
+        event = session.events[-1]
+        if event.summary.strip():
+            return event.summary
+        if event.issues:
+            return event.issues[0]
+    return session.status_note.strip()
 
 
 class HomeInput(ScrollingTextArea):
@@ -82,6 +126,24 @@ class HomeAction(Static):
 
     def on_click(self) -> None:
         self.post_message(self.Pressed(self.action_name))
+
+
+class QuickTask(Static):
+    """输入框下方的一个任务模板。点一下把模板填进输入框，不提交。"""
+
+    class Picked(TextualMessage):
+        """用户点了这个模板。"""
+
+        def __init__(self, key: str) -> None:
+            super().__init__()
+            self.key = key
+
+    def __init__(self, key: str, label: str, id: str | None = None) -> None:
+        super().__init__(label, id=id, classes="quick-task", markup=False)
+        self.key = key
+
+    def on_click(self) -> None:
+        self.post_message(self.Picked(self.key))
 
 
 class HomeScreen(Screen):
@@ -120,6 +182,7 @@ class HomeScreen(Screen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="home-frame"):
+            yield TopBar()
             with Horizontal(id="home-body"):
                 # 左栏是导航：运行中的任务单独一段，其余按更新时间排。点一行就切过去。
                 yield SessionList(id="home-side")
@@ -147,13 +210,21 @@ class HomeScreen(Screen):
                                 yield HomeAction("model", "/model 模型", id="home-action-model")
                                 yield HomeAction("tools", "/tools 工具", id="home-action-tools")
                                 yield HomeAction("send", "Enter 发送", id="home-send-hint")
+                    # 快捷入口：填的是任务模板，不直接提交。矮终端里整行收起，
+                    # 见 `apply_quick_visibility()`。
+                    with Horizontal(id="home-quick"):
+                        yield Static("快速开始", classes="quick-label", markup=False)
+                        for key, (label, _text) in QUICK_TEMPLATES.items():
+                            yield QuickTask(key, label, id=f"quick-{key}")
                     # 输入框下面是最近几条任务：左栏回答「有哪些」，这里回答「最近做了什么」。
                     yield Vertical(id="home-recent")
                     yield Static(HELP_TEXT, id="home-help")
-            # 斜杠命令补全弹窗：默认 display:none，往上浮、底边停在最底下那行状态栏上沿。
-            # 不能挂在 `#home-center` 里：那一块是居中布局，弹窗虽然不占布局流，高度仍然
-            # 算进它的内容总高，一弹出就把 logo 与输入框整块往上挪（实测挪了 5 行）。
+            # 两个补全弹窗：斜杠命令与 @ 文件引用。默认 display:none，往上浮、
+            # 底边停在最底下那行状态栏上沿。不能挂在 `#home-center` 里：那一块是
+            # 居中布局，弹窗虽然不占布局流，高度仍然算进它的内容总高，一弹出就把
+            # logo 与输入框整块往上挪（实测挪了 5 行）。
             # `keep_below` 挡住它长到提示行以上：矮终端下会盖在输入框上面。
+            yield FileAutocomplete(keep_below="#home-help")
             yield CommandAutocomplete(keep_below="#home-help")
             with Horizontal(id="home-footer"):
                 # 左端是项目根目录的完整路径，路径里可能出现方括号，关掉标签解析。
@@ -163,6 +234,7 @@ class HomeScreen(Screen):
     def on_mount(self) -> None:
         """把焦点交给输入框，并把左栏与最近任务画出来。"""
         self.apply_widths()
+        self.apply_quick_visibility()
         self.input.focus()
         self.refresh_tasks()
 
@@ -175,9 +247,20 @@ class HomeScreen(Screen):
         if not self.is_mounted:
             return
         self.apply_widths()
+        self.apply_quick_visibility()
         # 最近任务那几行是按当时的宽度截断的，宽度变了要重截一遍；
         # 留着旧的那份会在窄屏里溢出、宽屏里过早省略。
         self.refresh_tasks()
+
+    def apply_quick_visibility(self) -> None:
+        """矮终端里收起快捷入口。
+
+        这一行加上它上面的间距占 2 行；24 行终端里除输入区以外已经占掉 20 行，
+        多这两行会把字标顶出屏幕。
+        """
+        self.query_one("#home-quick").styles.display = (
+            "block" if self.app.size.height >= 26 else "none"
+        )
 
     def apply_widths(self) -> None:
         """按终端宽度摆好左栏与分栏界线。
@@ -211,7 +294,9 @@ class HomeScreen(Screen):
 
     def refresh_tasks(self) -> None:
         """重画左栏与「最近任务」。会话列表随切换与新建变化，进屏幕时重取一次。"""
-        self.query_one("#home-side", SessionList).refresh_sessions()
+        self.query_one("#home-side", SessionList).refresh_sessions(
+            new_task=True, list_title="最近任务"
+        )
         box = self.query_one("#home-recent", Vertical)
         box.remove_children()
         sessions = self.app.session_manager.root_sessions()[:4]
@@ -219,21 +304,54 @@ class HomeScreen(Screen):
             return
         box.mount(Static("最近任务", classes="rail-section -first"))
         current = self.app.session_manager.current_session_id
+        width = max(20, box.content_size.width or 78)
         for item in sessions:
-            meta = f"{len(item.events)} 主题 · {_clock(item.updated_at)}"
             box.mount(
                 SessionRow(
                     item,
                     current=item.id == current,
-                    width=max(20, box.content_size.width or 78),
-                    meta=meta,
+                    width=width,
+                    meta=self._recent_meta(item, width),
                 )
             )
+
+    @staticmethod
+    def _recent_meta(session: Session, width: int) -> str:
+        """最近任务那一行的附加信息：主题数、产物数、时间与最近结果。
+
+        结果按剩余宽度截断。`SessionRow` 的两列内边距、状态词 6 格与它前后各
+        两格的空隙，加上 meta 自己的分隔，一共占掉 13 格；标题留 12 格、
+        meta 前面的分隔留 2 格，所以结果那一段最多 `width - 27 - counts` 格，
+        不够 6 格就不写结果。
+        """
+        counts = (
+            f"{len(session.events)} 主题 · {_artifact_count(session)} 产物"
+            f" · {_clock(session.updated_at)}"
+        )
+        result = _latest_result(session)
+        room = width - 27 - cell_len(counts)
+        if not result or room < 6:
+            return counts
+        return f"{counts} · {fit(result, room)}"
 
     def on_session_row_picked(self, message: SessionRow.Picked) -> None:
         """点左栏或最近任务里的一行：切到那个会话并进入聊天界面。"""
         message.stop()
         self.app.open_session(message.session_id)
+
+    def on_new_task_row_pressed(self) -> None:
+        """左栏顶部的「新建任务」：清空输入框、把焦点放回去。
+
+        会话不在这里建：点了又什么都不输入的话，列表里会多一个空壳。真正建会话
+        在提交时由 `start_chat_with()` 决定（当前会话有内容才另起一个）。
+        """
+        self.input.text = ""
+        self.input.focus()
+
+    def on_top_link_picked(self, message: TopLink.Picked) -> None:
+        """顶栏右侧的入口：走对应的斜杠命令，面板与命令那一头共用一份。"""
+        message.stop()
+        self.app.execute_command(message.command)
 
     def on_home_action_pressed(self, message: HomeAction.Pressed) -> None:
         """输入框底部那几格：附件插入引用前缀，模型与工具开面板，发送等于回车。"""
@@ -249,6 +367,13 @@ class HomeScreen(Screen):
         # 模型与工具各自有面板，直接走命令；输入框里的草稿留着不动。
         self.app.execute_command(message.action)
 
+    def on_quick_task_picked(self, message: QuickTask.Picked) -> None:
+        """点快捷入口：把模板填进输入框，光标放到末尾，任务不提交。"""
+        message.stop()
+        self.input.text = QUICK_TEMPLATES[message.key][1]
+        self.input.move_cursor(self.input.document.end)
+        self.input.focus()
+
     @property
     def input(self) -> HomeInput:
         """返回核心文本框里的输入框。"""
@@ -259,15 +384,41 @@ class HomeScreen(Screen):
         """斜杠命令补全弹窗。"""
         return self.query_one("#command-autocomplete", CommandAutocomplete)
 
+    @property
+    def file_popup(self) -> FileAutocomplete:
+        """`@` 文件引用补全弹窗。"""
+        return self.query_one("#file-autocomplete", FileAutocomplete)
+
+    def _active_popup(self) -> AutocompletePopup | None:
+        """当前打开的那个补全弹窗；两个都关着时返回 None。
+
+        文件引用排在命令前面：同时开着的一瞬（输入里既有 / 又有 @）采纳文件，
+        因为 `@` 只在光标附近有效，而命令要求整段输入以 / 开头。
+        """
+        for popup in (self.file_popup, self.command_popup):
+            if popup.is_open:
+                return popup
+        return None
+
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
         """弹窗开着的时候上下键与 esc 才归弹窗，否则留给输入框。"""
         if action in ("popup_up", "popup_down", "close_popup"):
-            return self.command_popup.is_open
+            return self._active_popup() is not None
         return True
 
     def on_text_area_changed(self) -> None:
-        """输入变化时刷新斜杠命令候选。"""
+        """输入变化时刷新斜杠命令与文件引用候选。"""
+        self._update_file_popup()
         self._update_command_popup()
+
+    def _update_file_popup(self) -> None:
+        """输入 @ 时按已经打出来的那一段列文件候选，与聊天界面同一个写法。"""
+        token = FILE_TOKEN.search(self.input.text)
+        if token is None:
+            if self.file_popup.is_open:
+                self.file_popup.hide()
+            return
+        self.file_popup.set_items(search_files(self.app.root, token.group(1)))
 
     def _update_command_popup(self) -> None:
         """输入 / 时列出命令候选，与聊天界面那一份同一个写法。
@@ -312,10 +463,10 @@ class HomeScreen(Screen):
         super()._watch__select_state(select_state)
 
     def action_submit_input(self) -> None:
-        """提交输入：命令补全开着时先采纳候选，斜杠开头走命令，其余进入聊天界面发送。"""
-        popup = self.command_popup
-        if popup.is_open:
-            self._accept_command()
+        """提交输入：补全开着时先采纳候选，斜杠开头走命令，其余进入聊天界面发送。"""
+        popup = self._active_popup()
+        if popup is not None:
+            self._accept(popup)
             return
         text = self.input.text.strip()
         if not text:
@@ -332,19 +483,50 @@ class HomeScreen(Screen):
 
     def action_popup_up(self) -> None:
         """候选项上移。"""
-        self.command_popup.move(-1)
+        popup = self._active_popup()
+        if popup is not None:
+            popup.move(-1)
 
     def action_popup_down(self) -> None:
         """候选项下移。"""
-        self.command_popup.move(1)
+        popup = self._active_popup()
+        if popup is not None:
+            popup.move(1)
 
     def action_close_popup(self) -> None:
-        """关闭命令补全弹窗，这一次输入不再弹。
+        """关闭当前补全弹窗。
 
-        只收起一个的话，接着打下一个字母又会去匹配一次，esc 等于没按。
+        命令补全关掉之后这一次输入不再弹：只收起一个的话，接着打下一个字母又会
+        去匹配一次，esc 等于没按。文件补全跟着输入内容走，下一个字符仍然匹配就再弹。
         """
-        self._command_dismissed = True
-        self.command_popup.hide()
+        popup = self._active_popup()
+        if popup is None:
+            return
+        if popup is self.command_popup:
+            self._command_dismissed = True
+        popup.hide()
+
+    def _accept(self, popup: AutocompletePopup) -> None:
+        """采纳当前弹窗里高亮的那一条。"""
+        if popup is self.file_popup:
+            self._accept_file()
+        else:
+            self._accept_command()
+
+    def _accept_file(self) -> None:
+        """把高亮的文件路径填进输入框，替换掉正在输入的那一段引用。"""
+        choice = self.file_popup.current()
+        if choice is None:
+            self.file_popup.hide()
+            return
+        token = FILE_TOKEN.search(self.input.text)
+        if token is None:
+            self.file_popup.hide()
+            return
+        head = self.input.text[: token.start()]
+        self.input.text = f"{head}@{choice} "
+        self.input.move_cursor(self.input.document.end)
+        self.file_popup.hide()
 
     def _accept_command(self) -> None:
         """把当前高亮的命令名填进输入框。

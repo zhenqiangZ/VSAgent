@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import TYPE_CHECKING, Callable, cast
 
@@ -10,6 +11,7 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Markdown, Static
 
+from ..core.agent.event_log import artifact_refs
 from ..core.agent.topics import (
     TopicView,
     position_key,
@@ -17,7 +19,7 @@ from ..core.agent.topics import (
     topic_views,
 )
 from ..core.models import Message, Part, PartType, Session, Step, ToolStatus
-from .topic_card import StepRow, TopicHeader, format_seconds
+from .topic_card import ArtifactRow, StepRow, TopicHeader, format_seconds
 
 if TYPE_CHECKING:
     from ..app import VSAgentApp
@@ -61,6 +63,10 @@ MAX_OUTPUT_LINES = 6
 # 只留开头的话跑失败的 bash 只看得到命令本身，看不到为什么失败。
 OUTPUT_HEAD_LINES = 3
 OUTPUT_TAIL_LINES = 3
+
+# 单个参数值最多显示这么多个字符。参数里偶尔塞着整段文件内容，
+# 一个值铺一屏的话，卡片就不是卡片了。
+PARAM_LIMIT = 160
 
 # 流式文本两次重写之间的最短间隔。窗口里累积的文本由 flush_text 写出来。
 # 正文（Markdown 重解析）与思考块（Static 整段重排）共用这一个窗口。
@@ -227,11 +233,15 @@ class ToolCard(Container):
 
     卡片上有两级折叠，各自管一段：
 
-    - 标题行（`▾/▸`）收起整段输出。默认是收起的，`/details` 可以一次全展开；
-      点标题行才切换，点正文什么都不做——用户点一下输出多半只是想选中它读一眼，
+    - 标题行（`▾/▸`）收起整段正文，包括参数、输出与产物。默认是收起的，
+      点标题行才切换；点正文什么都不做——用户点一下输出多半只是想选中它读一眼，
       整段消失是最烦人的一种「帮忙」。
     - 省略行（`▾ 中间省略 N 行 · 点开看全文`）只展开被折掉的中间部分，点一下换回「收起」。
       没有这一条，长输出被折掉的那几十行在界面上就再也看不到了，只能去翻 trace。
+
+    展开之后的第一段是全部参数。标题行只装得下第一个键，模型究竟给了什么
+    （尤其是 `dock` 的盒子、`score_affinity` 的 model）要在这里才看得全。
+    失败时卡片自己展开：标题行变红只说明「出事了」，错误原文才是可用的信息。
     """
 
     DEFAULT_CSS = """
@@ -247,11 +257,15 @@ class ToolCard(Container):
     ToolCard.-running .tool-header { color: #4A9EFF; }
     ToolCard.-awaiting .tool-header { color: #FFB300; }
     ToolCard.-failed .tool-header { color: #C62828; }
+    ToolCard .tool-params { color: #8B949E; }
     ToolCard .tool-output { color: #5A5A5A; }
     ToolCard .tool-tail { color: #5A5A5A; }
+    ToolCard .tool-files { color: #4A9EFF; }
     ToolCard .tool-more { color: #8B949E; height: 1; }
+    ToolCard .tool-params.-hidden,
     ToolCard .tool-output.-hidden,
     ToolCard .tool-tail.-hidden,
+    ToolCard .tool-files.-hidden,
     ToolCard .tool-more.-hidden { display: none; }
     """
 
@@ -269,16 +283,20 @@ class ToolCard(Container):
         self._elapsed: float | None = None
         self._timer: Timer | None = None
         self._header = Static(self._header_text(), classes="tool-header", markup=False)
+        self._params = Static("", classes="tool-params", markup=False)
         self._output = Static("", classes="tool-output", markup=False)
         self._more = Static("", classes="tool-more", markup=False)
         self._tail = Static("", classes="tool-tail", markup=False)
+        self._files = Static("", classes="tool-files", markup=False)
         self._refresh()
 
     def compose(self) -> ComposeResult:
         yield self._header
+        yield self._params
         yield self._output
         yield self._more
         yield self._tail
+        yield self._files
 
     def _header_text(self) -> str:
         status = self._part.tool_status or ToolStatus.PENDING
@@ -318,6 +336,32 @@ class ToolCard(Container):
         if len(value) > 40:
             value = value[:37] + "..."
         return f"  {first_key}={value}"
+
+    def _params_text(self) -> str:
+        """展开之后的参数清单，一行一个键。
+
+        标题行只装得下第一个键；盒子、模型名、配体集这些参数决定了这次调用
+        究竟做了什么，缺了它们只能去翻 trace。
+        """
+        given = self._part.tool_input if isinstance(self._part.tool_input, dict) else {}
+        if not given:
+            return ""
+        lines = ["参数"]
+        for key, value in given.items():
+            if isinstance(value, str):
+                text = value
+            else:
+                text = json.dumps(value, ensure_ascii=False)
+            text = " ".join(text.split())
+            if len(text) > PARAM_LIMIT:
+                text = text[: PARAM_LIMIT - 3] + "..."
+            lines.append(f"  {key}: {text}")
+        return "\n".join(lines)
+
+    def _files_text(self) -> str:
+        """这次调用登记下来的产物。读数从 `tool_meta` 取，与步的流水同一份口径。"""
+        refs = artifact_refs(self._part.tool_meta)
+        return f"产物 {'、'.join(refs)}" if refs else ""
 
     def _split_output(self) -> tuple[str, str, int]:
         """把输出拆成「开头、末尾、被省略的行数」。
@@ -361,19 +405,25 @@ class ToolCard(Container):
         return f"▾ 中间省略 {hidden} 行 · 点开看全文"
 
     def _refresh(self) -> None:
-        """按当前状态把四块内容与可见性一起写好。"""
+        """按当前状态把几块内容与可见性一起写好。"""
+        params = self._params_text()
         output = self._output_text()
         tail = self._tail_text()
         more = self._more_text()
+        files = self._files_text()
         self._header.update(self._header_text())
+        self._params.update(params)
         self._output.update(output)
         self._tail.update(tail)
         self._more.update(more)
+        self._files.update(files)
         # 还没输出的卡片（等待、执行中）不留一行空白：空 Static 的 auto 高度是 1 行，
         # 每张卡多一行，几张卡叠起来就是一屏的空白。
+        self._params.set_class(not self._show_output or not params, "-hidden")
         self._output.set_class(not self._show_output or not output, "-hidden")
         self._tail.set_class(not self._show_output or not tail, "-hidden")
         self._more.set_class(not self._show_output or not more, "-hidden")
+        self._files.set_class(not self._show_output or not files, "-hidden")
 
     def _track_elapsed(self, status: ToolStatus) -> None:
         """执行中起一个一秒一跳的秒表，离开执行中就把最终值定下来。"""
@@ -394,9 +444,12 @@ class ToolCard(Container):
         self._header.update(self._header_text())
 
     def sync(self, part: Part) -> None:
-        """刷新工具状态与输出。"""
+        """刷新工具状态与输出。失败那一刻把正文展开：错误原文才是能用的信息。"""
+        was_failed = self._part.tool_status is ToolStatus.FAILED
         self._part = part
         status = part.tool_status or ToolStatus.PENDING
+        if status is ToolStatus.FAILED and not was_failed:
+            self._show_output = True
         self._track_elapsed(status)
         self.set_class(status is ToolStatus.RUNNING, "-running")
         self.set_class(status is ToolStatus.AWAITING, "-awaiting")
@@ -413,7 +466,7 @@ class ToolCard(Container):
             self._refresh()
 
     def set_output_visible(self, visible: bool) -> None:
-        """控制工具输出是否显示（对应 /details 开关与点标题行收起）。"""
+        """控制工具输出是否显示（对应主题里的工具开关、`/details` 与点标题行收起）。"""
         self._show_output = visible
         self._refresh()
 
@@ -636,7 +689,6 @@ class MessagesPane(ScrollableContainer):
         self._message_views: dict[str, MessageView] = {}
         self._part_views: dict[str, Widget] = {}
         self._follow = True
-        self._show_details = False
         self._show_thinking = True
         self._tool_cards: list[ToolCard] = []
         self._reasoning_views: list[ReasoningPartView] = []
@@ -659,11 +711,15 @@ class MessagesPane(ScrollableContainer):
         self._topics: list[TopicView] = []
         self._topic_by_key: dict[str, TopicView] = {}
         self._header_views: dict[str, TopicHeader] = {}
+        self._artifact_rows: dict[str, ArtifactRow] = {}
         self._step_rows: dict[tuple[int, int], StepRow] = {}
         self._step_spans: list[tuple[tuple[int, int], tuple[int, int], Step]] = []
         self._open: dict[str, bool] = {}
         self._manual_open: set[str] = set()
         self._step_open: dict[tuple[int, int], bool] = {}
+        # 每个主题的工具输出是不是被一次展开过。第三层的状态按主题记：
+        # 主题、步、输出三层各管一段，互不覆盖。
+        self._tools_open: dict[str, bool] = {}
 
     def compose(self) -> ComposeResult:
         """底部那条「有新内容」提示。停靠的组件不参与内容滚动，也不进窗口索引。"""
@@ -747,6 +803,7 @@ class MessagesPane(ScrollableContainer):
             self._open.clear()
             self._manual_open.clear()
             self._step_open.clear()
+            self._tools_open.clear()
         last = self._topics[-1].key if self._topics else ""
         for topic in self._topics:
             self._open.setdefault(topic.key, topic.key == last or not topic.steps)
@@ -755,7 +812,11 @@ class MessagesPane(ScrollableContainer):
         for key, header in list(self._header_views.items()):
             topic = self._topic_by_key.get(key)
             if topic is not None:
-                header.sync(topic, self._is_open(key))
+                header.sync(topic, self._is_open(key), self._tools_open.get(key, False))
+        for key, row in list(self._artifact_rows.items()):
+            topic = self._topic_by_key.get(key)
+            if topic is not None:
+                row.sync(topic)
         for key, row in list(self._step_rows.items()):
             step = self._step_by_key(key)
             if step is not None:
@@ -817,10 +878,22 @@ class MessagesPane(ScrollableContainer):
         if header is None:
             header = TopicHeader(topic, self)
             self._header_views[topic.key] = header
+        else:
+            header.sync(topic, self._is_open(topic.key), self._tools_open.get(topic.key, False))
         return header
 
+    def _artifacts_for(self, topic: TopicView) -> ArtifactRow:
+        """主题下面那一行产物。名单为空时它自己藏起来，不必在这里判断。"""
+        row = self._artifact_rows.get(topic.key)
+        if row is None:
+            row = ArtifactRow(topic)
+            self._artifact_rows[topic.key] = row
+        else:
+            row.sync(topic)
+        return row
+
     def _rows_before(self, message_index: int, part_index: int) -> list[Widget]:
-        """这个位置前面该放的行：主题头在前，步行在后。
+        """这个位置前面该放的行：主题头在前，产物行与步行在后。
 
         两个都可以出现在这里：主题能从一条助手消息中间开始（`close_topic` 的切点
         就在同一条消息里），步从第一个工具调用那一格开始。
@@ -832,6 +905,7 @@ class MessagesPane(ScrollableContainer):
         topic = self._topic_starting_at((message_index, part_index))
         if topic is not None:
             rows.append(self._header_for(topic))
+            rows.append(self._artifacts_for(topic))
         step = self._step_starting_at((message_index, part_index))
         if step is not None:
             key = (step.message_index, step.part_start)
@@ -917,6 +991,40 @@ class MessagesPane(ScrollableContainer):
 
         self._change_height(mutate)
 
+    def toggle_topic_tools(self, key: str) -> bool:
+        """一次展开或收起一个主题里全部工具的输出，返回换过之后的可见状态。
+
+        只管输出这一层：步行的展开状态不动，收起的是工具正文，步本身仍是入口。
+        """
+        topic = self._topic_by_key.get(key)
+        if topic is None:
+            return False
+        visible = not self._tools_open.get(key, False)
+        self._tools_open[key] = visible
+
+        def mutate() -> None:
+            for card in self._topic_cards(topic):
+                card.set_output_visible(visible)
+            header = self._header_views.get(key)
+            if header is not None:
+                header.sync(topic, self._is_open(key), visible)
+
+        self._change_height(mutate)
+        return visible
+
+    def _topic_cards(self, topic: TopicView) -> list[ToolCard]:
+        """这个主题里已经建出来的工具卡。更早的段没挂上时返回空表。"""
+        cards: list[ToolCard] = []
+        for step in topic.steps:
+            if step.message_index >= len(self._messages):
+                continue
+            message = self._messages[step.message_index]
+            for part in message.parts[step.part_start : step.part_end]:
+                widget = self._part_views.get(part.id)
+                if isinstance(widget, ToolCard):
+                    cards.append(widget)
+        return cards
+
     def focus_topic(self, key: str) -> bool:
         """把某个主题打开，并滚到它的标题行。左栏的主题列表点一下走这里。
 
@@ -947,6 +1055,9 @@ class MessagesPane(ScrollableContainer):
         for header in list(self._header_views.values()):
             if header.is_mounted:
                 header.remove()
+        for row in list(self._artifact_rows.values()):
+            if row.is_mounted:
+                row.remove()
         for row in list(self._step_rows.values()):
             if row.is_mounted:
                 row.remove()
@@ -956,6 +1067,7 @@ class MessagesPane(ScrollableContainer):
         self._reasoning_views.clear()
         self._pending_parts.clear()
         self._header_views.clear()
+        self._artifact_rows.clear()
         self._step_rows.clear()
 
         total = len(self._messages)
@@ -1057,7 +1169,7 @@ class MessagesPane(ScrollableContainer):
         for topic in self._topics:
             header = self._header_views.get(topic.key)
             if header is not None:
-                header.sync(topic, self._is_open(topic.key))
+                header.sync(topic, self._is_open(topic.key), self._tools_open.get(topic.key, False))
         for key, row in list(self._step_rows.items()):
             step = self._step_by_key(key)
             if step is not None:
@@ -1254,12 +1366,16 @@ class MessagesPane(ScrollableContainer):
         for header in list(self._header_views.values()):
             if header.parent is self:
                 header.remove()
+        for row in list(self._artifact_rows.values()):
+            if row.parent is self:
+                row.remove()
         self._message_views.clear()
         self._part_views.clear()
         self._tool_cards.clear()
         self._reasoning_views.clear()
         self._pending_parts.clear()
         self._header_views.clear()
+        self._artifact_rows.clear()
         self._step_rows.clear()
         self._topics = []
         self._topic_by_key = {}
@@ -1267,6 +1383,7 @@ class MessagesPane(ScrollableContainer):
         self._open.clear()
         self._manual_open.clear()
         self._step_open.clear()
+        self._tools_open.clear()
         self._messages = []
         self._mounted_start = 0
         self._mounted_end = 0
@@ -1360,6 +1477,7 @@ class MessagesPane(ScrollableContainer):
                 topic = self._topic_starting_at((index, 0))
                 if topic is not None:
                     views.append(self._header_for(topic))
+                    views.append(self._artifacts_for(topic))
                 continue
             view = MessageView(message, self, index)
             self._message_views[message.id] = view
@@ -1403,6 +1521,11 @@ class MessagesPane(ScrollableContainer):
                     if header.parent is self:
                         header.remove()
                     self._header_views.pop(key, None)
+            for key, row in list(self._artifact_rows.items()):
+                if start <= row.topic.start[0] < end:
+                    if row.parent is self:
+                        row.remove()
+                    self._artifact_rows.pop(key, None)
         for key, row in list(self._step_rows.items()):
             if start <= key[0] < end:
                 self._step_rows.pop(key, None)
@@ -1623,12 +1746,6 @@ class MessagesPane(ScrollableContainer):
         self._set_follow(True)
         self.scroll_end(animate=False)
 
-    def set_details(self, visible: bool) -> None:
-        """切换工具输出详情的可见性。"""
-        self._show_details = visible
-        for card in self._tool_cards:
-            card.set_output_visible(visible)
-
     def set_thinking(self, visible: bool) -> None:
         """切换思考块的可见性。"""
         self._show_thinking = visible
@@ -1661,7 +1778,7 @@ class MessagesPane(ScrollableContainer):
 
         组件的创建有两条路：流式追加走 `add_part`，会话重建时由 `MessageView.compose` 直接调用。
         两张表在这里填，两条路才都填得上；只填一条路的后果是另一张表空着，
-        `/thinking` 或 `/details` 只改了数据与提示，画面不会有任何变化。
+        `/thinking` 只改了数据与提示，画面不会有任何变化。
 
         位置也在这里判一次：属于收起主题或收起步的组件建出来就是隐藏的，
         不必等折叠那一刻再去找它。
@@ -1669,13 +1786,18 @@ class MessagesPane(ScrollableContainer):
         widget = self._build_part(part)
         self._part_views[part.id] = widget
         if isinstance(widget, ToolCard):
-            widget.set_output_visible(self._show_details)
             self._tool_cards.append(widget)
         if isinstance(widget, ReasoningPartView):
             widget.set_class(not self._show_thinking, "-hidden")
             self._reasoning_views.append(widget)
         if message_index >= 0 and self._topics:
             self._apply_classes(widget, (message_index, part_index), part)
+            # 主题被一次展开过之后，后面才流进来的工具卡也要跟着展开，
+            # 否则用户点过「展开全部工具」，下一条输出仍然藏着。
+            if isinstance(widget, ToolCard):
+                topic = self._topic_for((message_index, part_index))
+                if topic is not None and self._tools_open.get(topic.key):
+                    widget.set_output_visible(True)
         return widget
 
     def _flush_pending(self) -> None:

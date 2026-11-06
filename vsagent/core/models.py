@@ -360,7 +360,7 @@ class Hypothesis:
     各自的分数」。那种产出无法被证伪，也无法指导下一步该合哪个分子。有了它，
     「这批 hit 为什么活」才有地方落，实验数据回来才有东西可以对。
 
-    字段对应 Roche 那篇 Perspective 的判据（`docs/molecular-design-principles.md`）：
+    字段对应 Roche 那篇 Perspective 的判据（`docs/reference.md` 第一节）：
     `claim` 是主张，`mechanism` 是机制，`evidence` 是已有证据，`test` 是怎么检验，
     `expected` 是预期结果（必须可判真假），`result_ref` 是回填的证据出处。
     """
@@ -687,7 +687,7 @@ class Step:
 
     只记**已经算好的事实**——工具名、参数、状态、产物 handle。不记 reasoning，
     也不让模型写自述：记录必须零请求，而自述会美化过程（「验证受体质量」比
-    「读了一下文件」好听，但后者才是过程）。见 `docs/session-review-plan.md` §4.3。
+    「读了一下文件」好听，但后者才是过程）。见 `docs/design.md` §4.3。
 
     `part_start` / `part_end` 是本步那几个 Part 在消息里的下标区间（开区间），
     Step 级召回（`recall_event evt_0003 7`）靠它切原文。

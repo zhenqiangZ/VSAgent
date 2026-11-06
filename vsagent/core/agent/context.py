@@ -7,7 +7,7 @@
 位置截断会把报错切掉一半，或者把结论所在的那一行留在省略号之外，
 而削掉的正是要看的那部分。哪一类先丢由 Part 类型决定，见 `_degrade_recent`。
 
-设计依据见 `docs/context-design.md`，实施计划见 `docs/context-plan.md`。
+设计见 `docs/design.md` §4，决策过程见 `docs/history.md` §1。
 """
 
 from __future__ import annotations

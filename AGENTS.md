@@ -1,8 +1,7 @@
 # VSAgent
 
 项目约定。细则是 `docs/screening-playbook.md`，讲到具体数字或参数前先读对应那一节。
-判据的来源是 `docs/molecular-design-principles.md`（Roche 十份前瞻性案例的复盘，
-原文 J. Med. Chem. 2016, 59, 4087）。
+判据的来源是 `docs/reference.md` 第一节（Roche 十份前瞻性案例的复盘，原文 J. Med. Chem. 2016）。
 
 ## 第 0 关：意图不清楚时先查再讲
 

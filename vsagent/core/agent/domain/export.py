@@ -13,7 +13,7 @@
 
 **为什么不算「接触」与「打分」。** `contacts`（逐原子接触对）要真实位姿，
 `score` 要对接程序。本轮两样都没有，**字段本身不出现**——写 0 会被当成「算出来是零」。
-见 `docs/web-viewer-plan.md` §2.1。
+见 `docs/design.md` §八。
 
 数值一律现算，**绝不接受调用方传进来的距离**：模型心算的 `min_distance: 2.67`
 看上去永远很像对的，而页面上几十个这样的值没有一个是真的。
@@ -1890,7 +1890,7 @@ def _run_files(target: Path, limit: int = 8) -> str:
     为什么要写进返回：`write_run` 之后最常被问的一句就是「里面有哪些文件」。
     不列的话模型要么答「不知道」，要么再跑一次 `ls` —— 而那次 `ls` 只是把
     磁盘上已经数得出来的东西重新描述一遍。四条上下文探针里，artifact 那一问
-    就卡在这里（见 `docs/context-rework-plan.md` Phase 5）。
+    就卡在这里（见 `docs/history.md` §1.1）。
     """
     try:
         entries = sorted(target.iterdir(), key=lambda item: item.name)

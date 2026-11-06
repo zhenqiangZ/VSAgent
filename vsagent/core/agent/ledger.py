@@ -572,7 +572,7 @@ class SessionLedger:
         为什么要有这一段：handle 只在**工具返回的那一刻**出现在上下文里，之后要么
         进了证据层、要么随旧工具结果被清掉。模型要用的时候手里没有索引，只能按前几步
         见过的编号往后推——实测里它就是这么写出 `artifact#2`、而登记表里只有
-        `artifact#1` 的（见 `docs/real-session-findings.md` F3）。
+        `artifact#1` 的（见 `docs/review.md` §1.3）。
 
         刻意只做三件事：报当前受体、报最近的产物、报配体集的 handle。**不调
         `reconcile()`**：那会把登记过的每个路径都读一遍算指纹，而这段每一步都要

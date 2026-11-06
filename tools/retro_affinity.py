@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""回顾性实验：靶点内活性数据能带来多少排序提升。方案见 `docs/retro-affinity-plan.md`。
+"""回顾性实验：靶点内活性数据能带来多少排序提升。读法与结论见 `docs/review.md` §4。
 
 ```
 python tools/retro_affinity.py select --target P00533 --target P00734 --target Q86WV6
@@ -2864,7 +2864,7 @@ def cmd_select(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="retro_affinity",
-        description="回顾性实验：select 审计 → build 切分 → run 跑臂 → report 判定。方案见 docs/retro-affinity-plan.md",
+        description="回顾性实验：select 审计 → build 切分 → run 跑臂 → report 判定。读法见 docs/review.md §4",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

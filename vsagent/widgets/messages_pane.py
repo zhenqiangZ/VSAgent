@@ -16,6 +16,7 @@ from ..core.agent.topics import (
     TopicView,
     position_key,
     step_seconds,
+    step_status,
     topic_views,
 )
 from ..core.models import Message, Part, PartType, Session, Step, ToolStatus
@@ -800,7 +801,8 @@ class MessagesPane(ScrollableContainer):
                 step,
             )
             for topic in self._topics
-            for step in topic.steps
+            for step in (*topic.steps, topic.live_step)
+            if step is not None
         ]
         if reset:
             self._open.clear()
@@ -823,7 +825,12 @@ class MessagesPane(ScrollableContainer):
         for key, row in list(self._step_rows.items()):
             step = self._step_by_key(key)
             if step is not None:
-                row.sync(step, step_seconds(self._messages, step), self._step_is_open(key))
+                row.sync(
+                    step,
+                    self._step_seconds(step),
+                    self._step_is_open(key),
+                    step_status(self._messages, step),
+                )
         self._sync_step_rows()
 
     def refresh_live(self) -> None:
@@ -875,6 +882,17 @@ class MessagesPane(ScrollableContainer):
                 return step
         return None
 
+    def _step_seconds(self, step: Step) -> float:
+        """这一步的耗时。运行中的那一步不写。
+
+        它的时段还含模型生成，而工具卡上另有秒表；两个数并排会互相矛盾。
+        记成步之后按原文算出来的最终值显示。
+        """
+        for topic in self._topics:
+            if topic.live_step is step:
+                return 0.0
+        return step_seconds(self._messages, step)
+
     def _header_for(self, topic: TopicView) -> TopicHeader:
         """主题头一列只有一个：重建与流式追加都从这里取。"""
         header = self._header_views.get(topic.key)
@@ -914,7 +932,12 @@ class MessagesPane(ScrollableContainer):
             key = (step.message_index, step.part_start)
             row = self._step_rows.get(key)
             if row is None:
-                row = StepRow(step, step_seconds(self._messages, step), self)
+                row = StepRow(
+                    step,
+                    self._step_seconds(step),
+                    self,
+                    step_status(self._messages, step),
+                )
                 self._step_rows[key] = row
             # 行是随消息一起建出来的，不走 `_build_and_register`，可见性得在这里补。
             self._apply_classes(row, key, None)
@@ -924,14 +947,17 @@ class MessagesPane(ScrollableContainer):
         return rows
 
     def _sync_step_rows(self) -> None:
-        """给刚记下来的步补一行。
+        """给还没有行的步补一行。
 
-        步是工具跑完之后才挂到会话上的，追加 Part 那一刻这一步还不在流水里，
-        按位置插入来不及。等 `step.recorded` 到了，再把行补到它第一个工具卡前面。
+        步要等这一段跑完才记下来，追加 Part 那一刻它还不在流水里；运行中的那一步
+        同样如此，它只存在于主题视图的 `live_step` 上。工具状态一变就把行补到
+        它第一个工具卡前面。
         """
         mounted = False
         for topic in self._topics:
-            for step in topic.steps:
+            for step in (*topic.steps, topic.live_step):
+                if step is None:
+                    continue
                 key = (step.message_index, step.part_start)
                 if key in self._step_rows or step.message_index >= len(self._messages):
                     continue
@@ -939,7 +965,12 @@ class MessagesPane(ScrollableContainer):
                 view = self._message_views.get(message.id)
                 if view is None or view.parts_box is None or not view.parts_box.is_attached:
                     continue
-                row = StepRow(step, step_seconds(self._messages, step), self)
+                row = StepRow(
+                    step,
+                    self._step_seconds(step),
+                    self,
+                    step_status(self._messages, step),
+                )
                 self._step_rows[key] = row
                 anchor = None
                 for position in range(step.part_start, min(step.part_end, len(message.parts))):
@@ -990,7 +1021,12 @@ class MessagesPane(ScrollableContainer):
                     widget.set_class(not open_now, "-step-hidden")
             row = self._step_rows.get(key)
             if row is not None:
-                row.sync(step, step_seconds(self._messages, step), open_now)
+                row.sync(
+                    step,
+                    self._step_seconds(step),
+                    open_now,
+                    step_status(self._messages, step),
+                )
 
         self._change_height(mutate, self._step_rows.get(key))
 
@@ -1016,10 +1052,14 @@ class MessagesPane(ScrollableContainer):
         return visible
 
     def _topic_cards(self, topic: TopicView) -> list[ToolCard]:
-        """这个主题里已经建出来的工具卡。更早的段没挂上时返回空表。"""
+        """这个主题里已经建出来的工具卡。更早的段没挂上时返回空表。
+
+        运行中的那一步也要算进来：点「展开全部工具」时，正在跑的那几张卡
+        同样要跟着展开。
+        """
         cards: list[ToolCard] = []
-        for step in topic.steps:
-            if step.message_index >= len(self._messages):
+        for step in (*topic.steps, topic.live_step):
+            if step is None or step.message_index >= len(self._messages):
                 continue
             message = self._messages[step.message_index]
             for part in message.parts[step.part_start : step.part_end]:
@@ -1176,7 +1216,12 @@ class MessagesPane(ScrollableContainer):
         for key, row in list(self._step_rows.items()):
             step = self._step_by_key(key)
             if step is not None:
-                row.sync(step, step_seconds(self._messages, step), self._step_is_open(key))
+                row.sync(
+                    step,
+                    self._step_seconds(step),
+                    self._step_is_open(key),
+                    step_status(self._messages, step),
+                )
         self._unmount_hidden_messages()
         self._mount_visible_messages()
 

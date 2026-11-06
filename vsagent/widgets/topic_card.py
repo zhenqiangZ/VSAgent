@@ -22,14 +22,15 @@ from ..core.models import Step
 if TYPE_CHECKING:
     from .messages_pane import MessagesPane
 
-# 与工具卡同一套字形：空心的圆还没开始，实心在做，勾与叉是两种结局，
-# 方块表示用户按停。
+# 与工具卡同一套字形：空心的圆还没开始，实心在做，半圆在等用户答复，
+# 勾与叉是两种结局，方块表示用户按停。
 STATUS_MARK = {
     "completed": "✓",
     "failed": "✕",
     "interrupted": "■",
     "running": "●",
     "unsealed": "○",
+    "waiting": "◐",
 }
 
 STATUS_LABEL = {
@@ -38,6 +39,7 @@ STATUS_LABEL = {
     "interrupted": "已中断",
     "running": "进行中",
     "unsealed": "未封存",
+    "waiting": "等待确认",
 }
 
 STATUS_COLOR = {
@@ -46,7 +48,24 @@ STATUS_COLOR = {
     "interrupted": "#FFB300",
     "running": "#4A9EFF",
     "unsealed": "#5A5A5A",
+    "waiting": "#FFB300",
 }
+
+
+def topic_state(topic: TopicView) -> str:
+    """主题这一行该按哪个状态画。
+
+    运行中又在等用户答复时按 waiting 画：这一轮卡在一个没人回答的确认上，
+    与还在跑的工具看起来应当不一样。主题的状态值仍是 running——等待是运行中的
+    一个相位，`Event.status` 的换算与此无关，这里只决定字形与颜色。
+
+    等待的源头在工具卡的 `ToolStatus.AWAITING`，主题行与标题行都读这一个判断，
+    两处各写一份的话，同一个主题会在左栏与卡片上显示成两种样子。
+    """
+    if topic.status == "running" and (topic.current or {}).get("phase") == "waiting":
+        return "waiting"
+    return topic.status if topic.status in STATUS_MARK else "completed"
+
 
 TITLE_LIMIT = 28
 LINE_LIMIT = 72
@@ -122,7 +141,9 @@ def detail_text(topic: TopicView, open_now: bool) -> str:
         phase = str(current.get("phase") or "")
         tool = str(current.get("tool") or "")
         if phase == "waiting" and tool:
-            head = f"等待确认：{tool}"
+            # 标题行已经写了「◐ 等待确认」，这一行只补是哪个工具在等，
+            # 同样的四个字再写一遍读起来像两句话。
+            head = f"{tool} 等你答复"
         elif phase == "tool" and tool:
             head = f"正在运行 {tool}"
         else:
@@ -225,7 +246,7 @@ class TopicHeader(Container):
         line.append("▾ " if open_now else "▸ ", style="#5A5A5A")
         line.append(f"{topic.index:02d} ", style="#4A9EFF")
         line.append(short(topic.title, TITLE_LIMIT) or "新主题", style="bold")
-        status = topic.status if topic.status in STATUS_MARK else "completed"
+        status = topic_state(topic)
         line.append(f"  {STATUS_MARK[status]} {STATUS_LABEL[status]}", style=STATUS_COLOR[status])
         if topic.steps:
             line.append(f" · {len(topic.steps)} 步", style="#5A5A5A")
@@ -322,9 +343,11 @@ class ArtifactRow(Horizontal):
 
 
 class StepRow(Static):
-    """一步一行：序号、做了什么、耗时、成败。
+    """一步一行：序号、做了什么、耗时、状态。
 
     点击收起或展开这一步的工具卡。行本身不藏起来，否则收起之后就没有入口再打开。
+    还没记成步的那一步也用它画，状态取工具卡上的实时值，所以运行中与等确认的
+    那一步在流水里也有一行。
     """
 
     DEFAULT_CSS = """
@@ -338,17 +361,21 @@ class StepRow(Static):
     StepRow.-pane-row { margin-left: 4; }
     """
 
-    def __init__(self, step: Step, seconds: float, pane: MessagesPane) -> None:
+    def __init__(
+        self, step: Step, seconds: float, pane: MessagesPane, status: str
+    ) -> None:
         super().__init__(markup=False)
         self.step = step
         self.seconds = seconds
         self.pane = pane
+        self.status = status
         self.add_class("step-row")
         self.update(self.render_step(True))
 
-    def sync(self, step: Step, seconds: float, open_now: bool) -> None:
+    def sync(self, step: Step, seconds: float, open_now: bool, status: str) -> None:
         self.step = step
         self.seconds = seconds
+        self.status = status
         self.update(self.render_step(open_now))
 
     def render_step(self, open_now: bool) -> Text:
@@ -359,8 +386,12 @@ class StepRow(Static):
         line.append(short(step.intent or "、".join(step.tools), LINE_LIMIT), style="#8B949E")
         if self.seconds:
             line.append(f" · {format_seconds(self.seconds)}", style="#5A5A5A")
-        if step.issues:
-            line.append("  ✕ 失败", style="#C62828")
+        if self.status == "failed":
+            line.append("  ✕ 失败", style=STATUS_COLOR["failed"])
+        elif self.status in ("running", "waiting", "pending"):
+            # 三种未完成的状态只画字形，不写词：工具卡上是同一套字形，
+            # 一行里再加「执行中」就是把同一件事说两遍。
+            line.append(f"  {STATUS_MARK[self.status]}", style=STATUS_COLOR[self.status])
         else:
             line.append("  ✓", style="#5A5A5A")
         return line

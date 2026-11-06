@@ -550,6 +550,8 @@ graph TD
   **主题的结局在封存之前就定**（`topics._stopped_status`）：取消的一轮画成中断、停在
   失败上的一段画成失败，不必等事件写完；进行中失败过的主题，第二行第一句就是「失败：」，
   颜色按红色。中断时界面自己调 `messages.set_running(False)`——取消不走 `turn.done`。
+  运行中的那一步还没记成步，由 `TopicView.live_step` 从 Part 现折，状态取
+  `topics.step_status()`（失败 → 等确认 → 执行中 → 未开始 → 完成），记成步前后是同一行。
   主题头下面还有一行 `ArtifactRow`：列前三件产物，收起主题时仍在，点名字走
   `app.open_artifact()` 在浏览器里打开。
   工具卡的输入与输出**默认收起**（`ToolCard._show_output=False`），主题与步默认展开，

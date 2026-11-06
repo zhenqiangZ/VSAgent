@@ -42,7 +42,7 @@ PLAN_DENY = frozenset(
      "build_pharmacophore", "screen_pharmacophore", "align_ligands"}
 )
 
-# 按次计费的联网工具：5 元 / 1000 次成功请求（`docs/knowledge-plan.md` §5.1）。
+# 按次计费的联网工具：5 元 / 1000 次成功请求（`docs/reference.md` 第三节）。
 # 单次约 0.005 元，为这个价钱每一步都弹一次窗只会把人逼成条件反射按 y，
 # 所以给一个**本会话配额**：前 BILLED_ASK_AFTER 次直接放行，之后每次都问。
 BILLED_TOOLS = frozenset({"search_web", "fetch_webpage"})

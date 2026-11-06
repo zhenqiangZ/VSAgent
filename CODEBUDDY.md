@@ -54,9 +54,10 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 模型自己决定调用哪些工具去查靶点、取结构、准备受体、算口袋、写运行目录、打开结构查看器，
 把结果与推理过程实时流回界面。附带的 `web/` + `viz/` 是同一份数据的只读网页查看端。
 
-没有 README，没有 pyproject / setup.py / pytest / ruff / mypy 配置，也没有 Makefile。
-依赖手工装，测试是**直接跑的脚本**。详细逐文件导览见 `docs/source-map.md`（很长但准确；
-开头的文件/行数统计会随改动漂移，别拿它当基线，且不含 `web/` `viz/`）。
+没有 pyproject / setup.py / pytest / ruff / mypy 配置，也没有 Makefile（`README.md` 只讲装法与
+跑法，架构看 `docs/design.md`）。
+依赖手工装，测试是**直接跑的脚本**。模块地图见 `docs/design.md` 第十节（不给逐文件行数，
+那类数字随改动漂移；也不含 `web/` `viz/`）。
 
 CI 只有一个 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，**两份依赖都装**
 （叠合与先验口袋那几条断言需要 gemmi，缺了会直接抛出 ToolError）。
@@ -280,9 +281,7 @@ graph TD
   原文一条不删：`Step` 上的 `message_index` / `part_start` / `part_end` 就是取回它的地址。
   召回三级：`recall_event()` 列主题、`recall_event("evt_0003")` 读流水结论与原文、
   `recall_event("evt_0003", step=7)` 读那一步的工具输出原文。
-  三条不变式（连续覆盖、边界不收当前步、封存不花请求）见
-  [`docs/session-review-plan.md`](docs/session-review-plan.md) §4；
-  [`docs/event-log-design.md`](docs/event-log-design.md) 记录的是旧设计，不随代码更新。
+  三条不变式（连续覆盖、边界不收当前步、封存不花请求）见 `docs/design.md` §4.3。
   事件块超额裁掉最旧几个主题时要补一行「更早还有 N 个主题」——被裁事件覆盖的原文
   既不在事件里也不在 RECENT 里，不说就是无声消失。
   **摘要已退休**：它的三段分别由 TASK、Step 流水、主题结论覆盖；
@@ -343,7 +342,7 @@ graph TD
   写入做三件事：精确去重、同 refs + 更新词时把旧条目标 `superseded_by`（不直接删除）、
   agent 的引用必须存在（用户写入可不存在，标 `unverified` 排在后面）。
   常驻注入是「核心 / 相关 / 最近」三段，1200 token，其余用 `recall` 取；`recall` 按
-  字段权重 × 90 天衰减打分。详见 [`docs/memory-design.md`](docs/memory-design.md) §13。
+  字段权重 × 90 天衰减打分。详见 `docs/design.md` §4.6 与 `docs/history.md` §2.2。
 - `hypothesis.py` — **产出单位**：这个 agent 交出的是一组可检验的判断。
   `Hypothesis` 对象存在 `TaskState.hypotheses` 里（数据在 `models.py`，工具在 `core/agent/`，
   分层理由与 `task.py` 相同），未结的按粒度分组渲染（策略 2 条、机制 3 条）进 `TASK` 层。
@@ -398,7 +397,7 @@ graph TD
   `domain/fit_train.py` 在 `models/DTA/.venv` 里跑（5–10 分钟，CPU），主仓一行
   torch 都不 import。**它只对这个口袋有效，换受体或换口袋要重训**；而且实测只与
   「ECFP4 + LightGBM」打平、不超越。DTA 通道固定走「微调 → 推理」，零样本不再是
-  流程的一部分。依据见 [`docs/retro-affinity-report.md`](docs/retro-affinity-report.md) §九。
+  流程的一部分。依据见 `docs/review.md` §4.4。
 - `affinity.py` 是**第二个调外部进程的工具**，外面是一个 Python 解释器，
   所以它比 `docking.py` 多两件事：`dta_python()` / `dta_root()` 两个环境变量入口，
   以及**现截口袋**（受体的 `box.txt` 只给中心，模型要的是中心 10Å 内的残基）。
@@ -483,7 +482,7 @@ graph TD
 
 - **每路 40 条是量出来的**（`index.CHANNEL_LIMIT`）：30 → 40 让「标注源进前 8 组」
   从 0.927 升到 0.945、「答案在片段里」从 0.796 升到 0.815，50/80 不涨。RRF 权重、
-  k、章节加权、References 过滤、邻块范围都扫过，均无增益（见 `docs/knowledge-plan.md` §11）。
+  k、章节加权、References 过滤、邻块范围都扫过，均无增益（见 `docs/review.md` §3）。
 
 - **解析与切块只有一条路**：`index.chunks_for`。入库与 `reindex` 各写一份的话，
   重建出来的块跟当初写进去的不一样，而「重建两次一致」的判据正好抓不到这种漂移。
@@ -577,7 +576,7 @@ graph TD
 
 ### 状态与持久化
 
-真相在 `~/.vsagent/state.toml`（`session_manager.py:default_state_path()`），TOML + `STATE_VERSION=1`。
+真相在 `~/.vsagent/state.toml`（`session_manager.py:default_state_path()`），TOML + `STATE_VERSION=2`。
 同目录还有 `connection.toml`（模型接口，权限 0600）、`ledgers/`（按会话 id 隔离），traces 在 `logs/`，运行产物在仓库根的 `runs/`。
 
 写入是**原子替换**：同目录临时文件 → flush → `os.fsync` → `_replace_with_retry`（40 次 × 5ms 重试 `PermissionError`）。
@@ -731,5 +730,5 @@ import 任何 npm 包，换 3D 库只动 `viz/`。
   读的就是它，且按**代码位置**定位——源码运行时是仓库根，打包后是 exe 所在目录。
   它在每个 step 注入系统提示的「项目规则」段，改完下一个 step 即生效；**不设大小上限**，
   整份注入（编码坏了才返回空串）。它装着**确认点、许可与判据**，展开的操作细则在
-  `docs/screening-playbook.md`——改流程细节写 playbook，`AGENTS.md` 只放「什么算数、
+  `docs/screening-playbook.md`——改流程细节写那一份，`AGENTS.md` 只放「什么算数、
   什么不许做」。

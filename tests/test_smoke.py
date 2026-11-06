@@ -1229,6 +1229,7 @@ async def run() -> None:
         await run_topic_card_checks()
         run_topic_state_checks()
         await run_artifact_row_checks()
+        await run_topic_scroll_checks()
         run_viewer_address_checks()
         await run_coalesce_checks()
         await run_tools_panel_checks()
@@ -1774,6 +1775,137 @@ async def run_artifact_row_checks() -> None:
         await pilot.click(chip)
         await pilot.pause()
         check(opened == ["run#1"], f"点名字把 handle 交上去：{opened}")
+
+
+async def run_topic_scroll_checks() -> None:
+    """折叠与展开之后，视口里那一段留在原处。
+
+    按总高度差补偿会把整屏平移：折叠由点击触发，变化发生在被点的那一行下面，
+    视口上方一行都不该跟着动。三条路各验一次，外加「贴底时点一下不再被拽回底部」。
+    """
+    from vsagent.core.agent.event_log import record_step, seal_topic
+    from vsagent.widgets.topic_card import StepRow, TopicHeader
+
+    session = Session(id="ses_topic_scroll", title="折叠滚动")
+    for topic_no in range(6):
+        user = session.add_message(Message(role="user"))
+        user.add_part(Part(type=PartType.TEXT, text=f"第 {topic_no} 个问题"))
+        assistant = session.add_message(Message(role="assistant"))
+        assistant.add_part(Part(type=PartType.STEP_START, text=f"{topic_no} · fake"))
+        calls = []
+        for call_no in range(4):
+            call = Part(
+                type=PartType.TOOL,
+                tool_name="bash",
+                tool_status=ToolStatus.COMPLETED,
+                tool_input={"command": f"echo {topic_no}-{call_no}"},
+                tool_output="\n".join(f"第 {line} 行" for line in range(6)),
+            )
+            assistant.add_part(call)
+            calls.append(call)
+        record_step(
+            session,
+            step_no=topic_no,
+            parts=calls,
+            message_index=len(session.messages) - 1,
+            part_start=1,
+            part_end=5,
+        )
+        assistant.add_part(Part(type=PartType.TEXT, text=f"结论 {topic_no}"))
+        seal_topic(session, cut=(len(session.messages), 0))
+
+    class Demo(App):
+        def compose(self) -> ComposeResult:
+            self.pane = MessagesPane()
+            yield self.pane
+
+        def on_mount(self) -> None:
+            self.pane.rebuild(session.messages, session, running=False)
+
+    async def settle(pilot) -> None:
+        # 补偿排在刷新之后，还要等布局连着两帧不变才动手，多停几帧才读得准。
+        for _ in range(12):
+            await pilot.pause()
+
+    app = Demo()
+    async with app.run_test(size=(100, 30)) as pilot:
+        await settle(pilot)
+        pane = app.pane
+        headers = list(pane.query(TopicHeader))
+        check(len(headers) == 6, f"六个主题六个头：{len(headers)}")
+        target = headers[2]
+
+        pane.scroll_to_widget(target, animate=False, top=True)
+        await settle(pilot)
+        row = target.region.y
+        check(row >= 0, f"目标头滚进视口：{row}")
+
+        pane.toggle_topic(target.topic.key)
+        await settle(pilot)
+        check(
+            target.region.y == row,
+            f"展开之后头部那一行不动：{row} → {target.region.y}",
+        )
+        check(pane.scroll_y > 0, f"展开之后视口仍在原来的位置：scroll_y={pane.scroll_y}")
+
+        pane.toggle_topic(target.topic.key)
+        await settle(pilot)
+        check(
+            target.region.y == row,
+            f"收起之后头部那一行不动：{row} → {target.region.y}",
+        )
+
+        # 第二层：工具的展开与收起。
+        pane.toggle_topic(target.topic.key)
+        await settle(pilot)
+        pane.scroll_to_widget(target, animate=False, top=True)
+        await settle(pilot)
+        row = target.region.y
+        pane.toggle_topic_tools(target.topic.key)
+        await settle(pilot)
+        check(
+            target.region.y == row,
+            f"展开全部工具之后头部那一行不动：{row} → {target.region.y}",
+        )
+
+        # 第三层：收起步。步行自己是锚点，它的行也不该动。
+        steps = [step for step in pane.query(StepRow) if 0 <= step.region.y < 30]
+        check(bool(steps), "视口里有一行步")
+        step_row = steps[0]
+        step_line = step_row.region.y
+        pane.toggle_step(step_row.step.message_index, step_row.step.part_start)
+        await settle(pilot)
+        check(
+            step_row.region.y == step_line,
+            f"收起一步之后那一行不动：{step_line} → {step_row.region.y}",
+        )
+
+        # 贴底跟随的时候点一下：头部留住，视口不再被拽回底部。
+        pane.scroll_to_bottom()
+        await settle(pilot)
+        visible = [head for head in headers if 0 <= head.region.y < 30]
+        check(bool(visible), "底部上有一屏可见的头")
+        head = visible[0]
+        head_line = head.region.y
+        pane.toggle_topic(head.topic.key)
+        await settle(pilot)
+        check(
+            head.region.y == head_line,
+            f"贴底时点一下，头部那一行不动：{head_line} → {head.region.y}",
+        )
+        check(
+            not pane.following,
+            "点开之后不再跟随：下一次流式输出不该把视口拽走",
+        )
+
+        # 跳到一个更早的主题：位置由这一次滚动决定，补偿不该把它拽回去。
+        pane.focus_topic(headers[0].topic.key)
+        await settle(pilot)
+        window = pane.region
+        check(
+            window.y <= headers[0].region.y < window.y + 2,
+            f"跳到第一个主题之后它的头在视口顶端：{headers[0].region.y}，消息区 {window.y}",
+        )
 
 
 def run_viewer_address_checks() -> None:

@@ -700,6 +700,9 @@ class MessagesPane(ScrollableContainer):
         self._mounted_start = 0
         self._mounted_end = 0
         self._loading = False
+        # 每次改高度领一个号。上一次的补偿还排在刷新队列里时又点了一下，
+        # 两个补偿会各按自己那份差值滚一次，画面来回跳；旧的那次看到号变了就退出。
+        self._restore_token = 0
         self._was_at_bottom = False
         self._history_hint: Static | None = None
         self._new_hint: NewMessagesHint | None = None
@@ -966,7 +969,7 @@ class MessagesPane(ScrollableContainer):
             self._manual_open.add(key)
         else:
             self._manual_open.discard(key)
-        self._sync_visibility()
+        self._sync_visibility(self._header_views.get(key))
 
     def toggle_step(self, message_index: int, part_start: int) -> None:
         """点步行：收起或展开这一步的工具卡。"""
@@ -989,7 +992,7 @@ class MessagesPane(ScrollableContainer):
             if row is not None:
                 row.sync(step, step_seconds(self._messages, step), open_now)
 
-        self._change_height(mutate)
+        self._change_height(mutate, self._step_rows.get(key))
 
     def toggle_topic_tools(self, key: str) -> bool:
         """一次展开或收起一个主题里全部工具的输出，返回换过之后的可见状态。
@@ -1009,7 +1012,7 @@ class MessagesPane(ScrollableContainer):
             if header is not None:
                 header.sync(topic, self._is_open(key), visible)
 
-        self._change_height(mutate)
+        self._change_height(mutate, self._header_views.get(key))
         return visible
 
     def _topic_cards(self, topic: TopicView) -> list[ToolCard]:
@@ -1039,7 +1042,7 @@ class MessagesPane(ScrollableContainer):
         self._open[key] = True
         header = self._header_views.get(key)
         if header is not None and header.is_mounted:
-            self._change_height(lambda: self._apply_visibility())
+            self._change_height(lambda: self._apply_visibility(), compensate=False)
             self.scroll_to_widget(header, animate=False, top=True)
             return True
         self._jump_window(topic.start[0], key)
@@ -1152,12 +1155,12 @@ class MessagesPane(ScrollableContainer):
         )
         widget.set_class(by_step, "-step-hidden")
 
-    def _sync_visibility(self) -> None:
+    def _sync_visibility(self, anchor: Widget | None = None) -> None:
         """把展开状态写进界面。
 
         一次处理全部主题：逐主题各做一遍的话，一次自动折叠会补偿好几次滚动。
         """
-        self._change_height(self._apply_visibility)
+        self._change_height(self._apply_visibility, anchor)
 
     def _apply_visibility(self) -> None:
         for index in range(self._mounted_start, self._mounted_end):
@@ -1225,24 +1228,96 @@ class MessagesPane(ScrollableContainer):
                 return
         self.mount_all(widgets)
 
-    def _change_height(self, mutate: Callable[[], None]) -> None:
+    def _change_height(
+        self,
+        mutate: Callable[[], None],
+        anchor: Widget | None = None,
+        compensate: bool = True,
+    ) -> None:
         """改完可见性之后把视口留在原处。
 
-        收起或展开一次能改掉上百行，不做补偿的话画面会跳到另一个主题上去。
-        等布局停稳再读高度差，理由与向上补挂那段相同。
+        补偿量按锚点那一块的屏幕行算：改完把它放回原来的行，用户正在看的那一段
+        就不动。按总高度差补偿只在「变化的行全部在视口上方」时成立，那是向上补挂
+        更早消息的情形；折叠与展开由点击触发，变化的行在锚点下面，照那个式子算
+        会让整屏平移同样的行数。
 
-        停在底部时（跟随中）走另一条路：补偿算的是「原来那段内容别动」，
-        而用户要看的是最新的结果，改动完重新贴回底部才对。
+        锚点缺一个时就退回高度差：自动折叠没有可点的位置，视口顶端那一块也可能
+        正是这次要收走的那段。`compensate=False` 给的是「位置由调用方自己安排」的
+        情形，例如跳到某个主题头，那里紧接着会显式滚一次。
         """
         self._loading = True
         scroll_before = self.scroll_y
         height_before = self.virtual_size.height
+        if anchor is None or not anchor.is_mounted or not self._in_view(anchor):
+            anchor = self._scroll_anchor()
+        row_before = anchor.region.y if anchor is not None else None
+        self._restore_token += 1
+        token = self._restore_token
         mutate()
+        if not compensate:
+            self._loading = False
+            return
+        if row_before is not None:
+            self.call_after_refresh(self._restore_anchor, anchor, row_before, token)
+            return
         if self._follow:
             self._loading = False
             self.call_after_refresh(self.scroll_end, animate=False)
             return
         self.call_after_refresh(self._restore_after_layout, scroll_before, height_before)
+
+    def _in_view(self, widget: Widget) -> bool:
+        """这一块是不是还露在视口里。
+
+        `/details` 不经过点击，目标主题的头可能已经滚到视口上方；拿它当参照量不到
+        它下方那些行的变化，得换视口顶端那一块。
+        """
+        top = self.region.y
+        bottom = self.region.bottom
+        return widget.region.y < bottom and widget.region.bottom > top
+
+    def _scroll_anchor(self) -> Widget | None:
+        """视口最上面那一块组件。
+
+        取底边还压在视口里的第一个：它可能是半个主题头、一条消息或一行产物。
+        高度变化之后拿它当参照，就不必判断变化发生在上方还是下方。
+        """
+        top = self.region.y
+        for child in self.children:
+            if child.region.height <= 0:
+                continue
+            if child.region.bottom > top:
+                return child
+        return None
+
+    def _restore_anchor(
+        self,
+        anchor: Widget,
+        row_before: int,
+        token: int,
+        last_height: int = -1,
+        attempts: int = 0,
+    ) -> None:
+        """布局停稳之后把锚点挪回原来的屏幕行。
+
+        差多少滚多少：锚点被推到下面说明它上方长高了，往下滚同样的行数；锚点没动
+        （变化全在它下面）就不滚。锚点在这一轮里被摘掉时不做补偿，交给上下界夹回。
+        号变了说明又点了一下，这一轮的基线已经不作数，直接退出。
+        """
+        if token != self._restore_token:
+            return
+        height_after = self.virtual_size.height
+        if height_after != last_height and attempts < 8:
+            self.call_after_refresh(
+                self._restore_anchor, anchor, row_before, token, height_after, attempts + 1
+            )
+            return
+        shift = anchor.region.y - row_before if anchor.is_mounted else 0
+        self.scroll_to(y=self.scroll_y + shift, animate=False, immediate=True)
+        self._loading = False
+        # 补偿之后不再贴底就关掉跟随：下一次流式输出不该把视口拽回底部。
+        self._set_follow(self._at_bottom())
+        self._after_layout_change()
 
     def _restore_after_layout(
         self, scroll_before: float, height_before: int, last_height: int = -1, attempts: int = 0

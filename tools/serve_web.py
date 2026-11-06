@@ -68,6 +68,12 @@ def main() -> None:
         default=None,
         help="结构全景根目录（默认 ~/.vsagent/surveys）",
     )
+    parser.add_argument(
+        "--ledgers",
+        type=Path,
+        default=None,
+        help="会话登记表根目录（默认 ~/.vsagent/ledgers）",
+    )
     args = parser.parse_args()
 
     port = args.port if args.port is not None else default_port()
@@ -78,6 +84,7 @@ def main() -> None:
         args.web.resolve(),
         corpus_root=args.corpus.resolve() if args.corpus else None,
         surveys_root=args.surveys.resolve() if args.surveys else None,
+        ledgers_root=args.ledgers.resolve() if args.ledgers else None,
     )
     print(f"状态文件 {server.state_path}")
     print(f"运行目录 {server.runs_dir}")

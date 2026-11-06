@@ -17,16 +17,23 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ..core.models import Message, Part, PartType, Session, ToolStatus
+from ..core.session_manager import RAIL_MAX, RAIL_MIN, SIDE_MAX, SIDE_MIN
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import EditorPane
-from ..widgets.messages_pane import STATUS_ICON, MessagesPane
+from ..widgets.messages_pane import SESSION_STATUS_TEXT, STATUS_ICON, MessagesPane
+from ..widgets.session_list import SessionList, SessionRow
+from ..widgets.splitter import Splitter
 from ..widgets.status_bar import (
     ContextUsage,
     SidebarToggle,
     StatusBar,
     format_tokens,
 )
+from ..widgets.topic_list import TopicList, TopicRow
 from .context_usage import ContextUsageScreen
+
+# 中间那一栏至少要留这么多列。拖动分栏界线时宽度夹在这里，终端变窄时按同一档重算。
+MIN_MAIN_WIDTH = 40
 
 
 def _short(text: str, width: int) -> str:
@@ -41,17 +48,6 @@ def _short(text: str, width: int) -> str:
     while text and cell_len(text) + 1 > width:
         text = text[:-1]
     return text + "…"
-
-
-def _status_text(status: str) -> str:
-    """子 agent 状态的中文说法。"""
-    return {
-        "idle": "空闲",
-        "running": "运行中",
-        "done": "完成",
-        "failed": "失败",
-        "cancelled": "已中断",
-    }.get(status, status)
 
 
 class AgentOptionList(OptionList):
@@ -101,6 +97,8 @@ class SidePanel(Vertical):
         yield Static("", id="side-files", classes="side-body", markup=False)
         yield Static("工具调用", classes="side-section")
         yield Static("", id="side-tools", classes="side-body", markup=False)
+        yield Static("产物", classes="side-section")
+        yield Static("", id="side-artifacts", classes="side-body", markup=False)
 
     def update_context(self, session: Session) -> None:
         """按当前会话刷新用量、引用文件与工具清单。
@@ -122,12 +120,28 @@ class SidePanel(Vertical):
         self._write("#side-stats", stats)
         self._write("#side-files", self._files_text(session))
         self._write("#side-tools", self._tools_text(session))
+        self._write("#side-artifacts", self._artifacts_text(session))
+
+    @staticmethod
+    def _artifacts_text(session: Session) -> str:
+        """这一轮产出的 handle，按主题倒序取最近几条。
+
+        handle 只在产出它的那次会话里有效，所以这里只列名字，不给路径：
+        要看文件去运行目录，要把 handle 交给工具就照抄整行。
+        """
+        names: list[str] = []
+        for event in reversed(session.events):
+            for name in event.artifacts:
+                if name not in names:
+                    names.append(name)
+            if len(names) >= 6:
+                break
+        return "\n".join(names[:6]) if names else "还没有产物"
 
     def refresh_agents(self, children: list[Session], current_id: str) -> None:
         """重画子 agent 列表。
 
-        这一段**不走 `_write`**：既有判据断言侧栏打开后 `_written` 恰好是
-        上下文那三个键，子 agent 列表是一组可点条目，不是几段文字。
+        这一段**不走 `_write`**：既有判据断言侧栏打开后 `_written` 恰好是上下文那四个键，子 agent 列表是一组可点条目，不是几段文字。
 
         每条两行：第一行状态、名字、时间，第二行一句说明（失败原因或消息条数）。
         父会话取了哪一段历史、谁派发的，都不进这两行——那是打开之后才要读的细节，
@@ -145,6 +159,8 @@ class SidePanel(Vertical):
             return
         title.update(f"子 AGENT ({len(children)})")
         listing.clear_options()
+        # 标题按栏宽截：把右栏拖宽之后还按 12 字截，多出来的地方就白空着。
+        width = max(16, self.content_size.width or 28)
         for child in children:
             marker = {
                 "running": "●",
@@ -159,14 +175,18 @@ class SidePanel(Vertical):
             note = child.status_note.strip()
             # 「仅创建」的子 agent 还是 idle，但任务书已经在了：说「空闲」会让人
             # 以为它什么都不用做，说「待开始」才对应界面里那条开始条。
-            detail = "待开始" if child.has_pending_prompt else _status_text(child.status)
+            detail = (
+                "待开始"
+                if child.has_pending_prompt
+                else SESSION_STATUS_TEXT.get(child.status, child.status)
+            )
             if note:
-                detail += f" · {_short(note, 10)}"
+                detail += f" · {_short(note, max(6, width - 18))}"
             else:
                 detail += f" · {len(child.messages)} 条"
             listing.add_option(
                 Option(
-                    f"{marker} {_short(child.title, 12)}{now} · {stamp}\n  {detail}",
+                    f"{marker} {_short(child.title, max(8, width - 16))}{now} · {stamp}\n  {detail}",
                     id=child.id,
                 )
             )
@@ -269,6 +289,10 @@ class ChatScreen(Screen):
         self._busy = False
         self._unsubscribes: list[object] = []
         self._title_written = ""
+        # 当前画出来的两栏宽度。拖动时按这一份加减，不读样式里的标量：
+        # 终端变窄之后样式被夹过一档，读回来再加减会跳。
+        self._rail_width = 30
+        self._side_width = 30
 
     @property
     def session(self) -> Session:
@@ -301,9 +325,19 @@ class ChatScreen(Screen):
     def compose(self) -> ComposeResult:
         with Vertical():
             with Horizontal(id="chat-body"):
-                yield MessagesPane(self._stop_consuming)
+                # 左栏是导航：上面是会话树（子 agent 缩进挂在父会话下），下面是这一轮的主题。
+                # 中间是对话与输入框，右栏是上下文与产物。三栏的显隐互不牵连。
+                with Vertical(id="chat-rail"):
+                    yield SessionList(id="chat-sessions")
+                    yield TopicList(id="chat-topics")
+                yield Splitter(id="rail-split")
+                # 对话与输入框放在同一栏里，两者的宽度天然一致：
+                # 输入框横贯整屏时，它比消息区多出左右两栏的宽度，两边的文字起始列对不上。
+                with Vertical(id="chat-main"):
+                    yield MessagesPane(self._stop_consuming)
+                    yield EditorPane(root=self.root)
+                yield Splitter(sign=-1, id="side-split")
                 yield SidePanel(id="side-panel")
-            yield EditorPane(root=self.root)
             yield StatusBar()
 
     def on_mount(self) -> None:
@@ -314,12 +348,15 @@ class ChatScreen(Screen):
             bus.subscribe("part.add", self._on_part_add),
             bus.subscribe("part.update", self._on_part_update),
             bus.subscribe("turn.done", self._on_turn_done),
+            bus.subscribe("event.sealed", self._on_event_sealed),
+            bus.subscribe("step.recorded", self._on_step_recorded),
             bus.subscribe("status.update", self._on_status_update),
             bus.subscribe("context.metrics", self._on_context_metrics),
             bus.subscribe("agent.created", self._on_agent_changed),
             bus.subscribe("agent.status", self._on_agent_changed),
         ]
         self.side_toggle.render_state(self.side_panel.has_class("-visible"))
+        self.apply_widths()
         self.rebuild()
         self.editor.focus_input()
         self.refresh_status()
@@ -349,6 +386,65 @@ class ChatScreen(Screen):
     def on_screen_resume(self) -> None:
         """弹窗关闭后按最新的模型与用法重画状态栏与侧栏。"""
         self.refresh_status()
+
+    def on_resize(self, event: events.Resize) -> None:
+        """窄终端里收起左栏：导航会把 80 列终端的正文挤到没法读。
+
+        宽度按新尺寸重算一次：终端变窄时两栏一起收，变宽时把用户拖出来的那份
+        宽度还回去。状态文件里那一份不动，免得临时缩小一次就把设定改掉。
+        """
+        if not self.is_mounted:
+            return
+        self.apply_widths()
+        self.refresh_status()
+
+    def apply_widths(self) -> None:
+        """按终端宽度摆好左栏、右栏与两条分栏界线。
+
+        状态文件里存的是用户拖出来的宽度，画的时候再按当前终端夹一次：
+        终端临时变窄不该把设定改掉，变宽之后原来的宽度要能回来。
+        """
+        manager = self.app.session_manager
+        total = self.app.size.width
+        rail_visible = total >= 92
+        side_visible = self.side_panel.has_class("-visible")
+        self.query_one("#chat-rail").styles.display = "block" if rail_visible else "none"
+        self.query_one("#rail-split").styles.display = "block" if rail_visible else "none"
+        self.query_one("#side-split").styles.display = "block" if side_visible else "none"
+
+        room = total - 1 - MIN_MAIN_WIDTH
+        rail_room = room - (self._side_width + 1 if side_visible else 0)
+        rail = max(RAIL_MIN, min(manager.rail_width, RAIL_MAX, max(RAIL_MIN, rail_room)))
+        side_room = room - (rail + 1 if rail_visible else 0)
+        side = max(SIDE_MIN, min(manager.side_width, SIDE_MAX, max(SIDE_MIN, side_room)))
+
+        self._rail_width = rail
+        self._side_width = side
+        self.query_one("#chat-rail").styles.width = rail
+        self.query_one("#side-panel").styles.width = side
+
+    def on_splitter_resize_requested(self, event: Splitter.ResizeRequested) -> None:
+        """拖动界线或按方向键：改左边或右边那一栏的宽度。"""
+        manager = self.app.session_manager
+        if event.splitter.id == "rail-split":
+            manager.rail_width = max(
+                RAIL_MIN, min(RAIL_MAX, self._rail_width + event.delta)
+            )
+        elif event.splitter.id == "side-split":
+            manager.side_width = max(
+                SIDE_MIN, min(SIDE_MAX, self._side_width + event.delta)
+            )
+        else:
+            return
+        self.apply_widths()
+
+    def on_splitter_resize_finished(self, event: Splitter.ResizeFinished) -> None:
+        """松手之后才写盘：拖动过程中每移一格都写一次状态文件太重。"""
+        # 右栏里子 agent 那两行是按栏宽截出来的，松手之后重截一次；拖动过程中
+        # 每移一格都遍历一遍会话里全部 Part，代价比得到的效果大。
+        if event.splitter.id == "side-split":
+            self.refresh_status()
+        self.app.save_state()
 
     def _watch__select_state(self, select_state: SelectState | None) -> None:
         """清空选区时不重画整屏。
@@ -391,10 +487,32 @@ class ChatScreen(Screen):
     def rebuild(self) -> None:
         """按当前会话内容重建消息列表。"""
         session = self.session
-        self.messages.rebuild(session.messages)
+        self.messages.rebuild(
+            session.messages, session, running=self.app.host.is_running(session.id)
+        )
         self.messages.set_details(self.app.session_manager.show_details)
         self.messages.set_thinking(self.app.session_manager.show_thinking)
+        self.refresh_rail()
         self.refresh_status()
+
+    def refresh_rail(self) -> None:
+        """重画左栏：会话树与这一轮的主题。
+
+        主题清单读消息区算出来的那一份，不在这里另算一遍边界；换会话、新主题、
+        封存与轮末都走这一个入口。
+        """
+        self.query_one("#chat-sessions", SessionList).refresh_sessions(with_children=True)
+        self.query_one("#chat-topics", TopicList).refresh_topics(self.messages.topics)
+
+    def on_session_row_picked(self, message: SessionRow.Picked) -> None:
+        """点左栏的会话：切过去。"""
+        message.stop()
+        self.app.open_session(message.session_id)
+
+    def on_topic_row_picked(self, message: TopicRow.Picked) -> None:
+        """点左栏的主题：打开它并滚到那一章。"""
+        message.stop()
+        self.messages.focus_topic(message.key)
 
     def _context_metrics(self) -> dict[str, object] | None:
         """最近一步的上下文度量；还没有发过请求时返回 None。
@@ -436,6 +554,8 @@ class ChatScreen(Screen):
         """
         panel = self.side_panel
         panel.set_class(visible, "-visible")
+        # 右栏出现或消失会改变中间那一栏的可用宽度，界线与两栏宽度一起重算。
+        self.apply_widths()
         self.status.set_sidebar(visible)
         # 侧栏关着的时候内容是被跳过的，打开时必须在这里补一次刷新。
         self.refresh_status()
@@ -488,6 +608,7 @@ class ChatScreen(Screen):
     def _mark_busy(self, busy: bool) -> None:
         """切到生成中并刷新状态栏。"""
         self._busy = busy
+        self.messages.set_running(busy)
         self.refresh_status()
 
     def on_editor_pane_agent_changed(self, event: EditorPane.AgentChanged) -> None:
@@ -584,12 +705,32 @@ class ChatScreen(Screen):
         return None
 
     def _on_message_add(self, data: dict[str, object]) -> None:
-        """事件总线：新增消息。"""
+        """事件总线：新增消息。
+
+        新的用户消息意味着上一个主题已经做完：先把更早的主题收起来，再把消息
+        接上去。用户主动点开过的主题留在原样（消息区自己记着）。
+        """
         if not self._belongs(data):
             return
         message = self._find_message(str(data.get("message_id", "")))
         if message is not None:
+            self.messages.fold_sealed_topics()
             self.messages.add_message(message)
+            self.refresh_rail()
+
+    def _on_event_sealed(self, data: dict[str, object]) -> None:
+        """事件总线：一个主题封存了。卡片上的标题、状态与结论换成封存后的那一份。"""
+        if not self._belongs(data):
+            return
+        self.messages.refresh_topics()
+        self.refresh_rail()
+
+    def _on_step_recorded(self, data: dict[str, object]) -> None:
+        """事件总线：一步跑完了。主题头的步数与当前动作跟着变。"""
+        if not self._belongs(data):
+            return
+        self.messages.refresh_live()
+        self.refresh_rail()
 
     def _on_part_add(self, data: dict[str, object]) -> None:
         """事件总线：新增 Part。"""
@@ -612,13 +753,19 @@ class ChatScreen(Screen):
         part = message.part_by_id(str(data.get("part_id", "")))
         if part is not None:
             self.messages.update_part(part)
+            # 工具状态变了才刷主题头。正文每来一小段都刷一遍，等于把同一份快照
+            # 算几十次，而第二行里的「正在运行 X」只跟工具状态有关。
+            if part.type is PartType.TOOL:
+                self.messages.refresh_live()
 
     def _on_turn_done(self, data: dict[str, object]) -> None:
         """事件总线：一轮生成结束。"""
         if not self._belongs(data):
             return
         self._busy = False
+        self.messages.set_running(False)
         self.messages.flush_text()
+        self.refresh_rail()
         self.refresh_status()
         # 最后一个 token 之后虚拟高度还没重算，立刻滚会停在差几行的位置，等这次刷新结束再滚
         self.call_after_refresh(self.messages.scroll_to_bottom)

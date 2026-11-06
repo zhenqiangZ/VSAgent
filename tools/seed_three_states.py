@@ -66,6 +66,9 @@ def seed(state: Path) -> str:
         summary="口袋定下来了，用户随后按了停止。",
         exit_reason="cancelled",
     )
+    # 实时快照写的是「正在跑」，会话状态跟着写成运行中：首页按这个字段决定
+    # 轮询哪几行，写成 idle 的话它会显示成「待开始」，与快照自相矛盾。
+    session.status = "running"
     manager.save_to_toml()
 
     # 运行中的那一份：当前工具停在等确认上，页面应当画出「请回终端回答」。

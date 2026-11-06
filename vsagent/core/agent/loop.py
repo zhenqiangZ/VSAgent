@@ -751,8 +751,17 @@ class AgentLoop:
         event = seal_topic(
             session, cut=self._step_cut(session, message, calls), kind="manual"
         )
+        self._announce_seal(session, event)
+        return event
+
+    def _announce_seal(self, session: Session, event: Event | None) -> None:
+        """告诉界面一个主题封存了。
+
+        轮末、溢出、压缩、手动收起都会封存，每条路各发一次的话总会漏掉其中一条，
+        那时界面上的主题卡就停在「进行中」。
+        """
         if event is None:
-            return None
+            return
         self.bus.publish(
             "event.sealed",
             {
@@ -763,11 +772,17 @@ class AgentLoop:
                 "steps": len(event.steps),
             },
         )
-        return event
 
     def _after_seal(self, session: Session, event: Event | None) -> Event | None:
-        """封存之后的收尾：没卸族就什么都不做。"""
-        if event is None or not event.steps:
+        """封存之后的收尾：先说一声，再收敛没卸掉的工具族。
+
+        收敛工具族只在轮末做：一轮里换三个主题不该把工具清单来回装卸，
+        每次装卸都改动请求体，缓存整段失效。
+        """
+        if event is None:
+            return None
+        self._announce_seal(session, event)
+        if not event.steps:
             return event
         dropped = prune_families(
             session,
@@ -795,7 +810,7 @@ class AgentLoop:
             for index, part in enumerate(message.parts)
             if any(part is call for call in calls)
         ]
-        record_step(
+        step = record_step(
             session,
             # 步号是主题内连号，不是循环层的 step 计数：那一个会把
             # 「没有工具调用、因此没记步」的那几步也算进去，读起来像漏了号。
@@ -805,6 +820,18 @@ class AgentLoop:
             part_start=min(positions) if positions else 0,
             part_end=(max(positions) + 1) if positions else 0,
         )
+        if step is not None:
+            # 界面要一步一行。步是这一步的工具跑完之后才折出来的，追加 Part 那一刻
+            # 界面还不知道它存在，所以在这里说一声。
+            self.bus.publish(
+                "step.recorded",
+                {
+                    "session_id": session.id,
+                    "seq": step.seq,
+                    "message_index": step.message_index,
+                    "part_start": step.part_start,
+                },
+            )
         if session.topic_title:
             self._seal_topic(session, message, calls)
         if open_tokens(session) > TOPIC_SOFT_LIMIT:

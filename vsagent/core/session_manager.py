@@ -19,6 +19,21 @@ STATE_VERSION = 2
 REPLACE_ATTEMPTS = 40
 REPLACE_RETRY_DELAY = 0.005
 
+# 侧栏宽度的取值区间。下限保证标题还能认出几个字，上限保证中间那一栏不会被挤没。
+RAIL_MIN, RAIL_MAX = 16, 60
+SIDE_MIN, SIDE_MAX = 20, 60
+HOME_MIN, HOME_MAX = 20, 60
+
+
+def width_from(state: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    """读出状态文件里的一栏宽度，写坏或越界时退回默认值与区间。"""
+    try:
+        value = int(state.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, value))
+
+
 
 class SessionManager:
     """管理会话的创建、切换与持久化。"""
@@ -30,8 +45,12 @@ class SessionManager:
         self.theme: str = "textual-dark"
         self.last_model_id: str = ""
         self.last_agent: str = "Build"
-        self.show_details: bool = True
+        self.show_details: bool = False
         self.show_thinking: bool = True
+        # 三栏的宽度由用户拖动分栏界线决定，启动时按状态文件里那一份摆回来。
+        self.rail_width: int = 30
+        self.side_width: int = 30
+        self.home_rail_width: int = 34
 
     @property
     def current(self) -> Session:
@@ -160,6 +179,9 @@ class SessionManager:
             "last_agent": self.last_agent,
             "show_details": self.show_details,
             "show_thinking": self.show_thinking,
+            "rail_width": self.rail_width,
+            "side_width": self.side_width,
+            "home_rail_width": self.home_rail_width,
             "sessions": [session.to_dict() for session in self.list_sessions()],
         }
 
@@ -225,8 +247,13 @@ class SessionManager:
         self.theme = str(state.get("theme", self.theme))
         self.last_model_id = str(state.get("last_model_id", ""))
         self.last_agent = str(state.get("last_agent", self.last_agent))
-        self.show_details = bool(state.get("show_details", True))
+        self.show_details = bool(state.get("show_details", False))
         self.show_thinking = bool(state.get("show_thinking", True))
+        self.rail_width = width_from(state, "rail_width", 30, RAIL_MIN, RAIL_MAX)
+        self.side_width = width_from(state, "side_width", 30, SIDE_MIN, SIDE_MAX)
+        self.home_rail_width = width_from(
+            state, "home_rail_width", 34, HOME_MIN, HOME_MAX
+        )
         sync_sequences(
             (session.id for session in self.sessions.values()),
             (message.id for session in self.sessions.values() for message in session.messages),

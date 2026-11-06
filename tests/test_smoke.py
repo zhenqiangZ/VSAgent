@@ -1230,6 +1230,7 @@ async def run() -> None:
         run_topic_state_checks()
         await run_artifact_row_checks()
         await run_topic_scroll_checks()
+        await run_live_step_checks()
         run_viewer_address_checks()
         await run_coalesce_checks()
         await run_tools_panel_checks()
@@ -1513,14 +1514,25 @@ async def run_topic_card_checks() -> None:
         )
 
         rows = list(pane.query(StepRow))
-        check(len(rows) == 2, f"两条主题各一步：{len(rows)}")
+        check(len(rows) == 3, f"两条主题的步加运行中的那一步：{len(rows)}")
         row2 = next(row for row in rows if row.step.part_start == 2)
         check(
             "bash" in str(row2.render()),
             f"行上写着这一步做了什么：{str(row2.render())}",
         )
-        older_row = next(row for row in rows if row.step.part_start == 1)
+        older_row = next(
+            row
+            for row in rows
+            if row.step.message_index == 1 and row.step.part_start == 1
+        )
         check(older_row.has_class("-topic-hidden"), "收起主题里的步行跟着不占位置")
+        # 第三个主题的工具已经开跑、这一步还没记下来，流水里也要有一行。
+        live_row = next(
+            row
+            for row in rows
+            if row.step.message_index == 3 and row.step.part_start == 1
+        )
+        check("●" in str(live_row.render()), f"运行中的那一步写实心圆：{str(live_row.render())}")
 
         # 点一下展开：整段回来，位置仍在头后面。
         await pilot.click(head1)
@@ -1603,6 +1615,19 @@ async def run_topic_card_checks() -> None:
         await pilot.pause()
         check(not card._show_output, "再点一次把这一主题的工具收回去")
 
+        # 等确认：标题行换成半圆，说明行只补哪个工具在等。
+        dock_call.tool_status = ToolStatus.AWAITING
+        pane.refresh_topics()
+        await pilot.pause()
+        check(
+            "◐ 等待确认" in head2.plain(),
+            f"等确认的主题标题行换成半圆：{head2.plain()}",
+        )
+        check(
+            "dock 等你答复" in head2.plain(),
+            f"说明行点名在等的工具：{head2.plain()}",
+        )
+
     # 主题从助手消息的开头起时，标题行挂在消息外面。收起它之后标题行必须还在，
     # 跟着消息一起摘掉的话这个主题就从画面上消失，再没有地方点开。
     session2 = Session(id="ses_topic_head", title="头留在画面上")
@@ -1662,7 +1687,7 @@ def run_topic_state_checks() -> None:
     """
     from vsagent.core.agent.event_log import record_step
     from vsagent.core.agent.topics import topic_views
-    from vsagent.widgets.topic_card import detail_color, detail_text
+    from vsagent.widgets.topic_card import detail_color, detail_text, topic_state
 
     def build(status: str, tool_status: ToolStatus, output: str) -> Session:
         session = Session(id=f"ses_state_{status}_{tool_status.value}", title="状态")
@@ -1715,6 +1740,28 @@ def run_topic_state_checks() -> None:
         detail_color(unsealed) == "#8B949E",
         f"停下来的主题说明行用次要文字色：{detail_color(unsealed)}",
     )
+
+    # 等待确认是运行中的一个相位：字形换成与工具卡一致的半圆，标题行与左栏
+    # 读同一个判断，两处不会画成两种样子。
+    waiting = topic_views(
+        build("running", ToolStatus.AWAITING, ""), running=True
+    )[-1]
+    check(topic_state(waiting) == "waiting", f"等确认的主题按等待画：{topic_state(waiting)}")
+    row = TopicRow(waiting, width=30)
+    text = row.render()
+    check(str(text).endswith(" ◐"), f"左栏主题行的等待字形是半圆：{str(text)}")
+    check(
+        span_style(text, " ◐").lower() == "#ffb300",
+        f"等待字形用琥珀色：{span_style(text, ' ◐')}",
+    )
+    check(
+        detail_text(waiting, True).startswith("dock 等你答复"),
+        f"说明行点名在等的工具：{detail_text(waiting, True)}",
+    )
+    still_running = topic_views(
+        build("running", ToolStatus.RUNNING, ""), running=True
+    )[-1]
+    check(topic_state(still_running) == "running", "真在跑的主题仍画实心圆")
 
 
 async def run_artifact_row_checks() -> None:
@@ -1905,6 +1952,144 @@ async def run_topic_scroll_checks() -> None:
         check(
             window.y <= headers[0].region.y < window.y + 2,
             f"跳到第一个主题之后它的头在视口顶端：{headers[0].region.y}，消息区 {window.y}",
+        )
+
+
+async def run_live_step_checks() -> None:
+    """运行中的那一步在流水里也有一行。
+
+    步要等这一段跑完才记下来；没有这一行时，画面里只有工具卡，主题头写着
+    「正在运行 dock · 已 2 步」，第三步却不在清单上。这一行的状态取工具卡上的
+    实时值，记成步前后是同一行。
+    """
+    from vsagent.core.agent.event_log import record_step
+    from vsagent.core.agent.topics import step_status, topic_views
+    from vsagent.widgets.topic_card import StepRow
+
+    session = Session(id="ses_live_step", title="运行中的步")
+    user = session.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="跑对接"))
+    assistant = session.add_message(Message(role="assistant"))
+    assistant.add_part(Part(type=PartType.STEP_START, text="1 · fake"))
+    dock = Part(
+        type=PartType.TOOL,
+        tool_name="dock",
+        tool_status=ToolStatus.RUNNING,
+        tool_input={"receptor": "receptor#1"},
+    )
+    assistant.add_part(dock)
+    later = Part(
+        type=PartType.TOOL,
+        tool_name="analyze_pose",
+        tool_status=ToolStatus.PENDING,
+        tool_input={"pose": "pose#1"},
+    )
+    assistant.add_part(later)
+    session.status = "running"
+
+    tail = topic_views(session, running=True)[-1]
+    live = tail.live_step
+    check(live is not None and live.seq == 1, f"还没记成步的那一步也在视图里：{live}")
+    check(live is not None and live.tools == ["dock", "analyze_pose"], "实时步列出这一轮的工具")
+    check(tail.steps == [], "实时步不进已记录的那一份：步数仍按记下来的算")
+    check(step_status(session.messages, live) == "running", "有工具在跑时步写运行中")
+
+    class Demo(App):
+        def compose(self) -> ComposeResult:
+            self.pane = MessagesPane()
+            yield self.pane
+
+        def on_mount(self) -> None:
+            self.pane.rebuild(session.messages, session, running=True)
+
+    app = Demo()
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        pane = app.pane
+        row = pane._step_rows.get((1, 1))
+        check(row is not None and row.is_mounted, "运行中的步在消息区有一行")
+        check("●" in str(row.render()), f"行上写运行中的字形：{str(row.render())}")
+        check(row.seconds == 0.0, "运行中的步不显示耗时：工具卡上另有秒表")
+        card = pane._part_views[dock.id]
+        check(row.region.y < card.region.y, "步行排在它第一个工具卡上面")
+
+        # 点这一行收起它的工具卡：行本身留在原处当入口，滚动补偿走同一套锚点规则。
+        line = row.region.y
+        pane.toggle_step(1, 1)
+        await pilot.pause()
+        await pilot.pause()
+        check(card.has_class("-step-hidden"), "收起实时步之后工具卡不占位置")
+        check(row.region.y == line, f"收起之后那一行不动：{line} → {row.region.y}")
+        pane.toggle_step(1, 1)
+        await pilot.pause()
+        await pilot.pause()
+        check(not card.has_class("-step-hidden"), "再点一下展开")
+
+        # 等确认与失败都从工具卡的状态来，不必等这一步记下来。
+        dock.tool_status = ToolStatus.AWAITING
+        pane.refresh_topics()
+        await pilot.pause()
+        check("◐" in str(row.render()), f"等确认时步写半圆：{str(row.render())}")
+
+        dock.tool_status = ToolStatus.FAILED
+        pane.refresh_topics()
+        await pilot.pause()
+        check("✕ 失败" in str(row.render()), f"这一步失败时行上写失败：{str(row.render())}")
+
+        # 记成步：同一行原地换成最终值，不新增第二行。
+        record_step(
+            session,
+            step_no=1,
+            parts=[dock, later],
+            message_index=1,
+            part_start=1,
+            part_end=3,
+        )
+        pane.refresh_live()
+        await pilot.pause()
+        check(pane._topics[-1].live_step is None, "记成步之后不再有实时步")
+        check(len(pane.query(StepRow)) == 1, f"记成步不新增一行：{len(pane.query(StepRow))}")
+        check(pane._step_rows[(1, 1)] is row, "记成步前后是同一行")
+
+        # 停下那一刻还在跑的那一步没记成步：按原文回填之后，那一行要按失败画。
+        # 只看 `pending_steps` 会把它漏掉，行就停在最后那次字形上。
+        stopped = Session(id="ses_live_stop", title="停下之后")
+        stopped_user = stopped.add_message(Message(role="user"))
+        stopped_user.add_part(Part(type=PartType.TEXT, text="跑两步"))
+        stopped_assistant = stopped.add_message(Message(role="assistant"))
+        stopped_assistant.add_part(Part(type=PartType.STEP_START, text="1 · fake"))
+        done = Part(
+            type=PartType.TOOL,
+            tool_name="bash",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"command": "ls"},
+            tool_output="ok",
+        )
+        stopped_assistant.add_part(done)
+        record_step(
+            stopped,
+            step_no=1,
+            parts=[done],
+            message_index=1,
+            part_start=1,
+            part_end=2,
+        )
+        stopped_assistant.add_part(Part(type=PartType.STEP_START, text="2 · fake"))
+        cut = Part(
+            type=PartType.TOOL,
+            tool_name="dock",
+            tool_status=ToolStatus.FAILED,
+            tool_input={"receptor": "receptor#1"},
+        )
+        stopped_assistant.add_part(cut)
+        pane.rebuild(stopped.messages, stopped, running=False)
+        await pilot.pause()
+        stopped_rows = list(pane.query(StepRow))
+        check(len(stopped_rows) == 2, f"停下之后两步都在：{len(stopped_rows)}")
+        stopped_row = next(row for row in stopped_rows if row.step.part_start == 3)
+        check(
+            "✕ 失败" in str(stopped_row.render()),
+            f"停下之后那一步按失败画：{str(stopped_row.render())}",
         )
 
 

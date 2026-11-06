@@ -14,9 +14,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .. import live
-from ..models import Message, PartType, Session, Step
+from ..models import Message, PartType, Session, Step, ToolStatus
 
-from .event_log import steps_from_messages
+from .event_log import step_from_parts, steps_from_messages
 
 Position = tuple[int, int]
 
@@ -50,6 +50,9 @@ class TopicView:
     degraded: bool = False
     # 只有未封存的那个有：`live.snapshot` 的 current，用来写「正在运行 dock」。
     current: dict[str, Any] | None = None
+    # 只对运行中的尾部有值：这一轮的工具已经出现在原文里，但这一步还没记成步。
+    # 它不放进 `steps`：步数与调用数仍按已记下的那些算，界面按键原地换数据。
+    live_step: Step | None = None
 
     def contains(self, position: Position) -> bool:
         """这个位置属不属于本主题。位置全序，比较两个端点就够。"""
@@ -79,6 +82,71 @@ def step_seconds(messages: list[Message], step: Step) -> float:
     if not stop and message.parts:
         stop = message.parts[-1].timestamp
     return max(0.0, stop - begin)
+
+
+def step_status(messages: list[Message], step: Step) -> str:
+    """这一步现在是什么状态。
+
+    失败的排在最前：一步里前面的工具失败了、后面的还在跑，这一行按失败算，
+    与主题头「失败那句话放在最前面」同一个理由。等待排在执行之前：有工具卡在
+    确认上时，整步对外表现为在等答复。
+
+    只读 Part 上已经算好的 `tool_status`，不看 `Step.issues`：那一项要等这一步
+    记下来才有，而运行中的那一步还没记。
+    """
+    if step.message_index < 0 or step.message_index >= len(messages):
+        return "completed"
+    parts = messages[step.message_index].parts[step.part_start : step.part_end]
+    statuses = [part.tool_status for part in parts if part.type is PartType.TOOL]
+    if any(status is ToolStatus.FAILED for status in statuses):
+        return "failed"
+    if any(status is ToolStatus.AWAITING for status in statuses):
+        return "waiting"
+    if any(status is ToolStatus.RUNNING for status in statuses):
+        return "running"
+    if any(status is ToolStatus.PENDING for status in statuses):
+        return "pending"
+    return "completed"
+
+
+def _live_step(session: Session, start: Position, recorded: list[Step]) -> Step | None:
+    """最后一条 assistant 消息里还没记成步的那一段。
+
+    工具一开始执行，Part 就已经在原文里，而步要等这一段跑完才记下来。界面要显示
+    「第 3 步正在运行」，只能从 Part 现场折一条。位置取法与 `loop._record_step`
+    一致（第一个与最后一个工具的格号），记成步前后键不变，同一行原地换数据。
+    """
+    if not session.messages:
+        return None
+    index = len(session.messages) - 1
+    message = session.messages[index]
+    if message.role != "assistant":
+        return None
+    begin = None
+    for position in range(len(message.parts) - 1, -1, -1):
+        if message.parts[position].type is PartType.STEP_START:
+            begin = position
+            break
+    if begin is None or (index, begin) < start:
+        return None
+    positions = [
+        position
+        for position in range(begin, len(message.parts))
+        if message.parts[position].type is PartType.TOOL
+        and message.parts[position].tool_name
+    ]
+    if not positions:
+        return None
+    key = (index, positions[0])
+    if any((step.message_index, step.part_start) == key for step in recorded):
+        return None
+    return step_from_parts(
+        len(recorded) + 1,
+        [message.parts[position] for position in positions],
+        index,
+        positions[0],
+        positions[-1] + 1,
+    )
 
 
 def topic_views(session: Session, *, running: bool) -> list[TopicView]:
@@ -149,13 +217,19 @@ def _stopped_status(session: Session, steps: list[Step]) -> str:
 def _tail_view(session: Session, start: Position, end: Position, *, running: bool) -> TopicView:
     """还没封存的那一段。
 
-    步优先用 `pending_steps`：那是每一步当场折出来的，零请求。重启之后它会是空的
-    （进程在一轮中间中断），这时按原文里的 Part 回填，并把状态写成「未封存」——
-    画成「进行中」等于告诉用户还在跑，而那个循环已经不在了。
+    跑着的时候用 `pending_steps`：那是每一步当场折出来的，零请求。停下之后一律按
+    原文里的 Part 回填——停下那一刻还在跑的那一步没记成步，只看 `pending_steps`
+    会把它从流水里漏掉，而它下面那几张工具卡还在画面上，那一行也就一直停在最后
+    一次的字形上。回填与 `record_step` 读的是同一批 Part，内容与键都一致。
+
+    不跑的时候还要把状态写成「未封存」这类结局：画成「进行中」等于告诉用户还在跑，
+    而那个循环已经不在了。
     """
-    steps = list(session.pending_steps)
-    if not steps and not running:
-        steps = steps_from_messages(session, start, end)
+    steps = (
+        list(session.pending_steps)
+        if running
+        else steps_from_messages(session, start, end)
+    )
     snapshot = live.snapshot(session, running=running)
     current = snapshot.get("current") if running else None
     if running:
@@ -197,4 +271,5 @@ def _tail_view(session: Session, start: Position, end: Position, *, running: boo
         issues=issues,
         sealed=False,
         current=current,
+        live_step=_live_step(session, start, steps) if running else None,
     )

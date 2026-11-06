@@ -14,7 +14,7 @@ from textual.widgets import Static
 
 from ..core.agent.topics import TopicView
 from .session_list import fit
-from .topic_card import STATUS_COLOR, STATUS_MARK
+from .topic_card import STATUS_COLOR, STATUS_MARK, topic_state
 
 
 class TopicRow(Static):
@@ -48,8 +48,10 @@ class TopicRow(Static):
 
     def render(self) -> Text:
         topic = self._topic
-        mark = STATUS_MARK.get(topic.status, "○")
-        color = STATUS_COLOR.get(topic.status, "#5A5A5A")
+        # 等待确认画成半圆：这一轮卡在一个没人回答的确认上，与还在跑的不一样。
+        state = topic_state(topic)
+        mark = STATUS_MARK.get(state, "○")
+        color = STATUS_COLOR.get(state, "#5A5A5A")
         # 序号 3 格、状态 2 格（空格加字形），其余都给标题。短标题补空格，
         # 状态字形才能一律停在最右边那一列；不补的话每一行的字形位置都不一样，
         # 一列竖着扫下去看不出哪一条还在跑。

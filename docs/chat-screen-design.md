@@ -552,8 +552,13 @@ Home 顶部加一条 1 行高的顶栏（`widgets/top_bar.py`）：左边 `VSAge
 中断时界面自己调 `messages.set_running(False)`：取消这条路不走 `turn.done`
 （`loop.py` 明说跳过收尾），不收回来的话主题头会一直写着「进行中」。
 
+等待确认按运行中的一个相位画：主题头与左栏主题行的字形都换成 `◐`，说明行写
+`<工具> 等你答复`。主题的状态值仍是 `running`——`Event.status` 的换算只认结局，
+把等待写成第六种结局会让封存前后的换算多出一条分支。等待的源头是
+`Part.tool_status == AWAITING`，两处显示读同一个 `topic_card.topic_state()`。
+
 判据在 `run_topic_state_checks()`：四种状态各一条，加一条「进行中失败过的说明行以
-失败开头」。
+失败开头」、一条等待确认的字形与说明行；`run_topic_card_checks()` 验标题行的半圆。
 
 ## 十九、工具过程的三级展开（2026-11-06）
 
@@ -608,3 +613,41 @@ Home 顶部加一条 1 行高的顶栏（`widgets/top_bar.py`）：左边 `VSAge
 
 判据在 `run_artifact_row_checks()` 与 `run_interface_checks()`：产物行在收起之后还在、
 点名字把 handle 交上去、右栏产物排在子 agent 上面、没有产物时给提示。
+
+## 二十一、运行中的那一步（2026-11-06）
+
+步要等一次模型往返与它调用的工具都跑完才记下来，在此之前流水里没有它：主题头写着
+「正在运行 dock · 已 2 步」，画面上却只有工具卡，第三步不在清单里。尾部主题的视图
+因此多一条 `live_step`，从最后一条助手消息里最后一个 `STEP_START` 之后现折，位置取法
+与 `loop._record_step` 一样（第一个与最后一个工具的下标）。
+
+它不放进 `steps`：步数与调用数仍按记下来的那些算；记成步之后按键原地换数据，不新增
+一行。状态由 `topics.step_status()` 从 Part 的 `tool_status` 现算，顺序是失败 →
+等确认 → 执行中 → 未开始 → 完成。失败排最前，与主题头「失败那句话放在最前面」是
+同一条规则。运行中的那一步不显示耗时：它的时段还含模型生成，工具卡上另有秒表，
+两个数并排会读成互相矛盾。
+
+停下之后按原文回填：停下那一刻还在跑的那一步没有记成步，只看 `pending_steps` 会把它
+从流水里漏掉，而它下面那几张工具卡还在画面上，那一行也就停在最后一次的字形上。
+回填与 `record_step` 读的是同一批 Part，键一致，那一行原地改成失败。
+
+判据在 `run_live_step_checks()`：运行中有一行、字形随工具状态变、收起与展开时行不动、
+记成步前后是同一行、停下之后那一步按失败画。
+
+## 二十二、执行状态的三层来源（2026-11-06）
+
+| 层级 | 真相来源 | 界面读哪里 |
+| --- | --- | --- |
+| Task | `session.status` | 左栏任务行、主界面最近任务、子 agent 面板、状态栏的「生成中」 |
+| Topic | 已封存看 `Event.status`，未封存看 `topics._stopped_status` | 主题头第一行、左栏主题行 |
+| Step | `topics.step_status()` 从 Part 现场算 | 步行 |
+| Tool | `Part.tool_status` | 工具卡字形 |
+
+主题的 `waiting` 与步的 `running` 都是显示时从工具层推出来的，不写进状态值：
+`Event.status` 只认结局，等待与执行中是运行中的两个相位。
+
+两种状态不做。Topic Pending 要模型事先交出主题序列，而主题是封存时按位置切出来的，
+运行中只有末尾一个；Step Pending 与工具卡上的 `○` 是同一份信息，工具按顺序执行，
+没轮到的那几个调用在卡上已经写明。
+
+判据：`run_topic_state_checks()`、`run_live_step_checks()`、`check_topic_views()`。

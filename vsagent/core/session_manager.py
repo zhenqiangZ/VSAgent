@@ -22,7 +22,6 @@ REPLACE_RETRY_DELAY = 0.005
 # 侧栏宽度的取值区间。下限保证标题还能认出几个字，上限保证中间那一栏不会被挤没。
 RAIL_MIN, RAIL_MAX = 16, 60
 SIDE_MIN, SIDE_MAX = 20, 60
-HOME_MIN, HOME_MAX = 20, 60
 
 
 def width_from(state: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
@@ -46,10 +45,9 @@ class SessionManager:
         self.last_model_id: str = ""
         self.last_agent: str = "Build"
         self.show_thinking: bool = True
-        # 三栏的宽度由用户拖动分栏界线决定，启动时按状态文件里那一份摆回来。
+        # 聊天界面两栏的宽度由用户拖动分栏界线决定，启动时按状态文件里那一份摆回来。
         self.rail_width: int = 30
         self.side_width: int = 30
-        self.home_rail_width: int = 34
 
     @property
     def current(self) -> Session:
@@ -186,7 +184,6 @@ class SessionManager:
             "show_thinking": self.show_thinking,
             "rail_width": self.rail_width,
             "side_width": self.side_width,
-            "home_rail_width": self.home_rail_width,
             "sessions": [session.to_dict() for session in self.list_sessions()],
         }
 
@@ -255,9 +252,6 @@ class SessionManager:
         self.show_thinking = bool(state.get("show_thinking", True))
         self.rail_width = width_from(state, "rail_width", 30, RAIL_MIN, RAIL_MAX)
         self.side_width = width_from(state, "side_width", 30, SIDE_MIN, SIDE_MAX)
-        self.home_rail_width = width_from(
-            state, "home_rail_width", 34, HOME_MIN, HOME_MAX
-        )
         sync_sequences(
             (session.id for session in self.sessions.values()),
             (message.id for session in self.sessions.values() for message in session.messages),

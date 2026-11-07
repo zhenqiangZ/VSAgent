@@ -11,6 +11,7 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Markdown, Static
 
+from .. import palette
 from ..core.agent.event_log import artifact_refs
 from ..core.agent.topics import (
     TopicView,
@@ -156,6 +157,36 @@ class TextPartView(CoalescedText, Markdown):
         self.update(text)
 
 
+class SummaryPartView(Markdown):
+    """收尾总结，按 Markdown 渲染。
+
+    第一版把它当成普通系统提示行（`SimplePartView`，`markup=False`）原样输出，
+    模型写的 `## 一、` 与 `**` 全都露在屏幕上。总结是这一轮停下来之后用户
+    最先读的一段，值得按正文渲染。
+
+    它只在收尾时写一次，没有流式更新，所以不需要 `CoalescedText` 的合并窗口。
+    """
+
+    DEFAULT_CSS = palette.css("""
+    SummaryPartView {
+        height: auto;
+        padding: 0 2;
+        margin-top: 1;
+        border-left: thick $vsa-line-strong;
+    }
+    """)
+
+    def __init__(self, part: Part) -> None:
+        super().__init__(part.text, classes="part part-summary")
+        self.part = part
+        self.part_id = part.id
+
+    def sync(self, part: Part) -> None:
+        """收尾总结被重写时直接换正文。"""
+        self.part = part
+        self.update(part.text)
+
+
 class FoldBlock(CoalescedText, Container):
     """可折叠的块，用于思考过程。
 
@@ -164,16 +195,16 @@ class FoldBlock(CoalescedText, Container):
     用户一个字都看不见。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     FoldBlock {
         height: auto;
-        border-left: thick #2A2A2A;
+        border-left: thick $vsa-line-soft;
         padding: 0 1;
     }
-    FoldBlock .fold-header { color: #5A5A5A; }
-    FoldBlock .fold-body { color: #8B949E; }
+    FoldBlock .fold-header { color: $vsa-text-3; }
+    FoldBlock .fold-body { color: $vsa-text-2; }
     FoldBlock .fold-body.-hidden { display: none; }
-    """
+    """)
 
     def __init__(self, title: str, classes: str = "") -> None:
         super().__init__(classes=classes)
@@ -245,7 +276,7 @@ class ToolCard(Container):
     失败时卡片自己展开：标题行变红只说明「出事了」，错误原文才是可用的信息。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     ToolCard {
         height: auto;
         padding: 0 1;
@@ -254,21 +285,21 @@ class ToolCard(Container):
     }
     /* 状态只用字形与标题那一档颜色表达，不另加左侧竖线：
        一条彩色的竖线在整屏里比卡片本身的正文还显眼。 */
-    ToolCard .tool-header { color: #8B949E; }
-    ToolCard.-running .tool-header { color: #4A9EFF; }
-    ToolCard.-awaiting .tool-header { color: #FFB300; }
-    ToolCard.-failed .tool-header { color: #C62828; }
-    ToolCard .tool-params { color: #8B949E; }
-    ToolCard .tool-output { color: #5A5A5A; }
-    ToolCard .tool-tail { color: #5A5A5A; }
-    ToolCard .tool-files { color: #4A9EFF; }
-    ToolCard .tool-more { color: #8B949E; height: 1; }
+    ToolCard .tool-header { color: $vsa-text-2; }
+    ToolCard.-running .tool-header { color: $vsa-accent; }
+    ToolCard.-awaiting .tool-header { color: $vsa-warn; }
+    ToolCard.-failed .tool-header { color: $vsa-error; }
+    ToolCard .tool-params { color: $vsa-text-2; }
+    ToolCard .tool-output { color: $vsa-text-3; }
+    ToolCard .tool-tail { color: $vsa-text-3; }
+    ToolCard .tool-files { color: $vsa-accent; }
+    ToolCard .tool-more { color: $vsa-text-2; height: 1; }
     ToolCard .tool-params.-hidden,
     ToolCard .tool-output.-hidden,
     ToolCard .tool-tail.-hidden,
     ToolCard .tool-files.-hidden,
     ToolCard .tool-more.-hidden { display: none; }
-    """
+    """)
 
     def __init__(self, part: Part) -> None:
         super().__init__(classes="part part-tool")
@@ -583,7 +614,7 @@ class MessageView(Container):
     谁在说话，位置与底色已经说了。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     MessageView { height: auto; margin-bottom: 1; }
     MessageView .message-parts { height: auto; }
     /* 用户消息：与回复同左边界，整块换一层浅底，靠底色而不是竖线区分是谁在说话。
@@ -591,7 +622,7 @@ class MessageView(Container):
        回复那一侧的内边距在容器上，用户这一侧在容器上补同样多，正文（Markdown 自带
        两列）于是落在同一列；右侧不留，底色右沿与回复正文右沿对齐。 */
     MessageView.message-user {
-        background: #1A1A1A;
+        background: $vsa-layer;
         padding: 1 0 1 2;
     }
     MessageView.message-assistant { padding-left: 2; }
@@ -605,7 +636,7 @@ class MessageView(Container):
            这里补上容器这 2 列，SimplePartView 自己还有 2 列。 */
         padding: 0 0 0 2;
     }
-    """
+    """)
 
     def __init__(self, message: Message, pane: MessagesPane, index: int = -1) -> None:
         # 只有派发标记的消息不是「用户说了什么」：给它单独的样式类，
@@ -646,17 +677,17 @@ class NewMessagesHint(Static):
     停靠在消息区底部（`dock: bottom`），所以它跟着视口走，不随内容滚动。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     NewMessagesHint {
         dock: bottom;
         height: 1;
         display: none;
-        background: #1A1A1A;
-        color: #8B949E;
+        background: $vsa-layer;
+        color: $vsa-text-2;
         content-align: center middle;
     }
     NewMessagesHint.-visible { display: block; }
-    """
+    """)
 
     def __init__(self, id: str | None = None) -> None:
         super().__init__("↓ 有新内容 · 点这里回到底部", id=id, markup=False)
@@ -770,7 +801,7 @@ class MessagesPane(ScrollableContainer):
         消息区里每一段正文（Markdown 自己还铺着一棵子树）、每一张工具卡各自都有子树，
         一段会话下来是几千个组件：实测 296 条消息、4435 个组件时，一次重算要 2.6 到 3.9 秒，
         而消息区在点一下就获得焦点、点回输入框又失去焦点。样式表里没有任何一条规则靠焦点取值
-        （应用自己的 tcss 里只有启动界面那三条 `:focus-within`），需要跟着焦点变的只有滚动条，
+        （`app.tcss` 里没有 `:focus-within` 规则），需要跟着焦点变的只有滚动条，
         所以重算名单里只放消息区自己，`update_nodes` 会自动带上它的滚动条。
         """
         self.app.stylesheet.update_nodes([self], animate=True)
@@ -1889,6 +1920,8 @@ class MessagesPane(ScrollableContainer):
             return card
         if part.type is PartType.PATCH:
             return PatchPartView(part)
+        if part.type is PartType.SUMMARY:
+            return SummaryPartView(part)
         return SimplePartView(part)
 
     def _build_and_register(

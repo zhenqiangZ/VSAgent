@@ -10,6 +10,8 @@ from textual.containers import Container
 from textual.message import Message
 from textual.widgets import Static
 
+from .. import palette
+
 # 上下文各层在界面上的名字。键是 `context.Layer` 的值。
 LAYER_LABELS: dict[str, str] = {
     "prefix": "稳定前缀",
@@ -40,11 +42,11 @@ def percent_line(tokens: int, window: int) -> Text:
     """
     percent = percent_text(tokens, window)
     ratio = tokens / window if window else 0.0
-    color = "#4A9EFF"
+    color = palette.ACCENT
     if ratio >= 0.85:
-        color = "#C62828"
+        color = palette.ERROR
     elif ratio >= 0.6:
-        color = "#FFB300"
+        color = palette.WARN
     return Text(percent, style=color)
 
 

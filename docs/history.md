@@ -294,6 +294,53 @@
 - **不做的**：Topic Pending（要模型事先交出主题序列，而主题是封存时按位置切的）；Step Pending
   （与工具卡的 `○` 是同一份信息）；动画（只有秒表已经在跑，加旋转会与刚修好的滚动锚点互相干扰）。
 
+### 7.6 启动界面删掉左栏（2026-11-07）
+
+- **约束**：左栏（运行中 + 全部任务）与中间下方的「最近任务」列的是同一批会话，区别只有分组与
+  条数；左栏还多带一条可拖动界线、一个宽度设定，以及 92 列以下的一整套收起逻辑。
+- **做法**：删除 `#home-side` 与 `#home-split`，`apply_widths()` 与两个拖动回调一起删；
+  最近任务承接分组，运行中单独一段排最前，其余最多 4 条；「+ 新建任务」移到第一段标题行右端；
+  `tab 切换 Agent` 那一行从页脚移到输入框下方，靠左。
+- **代价**：`state.toml` 的 `home_rail_width` 不再读写，下次保存时自然消失；
+  `tests/test_smoke.py` 里三组针对左栏的断言重写，`tests/output/home.txt` 重新生成。
+- **判据**：`test_smoke` 的 `home-session`、`home-recent`、`splitter` 三组；
+  `dump_layout.py` 的快照里只剩一栏。
+
+### 7.7 收尾总结按 Markdown 渲染（2026-11-07）
+
+- **约束**：`SUMMARY` 走 `SimplePartView(Static, markup=False)`，模型写的 `## 一、` 与 `**`
+  原样露在屏幕上；网页端用 `textContent`，并且整段默认折叠在「这一轮停在哪儿」后面。
+- **做法**：新增 `SummaryPartView(Markdown)`，在 `_build_part()` 里单独分支；网页端改用
+  `vsMarkdown.renderMarkdown` 并默认展开。同时把 `WRAPUP_INSTRUCTION` 改成四段简报
+  （停在哪里 / 已经产出 / 还没做完 / 下一轮从这里继续），禁止 Markdown 语法与向用户提问。
+- **依据**：总结是停下之后用户最先读的一段，它要回答「接下来怎么接」；过程在工具卡里
+  已经有一遍。格式化与提示词要一起改，只改渲染会留下「模型语法依赖渲染器」的隐患。
+- **判据**：`test_smoke` 的 Part 渲染分支；网页端 `history.js` 的 `summary` 分支。
+
+### 7.8 配色收进 `palette.py`（2026-11-07）
+
+- **约束**：同一套配色散在三处：`app.tcss` 里 163 处十六进制、widget 的 `DEFAULT_CSS` 与
+  Rich 的 `style=` 里 81 处、`themes/default.json` 又存了一份，值与代码已经分叉。改一个色要
+  改三处，漏掉的那一处不报错。
+- **做法**：`vsagent/palette.py` 收下 18 个常量与 `CSS_VARIABLES`；`app.tcss` 只写 `$vsa-*`，
+  由 `VSAgentApp.get_css_variables` 注入；widget 的 `DEFAULT_CSS` 用 `palette.css()` 在导入时
+  换值；Rich 标记用 `palette.TEXT_1` 这类常量；`themes/default.json` 删除。
+- **依据**：Textual 的变量按样式表隔离，`app.tcss` 的声明到不了 widget，所以 widget 那条路
+  走导入时替换，只挂一个 widget 的测试应用也拿到同一份值。前缀 `vsa-` 与 Textual 自带的
+  `$accent` / `$error` 分开：那批跟着 `/themes` 变，应用自己的区块不跟着变。
+- **判据**：`tools/check_style.py` 的终端色值一项；`test_smoke` 里断言 `#C62828` 等具体色值的用例。
+
+### 7.9 两个界面的输入框合成一个类（2026-11-07）
+
+- **约束**：两个输入框各写一份焦点处理。启动界面靠 `#home-box:focus-within` 让区块、输入区、
+  状态行与操作提示一起提亮，焦点每进出一次整块重算样式；聊天界面早已改成只点亮左侧竖条。
+- **做法**：`ComposerInput` 收下 `_on_focus` / `_on_blur` / `focus` 三个重写，`HomeInput` 只留
+  `shift+enter`；`HomeScreen.on_descendant_focus` / `on_descendant_blur` 给竖条加 `-focused` 类；
+  删掉 `#home-box:focus-within` 与 `#home-box:focus-within #home-input` 两条规则。
+- **依据**：样式表里不再有一条规则靠焦点取值，`MessagesPane.watch_has_focus` 的「只重算自己」
+  因此成立；焦点变化只改一列宽的竖条。
+- **判据**：`test_smoke` 的启动界面那一组（竖条亮蓝与变暗、区块底色在焦点进出时保持 `#1a1a1a`）。
+
 ---
 
 ## 八、网页端
@@ -316,6 +363,27 @@
 - **约束**：网页服务是应用进程里的一个线程，`SessionManager` 不是线程安全的。
 - **做法**：写入口回 202 或 200，真正的动作交回应用的事件循环；独立运行的服务没有回调，明确回 503。
 - **安全**：写入口要求 `X-VSA-Request: 1` 并校验 `Origin`；入库只认 inbox 里已有的文件名。
+
+### 8.4 收尾总结与新建会话的标题（2026-11-07）
+
+- **背景**：网页端把 `summary` 当纯文本塞进折叠块，模型写的 Markdown 全部露出来；
+  新建会话的标题由 `_submit_in_loop` 自己拼，与 TUI 各写一份规则。
+- **做法**：`summary` 改用 `vsMarkdown.renderMarkdown` 并默认展开；新建会话改走
+  `set_placeholder_title()`，与 TUI 共用同一条首句规则和同一个来源标记。
+- **判据**：`tools/check_web_api.py`（提交新建会话那一组）；`test_smoke` 的网页渲染断言。
+
+### 8.5 排版与动效收敛到 `:root`（2026-11-07）
+
+- **约束**：网页端 11 种字号、153 处字面量间距；`--space-*` 定义了八档，一处没用。字号多到
+  读者分不出层级，改一次间距要扫全文件。
+- **做法**：`:root` 收下六档字号、八档间距、三档内容宽度、两档动效；每条 `font-size` 都走
+  `var(--fs-*)`，大于 3px 的间距都走 `var(--space-*)`；状态胶囊的颜色改 120ms 过渡，新出现的
+  一步 180ms 淡入。实时卡片在步数变化时把当前行原地改写成已完成的步，整块重画会让过渡没有
+  起点；淡入按「会话 + 主题序号 + 步号」去重，实时卡片每两秒重画一次，不去重会一直重播。
+- **依据**：实测 11 种字号、153 处字面量间距，档位变量 `--space-*` 一处没用——这套档位当时
+  没有生效。字号收成六档之后，相邻两档的差值最小 0.5px（小节标题与正文），靠字重分开。
+- **判据**：`tools/check_style.py` 的字号与间距两项；`tools/check_web_ui.js` 的「一步做完是原地改写」
+  一条；`prefers-reduced-motion` 压到 1ms。
 
 ---
 
@@ -360,8 +428,20 @@
 
 ### 10.4 CI 只有一条
 
-Linux 上跑 `tests/test_agent.py` 与 `tests/test_smoke.py`，两份依赖都装。没有 Windows job；
+Linux 上两个 job：内核跑 `tests/test_agent.py`、`tools/check_prefix.py` 与
+`tools/check_style.py`，界面跑 `tests/test_smoke.py`；两份依赖都装。没有 Windows job；
 `verify_exe.py` 需要 pywinpty，那条路还没有人验证过。
+
+### 10.5 样式判据（2026-11-07）
+
+- **约束**：配色与档位的两条纪律靠人记。色值抄进第二处、字号就地写死、变量声明了没人用，
+  这三种都不会报错，只会让下一次改样式多一处要扫的地方。
+- **做法**：`tools/check_style.py`，标准库加正则。网页查字号与间距，终端查色值与变量引用；
+  注释换成等长空白以保住行号，Python 用 `tokenize` 取字符串、用 `ast` 认出 docstring；
+  `palette.OK` 这类常量引用算作对 `$vsa-ok` 的引用。
+- **依据**：这四条都能机械判——名字对得上、数值在范围里、声明与引用两边都有。
+- **判据**：CI 内核 job 里的 `python tools/check_style.py`；`.probe/probe_check_style.py`
+  用一份故意写坏的样例逐条验证它报得出来，也验证注释与 docstring 里的色值被放过。
 
 ---
 
@@ -374,7 +454,7 @@ Linux 上跑 `tests/test_agent.py` 与 `tests/test_smoke.py`，两份依赖都�
 | 主题 Pending 状态 | 要模型事先交出主题序列，而主题是封存时按位置切的 |
 | 步 Pending 状态 | 与工具卡的 `○` 是同一份信息 |
 | 全局展开所有工具卡 | 一次摊开几十张卡，滚动长度与每帧重排代价一起涨，下次打开还是展开的 |
-| 界面动画 | 工具卡已有秒表，旋转会与滚动锚点互相干扰 |
+| 终端界面动画 | 工具卡已有秒表，旋转会与滚动锚点互相干扰 |
 | 向量库做记忆检索 | 条目只有几十到几百，索引与模型依赖换不来收益 |
 | 自动抽取记忆 | 自动写错比不写更糟，写入只有 agent 显式与用户显式两条路 |
 | 按分数相加融合检索 | BM25 与余弦量纲不同，某一路会单方面支配 |

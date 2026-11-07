@@ -11,6 +11,8 @@ from textual.binding import Binding
 from textual.message import Message as TextualMessage
 from textual.widgets import Static
 
+from .. import palette
+
 
 class Splitter(Static):
     """1 列宽的分栏界线，左右拖动或按键调整宽度。
@@ -26,20 +28,20 @@ class Splitter(Static):
         Binding("right", "resize(1)", "变宽", show=False),
     ]
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     Splitter {
         width: 1;
         height: 100%;
-        background: #1A1A1A;
+        background: $vsa-layer;
     }
     /* 悬停时抬一档灰，按下或键盘调宽度时转强调色：这一列能拖动，不点亮看不出来。 */
     Splitter:hover {
-        background: #333333;
+        background: $vsa-line;
     }
     Splitter:focus {
-        background: #4A9EFF;
+        background: $vsa-accent;
     }
-    """
+    """)
 
     class ResizeRequested(TextualMessage):
         """界线动了一格：`delta` 是屏幕列数，正数往右。"""

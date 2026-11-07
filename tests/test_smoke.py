@@ -58,7 +58,6 @@ from vsagent.core.models import (  # noqa: E402
 )
 from vsagent.core.project_scan import BEGIN_MARK, END_MARK  # noqa: E402
 from vsagent.core.session_manager import (  # noqa: E402
-    HOME_MIN,
     RAIL_MIN,
     SIDE_MIN,
     SessionManager,
@@ -512,31 +511,30 @@ async def run_rail_checks() -> None:
         manager.create_session("第二条任务")
 
         home = app.screen
-        side = home.query_one("#home-side", SessionList)
         home.refresh_tasks()
         await pilot.pause()
-        rows = list(side.query(SessionRow))
+        rows = list(home.query_one("#home-recent").query(SessionRow))
         check(
             len(rows) == len(manager.root_sessions()),
-            f"主界面左栏一条会话一行：{len(rows)} 行，会话 {len(manager.root_sessions())} 条",
+            f"主界面一条会话一行：{len(rows)} 行，会话 {len(manager.root_sessions())} 条",
         )
         check(
             sum(1 for row in rows if row.has_class("-current")) == 1,
-            "左栏把当前会话标出来，且只标一条",
+            "最近任务把当前会话标出来，且只标一条",
         )
-        recent = list(home.query_one("#home-recent").query(SessionRow))
-        check(len(recent) == len(manager.root_sessions()), "输入框下面也列出最近任务")
+        recent = rows
+        check(len(recent) == len(manager.root_sessions()), "输入框下面列出最近任务")
 
-        # 左栏顶部是「新建任务」入口：清空输入框、把焦点放回去，不建空会话。
+        # 标题行右端是「新建任务」入口：清空输入框、把焦点放回去，不建空会话。
         new_task = home.query_one(NewTaskRow)
         check(
             str(new_task.content) == "+ 新建任务",
-            f"左栏顶部是新建任务入口：{str(new_task.content)!r}",
+            f"最近任务那一行是新建任务入口：{str(new_task.content)!r}",
         )
-        headers = [str(item.content) for item in side.query(".rail-section")]
+        headers = [str(item.content) for item in home.query(".rail-title")]
         check(
-            any(text.startswith("最近任务 ") for text in headers),
-            f"主界面左栏第二段叫最近任务：{headers}",
+            headers and headers[0] in ("最近任务", "运行中"),
+            f"最近任务标题在第一行：{headers}",
         )
         home.input.text = "打了一半的草稿"
         before = len(manager.root_sessions())
@@ -550,10 +548,10 @@ async def run_rail_checks() -> None:
         target = next(row for row in rows if row.session_id == first.id)
         await pilot.click(target)
         await pilot.pause(0.4)
-        check(isinstance(app.screen, ChatScreen), "点左栏一行进入聊天界面")
+        check(isinstance(app.screen, ChatScreen), "点最近任务一行进入聊天界面")
         check(
             manager.current_session_id == first.id,
-            f"点左栏一行切到那个会话：现在是 {manager.current_session_id}",
+            f"点最近任务一行切到那个会话：现在是 {manager.current_session_id}",
         )
 
         chat = app.screen
@@ -660,29 +658,17 @@ async def run_narrow_checks() -> None:
         home.refresh_tasks()
         await pilot.pause()
 
-        side = home.query_one("#home-side")
         center = home.query_one("#home-center")
-        check(side.region.width == 34, f"宽屏主界面左栏 34 列：{side.region.width}")
-        check(side.styles.display != "none", "120 列时主界面左栏在")
         check(
-            center.region.x == side.region.right + 1,
-            f"中间栏隔着一条分栏界线紧挨左栏：{center.region.x} / {side.region.right}",
+            center.region.width == 120,
+            f"主界面只有一栏，占满整屏：{center.region.width}",
         )
-
-        await pilot.resize_terminal(92, 36)
-        await pilot.pause(0.3)
-        check(side.styles.display != "none", "92 列时主界面左栏还在")
 
         await pilot.resize_terminal(91, 36)
         await pilot.pause(0.3)
-        check(side.styles.display == "none", "91 列时主界面左栏收起")
         check(
-            home.query_one("#home-split").styles.display == "none",
-            "左栏收起后分栏界线一起收起",
-        )
-        check(
-            center.region.x == 0 and center.region.width == 91,
-            f"左栏收起后中间栏占满整屏：{center.region.x}+{center.region.width}",
+            center.region.width == 91,
+            f"窄屏里中间栏仍占满整屏：{center.region.x}+{center.region.width}",
         )
         rows = list(home.query_one("#home-recent").query(SessionRow))
         check(
@@ -702,8 +688,8 @@ async def run_narrow_checks() -> None:
         await pilot.resize_terminal(120, 40)
         await pilot.pause(0.3)
         check(
-            side.styles.display != "none" and center.region.x == 35,
-            f"放大回 120 列左栏回来：{center.region.x}",
+            center.region.width == 120,
+            f"放大回 120 列仍是满宽：{center.region.width}",
         )
 
         # 聊天界面同一套阈值。
@@ -760,7 +746,7 @@ async def run_narrow_checks() -> None:
 
 
 async def run_splitter_checks() -> None:
-    """三栏宽度：方向键、拖动、夹取区间、写进状态文件、终端缩窄后还原。"""
+    """聊天界面的两栏宽度：方向键、拖动、夹取区间、写进状态文件、终端缩窄后还原。"""
     path = ROOT / ".probe" / "splitter_state.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.unlink(missing_ok=True)
@@ -769,38 +755,6 @@ async def run_splitter_checks() -> None:
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause(0.4)
         manager = app.session_manager
-        home = app.screen
-        side = home.query_one("#home-side")
-        center = home.query_one("#home-center")
-        check(side.region.width == 34, f"主界面左栏初始 34 列：{side.region.width}")
-
-        # 方向键：界线有焦点时左右各调一格，中间栏跟着让。
-        split = home.query_one("#home-split", Splitter)
-        split.focus()
-        await pilot.press("right", "right")
-        await pilot.pause()
-        check(side.region.width == 36, f"按两次右键左栏加宽两列：{side.region.width}")
-        check(center.region.x == side.region.right + 1, "中间栏跟着界线右移")
-        check(manager.home_rail_width == 36, f"宽度记进会话管理器：{manager.home_rail_width}")
-
-        # 拖动：按住界线往右拖六格。移动事件按相邻两次的位置差累加。
-        start = split.region.x
-        await pilot.mouse_down(split)
-        await pilot.hover(None, offset=(start + 6, 2))
-        await pilot.mouse_up(offset=(start + 6, 2))
-        await pilot.pause()
-        check(side.region.width == 42, f"拖动六格之后左栏 42 列：{side.region.width}")
-        check(
-            tomllib.loads(path.read_text(encoding="utf-8"))["home_rail_width"] == 42,
-            "松手之后宽度写进状态文件",
-        )
-
-        # 夹取：一直往左按，停在最小值，中间栏不会被挤没。
-        for _ in range(30):
-            await pilot.press("left")
-        await pilot.pause()
-        check(side.region.width == HOME_MIN, f"左栏最窄夹到 {HOME_MIN} 列：{side.region.width}")
-        check(center.region.width > 0, f"夹取之后中间栏仍然有宽度：{center.region.width}")
 
         # 聊天界面：左栏、右栏各一条界线，消息区与输入框一起变窄。
         manager.create_session("分栏测试")
@@ -870,10 +824,9 @@ async def run_splitter_checks() -> None:
     reloaded = SessionManager(path)
     check(reloaded.load_from_toml(), "重新读回状态文件")
     check(
-        (reloaded.home_rail_width, reloaded.rail_width, reloaded.side_width)
-        == (HOME_MIN, RAIL_MIN, 31),
-        f"重启后三栏宽度是上次拖出来的那一份："
-        f"{reloaded.home_rail_width} / {reloaded.rail_width} / {reloaded.side_width}",
+        (reloaded.rail_width, reloaded.side_width) == (RAIL_MIN, 31),
+        f"重启后两栏宽度是上次拖出来的那一份："
+        f"{reloaded.rail_width} / {reloaded.side_width}",
     )
 
     path.unlink(missing_ok=True)
@@ -2092,6 +2045,36 @@ async def run_live_step_checks() -> None:
             f"停下之后那一步按失败画：{str(stopped_row.render())}",
         )
 
+        # 停在「模型要了工具、工具还没开始」那一刻：这一步的状态是未开始。
+        # 步行与工具卡同一套字形，点开时重算一次状态，这条路也要画得出来。
+        never = Session(id="ses_live_pending", title="还没开始")
+        never_user = never.add_message(Message(role="user"))
+        never_user.add_part(Part(type=PartType.TEXT, text="跑一步"))
+        never_assistant = never.add_message(Message(role="assistant"))
+        never_assistant.add_part(Part(type=PartType.STEP_START, text="1 · fake"))
+        never_assistant.add_part(
+            Part(
+                type=PartType.TOOL,
+                tool_name="read_turn",
+                tool_status=ToolStatus.PENDING,
+                tool_input={"step": 89},
+            )
+        )
+        pane.rebuild(never.messages, never, running=False)
+        await pilot.pause()
+        pending_row = pane._step_rows.get((1, 1))
+        check(pending_row is not None, "还没开始的那一步也有一行")
+        check(
+            "○" in str(pending_row.render()),
+            f"还没开始的步画空心圆：{str(pending_row.render())}",
+        )
+        pane.toggle_step(1, 1)
+        await pilot.pause()
+        check(
+            "○" in str(pending_row.render()),
+            f"点开之后仍是空心圆：{str(pending_row.render())}",
+        )
+
 
 def run_viewer_address_checks() -> None:
     """产物地址：工具与界面共用一份拼装。
@@ -2320,9 +2303,9 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(bar.region.height == box.height, "左侧竖条贯穿文本框整个高度")
         check(bar.rich_style.bgcolor.name == "#4a9eff", "输入框聚焦时竖条为亮蓝色")
         check(
-            home.query_one("#home-input").rich_style.bgcolor.name
-            == home.query_one("#home-box").rich_style.bgcolor.name,
-            "聚焦时输入区底色与区块一致（区块被 focus-within 抬亮，输入区要跟着抬）",
+            home.query_one("#home-input").rich_style.bgcolor.name == "#1a1a1a"
+            and home.query_one("#home-box").rich_style.bgcolor.name == "#1a1a1a",
+            "输入区与区块同底色，焦点进出不改变它（焦点只点亮左侧竖条）",
         )
         check(
             home.query_one("#home-input", HomeInput).highlight_cursor_line is False,
@@ -2332,6 +2315,10 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.pause()
         await pilot.pause()
         check(bar.rich_style.bgcolor.name == "#2a2a2a", "输入框失焦后竖条变暗")
+        check(
+            home.query_one("#home-box").rich_style.bgcolor.name == "#1a1a1a",
+            "失焦后区块底色不变",
+        )
         home.query_one("#home-input", HomeInput).focus()
         await pilot.pause()
         await pilot.pause()

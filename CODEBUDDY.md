@@ -59,8 +59,9 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 依赖手工装，测试是**直接跑的脚本**。模块地图见 `docs/design.md` 第十节（不给逐文件行数，
 那类数字随改动漂移；也不含 `web/` `viz/`）。
 
-CI 只有一个 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，**两份依赖都装**
-（叠合与先验口袋那几条断言需要 gemmi，缺了会直接抛出 ToolError）。
+CI 只有一个 `.github/workflows/ci.yml`：Linux 上两个 job，判据脚本四个——内核 job 跑
+`test_agent.py`、`check_prefix.py` 与 `check_style.py`，界面 job 跑 `test_smoke.py`；
+**两份依赖都装**（叠合与先验口袋那几条断言需要 gemmi，缺了会直接抛出 ToolError）。
 没有 Windows job——`verify_exe` 需要 pywinpty，那条路还没有人验证过。
 
 代码注释与 docstring 一律用中文写，解释「为什么这么写」。新增代码跟随这一惯例。
@@ -126,6 +127,7 @@ python tools/check_retrieval.py --list          # 只看评测集概况
 python tools/build_demo_data.py     # 由 RCSB 1IEP 原始 PDB 生成 runs/1iep-demo（可复现）
 python tools/check_demo_data.py     # 纯几何：口袋残基是否真的接触共晶配体（≤4.5Å、≥60%）
 python tools/check_prefix.py        # 稳定前缀：token 预算 / 点名工具首步可见 / 枚举残留 / 字节稳定
+python tools/check_style.py         # 样式：网页字号六档 / 间距八档 / 终端色值只在 palette.py / 变量有人用
 
 # 上下文 / 记忆探针（手动，不进 CI）
 python tools/eval_context.py --session ses_xxx   # 逐个截断点看装配估算与降级
@@ -142,6 +144,12 @@ python tools/replay_cost.py                      # 成本探针：同一份会�
 python tools/replay_cost.py --session ses_xxx --json .probe/cost.json
 python tools/replay_cost.py --list               # 哪些会话有 trace
 
+# 会话分析页（静态 HTML，双击就看，不联网）
+python tools/report_session.py                   # 默认取最近改动的 trace，输出 .probe/report-<会话>.html
+python tools/report_session.py --session ses_0023 --out .probe/report.html
+python tools/report_session.py --list            # 列出状态文件里的会话与 trace 体量
+                                                 # 逐轮耗时 / token / 缓存命中 / 分层占用 / 工具 / 主题 / 异常
+
 # 本地语料（免费离线）
 python -m vsagent.core.index reindex        # 按盘上原件重建索引，并顺手补向量
 python -m vsagent.core.embed download       # 拉模型（255MB；直连不通自动走 hf-mirror）
@@ -149,7 +157,9 @@ python -m vsagent.core.embed index          # 只补向量（换模型后跑这�
 
 # 前端（viz/ 是唯一装 npm 包的地方）
 cd viz && npm install && npm run build     # esbuild → viz/build/{viewer,markdown}-lib.js
-node tools/check_web_ui.js                 # WEB_PORT，默认 8866；自己造夹具、自己 spawn serve_web.py
+NODE_PATH=viz/node_modules node tools/check_web_ui.js
+                                           # playwright 装在 viz/node_modules，脚本在 tools 下
+                                           # WEB_PORT，默认 8866；自己造夹具、自己 spawn serve_web.py
                                            # 含：数据驱动、口袋深链接、对接分数排序方向、
                                            # 三态主题（完成/失败/中断）与运行中卡片
 python tools/seed_three_states.py --state .probe/web-ui-state/state.toml
@@ -323,7 +333,7 @@ graph TD
   **固定那几段预算 1900 token（实测 1592），由 `tools/check_prefix.py` 守着**：超预算、
   点名了首步看不见的工具、出现「全库只有…」这类枚举，都会被检查出来。
   `AGENTS.md` 那一块**不设上限**：它是许可与判据的来源，少一条就可能让模型做一个本来
-  被禁止的动作，判据只报它的体量（现 3475 token / 288 行）。
+  被禁止的动作，判据只报它的体量（现 3527 token / 286 行）。
   `project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`），整份注入、不截断；
   编码坏了返回空串——`stable_prefix` 在装配之前调，那里没有 try，一个异常会掀掉一整轮。
   平台那句由 `platform_note()` 按 `sys.platform` 现取，**必须现取**：把「这套环境是
@@ -522,7 +532,7 @@ graph TD
   产物是一组可点条目，点一行走 `app.open_artifact()`：地址由
   `domain/export.viewer_address()` 算，与模型调 `open_viewer` 拿到的是同一个。
   三栏之间各有一条 1 列宽的 `Splitter`：按住拖动或聚焦后按左右键调宽，宽度存进
-  `state.toml` 的 `rail_width` / `side_width` / `home_rail_width`；画的时候按终端宽度
+  `state.toml` 的 `rail_width` / `side_width`；画的时候按终端宽度
   再夹一次（左栏 16–60、右栏 20–60，放得下时给中间栏留 40 列），夹的只是画面，不改设定。
   左栏的两份清单来自 `widgets/session_list.py` 与 `widgets/topic_list.py`；主题清单读
   `MessagesPane.topics`，不另算一遍边界，点一条走 `focus_topic()` 打开并滚过去
@@ -533,22 +543,21 @@ graph TD
   位置推回顶部，主题多出来时才跟着滚到底。
   **侧栏可见性只有 `set_sidebar()` 一个入口**——`/sidebar`、点按钮、子 agent 刚建出来时
   自动打开，三条路都走它；各写一份的话按钮上的字会跟实际状态对不上。
-- `HomeScreen` 也是左右两段：左栏 `SessionList` 列运行中与全部任务，中间是字标、输入框与
-  「最近任务」四行；两段之间同样有一条可拖动的 `Splitter`，点任意一行走 `app.open_session()`
-  （与 `/sessions` 选择器同一个入口）。
+- `HomeScreen` 只有一栏：字标、输入框与「最近任务」都在中间，左栏已经删掉。
+  最近任务最多 6 条，运行中的排最前，其余按更新时间；标题行右端是「+ 新建任务」
+  （`NewTaskRow`）：清空输入框、焦点归位，会话等提交时再建。点任意一行走
+  `app.open_session()`（与 `/sessions` 选择器同一个入口）。
   顶部一条 1 行高的 `TopBar`：左边应用名，右边「模型 / 工具 / 主题 / 帮助」四格，
   点一下走对应的斜杠命令；聊天界面没有顶栏。
   输入框内部最后一行是四格操作提示（`HomeAction`）：`@ 文件` / `/model 模型` /
   `/tools 工具` / `Enter 发送`。附件在光标处插 `@` 并打开文件候选（与聊天界面同一个
   `FileAutocomplete`；回车采纳后写成 `@路径 `，提交时由 `resolve_file_refs` 读成
   文件引用），模型与工具走各自的命令打开面板（草稿留着），发送与回车同一条路。
+  输入框下面紧跟一行快捷键提示（`tab 切换 Agent · ctrl+p 命令面板 · / 列出命令`），
+  再下面是「快速开始」三个模板（`QuickTask`：研究 / 结构 / 知识）：点一下整段填进
+  输入框、光标停在末尾、不提交；终端不足 26 行时整行收起。
   最近任务每行写标题、状态、`N 主题 · M 产物 · 时间` 与最近一次结果（结论 → 失败原因 →
   状态说明），结果按剩余宽度截断；`SessionRow` 的预留把状态词前后的空隙算了进去。
-  输入框下面一行「快速开始」三个模板（`QuickTask`：研究 / 结构 / 知识）：点一下整段填进
-  输入框、光标停在末尾、不提交；终端不足 26 行时整行收起。
-  左栏顶部是「+ 新建任务」（`NewTaskRow`，只在主界面有）：清空输入框、焦点归位，
-  会话等提交时再建；主界面第二段标题叫「最近任务」，聊天左栏仍是「全部任务」。
-  终端宽度不到 92 列时左栏与界线一起收起，字标一行 60 格，加 34 格导航会在 80 列终端里折行。
 - 消息区按主题卡组织。**用户消息是任务的头，永远显示；主题挂在它下面**：一轮里有几个
   主题就排几行标题，点开一个才展开它的过程。三层：主题头（标题、状态、步数与工具数、
   一句结论）→ 步行（序号、做了什么、耗时、成败）→ 工具卡，缩进依次加深。思考过程属于
@@ -579,6 +588,9 @@ graph TD
   所以补挂与裁剪的算术不变。它有 `on_removed` 回调让 ChatScreen 在移除前先退订（注释里记着一次真实的 `NoMatches` 竞态）。
   多个 handler `prevent_default()` 之后要调 `stylesheet.update_nodes([self])`，否则整棵子树重排要 2.6–3.9 秒。
 - `EditorPane` 有三种模式 `mode-chat` / `mode-command` / `mode-bash`（CSS 类切换），配三个自动补全弹窗。
+  两个界面的输入框共用 `ComposerInput`（`widgets/editor_pane.py`）：焦点进出不重画整块，
+  滚动跟着光标走；启动界面只多一个 `shift+enter`。焦点那条竖条由外层的
+  `on_descendant_focus` / `on_descendant_blur` 加类点亮，不写 `:focus-within`。
 - 命令表 `core/command_registry.py` 有 32 个斜杠命令。**命令刻意没有键位**，键位单独放
   `core/keybind_manager.py`，且那两个表只用于渲染帮助——smoke 测试会比对它们和 `HomeScreen.BINDINGS`。
 - `app.py:execute_command` 解析 `/name args`，查表，然后按约定分发到 `self._command_<name>`。
@@ -680,6 +692,9 @@ graph TD
 互相清掉 `loadToken`，中间栏停在「正在读取会话…」。挂载结束时给 `#app-view` 打
 `data-ready`，判据靠它区分「这一页画完了」与「上一页的元素还在」。
 
+字号六档、间距八档、内容宽度三档、动效两档都写在 `web/app.css` 的 `:root`：页面里不再写
+字号与大于 3px 的间距，`tools/check_style.py` 守着这一条。
+
 默认页是 `#/home`（工作空间）：
 左栏是运行中与全部任务，主区是输入框与最近任务表，一行给出标题、状态、主题数、产物数与最近一个
 主题；点一行进 `#/history/<id>?event=<最近主题>`。**首页不轮询整表**——`/api/sessions`
@@ -728,8 +743,13 @@ graph TD
 用 esbuild 把 Mol\* 和 marked 打成 IIFE 全局 `vsViewer` / `vsMarkdown`——页面代码不
 import 任何 npm 包，换 3D 库只动 `viz/`。
 
-`vsagent/themes/default.json` **目前没有任何代码读它**，是设计参考稿；真实颜色硬编码在
-`styles/app.tcss`，主题切换走的是 Textual 自带的 `available_themes`。
+`vsagent/palette.py` 是终端配色的唯一来源：`app.tcss` 用 `$vsa-*` 变量，
+widget 的 `DEFAULT_CSS` 用 `palette.css("""…""")` 包一层，Rich 标记用 `palette.TEXT_1`
+这类常量。变量由 `VSAgentApp.get_css_variables` 注入——Textual 的变量按样式表隔离，
+只在 `app.tcss` 里声明的话 widget 的 `DEFAULT_CSS` 看不见。前缀与 Textual 自带的
+`$surface` / `$accent` 分开：那批变量跟着 `/themes` 变，应用自己的区块不跟着变。
+`tools/check_style.py` 守着这条与网页端那套档位。
+主题切换走的是 Textual 自带的 `available_themes`。
 
 ## 约定
 

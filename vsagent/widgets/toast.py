@@ -4,6 +4,8 @@ from textual.app import ComposeResult
 from textual.containers import Container
 from textual.widgets import Static
 
+from .. import palette
+
 KIND_ICON = {
     "info": "●",
     "success": "✓",
@@ -78,7 +80,7 @@ class ToastRack(Container):
 class ToastNotification(Container):
     """非阻塞通知浮层，右下角显示并在数秒后自动消失。"""
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     ToastNotification {
         height: auto;
         width: auto;
@@ -87,8 +89,8 @@ class ToastNotification(Container):
         max-width: 60vw;
         margin: 0;
         padding: 0 1;
-        background: #1A1A1A;
-        color: #E0E0E0;
+        background: $vsa-layer;
+        color: $vsa-text-1;
     }
     /* 正文取自动宽度并放开到外层内宽：只写 `width: auto` 的话它按整段文字的
        自然宽度量（长提示能到八九十列），外层被 `max-width` 收窄之后正文不跟着换行，
@@ -101,10 +103,10 @@ class ToastNotification(Container):
     }
     /* 只有需要人注意的两档带底色：完成与失败。普通提示换成一层浅底就够了，
        四档都铺满一层彩色，屏幕上同时挂几条时反而分不出哪条要紧。 */
-    ToastNotification.success { background: #2E7D32; color: #FFFFFF; }
-    ToastNotification.warning { background: #FFB300; color: #000000; }
-    ToastNotification.error { background: #C62828; color: #FFFFFF; }
-    """
+    ToastNotification.success { background: $vsa-ok-solid; color: $vsa-on-solid; }
+    ToastNotification.warning { background: $vsa-warn; color: $vsa-screen; }
+    ToastNotification.error { background: $vsa-error; color: $vsa-on-solid; }
+    """)
 
     def __init__(self, text: str, kind: str = "info") -> None:
         super().__init__(classes=f"toast {kind}")

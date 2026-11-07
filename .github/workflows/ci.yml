@@ -44,6 +44,9 @@ jobs:
       # 前缀判据：预算、点名工具首步可见性、越界参数表与工具 schema 一致、Plan 类别覆盖。
       # 它要装全部 68 个工具、读真实的 AGENTS.md，比 test_agent 里那一组贵，所以单独跑。
       - run: python tools/check_prefix.py
+      # 样式判据：终端色值只在 palette.py，网页字号六档、间距八档，变量声明与引用两边都有。
+      # 只读源码与 palette.py，不装依赖也能跑；挂在这个 job 上省一次 checkout 与 setup。
+      - run: python tools/check_style.py
 
   ui:
     name: 界面 + 内核

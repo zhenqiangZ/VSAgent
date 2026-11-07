@@ -1258,6 +1258,58 @@ async function checkLiveCard(page, sessionId) {
     text.slice(0, 80).replace(/\n/g, " / ")
   );
 
+  // 一步做完：快照里多一条已完成的步，当前步换成下一个。这里盯的是「原地改写」：
+  // 整块重画之后文字照样对，但状态色没有过渡，滚动位置与悬停状态也会丢。
+  // 所以留下当前那一行的节点句柄，改完之后看它还在不在、类名变了没有。
+  const beforeRow = await page
+    .locator("#conversation .topic-card.is-live .step-row.is-current")
+    .elementHandle();
+  payload.steps.push({
+    seq: 2,
+    intent: "analyze_pose(handle=docking#1)",
+    tools: ["analyze_pose"],
+    result: "成功：3 个接触",
+    issues: [],
+    status: "completed",
+  });
+  payload.current = {
+    phase: "tool",
+    tool: "contact_map",
+    status: "running",
+    preview: "统计接触频次",
+    since: Date.now() / 1000,
+    calls: 1,
+  };
+  payload.updatedAt = Date.now() / 1000;
+  fs.writeFileSync(target, JSON.stringify(payload), "utf8");
+  let advanced = true;
+  try {
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll("#conversation .topic-card.is-live .step-row").length === 3,
+      undefined,
+      { timeout: 20000 }
+    );
+  } catch (error) {
+    advanced = false;
+  }
+  const inPlace = beforeRow
+    ? await beforeRow.evaluate((node) => ({
+        connected: node.isConnected,
+        current: node.classList.contains("is-current"),
+        status: node.querySelector(".step-status")?.textContent.trim() ?? "",
+      }))
+    : null;
+  check(
+    "一步做完是原地改写，不是整块重画",
+    advanced &&
+      inPlace !== null &&
+      inPlace.connected &&
+      !inPlace.current &&
+      inPlace.status === "完成",
+    JSON.stringify(inPlace)
+  );
+
   payload.running = false;
   payload.current = null;
   payload.updatedAt = Date.now() / 1000;

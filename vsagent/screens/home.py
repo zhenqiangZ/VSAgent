@@ -15,20 +15,15 @@ from textual.selection import SelectState
 from textual.widget import Widget
 from textual.widgets import Static
 
-from .. import __version__
+from .. import __version__, palette
 from ..core.models import Session
-from ..core.session_manager import HOME_MAX, HOME_MIN
 from ..widgets.agent_autocomplete import AGENTS
 from ..widgets.command_autocomplete import CommandAutocomplete
 from ..widgets.command_palette import CommandPalette
-from ..widgets.editor_pane import COMMAND_TOKEN, FILE_TOKEN, ScrollingTextArea, search_files
+from ..widgets.editor_pane import COMMAND_TOKEN, FILE_TOKEN, ComposerInput, search_files
 from ..widgets.file_autocomplete import AutocompletePopup, FileAutocomplete
-from ..widgets.session_list import NewTaskRow, SessionList, SessionRow, fit
-from ..widgets.splitter import Splitter
+from ..widgets.session_list import NewTaskRow, SessionRow, fit
 from ..widgets.top_bar import TopBar, TopLink
-
-# 中间那一栏至少留这么多列：字标一行 60 格，再窄就放不下了。
-MIN_CENTER_WIDTH = 40
 
 # 字标逐行写、最后补齐到同一宽度再拼起来。**不能省掉补齐**：`#home-logo` 是
 # `text-align: center`，每行各自居中，长短不一的几行会互相错开一格，整块看着是歪的。
@@ -96,8 +91,11 @@ def _latest_result(session: Session) -> str:
     return session.status_note.strip()
 
 
-class HomeInput(ScrollingTextArea):
-    """启动界面输入框：内容换行时框体随之增高，超出高度上界后滚动掩盖最早的内容。"""
+class HomeInput(ComposerInput):
+    """启动界面输入框：内容换行时框体随之增高，超出高度上界后滚动掩盖最早的内容。
+
+    焦点处理与聊天界面共用 `ComposerInput`；这里只多一个换行键。
+    """
 
     BINDINGS = [Binding("shift+enter", "insert_newline", "Newline", show=False)]
 
@@ -162,8 +160,6 @@ class HomeScreen(Screen):
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         # esc 关掉命令补全之后，这一次输入不再弹窗，直到输入不再是命令前缀。
         self._command_dismissed = False
-        # 当前画出来的左栏宽度，拖动时按这一份加减；样式里那份可能被窄屏夹过。
-        self._rail_width = 34
 
     # 与聊天界面同一套：只留命令面板、切 Agent、退出这三个键，
     # 其余（新建会话、模型、主题、帮助、会话列表）都打 /命令，或者 ctrl+p 打开面板。
@@ -184,9 +180,6 @@ class HomeScreen(Screen):
         with Vertical(id="home-frame"):
             yield TopBar()
             with Horizontal(id="home-body"):
-                # 左栏是导航：运行中的任务单独一段，其余按更新时间排。点一行就切过去。
-                yield SessionList(id="home-side")
-                yield Splitter(id="home-split")
                 with Vertical(id="home-center"):
                     yield Static(ASCII_LOGO, id="home-logo")
                     yield Static(TAGLINE, id="home-tagline", markup=False)
@@ -210,15 +203,17 @@ class HomeScreen(Screen):
                                 yield HomeAction("model", "/model 模型", id="home-action-model")
                                 yield HomeAction("tools", "/tools 工具", id="home-action-tools")
                                 yield HomeAction("send", "Enter 发送", id="home-send-hint")
+                    # 快捷键提示紧跟输入框：它讲的是输入框里的操作，
+                    # 放到最近任务下面就成了页脚，用户不会有耐心看到那里。
+                    yield Static(HELP_TEXT, id="home-help")
                     # 快捷入口：填的是任务模板，不直接提交。矮终端里整行收起，
                     # 见 `apply_quick_visibility()`。
                     with Horizontal(id="home-quick"):
                         yield Static("快速开始", classes="quick-label", markup=False)
                         for key, (label, _text) in QUICK_TEMPLATES.items():
                             yield QuickTask(key, label, id=f"quick-{key}")
-                    # 输入框下面是最近几条任务：左栏回答「有哪些」，这里回答「最近做了什么」。
+                    # 输入框下面是最近几条任务：分组由这张表承担，左栏已经删掉。
                     yield Vertical(id="home-recent")
-                    yield Static(HELP_TEXT, id="home-help")
             # 两个补全弹窗：斜杠命令与 @ 文件引用。默认 display:none，往上浮、
             # 底边停在最底下那行状态栏上沿。不能挂在 `#home-center` 里：那一块是
             # 居中布局，弹窗虽然不占布局流，高度仍然算进它的内容总高，一弹出就把
@@ -233,23 +228,31 @@ class HomeScreen(Screen):
 
     def on_mount(self) -> None:
         """把焦点交给输入框，并把左栏与最近任务画出来。"""
-        self.apply_widths()
         self.apply_quick_visibility()
         self.input.focus()
         self.refresh_tasks()
 
-    def on_resize(self, event: events.Resize) -> None:
-        """窄终端里收起左栏。
+    def on_descendant_focus(self) -> None:
+        """焦点进到输入框时点亮最左侧那条竖条。
 
-        字标一行 60 格，加上导航之后 80 列的终端放不下，字标会折成两行。
-        任务列表是导航，输入框与最近任务才是这一屏要回答的问题，先让导航退场。
+        只给竖条一个类。写成 `#home-box:focus-within` 的话，规则命中的是区块自己，
+        区块连同输入区、状态行与操作提示一起重算样式再重绘，焦点每进出一次就闪一下。
+        """
+        self.query_one("#home-accent-bar", Static).add_class("-focused")
+
+    def on_descendant_blur(self) -> None:
+        """焦点离开输入框时把竖条收回暗色。"""
+        self.query_one("#home-accent-bar", Static).remove_class("-focused")
+
+    def on_resize(self, event: events.Resize) -> None:
+        """窗口尺寸变化时重排快捷入口与最近任务。
+
+        最近任务那几行是按当时的宽度截断的，宽度变了要重截一遍；
+        留着旧的那份会在窄屏里溢出、宽屏里过早省略。
         """
         if not self.is_mounted:
             return
-        self.apply_widths()
         self.apply_quick_visibility()
-        # 最近任务那几行是按当时的宽度截断的，宽度变了要重截一遍；
-        # 留着旧的那份会在窄屏里溢出、宽屏里过早省略。
         self.refresh_tasks()
 
     def apply_quick_visibility(self) -> None:
@@ -262,50 +265,24 @@ class HomeScreen(Screen):
             "block" if self.app.size.height >= 26 else "none"
         )
 
-    def apply_widths(self) -> None:
-        """按终端宽度摆好左栏与分栏界线。
-
-        存的是用户拖出来的宽度，画的时候再按当前终端夹一次：临时缩小不该把设定改掉。
-        """
-        manager = self.app.session_manager
-        total = self.app.size.width
-        visible = total >= 92
-        self.query_one("#home-side").styles.display = "block" if visible else "none"
-        self.query_one("#home-split").styles.display = "block" if visible else "none"
-        room = max(HOME_MIN, total - 1 - MIN_CENTER_WIDTH)
-        width = max(HOME_MIN, min(manager.home_rail_width, HOME_MAX, room))
-        self._rail_width = width
-        self.query_one("#home-side").styles.width = width
-
-    def on_splitter_resize_requested(self, event: Splitter.ResizeRequested) -> None:
-        """拖动界线或按方向键：改左栏宽度。"""
-        if event.splitter.id != "home-split":
-            return
-        manager = self.app.session_manager
-        manager.home_rail_width = max(
-            HOME_MIN, min(HOME_MAX, self._rail_width + event.delta)
-        )
-        self.apply_widths()
-        self.refresh_tasks()
-
-    def on_splitter_resize_finished(self, event: Splitter.ResizeFinished) -> None:
-        """松手之后才写盘：拖动过程中每移一格都写一次状态文件太重。"""
-        self.app.save_state()
-
     def refresh_tasks(self) -> None:
-        """重画左栏与「最近任务」。会话列表随切换与新建变化，进屏幕时重取一次。"""
-        self.query_one("#home-side", SessionList).refresh_sessions(
-            new_task=True, list_title="最近任务"
-        )
+        """重画「最近任务」。它同时承担运行中任务的入口。
+
+        左栏删掉之后，这一段是会话的唯一入口：运行中的单独一段排最前，
+        其余按更新时间。「+ 新建任务」只出现在第一段的标题行右端。
+        """
         box = self.query_one("#home-recent", Vertical)
         box.remove_children()
-        sessions = self.app.session_manager.root_sessions()[:4]
+        sessions = self.app.session_manager.root_sessions()
+        running = [item for item in sessions if item.status == "running"]
+        listed = [item for item in sessions if item.status != "running"][:4]
         if not sessions:
             return
-        box.mount(Static("最近任务", classes="rail-section -first"))
         current = self.app.session_manager.current_session_id
         width = max(20, box.content_size.width or 78)
-        for item in sessions:
+        first_title = "运行中" if running else "最近任务"
+        box.mount(self._section_header(first_title, with_new=True))
+        for item in running:
             box.mount(
                 SessionRow(
                     item,
@@ -314,6 +291,28 @@ class HomeScreen(Screen):
                     meta=self._recent_meta(item, width),
                 )
             )
+        if running and listed:
+            box.mount(self._section_header("最近任务", with_new=False))
+        for item in listed:
+            box.mount(
+                SessionRow(
+                    item,
+                    current=item.id == current,
+                    width=width,
+                    meta=self._recent_meta(item, width),
+                )
+            )
+
+    @staticmethod
+    def _section_header(title: str, *, with_new: bool) -> Horizontal:
+        """一段的标题行：左边名字，右端按需放「+ 新建任务」。"""
+        children: list[Widget] = [
+            Static(title, classes="rail-title", markup=False)
+        ]
+        if with_new:
+            children.append(NewTaskRow())
+        classes = "rail-section -first" if with_new else "rail-section"
+        return Horizontal(*children, classes=classes)
 
     @staticmethod
     def _recent_meta(session: Session, width: int) -> str:
@@ -571,9 +570,9 @@ class HomeScreen(Screen):
         """拼出状态行：Agent 用蓝色，模型与提供方用次要文字那一档。"""
         app = self.app
         text = Text()
-        text.append(app.session_manager.last_agent, style="#4A9EFF")
-        text.append(" · ", style="#4A4A4A")
-        text.append(f"{app.current_model_label} {app.current_model_provider}", style="#8B949E")
+        text.append(app.session_manager.last_agent, style=palette.ACCENT)
+        text.append(" · ", style=palette.TEXT_4)
+        text.append(f"{app.current_model_label} {app.current_model_provider}", style=palette.TEXT_2)
         return text
 
     def _refresh_info(self) -> None:

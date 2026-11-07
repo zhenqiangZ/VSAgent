@@ -5,6 +5,8 @@ from textual.markup import escape
 from textual.widget import Widget
 from textual.widgets import Static
 
+from .. import palette
+
 
 class AutocompletePopup(Widget):
     """补全弹窗基类，渲染一个带高亮项的可选列表。"""
@@ -12,7 +14,7 @@ class AutocompletePopup(Widget):
     # 一次显示多少个候选。弹窗高度由它算出来（见 `__init__`），改这一处就够。
     MAX_ROWS = 6
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     AutocompletePopup {
         height: auto;
         /* 浮在界面上，不占布局流：占流的话弹窗一开就把输入区往上顶（实测顶掉 11 行），
@@ -20,16 +22,16 @@ class AutocompletePopup(Widget):
         overlay: screen;
         offset: 0 -100%;
         display: none;
-        background: #1A1A1A;
-        border: round #4A9EFF;
+        background: $vsa-layer;
+        border: round $vsa-accent;
         padding: 0 1;
     }
     AutocompletePopup.-visible { display: block; }
-    AutocompletePopup .ac-item { color: #8B949E; }
-    /* 选中项是亮蓝底，文字取屏幕底那一档：白字压在 #4A9EFF 上对比不够，
+    AutocompletePopup .ac-item { color: $vsa-text-2; }
+    /* 选中项是亮蓝底，文字取栏底那一档黑：白字压在这一档蓝上对比不够，
        而深字与询问弹窗里那三个按键色块是同一种做法 */
-    AutocompletePopup .ac-item.-active { color: #0A0A0A; background: #4A9EFF; }
-    """
+    AutocompletePopup .ac-item.-active { color: $vsa-rail; background: $vsa-accent; }
+    """)
 
     def __init__(
         self,

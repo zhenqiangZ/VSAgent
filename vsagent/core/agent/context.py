@@ -116,10 +116,12 @@ MIN_AVAILABLE = 512
 MIN_RECENT_TURNS = 1
 # 本主题走到第几步才在尾部提示「该收口了」。
 #
-# 3 是 `close_topic` 自己的触发线（「这个主题跑了 3 步以上」）：两三轮的小事
-# 用本地标题就够，提示只会让模型为一次记账多跑一个往返。提示本身是尾部的
-# 一行字，不碰前缀缓存。
-CLOSE_TOPIC_AFTER = 3
+# 2 是 `close_topic` 自己的触发线：两三轮的小事用本地标题就够，提示只会让模型
+# 为一次记账多跑一个往返。提示本身是尾部的一行字，不碰前缀缓存。实测一条主题
+# 走到 21 步都没收（`evt_0009`），所以提前到第 2 步，并在第 8 步换一句更重的提醒。
+CLOSE_TOPIC_AFTER = 2
+# 一个主题走到这么多步还没收时，提示改成「先收一次再继续」。
+TOPIC_LONG_HINT = 8
 # 装配结果的估算值降到窗口的这个比例以内就算合格
 CONTEXT_RATIO = 0.8
 
@@ -169,6 +171,15 @@ EVIDENCE_REF_ARGUMENTS: tuple[str, ...] = (
 FOCUS_LIMIT = 300
 FOCUS_CONSTRAINTS = 3
 """复述里最多带几条约束。约束多的会话按先后顺序取前几条——最早提的通常最硬。"""
+# 上一轮的停因写进复述时用的说法。与 `loop.EXIT_LABELS` 同一套文案，
+# 放在这里是因为装配器不能 import 循环层（循环层 import 它）。
+_EXIT_TEXT = {
+    "exhausted": "步数用满",
+    "cancelled": "被中断",
+    "error": "请求出错",
+    "tool_failed": "工具连续失败",
+    "topic_full": "这个主题已经足够长，先收了一段",
+}
 
 # 降级链的固定顺序。`degraded` 按这个顺序排，读的人一眼看出削到了第几级。
 # 先前用的是集合排序，顺序被抹掉了——而顺序正是「先削谁、后削谁」这件事本身。
@@ -205,16 +216,21 @@ class Turn:
     切开会给模型留下「调了工具却没有结果」或「结果没有对应调用」的孤儿形状，
     部分服务端直接返回 400。
 
-    `message_index` 记的是它来自哪一条会话消息，`part_start` 是它在这一条
-    消息里的起点。两个合起来是**位置**：事件封存到哪儿、RECENT 从哪儿开始，
-    用的都是这个口径。一条 assistant 消息装着一整轮的所有步，只记消息下标
-    表达不了「一轮中间切开」，而位置可以。
+    `message_index` 记的是它来自哪一条会话消息，`part_start` / `part_end` 是它
+    在这一条消息里的区间。三者合起来是**位置**：事件封存到哪儿、RECENT 从哪儿
+    开始、`read_turn` 取回哪一段，用的都是这个口径。一条 assistant 消息装着一整轮
+    的所有步，只记消息下标表达不了「一轮中间切开」，而位置可以。
+
+    `step_no` 是会话内的步号，与界面上「第 N 步」同一个数。同一段里的模型项
+    （助手回复与它的工具结果）共用一个步号，按步取回时整段一起给。
     """
 
     index: int
     message_index: int
     messages: list[dict[str, Any]] = field(default_factory=list)
     part_start: int = 0
+    part_end: int = 0
+    step_no: int = 0
     # 组内工具结果对应的源 Part，与 `messages` 里的 tool 项一一对应。
     #
     # 模型项是派生物，有两件事只能回到 Part 上问：这次调用**失败了吗**（失败的结果
@@ -554,8 +570,8 @@ class ContextBundle:
 
     messages: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[Layer, int] = field(default_factory=dict)   # 每层估算 token
-    dropped_turns: list[int] = field(default_factory=list)  # 被移出的交互组序号
-    dropped: int = 0                                        # 被移出的交互组数
+    dropped_turns: list[int] = field(default_factory=list)  # 被移出的步号
+    dropped: int = 0                                        # 被移出的步数
     # 被移出的内容覆盖到第几条会话消息（不含），供摘要定位用；没移出时为 0
     dropped_upto: int = 0
     degraded: list[str] = field(default_factory=list)       # 这一轮触发的降级步骤
@@ -580,13 +596,20 @@ def split_turns(messages: list[Message]) -> list[Turn]:
     段内再按「assistant 项开头、紧随其后的 tool 项归它」分组，于是工具结果
     永远不会与它的调用分开——这条不变式由构造保证，不靠事后检查。
 
+    `step_no` 按段编号，从 1 开始：一段里的助手项与工具项共用同一个号，
+    `read_turn` 按这个号一次取回整段。用户消息也占一个号，它同样会被移出
+    RECENT，留号才能按清单取回；这个号是**会话内的段号**，与界面上的
+    「第 N 步」在同一轮里通常相等，跨轮之后各自延续（界面每轮从 1 重数）。
+
     用户消息自成一组；找不到调用方的孤儿工具结果也单独成组（正常不会出现）。
     """
     turns: list[Turn] = []
     serial = 0
+    step_no = 0
     for message_index, message in enumerate(messages):
         by_id = {part.id: part for part in message.parts}
         for begin, stop in step_segments(message):
+            step_no += 1
             fresh: list[Turn] = []
             current: Turn | None = None
             for item in translate_parts(message.role, message.parts[begin:stop]):
@@ -595,8 +618,14 @@ def split_turns(messages: list[Message]) -> list[Turn]:
                     fresh.append(current)
                     continue
                 serial += 1
-                current = Turn(index=serial, message_index=message_index, messages=[item])
-                current.part_start = begin
+                current = Turn(
+                    index=serial,
+                    message_index=message_index,
+                    messages=[item],
+                    part_start=begin,
+                    part_end=stop,
+                    step_no=step_no,
+                )
                 turns.append(current)
                 fresh.append(current)
             # 工具项自带 `tool_call_id`（就是 Part 的 id），照着取源 Part 即可：
@@ -678,8 +707,8 @@ def placeholder_stale_reasoning(turns: list[Turn], messages: list[Message]) -> i
 def turn_at(session: Session, index: int) -> Turn | None:
     """按 turn 序号取交互组。
 
-    序号就是 `_refs_block` 与归档占位里写的那个：`split_turns` 按模型项的
-    出现顺序给的连号。消息只会往后追加，所以已有消息的序号不会变。
+    序号就是归档占位里写的那个：`split_turns` 按模型项的出现顺序给的连号。
+    消息只会往后追加，所以已有消息的序号不会变。
     """
     for turn in split_turns(session.messages):
         if turn.index == index:
@@ -687,11 +716,25 @@ def turn_at(session: Session, index: int) -> Turn | None:
     return None
 
 
-def render_part(part: Part) -> str:
-    """把一个 Part 还原成给人读的一段文字。"""
+def step_at(session: Session, step_no: int) -> Turn | None:
+    """按步号取交互组。步号由 `split_turns` 在 assistant 消息的每一段上递增。"""
+    for turn in split_turns(session.messages):
+        if turn.step_no == step_no:
+            return turn
+    return None
+
+
+def render_part(part: Part, with_reasoning: bool = True) -> str:
+    """把一个 Part 还原成给人读的一段文字。
+
+    `with_reasoning=False` 时跳过思考那一段。取回原文的入口默认关掉它：
+    推理是当时的推演，跨轮之后由 TASK 与结论承载，铺出来只是重复占地方。
+    """
     if part.type is PartType.TEXT:
         return part.text
     if part.type is PartType.REASONING:
+        if not with_reasoning:
+            return ""
         return f"[思考]\n{part.text}" if part.text else ""
     if part.type is PartType.TOOL:
         status = f"（{part.tool_status.value}）" if part.tool_status else ""
@@ -712,7 +755,9 @@ def render_part(part: Part) -> str:
     return ""
 
 
-def render_range(session: Session, start: int, end: int) -> str:
+def render_range(
+    session: Session, start: int, end: int, with_reasoning: bool = True
+) -> str:
     """把会话里 `[start, end)` 这几条消息的原文铺成一段文字。
 
     `read_turn` 与 `recall_event` 共用它：两处的区别只是区间怎么来
@@ -722,13 +767,18 @@ def render_range(session: Session, start: int, end: int) -> str:
     blocks: list[str] = []
     for message in session.messages[max(0, start) : max(0, end)]:
         for part in message.parts:
-            block = render_part(part)
+            block = render_part(part, with_reasoning)
             if block:
                 blocks.append(block)
     return "\n\n".join(blocks)
 
 
-def render_between(session: Session, start: tuple[int, int], end: tuple[int, int]) -> str:
+def render_between(
+    session: Session,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    with_reasoning: bool = True,
+) -> str:
     """把位置区间 `[start, end)` 的原文铺成一段文字。
 
     事件按位置切，所以召回一段主题要用它：`start` 是上一条事件的切点，
@@ -743,20 +793,56 @@ def render_between(session: Session, start: tuple[int, int], end: tuple[int, int
         low = start[1] if index == start[0] else 0
         high = end[1] if index == end[0] else len(message.parts)
         for part in message.parts[low:high]:
-            block = render_part(part)
+            block = render_part(part, with_reasoning)
             if block:
                 blocks.append(block)
     return "\n\n".join(blocks)
 
 
-def render_turn_text(session: Session, turn: Turn) -> str:
+def page_lines(
+    lines: list[str], offset: int, limit: int, max_tokens: int
+) -> tuple[list[str], int, int]:
+    """按行窗口取一页，再按 token 预算截断。
+
+    返回这一页的行、下一页的 offset，以及还剩多少行。`read_turn` 与
+    `recall_event` 共用它：两处的额度必须同一套算法，否则同一个预算在
+    两个入口给出不同的页长，模型按一处的经验翻另一处会反复撞墙。
+
+    至少保留一行：第一行就超过预算时也给它，单行本身没有可切的位置。
+    """
+    window = lines[offset : offset + limit]
+    used = 0
+    kept = 0
+    for line in window:
+        cost = estimate_tokens(line) + 1
+        if kept and used + cost > max_tokens:
+            break
+        used += cost
+        kept += 1
+    return window[:kept], offset + kept, len(lines) - offset - kept
+
+
+def render_turn_text(
+    session: Session, turn: Turn, with_reasoning: bool = False
+) -> str:
     """把一个交互组还原成可读文本。
 
     读的是**原 Part**，不是模型项：模型项是翻译层的产物，工具输出超过
     `MODEL_OUTPUT_LIMIT` 时早已被截过，还带着 JSON 外壳。`read_turn` 要给的
     正是原文，所以只能回到会话本身取。
+
+    区间是 `(message_index, part_start)` 到 `(message_index, part_end)`，
+    也就是**一步**，不是整条消息：一条 assistant 消息装着一整轮的所有步，
+    按整条消息取会把十几步一起倒出来。
+
+    推理默认不给：它是当时的推演，跨轮之后由任务状态与结论承载。
     """
-    return render_range(session, turn.message_index, turn.message_index + 1)
+    return render_between(
+        session,
+        (turn.message_index, turn.part_start),
+        (turn.message_index, turn.part_end),
+        with_reasoning,
+    )
 
 
 # ---- 选择性压缩 ----
@@ -987,19 +1073,22 @@ class ContextAssembler:
         digest_text: str = "",
         env_text: str = "",
         evidence: list[Evidence] | None = None,
+        steps_left: int | None = None,
     ) -> ContextBundle:
         """装配这一轮发给模型的消息。
 
         `stable_prefix` 由 `prompt.stable_prefix` 给出；`task_text` 是任务状态渲染出的一段，
         `digest_text` 是工作区索引（当前受体 + 最近的产物 handle），`env_text` 是
         运行环境（日期、工作目录、状态目录）。摘要与压缩位置从 `session` 上取。
+        `steps_left` 是本轮还剩几步，写进尾部提示；不给就不写这一项（探针脚本
+        与测试按默认值跑）。
 
         各层先按软配额取一份，装不下再按降级链逐级削；削到底仍装不下就报
         `ContextAssemblyError`，绝不静默截断。
         """
         raw_evidence = list(evidence or [])
         # 复述只从任务状态来；状态空着就没有这一段，不凭空造一句。
-        focus_text = self._focus_block(session.task_state)
+        focus_text = self._focus_block(session)
         budget = self.budget(tools)
         available = budget.available
         if available < MIN_AVAILABLE:
@@ -1028,7 +1117,7 @@ class ContextAssembler:
         raw_memory = memory_block(memory_text)
         memory = _cap_memory(raw_memory)
         # 进度提示只在本主题够长时出现（见 `CLOSE_TOPIC_AFTER`）。
-        progress = self._progress_block(session)
+        progress = self._progress_block(session, steps_left)
         # 事件块按可用额度的六分之一封顶：它比 RECENT 稳定，但也只是索引，
         # 不该把「最近发生了什么」挤掉。上限 6000 是量出来的——六七个主题的流水。
         event_limit = min(EVENT_LIMIT_MAX, max(EVENT_LIMIT_MIN, available // 6))
@@ -1180,7 +1269,7 @@ class ContextAssembler:
         return ContextBundle(
             messages=messages,
             usage=usage,
-            dropped_turns=[turn.index for turn in out],
+            dropped_turns=[turn.step_no for turn in out],
             dropped=dropped_now,
             dropped_upto=dropped_upto,
             degraded=levels,
@@ -1266,8 +1355,8 @@ class ContextAssembler:
             return False
         label = name or "工具"
         item["content"] = (
-            f"{TOOL_ARCHIVE_MARK}turn {turn.index} 的 {label}；"
-            f"原文用 read_turn turn={turn.index} 取回）"
+            f"{TOOL_ARCHIVE_MARK}step {turn.step_no} 的 {label}；"
+            f"原文用 read_turn step={turn.step_no} 取回）"
         )
         return True
 
@@ -1308,15 +1397,18 @@ class ContextAssembler:
                 cleared += 1
         return cleared
 
-    def _progress_block(self, session: Session) -> str:
+    def _progress_block(self, session: Session, steps_left: int | None = None) -> str:
         """当前主题走到哪儿——够长了才提示收口。
 
         为什么需要这一句：模型要判断「这一主题是不是已经做完」，手上得有两个数：
         已经走了几步、攒下了哪些产物。实测四轮真跑、三次机会、一次都没调
-        `close_topic`（§4.13）：光在提示词里写「3 步以上就考虑」，模型手上没有这个数。
+        `close_topic`（§4.13）：光在提示词里写「几步以上就考虑」，模型手上没有这个数。
 
         这一行同时就是运行中的主题摘要：步数、产物、未决全由本地从 `pending_steps`
         现算，零请求。主题没有封存，模型也已经能看见它积累了些什么。
+
+        `steps_left` 是本轮还剩多少步（由循环层给）。不说上限时模型只能看见
+        「已经走了几步」，看不出还剩几步，于是不会为收尾留额度。
 
         为什么放尾部：它每步都变，进 header 就等于每步改写第 1 条消息。
         尾部是纯追加，不碰前缀缓存（这一条在 §4.13 量过）。
@@ -1334,17 +1426,29 @@ class ContextAssembler:
                 if item not in issues:
                     issues.append(item)
         parts = [f"本主题已 {steps} 步"]
+        if steps_left is not None:
+            parts.append(f"本轮还剩 {max(0, steps_left)} 步")
         if artifacts:
             parts.append("产物 " + "、".join(artifacts[:4]))
         if issues:
             parts.append("未决 " + "；".join(issues[:2]))
+        head = "（" + " · ".join(parts) + "。"
+        if steps >= TOPIC_LONG_HINT:
+            return (
+                head
+                + "这一段已经很长，先调 close_topic 收一次再继续："
+                "title 写做成了什么，summary 写产物、关键数字与放弃过的路，"
+                "handoff 写后续依赖什么。封存之后这一段原文不再随请求发出，"
+                "要看细节用 recall_event。）"
+            )
         return (
-            "（" + " · ".join(parts) + "。目标做完或工作方向实质改变时调一次 close_topic："
+            head
+            + "目标做完或工作方向实质改变时调一次 close_topic："
             "title 写做成了什么，summary 写结论与关键数字，handoff 写后续依赖什么。"
             "封存之后这一段的原文不再随请求发出，只留摘要，要看细节用 recall_event。）"
         )
 
-    def _focus_block(self, state: TaskState) -> str:
+    def _focus_block(self, session: Session) -> str:
         """最后一条用户消息前面那段「目标复述」。
 
         为什么要有：任务状态在 TASK 层（窗口最上面），而长会话里 RECENT 能有几万
@@ -1352,11 +1456,14 @@ class ContextAssembler:
         新请求的正前方，让「现在要做成什么」紧挨着「用户刚说了什么」。
 
         为什么不直接再读一遍 `render()`：那一段带「已完成 / 待办 / 阻塞」全表，
-        是给会话看的状态；这里只要三样能让人立刻对齐的东西——目标、约束、下一步。
+        是给会话看的状态；这里只要几样能让人立刻对齐的东西——目标、约束、下一步，
+        外加「上一轮停在哪儿」与「上一段交接了什么」。
 
-        只复述、不新增：这个块里出现的每一句都来自 `TaskState`，没有它自己的判断。
+        只复述、不新增：这个块里出现的每一句都来自 `TaskState` 或事件记录，
+        没有它自己的判断。
         """
-        if state.is_empty():
+        state = session.task_state
+        if state.is_empty() and not session.last_exit_reason and not session.events:
             return ""
         lines = ["（当前任务复述：下面这些是前面已经定下的，不是新指令）"]
         if state.goal:
@@ -1372,6 +1479,10 @@ class ContextAssembler:
         elif state.blockers:
             # 没有待办时，「卡在哪」就是下一步要处理的，别把这一段空着。
             lines.append(f"当前阻塞：{state.blockers[0]}")
+        if session.last_exit_reason:
+            lines.append(f"上一轮停在：{_EXIT_TEXT.get(session.last_exit_reason, session.last_exit_reason)}")
+        if session.events and session.events[-1].handoff.strip():
+            lines.append(f"上一段交接：{session.events[-1].handoff.strip()}")
         return _cap_text("\n".join(lines), FOCUS_LIMIT)
 
     def _compose(
@@ -1494,28 +1605,39 @@ class ContextAssembler:
         return "\n\n".join(blocks)
 
     def _refs_block(self, moved: list[Turn]) -> str:
-        """被移出的交互组各占一行，之后能按序号取回原文。
+        """被移出的步各占一行，之后能按步号取回原文。
 
-        这里只说真话：`read_turn` 确实能按下面的序号把原文取回来
+        同一段里的助手项与工具项共用一个步号，这里按步号去重，只列第一项
+        （助手项带着这一步全部的工具名，标签最全）。用户消息组没有步号，
+        不列：用户说了什么已经由 TASK 与事件标题承载。
+
+        这里只说真话：`read_turn` 确实能按下面的步号把原文取回来
         （它读的是会话本身，不受 `compact_upto` 限制）。
 
-        只列最近的 20 组：一份长会话可能移出几百组，全列出来这一段自己就把
-        预算吃掉。更早的没有专门入口，所以宁可写清「还有多少组」也不装作列全了。
+        只列最近的 20 步：一份长会话可能移出几百步，全列出来这一段自己就把
+        预算吃掉。更早的没有专门入口，所以宁可写清「还有多少步」也不装作列全了。
         """
-        lines = ["（更早的内容已省略，可用 read_turn turn=<序号> 取回原文）"]
-        shown = moved[-REFS_TURN_LIMIT:]
-        hidden = len(moved) - len(shown)
+        lines = ["（更早的内容已省略，可用 read_turn step=<步号> 取回原文）"]
+        entries: list[Turn] = []
+        seen: set[int] = set()
+        for turn in moved:
+            if turn.step_no <= 0 or turn.step_no in seen:
+                continue
+            seen.add(turn.step_no)
+            entries.append(turn)
+        shown = entries[-REFS_TURN_LIMIT:]
+        hidden = len(entries) - len(shown)
         if hidden > 0:
-            lines.append(f"（再往前还有 {hidden} 组，未列出）")
+            lines.append(f"（再往前还有 {hidden} 步，未列出）")
         for turn in shown:
-            lines.append(f"- turn {turn.index}：{self._turn_label(turn)}")
+            lines.append(f"- step {turn.step_no}：{self._turn_label(turn)}")
         return _cap_text("\n".join(lines), REFS_TOKEN_LIMIT)
 
     def _turn_label(self, turn: Turn) -> str:
-        """给一个交互组起一行标签：调用了哪些工具，或是一句「用户消息 / 助手回复」。
+        """给一步起一行标签：调用了哪些工具，或是一句「用户消息 / 助手回复」。
 
         标签里**不放正文**：引用清单要轻，而且正文一旦写进来就等于没被移出。
-        要读原文就按序号回会话里取。
+        要读原文就按步号回会话里取。
         """
         names: list[str] = []
         for item in turn.messages:

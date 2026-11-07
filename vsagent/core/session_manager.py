@@ -130,11 +130,18 @@ class SessionManager:
         return sorted(self.sessions.values(), key=lambda item: item.updated_at, reverse=True)
 
     def rename_session(self, session_id: str, title: str) -> bool:
-        """重命名会话，返回是否成功。"""
+        """重命名会话，返回是否成功。
+
+        顺手把来源记成 `user`：自动起名只覆盖 `default`，人改过的名字
+        下一轮不能再被模型改掉。
+        """
         session = self.sessions.get(session_id)
         if session is None:
             return False
-        session.title = title.strip() or session.title
+        value = title.strip()
+        if value:
+            session.title = value
+            session.title_source = "user"
         session.touch()
         return True
 

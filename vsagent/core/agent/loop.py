@@ -37,6 +37,15 @@ from .workspace import Workspace
 
 # 一轮里最多问模型这么多次，防止模型在工具之间来回不收敛
 MAX_STEPS = 24
+# 剩这么多步时进入收束阶段：只放行收尾型的工具，不再展开新工作。
+# 等走到 0 再停，这一轮什么交代都没有，用户只能看见一截被截断的过程。
+CLOSING_STEPS = 3
+# 一个主题走到这么多步还没收，内核自己封一次。
+# `close_topic` 是模型判断，实测一条主题能走到 21 步（`evt_0009`），
+# 全靠它收不住。封存不花请求，封完原文让位、结论留下。
+TOPIC_STEP_LIMIT = 20
+# 收束阶段只放行这几个工具：写产物、收主题、记任务状态，外加回看原文。
+CLOSING_TOOLS = frozenset({"write_run", "close_topic", "task", "read_turn", "recall_event"})
 # Stop 钩子最多让一轮多走这么多次，单独计数，不吃 MAX_STEPS 的额度
 MAX_STOP_RETRIES = 2
 # 可以重试的错误最多重发这么多次
@@ -99,6 +108,7 @@ EXIT_EXHAUSTED = "exhausted"
 EXIT_CANCELLED = "cancelled"
 EXIT_ERROR = "error"
 EXIT_TOOL_FAILED = "tool_failed"
+EXIT_TOPIC_FULL = "topic_full"
 
 # 每种停法在前缀里怎么称呼。收尾总结的开头一行用它，用户一眼知道为什么停。
 EXIT_LABELS: dict[str, str] = {
@@ -106,6 +116,7 @@ EXIT_LABELS: dict[str, str] = {
     EXIT_CANCELLED: "被中断",
     EXIT_ERROR: "请求出错",
     EXIT_TOOL_FAILED: "工具没能完成",
+    EXIT_TOPIC_FULL: "这个主题已经足够长，先收一段",
 }
 
 
@@ -149,18 +160,20 @@ def missing_tool_reason(
 
 # 让模型写收尾总结时给的指令。
 #
-# 四段固定，与压缩摘要的四段刻意用同一套骨架：用户读到的两份总结因此形状一致，
-# 不必分辨「这是压缩还是收尾」。第一段要求写「产出在哪」，
-# 因为任务做到一半停下时，用户最需要的不是过程复述，而是已经产出了什么、在哪个文件里。
+# 四段固定，写的是「用户还能接着做什么」：停在哪里、已经产出什么、还差什么、
+# 下一轮从哪继续。第一版要求复述「这一轮做了什么」，实测写出来是一份过程报告，
+# 而过程本来就在工具卡里，用户重读一遍得不到新东西。
 WRAPUP_INSTRUCTION = (
     "这一轮任务还没有完成就停下了，停下来是因为：{reason}。\n"
-    "现在写一份收尾总结交给用户，只写四段，每段一个小标题：\n"
-    "一、这一轮做了什么（按顺序写清关键动作与用到的工具）\n"
-    "二、产出了什么（文件路径、登记条目、得到的关键结论）\n"
-    "三、还差什么（没做完的部分，以及卡在哪一步）\n"
-    "四、下一步建议（用户接下来可以怎么做，要说具体）\n"
-    "第二段的路径要照实写，写不准的宁可说「未产出」，不要编。\n"
-    "只写总结本身，不要寒暄，不要复述这段指令，不要再调用工具。"
+    "现在写一份简报交给用户，只写四段，每段一行短标题加正文：\n"
+    "停在哪里：一句话，写清是步数用满、请求出错、工具连续失败还是被中断。\n"
+    "已经产出：handle、文件路径、关键数字，最多 6 条；没有就写「没有新产物」。\n"
+    "还没做完：对照任务状态里的待办，写 1–4 条。\n"
+    "下一轮从这里继续：一句可执行的动作。\n"
+    "路径与数字要照实写，写不准的宁可说「未产出」，不要编。\n"
+    "不要用 Markdown 语法（不用 #、不用加粗、不用列表符号、不用表格）。\n"
+    "不要向用户提问：停下来不是让用户做决定的时刻。\n"
+    "只写简报本身，不要寒暄，不要复述这段指令，不要再调用工具。"
 )
 
 
@@ -227,6 +240,8 @@ class AgentLoop:
         # 一轮最多问模型多少次。默认取模块常量，装配处可以按场景放宽或收紧。
         self.max_steps = max_steps
         self.cancelled = False
+        # 收束阶段：剩 `CLOSING_STEPS` 步时打开，只放行收尾型工具。
+        self._closing = False
         self.last_latency_ms = 0
         # 最近几步的上下文度量。每步一条，`/context` 与主动压缩都读它。
         #
@@ -344,6 +359,7 @@ class AgentLoop:
         """
         self.cancelled = False
         self.last_exit_reason = None
+        self._closing = False
         # 证据是「本步相关」的，一轮开始时清空：上一轮 recall 出来的记忆，
         # 到这一轮多半已经不相干，留着只会占掉证据层的额度。
         self.evidence.clear()
@@ -386,6 +402,9 @@ class AgentLoop:
             # 用户最不知道发生了什么的时候。
             if exit_reason:
                 await self._wrap_up(session, message, exit_reason)
+            # 整轮的停因记在会话上，供下一轮的复述使用。事件上那一份记的是
+            # 「这一段是在什么结局下结束的」，两者回答的问题不同，都保留。
+            session.last_exit_reason = exit_reason or ""
             # 轮末自动封存当前主题。这是**默认边界**，也是「记录不依赖模型判断」
             # 的落点——模型一次 close_topic 都没调，流水与摘要照样有。
             self._seal_range(
@@ -590,12 +609,21 @@ class AgentLoop:
         """
         return self.registry.specs(exclude=hidden_names(session))
 
-    def _assemble(self, session: Session, prefix: str, with_tools: bool = True) -> ContextBundle:
+    def _assemble(
+        self,
+        session: Session,
+        prefix: str,
+        with_tools: bool = True,
+        steps_left: int | None = None,
+    ) -> ContextBundle:
         """按分层装配这一步发给模型的消息。
 
         工具定义每一步都要全量重发，因此算进预算——不算的话，工具一多，
         真正留给对话的额度就被悄悄吃掉了。收尾总结那一条请求不带工具，
         所以传 `with_tools=False`，免得白占一份额度。
+
+        `steps_left` 写进尾部的进度提示。模型看得见「还剩几步」才会为收尾
+        留额度；只说「已经走了几步」时，它会一路做到底。
 
         证据层现取一份：工具是上一步跑的，这一步装配时才看得见它们留下了什么。
         """
@@ -608,6 +636,7 @@ class AgentLoop:
             digest_text=self._digest_text(),
             env_text=self._env_text(),
             evidence=self.evidence.items(),
+            steps_left=steps_left,
         )
 
     async def _run_steps(
@@ -640,10 +669,12 @@ class AgentLoop:
                 exit_reason = EXIT_EXHAUSTED
                 break
             step += 1
+            steps_left = self.max_steps - tool_steps
+            self._closing = steps_left <= CLOSING_STEPS
             self._publish(message, Part(type=PartType.STEP_START, text=f"{step} · {self.config.model}"))
             prefix = stable_prefix(workspace, session)
             try:
-                context = self._assemble(session, prefix)
+                context = self._assemble(session, prefix, steps_left=steps_left)
             except ContextAssemblyError as error:
                 # 装不下就明说，不静默截断：模型在缺了材料的情况下继续往下做，
                 # 比停下来让用户知道「要腾地方」糟得多。
@@ -665,15 +696,15 @@ class AgentLoop:
                 if self._seal_range(session, kind="auto", upto=covered, force=True):
                     # 装不下是必须解决的约束：这一段的原文必须让位。
                     session.compact_upto = max(session.compact_upto, covered)
-                    context = self._assemble(session, prefix)
+                    context = self._assemble(session, prefix, steps_left=steps_left)
                 elif await self._summarize(session, message, context.dropped_upto):
-                    context = self._assemble(session, prefix)
+                    context = self._assemble(session, prefix, steps_left=steps_left)
             elif context.dropped_upto > 0:
                 # 判据是「上下文里有没有已经不在的内容」，不是「这一步新丢了没有」：
                 # 用户手动 /compact 推的边界不在当步产生新移出，但那一段同样要摘要；
                 # 已经收进摘要的会由 `_summarize` 自己判掉，只留一条界面记录。
                 if await self._summarize(session, message, context.dropped_upto):
-                    context = self._assemble(session, prefix)
+                    context = self._assemble(session, prefix, steps_left=steps_left)
             self._trace_context(session, context)
             before = dict(message.tokens)
             calls = await self._ask_model(
@@ -720,13 +751,48 @@ class AgentLoop:
             # **反复**换着法试同一件事都不成——那说明它没有能走通的路了。
             # 计数在成功那一步清零，所以中间只要对上过一次就重新算。
             if self._all_tools_failed(calls):
-                failed_streak += 1
-                if failed_streak >= MAX_FAILED_STREAK:
-                    exit_reason = EXIT_TOOL_FAILED
-                    break
+                # 收束阶段的拒绝是内核自己的决定，不算模型卡住：把它计进
+                # 失败连续数，会在还剩几步的时候改判成「工具没能完成」。
+                if not self._closing:
+                    failed_streak += 1
+                    if failed_streak >= MAX_FAILED_STREAK:
+                        exit_reason = EXIT_TOOL_FAILED
+                        break
             else:
                 failed_streak = 0
+            # 一个主题走到预算上限、且最近几步没有新产物时，内核自己收一次。
+            # 不靠模型判断：实测一条主题能走到 21 步，提示出现了它也没收。
+            if self._topic_over_budget(session):
+                self._seal_range(
+                    session,
+                    kind="auto",
+                    upto=event_boundary(session, len(session.messages)),
+                    force=True,
+                )
+                exit_reason = EXIT_TOPIC_FULL
+                break
         return message, step, int((time.time() - started) * 1000), exit_reason
+
+    @staticmethod
+    def _topic_over_budget(session: Session) -> bool:
+        """当前主题是否该由内核收掉：步数到上限，且最近 4 步没有新产物。
+
+        只看步数会让正常推进的长主题也被切断；只看「没有新产物」会让刚起步
+        还没产出的主题被误收。两个条件同时成立才算卡住。
+        """
+        steps = session.pending_steps
+        if len(steps) < TOPIC_STEP_LIMIT:
+            return False
+        earlier = {
+            item
+            for step in steps[:-4]
+            for item in step.artifacts
+        }
+        return not any(
+            item not in earlier
+            for step in steps[-4:]
+            for item in step.artifacts
+        )
 
     def _seal_range(self, session: Session, **options: Any) -> Event | None:
         """在消息边界封存一个主题，顺手收敛工具族（P2-1）。
@@ -921,19 +987,15 @@ class AgentLoop:
         return await self._ask_summary(message, messages)
 
     def _local_wrap_up(self, session: Session, message: Message, reason: str) -> str:
-        """模型写不出来时，本地把已有事实汇成一份总结。
+        """模型写不出来时，本地把已有事实汇成一份简报。
 
-        读的是这条消息上真实的 Part，不是凭空写的：用过的工具、产出的文件、
-        失败的项都取自现场。读起来不如模型写的那一份顺，但它**一定出得来**。
+        读的是这条消息上真实的 Part，不是凭空写的：产出的文件、失败的项都取自现场。
+        四段的形状与模型写的那一份一致，缺哪段就照实说缺，不从别处补一句。
         """
-        tools: list[str] = []
         files: list[str] = []
         failures: list[str] = []
         for part in message.parts:
             if part.type is PartType.TOOL and part.tool_name:
-                label = part.tool_name
-                if label not in tools:
-                    tools.append(label)
                 if part.tool_status is ToolStatus.FAILED:
                     failures.append(f"{part.tool_name}：{part.tool_output or '没有写明原因'}")
             if part.type is PartType.FILE and part.file_path:
@@ -941,17 +1003,38 @@ class AgentLoop:
                     files.append(part.file_path)
             if part.type is PartType.PATCH and part.text and part.text not in files:
                 files.append(part.text)
-        lines = [f"一、这一轮停下来是因为：{EXIT_LABELS.get(reason, reason)}。"]
+        artifacts: list[str] = []
+        for step in session.pending_steps:
+            for item in step.artifacts:
+                if item not in artifacts:
+                    artifacts.append(item)
+        for event in session.events[-2:]:
+            for item in event.artifacts:
+                if item not in artifacts:
+                    artifacts.append(item)
+        produced = [*files, *artifacts]
+        todo = session.task_state.todo[:4]
+        blockers = session.task_state.blockers[:2]
+        if todo:
+            next_step = todo[0]
+        elif blockers:
+            next_step = f"先处理阻塞：{blockers[0]}"
+        else:
+            next_step = "确认上一段产物是否可用，再从那里接着做。"
+        lines = [f"停在哪里：{EXIT_LABELS.get(reason, reason)}。"]
         lines.append(
-            "二、用到的工具：" + ("、".join(tools) if tools else "（一个都没用上）")
+            "已经产出：" + ("、".join(produced[:6]) if produced else "没有新产物")
         )
-        lines.append(
-            "三、产出的文件：" + ("、".join(files) if files else "（没产出文件）")
-        )
-        lines.append(
-            "四、失败的步骤：" + ("；".join(failures) if failures else "（没有失败项）")
-        )
-        lines.append("（这份总结由本地按已有记录汇编，模型那次收尾请求没有成功。）")
+        if failures:
+            lines.append("还没做完：" + "；".join(failures[:3]))
+        elif todo:
+            lines.append("还没做完：" + "；".join(todo))
+        elif blockers:
+            lines.append("还没做完：" + "；".join(blockers))
+        else:
+            lines.append("还没做完：（任务状态里没有记下待办）")
+        lines.append(f"下一轮从这里继续：{next_step}")
+        lines.append("（这份简报由本地按已有记录汇编，模型那次收尾请求没有成功。）")
         return "\n".join(lines)
 
     def _recover_context(self, session: Session) -> bool:
@@ -1204,6 +1287,17 @@ class AgentLoop:
                 message,
                 part,
                 missing_tool_reason(self.registry, part.tool_name, session),
+            )
+            return
+        if self._closing and not explicit and tool.spec.name not in CLOSING_TOOLS:
+            # 收束阶段：不再开新工作，只允许写产物、收主题、记状态与回看原文。
+            # 与走到 0 步直接断开相比，这一步把「还剩几步」交给模型自己安排。
+            self._fail_tool(
+                message,
+                part,
+                "本轮步数快用完了，不再展开新工作。"
+                "把已经做出来的写进 write_run，用 close_topic 收这一段，"
+                "再用 task 记下下一步。",
             )
             return
         error = argument_error(tool.spec, part.tool_input)

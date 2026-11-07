@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..file_log import record as log_read
-from .context import render_turn_text, split_turns, turn_at
+from .context import page_lines, render_turn_text, split_turns, step_at
 
 # bash 一次调用的等待上限。
 #
@@ -1096,59 +1096,71 @@ READ_TURN_LIMIT = 200
 """一次最多返回多少行原文。与小工具的输出量级对齐，不必让模型翻页翻很多次。"""
 
 READ_TURN_MAX = 400
-"""模型自己指定 limit 时的硬上限：一次读回几千行会把窗口一次吃满。"""
+"""模型自己指定 limit 时的行数上限：一次读回几千行会把窗口一次吃满。"""
+
+READ_TURN_MAX_TOKENS = 4000
+"""一次返回的 token 预算。行数只是分页手段，真正的额度按 token 算：
+中文一行几十个字，400 行能有上万 token，按行限制挡不住。"""
 
 
 class ReadTurnTool(Tool):
-    """按序号取回会话里某一步的原文。
+    """按步号取回会话里某一步的原文。
 
     两处会让原文离开上下文：旧工具结果的正文被换成了「输出已归档」占位，
-    整组交互被挤出 RECENT。两者都留了 turn 序号，这一个工具就是那条回程路。
+    整步被挤出 RECENT。两者都留了步号，这一个工具就是那条回程路。
 
     它读的是**会话本身**（`Session.messages` 里的原 Part），不受 `compact_upto`
     影响：已经移出上下文的内容照样取得回来。没有这条回程路的话，
     「更早的内容已省略」就只是一句没法兑现的提示。
+
+    返回的是**一步**：一次模型往返加它调用的工具。默认不给思考过程，
+    需要当时的推演才传 `reasoning=true`。
     """
 
     spec = ToolSpec(
         name="read_turn",
         description=(
-            "按序号取回会话里某一步的原文。工具输出被归档成一行占位、"
-            "或某个交互组已经移出上下文时，用占位行与省略清单里的 turn 序号读回完整内容。"
-            "offset / limit 按行分页，默认一次 200 行。"
+            "按步号取回会话里某一步的原文（那一步的助手正文与工具输出）。"
+            "工具输出被归档成一行占位、或整步已经移出上下文时，"
+            "用占位行与省略清单里的 step 序号读回。"
+            "默认不含思考过程，要当时的推演传 reasoning=true。"
+            f"offset / limit 按行分页，默认 {READ_TURN_LIMIT} 行；"
+            f"每次最多返回 {READ_TURN_MAX_TOKENS} token。"
         ),
         parameters={
             "type": "object",
             "properties": {
-                "turn": {"type": "integer", "description": "交互组序号（turn N 里的 N）"},
+                "step": {"type": "integer", "description": "步号（省略清单里 step N 的 N）"},
                 "offset": {"type": "integer", "description": "从第几行开始，默认 0"},
                 "limit": {
                     "type": "integer",
                     "description": f"最多返回多少行，默认 {READ_TURN_LIMIT}，上限 {READ_TURN_MAX}",
                 },
+                "reasoning": {
+                    "type": "boolean",
+                    "description": "是否带上当时的思考过程，默认 false",
+                },
             },
-            "required": ["turn"],
+            "required": ["step"],
             "additionalProperties": False,
         },
     )
     session_argument = "session"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        """按序号取一段原文。"""
+        """按步号取一段原文。"""
         session = arguments.get("session")
-        index = arguments.get("turn")
+        index = arguments.get("step")
         if isinstance(index, bool) or not isinstance(index, int):
-            return ToolResult(output="参数 turn 应当是整数序号", failed=True)
-        turn = turn_at(session, index)
+            return ToolResult(output="参数 step 应当是整数步号", failed=True)
+        turn = step_at(session, index)
         if turn is None:
-            total = len(split_turns(session.messages))
+            turns = split_turns(session.messages)
+            highest = max((item.step_no for item in turns), default=0)
             return ToolResult(
-                output=f"没有 turn {index}。这份会话现在有 1–{total} 个交互组。",
+                output=f"没有 step {index}。这份会话现在有 1–{highest} 步。",
                 failed=True,
             )
-        text = render_turn_text(session, turn)
-        if not text:
-            return ToolResult(output=f"turn {index} 没有可读内容。", failed=True)
         offset = arguments.get("offset") or 0
         limit = arguments.get("limit") or READ_TURN_LIMIT
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -1156,18 +1168,23 @@ class ReadTurnTool(Tool):
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             return ToolResult(output="参数 limit 应当是正整数", failed=True)
         limit = min(limit, READ_TURN_MAX)
+        with_reasoning = arguments.get("reasoning") is True
+        text = render_turn_text(session, turn, with_reasoning)
+        if not text:
+            return ToolResult(output=f"step {index} 没有可读内容。", failed=True)
         lines = text.splitlines()
-        window = lines[offset : offset + limit]
-        head = f"turn {turn.index}（会话第 {turn.message_index + 1} 条消息）"
-        if not window:
+        head = f"step {turn.step_no}（会话第 {turn.message_index + 1} 条消息）"
+        page, next_offset, remaining = page_lines(
+            lines, offset, limit, READ_TURN_MAX_TOKENS
+        )
+        if not page:
             return ToolResult(
                 output=f"{head}：offset {offset} 超出范围，共 {len(lines)} 行。",
                 failed=True,
             )
-        remaining = len(lines) - offset - len(window)
         note = (
-            f"\n（还有 {remaining} 行，用 offset={offset + len(window)} 继续）"
+            f"\n（还有 {remaining} 行，用 offset={next_offset} 继续）"
             if remaining > 0
             else ""
         )
-        return ToolResult(output=f"{head}\n" + "\n".join(window) + note)
+        return ToolResult(output=f"{head}\n" + "\n".join(page) + note)

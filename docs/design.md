@@ -1,7 +1,7 @@
 # 现行设计
 
 > 角色：现行设计（这个系统现在是什么样）
-> 状态：随代码更新，最后核对 2026-11-06
+> 状态：随代码更新，最后核对 2026-11-07
 > 配套：`history.md`（为什么这么定）、`review.md`（实测读数）、`reference.md`（判据与外部资料）、
 > `screening-playbook.md`（`AGENTS.md` 确认点的展开）
 
@@ -63,13 +63,16 @@ graph TD
 权限放到执行之后就没有意义。
 
 `AgentLoop` 不维护第二份历史：每一步从 `Session` 现场重建模型消息。任何非正常退出都会触发
-一次不带工具的收尾总结，模型写，失败时用本地兜底文案。
+一次不带工具的收尾总结，模型写，失败时用本地兜底文案。四段固定：停在哪里、已经产出、
+还没做完、下一轮从这里继续；不要求用户做决定，也不用 Markdown 语法。
 
 ### 3.2 上限与重试
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
 | `MAX_STEPS` | 24 | 一轮步数上限，`VSA_MAX_STEPS` 可改；写错按 24 处理 |
+| `CLOSING_STEPS` | 3 | 剩这么多步进入收束阶段，只放行收尾型工具 |
+| `TOPIC_STEP_LIMIT` | 20 | 一个主题走满这么多步且最近 4 步没有新产物，由内核封存并结束这一轮 |
 | `MAX_STOP_RETRIES` | 2 | STOP 钩子未通过时的重试次数 |
 | `MAX_RETRIES` | 2 | 模型请求的重试次数 |
 | `MAX_TOOL_RETRIES` | 1 | 工具调用的重试次数 |
@@ -83,8 +86,15 @@ graph TD
 重试用尽的文案写明「参数没有错，也不要用 bash 自己实现」——模型绕道自建客户端，实测一次
 误判烧掉 20 步。
 
-退出原因有四种：`exhausted`（步数用尽）、`cancelled`（用户中断）、`error`（模型或装配出错）、
-`tool_failed`（连续失败）。轮末写进 `Event.exit_reason`，界面的完成 / 失败 / 中断三态由它换算。
+剩 `CLOSING_STEPS` 步时进入收束：`write_run` / `close_topic` / `task` / `read_turn` /
+`recall_event` 之外的调用直接返回「本轮步数快用完了」。这一阶段的整步失败不计进
+`MAX_FAILED_STREAK`——拒绝由内核自己发出，模型并没有卡住。尾部提示同时给出
+「本轮还剩 K 步」，模型看得见额度才会为收尾留步。
+
+退出原因有五种：`exhausted`（步数用尽）、`cancelled`（用户中断）、`error`（模型或装配出错）、
+`tool_failed`（连续失败）、`topic_full`（主题预算用满）。整轮停因写在 `Session.last_exit_reason`
+上，轮末封存的那一段另把 `EXIT_*` 写进 `Event.exit_reason`；界面的完成 / 失败 / 中断三态
+由后者换算，下一轮开头的复述用前者。
 
 ### 3.3 工具协议
 
@@ -109,8 +119,9 @@ graph TD
 声明了某一类却收到 `None`，返回「内核装配问题」，措辞要让模型知道重试无用：这一路只可能是
 内核漏传。
 
-`ReadTurnTool` 按 `turn N` 取回被移出上下文的原文；`Tool.status` 的五种值是
-`PENDING / AWAITING / RUNNING / COMPLETED / FAILED`，界面工具卡用 `○ ◐ ● ✓ ✕` 一档一个。
+`ReadTurnTool` 按 `step N` 取回被移出上下文的**一步**原文，默认不带思考过程；`Tool.status`
+的五种值是 `PENDING / AWAITING / RUNNING / COMPLETED / FAILED`，界面工具卡用
+`○ ◐ ● ✓ ✕` 一档一个。
 
 ### 3.4 权限
 
@@ -226,8 +237,10 @@ evidence_detail → history_summary → recent_tool_clear → event_step_detail
 装配时 `RECENT` 从最后一条事件的切点开始；`Turn.part_start` 用同一个口径。
 
 封存时机：模型调 `close_topic`（步末执行）、轮末、新用户消息、当前主题原文超过
-`TOPIC_SOFT_LIMIT`（120K token）、溢出、`/compact`、中断。模型侧的触发条件是尾部那一行
-「本主题已 N 步 · 产物 … · 未决 …」，`CLOSE_TOPIC_AFTER` 为 3，放尾部是为了不碰前缀缓存。
+`TOPIC_SOFT_LIMIT`（120K token）、溢出、`/compact`、中断、当前主题走到 `TOPIC_STEP_LIMIT`
+（20 步）且最近 4 步没有新产物。模型侧的触发条件是尾部那一行「本主题已 N 步 · 本轮还剩
+K 步 · 产物 … · 未决 …」，`CLOSE_TOPIC_AFTER` 为 2，第 8 步换成「先收一次再继续」，
+放尾部是为了不碰前缀缓存。
 
 `seal_topic(force=True)` 与 `force=False` 的差别是覆盖：轮末遇到纯聊天的一轮可以跳过，
 溢出与 `/compact` 必须封，否则那一段原文两边都不在。自动封存不推进 `compact_upto`，
@@ -237,7 +250,11 @@ evidence_detail → history_summary → recent_tool_clear → event_step_detail
 `Event.actions` / `artifacts` / `issues` 是从 steps 聚合的 property，不写入磁盘。
 
 召回三级：`recall_event()` 列主题、`recall_event("evt_0003")` 读流水与结论、
-`recall_event("evt_0003", step=7)` 读那一步的工具输出原文。
+`recall_event("evt_0003", step=7)` 读那一步的工具输出原文。取回按**步**：`read_turn(step=N)`
+的编号来自 `Turn.step_no`（`split_turns` 在每一段上递增），区间是
+`(message_index, part_start..part_end)`。三个取回入口默认不带思考过程（`with_reasoning=False`），
+要当时的推演才显式打开；`read_turn` 与 `recall_event` 共用 `page_lines()`，单次 4,000 token。
+推理不进结论之外的上下文，是因为跨轮之后它由 `TASK` 与主题结论承载，铺出来只是重复。
 
 事件块超额裁掉最旧主题时补一行「更早还有 N 个主题」；被裁事件覆盖的原文既不在事件里也不在
 `RECENT` 里，不说就是无声消失。摘要已经退休：它的三段分别由 `TASK`、Step 流水、主题结论覆盖，
@@ -248,8 +265,8 @@ evidence_detail → history_summary → recent_tool_clear → event_step_detail
 `stable_prefix` 的顺序：身份 → 假设规则 → 工作方式 → shell → 登记表 → 记忆 → 事件 → 派发 →
 项目规则。排序是语义：假设规则紧跟身份（它定义产出长什么样），确认点放最后。
 
-固定那几段预算 1900 token，实测 1592（`tools/check_prefix.py` 守着），整段前缀 4499 token，
-其中 `AGENTS.md` 占 2890 token / 120 行且不设上限——它是许可与判据的来源，少一条就可能放行
+固定那几段预算 1900 token，实测 1592（`tools/check_prefix.py` 守着），整段前缀 5084 token，
+其中 `AGENTS.md` 占 3475 token / 288 行且不设上限——它是许可与判据的来源，少一条就可能放行
 一个本来被禁止的动作。平台那句由 `platform_note()` 按 `sys.platform` 现取。
 
 易变信息走 `environment_block()`，由循环层放进 user 头：今天日期（只到天）、工作目录、状态目录。
@@ -258,6 +275,9 @@ evidence_detail → history_summary → recent_tool_clear → event_step_detail
 
 把目标、前三条约束、下一步插成一条 user 消息，紧贴在最后一条用户消息前面，上限 300 token。
 任务状态在窗口最上面，`RECENT` 几万 token 之后模型早就看不到它了。
+
+同一段还带两行接续信息：上一轮的停因（`Session.last_exit_reason`，换算成中文说法）与
+最后一个事件的 `handoff`。用户回一句「继续」时，模型不必先 `read_turn` 找上一轮做到哪。
 
 ### 4.6 记忆
 

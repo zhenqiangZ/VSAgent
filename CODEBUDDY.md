@@ -226,13 +226,18 @@ graph TD
 - `loop.py` — `AgentLoop` 是唯一的驱动，界面只认它的 `stream_reply / run_bash / cancel`。
   它**不维护第二份历史**：每一步从 `Session` 现场重建模型消息。上限
   `MAX_STEPS=24` / `MAX_STOP_RETRIES=2` / `MAX_RETRIES=2` / `MAX_TOOL_RETRIES=1` /
-  `MAX_FAILED_STREAK=3`。**`RetryableToolError` 只在工具层重试 1 次**（模型请求那层是 2）：
+  `MAX_FAILED_STREAK=3`。剩 `CLOSING_STEPS=3` 步时进入收束阶段：只放行
+  `write_run` / `close_topic` / `task` / `read_turn` / `recall_event`，其余工具直接返回
+  「本轮步数快用完了」，这一阶段整步失败不计进 `MAX_FAILED_STREAK`。
+  当前主题走到 `TOPIC_STEP_LIMIT=20` 步且最近 4 步没有新产物时，内核自己封一次并
+  以 `EXIT_TOPIC_FULL` 结束这一轮。**`RetryableToolError` 只在工具层重试 1 次**（模型请求那层是 2）：
   一次调用的超时就有几十秒，重试两次会把一次抖动拖成三倍等待。重试只包 `execute`，
   不重跑权限与钩子；重试用尽的文案要写清「参数没有错，也不要用 bash 自己实现」——
   否则模型会绕道自建客户端（实测一次误判烧掉 20 步）。domain 层不许用
   `except Exception` 把它包成永久失败，`tool-retry` 组盯着这一条。
 - `tools.py` — `Tool` ABC + `ToolRegistry` + 五个内核文件工具（bash/read/write/patch/grep）
-  + `read_turn`（按 `turn N` 取回被归档/被移出的原文，会话由内核注入）
+  + `read_turn`（按 `step N` 取回被归档/被移出的**一步**原文，会话由内核注入；
+  默认不带思考过程，一次最多 4,000 token）
   与 `ToolSpec` / `ToolResult` / `ToolError` / `RetryableToolError` / `argument_error` 校验器。
   **依赖注入是声明式的**：工具在类属性上写 `primary_argument`（权限匹配用）、
   `context_argument`（登记表）、`task_argument`、`evidence_argument`、`viewer_argument`、
@@ -269,9 +274,10 @@ graph TD
   `Turn.part_start`（`context.py`）是同一个口径：它由「按 `STEP_START` 分段、逐段
   `translate_parts`」得来。
   封存时机：模型调 `close_topic`（步末执行）、轮末、新用户消息、预算达到 120K
-  （`TOPIC_SOFT_LIMIT`）、溢出 / `/compact` / 中断。模型侧的触发条件是尾部那一行
-  「本主题已 N 步 · 产物 … · 未决 …」（≥3 步才出现，放尾部是为了不碰前缀缓存），
-  它同时也是运行中的本地摘要。
+  （`TOPIC_SOFT_LIMIT`）、溢出 / `/compact` / 中断、当前主题走到 20 步且最近 4 步
+  没有新产物（`TOPIC_STEP_LIMIT`，内核自己封，不靠模型判断）。模型侧的触发条件是
+  尾部那一行「本主题已 N 步 · 本轮还剩 K 步 · 产物 … · 未决 …」（≥2 步出现，
+  第 8 步换成「先收一次再继续」，放尾部是为了不碰前缀缓存），它同时也是运行中的本地摘要。
   **`seal_topic(force=True)` 与 `force=False` 的差别是覆盖**：轮末遇到纯聊天的一轮
   可以跳过，溢出 / `/compact` / 强行腾地方必须封，否则那一段原文两边都不在。
   `Event.actions` / `artifacts` / `issues` 是**从 steps 聚合的 property**，不写入磁盘——
@@ -281,6 +287,9 @@ graph TD
   原文一条不删：`Step` 上的 `message_index` / `part_start` / `part_end` 就是取回它的地址。
   召回三级：`recall_event()` 列主题、`recall_event("evt_0003")` 读流水结论与原文、
   `recall_event("evt_0003", step=7)` 读那一步的工具输出原文。
+  **取回默认不含推理**：`render_part` 的 `with_reasoning=False` 是三个取回入口的默认值，
+  要当时的推演才显式打开。`read_turn` 按**步号**取（`Turn.step_no`，一段一个号），
+  区间是 `(message_index, part_start..part_end)`；一次最多 4,000 token。
   三条不变式（连续覆盖、边界不收当前步、封存不花请求）见 `docs/design.md` §4.3。
   事件块超额裁掉最旧几个主题时要补一行「更早还有 N 个主题」——被裁事件覆盖的原文
   既不在事件里也不在 RECENT 里，不说就是无声消失。
@@ -311,10 +320,10 @@ graph TD
 - `prompt.py` — `stable_prefix` 组装：身份 → **假设规则** → 工作方式 → shell → 登记表 →
   记忆 → 事件 →（派发）→ 项目规则。**前缀里不放时间不放进度**，否则每步都击穿 prompt cache。
   排序是语义：假设规则紧跟身份（它定义「产出长什么样」，先于所有操作纪律），确认点放最后。
-  **固定那几段预算 1900 token（实测 1521），由 `tools/check_prefix.py` 守着**：超预算、
+  **固定那几段预算 1900 token（实测 1592），由 `tools/check_prefix.py` 守着**：超预算、
   点名了首步看不见的工具、出现「全库只有…」这类枚举，都会被检查出来。
   `AGENTS.md` 那一块**不设上限**：它是许可与判据的来源，少一条就可能让模型做一个本来
-  被禁止的动作，判据只报它的体量（现 2890 token / 120 行）。
+  被禁止的动作，判据只报它的体量（现 3475 token / 288 行）。
   `project_rules()` 每次发问重读 `AGENTS.md`（`RULES_FILE`），整份注入、不截断；
   编码坏了返回空串——`stable_prefix` 在装配之前调，那里没有 try，一个异常会掀掉一整轮。
   平台那句由 `platform_note()` 按 `sys.platform` 现取，**必须现取**：把「这套环境是
@@ -359,7 +368,9 @@ graph TD
 逐个（**故意不并发**）执行工具：registry 查找 → 参数校验 → PreToolUse 钩子 → `policy.check`
 → 可选的 UI 询问（发 `permission.ask`，界面弹模态）→ 执行 → PostToolUse 钩子 → 收证据 →
 连续 3 步整步全失败则 `EXIT_TOOL_FAILED`。任何非正常退出都会触发一次**不带工具的收尾总结**
-（模型写，失败则本地兜底）。
+（模型写，失败则本地兜底）。这份总结是四段简报：停在哪里、已经产出、还没做完、
+下一轮从这里继续；要求不用 Markdown 语法、不向用户提问，整轮停因另记在
+`Session.last_exit_reason` 上，下一轮由 FOCUS 复述带出来。
 
 装配发现这一步新挤出了交互组时：没有事件 → 让模型写摘要；**已经有事件 → 补一条本地
 `auto` 事件**（零请求），摘要从此冻结。上下文装不下时先强压一次再重试，
@@ -583,6 +594,11 @@ graph TD
 读回来调 `sync_sequences` 把 ID 计数器推进到已加载 ID 之前。网页端**每个请求都重新从磁盘读**，
 所以网页看到的永远和 `state.toml` 一致——这是它跟 TUI 之间唯一的数据通路，没有 SSE、没有 websocket。
 
+会话标题的来源记在 `Session.title_source` 上：`default`（占位）/ `placeholder`（首句截断）/
+`auto`（模型按主题起）/ `user`（`/rename`）。提交时先写占位，第一条主题封存时用
+`close_topic` 的 `session_title`（没给就用那一条的标题）替换一次，之后不再改；
+`user` 的名字谁也覆盖不了。旧状态文件没有这个字段，非默认标题按 `user` 读回来。
+
 同目录的 `live/<sid>.json` 是唯一一份不在这条通路上的数据：当前主题的实时快照，
 原子替换但**不做 fsync**，只给网页端补「状态文件还没写进去的那一截」。它不参与恢复，
 进程退出时丢掉也不影响任何东西；状态文件仍然是唯一真相。
@@ -611,6 +627,8 @@ graph TD
 
 **主题的显示状态（完成 / 失败 / 中断）存在 `Event.exit_reason` 上**：轮末封存时由循环层
 把 `EXIT_*` 写进去。不存这一项的话，取消之后照常封存，事后分不出「做完的」与「被停下的」。
+整轮停因另存一份 `Session.last_exit_reason`：事件上那一份回答「这一段是怎么结束的」，
+会话上那一份回答「上一轮为什么停」，下一轮开头由 FOCUS 复述带出来。
 取值到显示状态的换算是 `Event.status`：`cancelled` 是中断，`error` / `tool_failed` 是失败，
 其余看最后一步有没有未决项（中间失败、后面做成了的仍然算完成）。
 
@@ -649,7 +667,8 @@ graph TD
 （省略 `sessionId` 就新建）。真正的动作在应用进程的事件循环里做——`SessionManager`
 不是线程安全的，HTTP 线程只等一个 `Future`。`WebServer.submit` 与 `ingest` 是同一种形状，
 `app.py` 传 `self._submit_task`：`call_soon_threadsafe` 把活交回循环，`_submit_in_loop`
-依次检查模型已配置、取或建会话（标题取正文第一行前 40 字）、`host.prompt`、`save_state`。
+依次检查模型已配置、取或建会话（标题先由 `set_placeholder_title` 取正文第一行前 40 字
+占位）、`host.prompt`、`save_state`。
 **最后那一步不能省**：页面提交完立刻跳 `#/history/<id>`，那个接口读的是状态文件。
 返回 200 带 `sessionId` / `created`；这一轮没结束 409、没有模型 400、会话不存在 404、
 独立运行的服务没有回调 503。`on_mount` 里先记 `self._loop` 再 `web_service.start()`，

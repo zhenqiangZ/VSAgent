@@ -573,7 +573,24 @@ class VSAgentApp(App[None]):
         session = self.session_manager.current
         if self.is_configured and session.messages:
             self.session_manager.new_session()
+            session = self.session_manager.current
+        self.set_placeholder_title(session, prompt)
         self.switch_screen(ChatScreen(self.root, initial_prompt=prompt))
+
+    @staticmethod
+    def set_placeholder_title(session: Session, text: str) -> bool:
+        """把首句截成占位标题，返回是否写了。
+
+        只写 `default`：会话已经有名字（模型起的或人改的）就不动。
+        来源记成 `placeholder`，封存时模型给出更好的名字还能替换一次。
+        """
+        if session.title_source != "default":
+            return False
+        title = (text.strip().splitlines() or [""])[0][:40].strip() or "新任务"
+        session.title = title
+        session.title_source = "placeholder"
+        session.touch()
+        return True
 
     def save_state(self) -> None:
         """把会话与显示设定写入磁盘。"""
@@ -615,9 +632,8 @@ class VSAgentApp(App[None]):
                     future.set_result({"error": "这一轮还没结束", "status": 409})
                     return
             else:
-                # 标题取正文第一行前 40 字：列表里要能认出这是哪一件事。
-                title = (text.strip().splitlines() or [""])[0][:40].strip() or "新任务"
-                session = self.session_manager.create_session(title)
+                session = self.session_manager.create_session()
+                self.set_placeholder_title(session, text)
                 created = True
             if not self.host.prompt(session.id, text):
                 future.set_result({"error": "这一轮还没结束", "status": 409})

@@ -35,11 +35,12 @@ from vsagent.core.agent.hooks import (  # noqa: E402
 )
 from vsagent.core.agent.host import AgentHost  # noqa: E402
 from vsagent.core.agent.loop import (  # noqa: E402
+    EXIT_TOPIC_FULL,
     MAX_RETRIES,
-    MAX_STEPS,
     MAX_STOP_RETRIES,
     STOP_NOTICE,
     TOOL_HOOK_NOTICE,
+    TOPIC_STEP_LIMIT,
     AgentLoop,
     missing_tool_reason,
 )
@@ -2535,17 +2536,17 @@ def check_prompt() -> None:
     kept_text = json.dumps([item["content"] for item in built.messages[2:]], ensure_ascii=False)
     check("第 39 条消息" in kept_text, "最后一条消息永远留着")
     check("第 0 条消息" not in kept_text, "丢掉的是开头那一段")
-    # 引用清单只列**最近** REFS_TURN_LIMIT 组，更早的写一行「再往前还有 N 组」。
+    # 引用清单只列**最近** REFS_TURN_LIMIT 步，更早的写一行「再往前还有 N 步」。
     # 原先断言 dropped_turns[0]（最早那组）在清单里，它隐含「移出不超过 20 组」；
     # 而移出多少组取决于前缀长度——AGENTS.md 长一截就会破，破的还不是被测的那条契约。
     check(
-        f"- turn {built.dropped_turns[-1]}：" in built.messages[1]["content"],
-        "最近被移出的交互组在引用清单里",
+        f"- step {built.dropped_turns[-1]}：" in built.messages[1]["content"],
+        "最近被移出的步在引用清单里",
     )
     check(
         built.dropped <= REFS_TURN_LIMIT
         or "再往前还有" in built.messages[1]["content"],
-        f"移出超过 {REFS_TURN_LIMIT} 组时写明「再往前还有 N 组」，不装作列全了",
+        f"移出超过 {REFS_TURN_LIMIT} 步时写明「再往前还有 N 步」，不装作列全了",
     )
     try:
         ContextAssembler(context_window=2_000).build(long_session, prefix)
@@ -3742,10 +3743,14 @@ async def check_step_limit(server: FakeModelServer) -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
     loop = build_loop(server, bus, registry)
+    # 用小于主题预算的上限，测的是「轮步数用满」这一条路；
+    # 主题预算那一条另有断言，不能让它先触发。
+    limit = 8
+    loop.max_steps = limit
     session = Session(id="ses_limit", title="步数上限")
     ask(session, "一直调用工具")
     server.clear()
-    for _ in range(MAX_STEPS):
+    for _ in range(limit):
         server.script(
             Reply(
                 chunks=[
@@ -3764,7 +3769,10 @@ async def check_step_limit(server: FakeModelServer) -> None:
             )
         )
     # 走满之后的那一次请求是**收尾总结**：它不带工具，模型在这里写的正文就是总结。
-    summary_text = "一、这一轮反复调用了 echo。二、没有产出文件。三、任务未完成。四、可以把目标分小。"
+    summary_text = (
+        "停在哪里：步数用满。已经产出：没有新产物。"
+        "还没做完：任务未完成。下一轮从这里继续：把目标分小。"
+    )
     server.script(Reply(chunks=[*text_chunks(summary_text, size=8), usage_chunk(9, 9)]))
     watcher = Recorder(bus)
     watcher.session = session
@@ -3776,7 +3784,7 @@ async def check_step_limit(server: FakeModelServer) -> None:
         f"步数用满时留一条 SUMMARY Part：{[p.type.value for p in message.parts][-4:]}",
     )
     check(
-        "二、没有产出文件" in summaries[0],
+        "已经产出：没有新产物" in summaries[0],
         f"收尾总结带上了模型写的四段正文：{summaries[0][:120]}",
     )
     # 收尾请求本身不带工具：它是让模型写字，不是让它接着干活。
@@ -3795,12 +3803,51 @@ async def check_step_limit(server: FakeModelServer) -> None:
         "走满步数上限之后照样收尾，界面不会停在忙状态",
     )
     check(
-        len([part for part in message.parts if part.type is PartType.STEP_START]) == MAX_STEPS,
-        f"正好问了 {MAX_STEPS} 次工具步",
+        len([part for part in message.parts if part.type is PartType.STEP_START]) == limit,
+        f"正好问了 {limit} 次工具步",
     )
     check(
         not [part for part in message.parts if part.type is PartType.TEXT],
         "步数用满时不再往正文里插一句「先停在这里」，交代由 SUMMARY 承担",
+    )
+
+    # 主题预算：步数没到轮上限，但当前主题已经 20 步且没有新产物，内核自己收。
+    server.clear()
+    bus = EventBus()
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    loop = build_loop(server, bus, registry)
+    session_topic = Session(id="ses_topic_full", title="主题太长")
+    ask(session_topic, "一直调用工具")
+    server.clear()
+    for _ in range(TOPIC_STEP_LIMIT):
+        server.script(
+            Reply(
+                chunks=[
+                    delta_chunk(
+                        tool_calls=[
+                            tool_call_delta(
+                                0,
+                                call_id="c1",
+                                name="echo",
+                                arguments=json.dumps({"text": "再来"}, ensure_ascii=False),
+                            )
+                        ]
+                    ),
+                    usage_chunk(1, 1),
+                ]
+            )
+        )
+    server.script(Reply(chunks=[*text_chunks("收一段。", size=4), usage_chunk(1, 1)]))
+    await loop.stream_reply(session_topic, "")
+    check(
+        loop.last_exit_reason == EXIT_TOPIC_FULL,
+        f"主题走到 {TOPIC_STEP_LIMIT} 步没有新产物时由内核收：{loop.last_exit_reason}",
+    )
+    check(bool(session_topic.events), "收掉之后留下一条事件")
+    check(
+        session_topic.last_exit_reason == EXIT_TOPIC_FULL,
+        "整轮停因记在会话上，下一轮复述要用",
     )
 
 
@@ -3812,12 +3859,13 @@ async def check_wrap_up_fallbacks(server: FakeModelServer) -> None:
     registry.register(EchoTool())
     registry.register(SlowTool())
     loop = build_loop(server, bus, registry)
+    loop.max_steps = 8
 
     # 一、收尾请求失败 -> 本地按已有 Part 汇编，不能空手收场。
     session = Session(id="ses_wrap_fail", title="收尾请求失败")
     ask(session, "一直调用工具")
     server.clear()
-    for _ in range(MAX_STEPS):
+    for _ in range(loop.max_steps):
         server.script(
             Reply(
                 chunks=[
@@ -3844,8 +3892,8 @@ async def check_wrap_up_fallbacks(server: FakeModelServer) -> None:
         f"本地汇编的总结写明为什么停下：{summaries[0][:80]}",
     )
     check(
-        "echo" in summaries[0],
-        f"本地汇编读的是真实的工具记录：{summaries[0][:160]}",
+        "已经产出：没有新产物" in summaries[0],
+        f"本地汇编读的是真实的产出记录：{summaries[0][:160]}",
     )
     check(
         "本地按已有记录汇编" in summaries[0],
@@ -4886,20 +4934,24 @@ def check_ledger_digest() -> None:
     # 整条前缀缓存作废——那正是长会话命中率掉下来的原因（§4.13 量过）。
     tick = Session(title="进度")
     tick.add_message(Message(role="user", parts=[Part(type=PartType.TEXT, text="开始")]))
-    for count in (1, 2):
-        tick.pending_steps.append(Step(seq=count, intent="bash", tools=["bash"]))
+    tick.pending_steps.append(Step(seq=1, intent="bash", tools=["bash"]))
+    single = ContextAssembler(200_000).build(tick, prefix)
+    check("本主题已" not in single.messages[-1]["content"], "一步时不提示收口")
+    tick.pending_steps.append(Step(seq=2, intent="bash", tools=["bash"]))
     short = ContextAssembler(200_000).build(tick, prefix)
-    check("本主题已" not in short.messages[-1]["content"], "两步以内不提示收口")
-    tick.pending_steps.append(Step(seq=3, intent="bash", tools=["bash"]))
+    check("本主题已 2 步" in short.messages[-1]["content"], "第 2 步起在尾部提示收口")
+    check("close_topic" in short.messages[-1]["content"], "提示里点名要调哪个工具")
+    for count in range(3, 9):
+        tick.pending_steps.append(Step(seq=count, intent="bash", tools=["bash"]))
     long_run = ContextAssembler(200_000).build(tick, prefix)
-    check("本主题已 3 步" in long_run.messages[-1]["content"], "第 3 步起在尾部提示收口")
-    check("close_topic" in long_run.messages[-1]["content"], "提示里点名要调哪个工具")
+    check("本主题已 8 步" in long_run.messages[-1]["content"], "第 8 步仍报步数")
+    check("先调 close_topic" in long_run.messages[-1]["content"], "第 8 步改成先收一次")
     check(
-        long_run.messages[1]["content"] == short.messages[1]["content"],
+        long_run.messages[1]["content"] == single.messages[1]["content"],
         "提示不进 user 头：前缀一个字节都没动",
     )
     check(
-        long_run.usage[Layer.TASK] > short.usage[Layer.TASK],
+        long_run.usage[Layer.TASK] > single.usage[Layer.TASK],
         "提示算进 TASK 用量（否则它是一段看不见的开销）",
     )
 
@@ -19067,10 +19119,10 @@ def check_context_budget() -> None:
     long_session.compact_upto = len(long_session.messages)
     compacted = ContextAssembler(128_000).build(long_session, "系统提示。" * 20)
     header = str(compacted.messages[1]["content"])
-    check("再往前还有" in header, "超过上限时写明还有多少组没列")
+    check("再往前还有" in header, "超过上限时写明还有多少步没列")
     check(
-        header.count("- turn ") == 20,
-        f"引用清单只列最近 20 组：{header.count('- turn ')}",
+        header.count("- step ") == 20,
+        f"引用清单只列最近 20 步：{header.count('- step ')}",
     )
 
     state = TaskState()
@@ -19490,7 +19542,7 @@ async def check_tool_clear() -> None:
     archived = [item for item in items if item["content"].startswith(TOOL_ARCHIVE_MARK)]
     check(len(archived) == 3, f"占位条数对得上：{len(archived)}")
     check(
-        all("read_turn turn=" in item["content"] for item in archived),
+        all("read_turn step=" in item["content"] for item in archived),
         "占位行写明怎么取回",
     )
     failed_item = next(item for item in items if item["tool_call_id"] == parts[2].id)
@@ -19506,18 +19558,18 @@ async def check_tool_clear() -> None:
         for turn in turns
         if turn.tool_outputs() and turn.tool_outputs()[0]["content"].startswith(TOOL_ARCHIVE_MARK)
     )
-    restored = await ReadTurnTool().execute({"turn": target.index}, session=session)
-    check(not restored.failed, f"read_turn 能按序号取回：{restored.output[:40]}")
+    restored = await ReadTurnTool().execute({"step": target.step_no}, session=session)
+    check(not restored.failed, f"read_turn 能按步号取回：{restored.output[:40]}")
     check("原文标记" in restored.output, "取回的是原文，不是占位")
     check(len(restored.output) > 500, "原文长度回来了（不是只剩一行占位）")
 
     page = await ReadTurnTool().execute(
-        {"turn": target.index, "offset": 0, "limit": 1}, session=session
+        {"step": target.step_no, "offset": 0, "limit": 1}, session=session
     )
     check("还有" in page.output, f"分页时写明还剩多少行怎么继续：{page.output}")
 
-    missing = await ReadTurnTool().execute({"turn": 999}, session=session)
-    check(missing.failed and "1–" in missing.output, f"序号不存在时给出范围：{missing.output}")
+    missing = await ReadTurnTool().execute({"step": 999}, session=session)
+    check(missing.failed and "1–" in missing.output, f"步号不存在时给出范围：{missing.output}")
 
     # ---- 装不下时先清正文，而不是整组丢 ----
     #
@@ -19562,7 +19614,7 @@ async def check_tool_clear() -> None:
         for turn in split_turns(packed.messages)
         if any(part.id == packed_parts[0].id for part in turn.tool_parts)
     )
-    restored = await ReadTurnTool().execute({"turn": first_tool_turn.index}, session=packed)
+    restored = await ReadTurnTool().execute({"step": first_tool_turn.step_no}, session=packed)
     check("输出00" in restored.output, "被收成占位的那条仍能取回原文")
 
 

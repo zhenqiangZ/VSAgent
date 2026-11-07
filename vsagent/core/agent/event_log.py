@@ -36,13 +36,18 @@ from .tools import Tool, ToolResult, ToolSpec
 # 标题、结论、交接的长度上限。**代码里截**，不只写在提示词里：
 # 模型不会每次都照做，而这几段进的是每步都要发的索引。
 EVENT_TITLE_MAX = 40
-EVENT_SUMMARY_MAX = 600
+EVENT_SUMMARY_MAX = 1000
 EVENT_HANDOFF_MAX = 200
+# 会话标题比主题标题短：它要挤进左栏与状态栏，写成长句两边都会被截。
+SESSION_TITLE_MAX = 20
 # 本地标题里最多拼几段用户诉求。两段够看出「从哪做到哪」，再多就把标题
 # 变成一份清单；超出的用「等 N 段」交代，不假装没发生。
 TITLE_ASKS = 2
 # `recall_event` 一次最多铺多少行原文。
 EVENT_RECALL_LIMIT = 120
+# 一次召回的 token 预算。行数只是分页手段：中文一行几十个字，
+# 120 行能有上万 token，按行限制挡不住。
+EVENT_RECALL_MAX_TOKENS = 4000
 # 单个主题的原文估算上限。一轮跑了三十步的情况靠它切开：
 # 不切的话一个主题会一直长到把 RECENT 撑满，而流水是「一个主题」的粒度，
 # 太长就退化成第二份逐条列表。120K 是 §4.8 的成本表里定下的。
@@ -136,15 +141,6 @@ def _short(text: Any, limit: int) -> str:
     if len(flat) <= limit:
         return flat
     return flat[: max(1, limit - 1)] + "…"
-
-
-def _tool_list(actions: list[str]) -> str:
-    """工具名列表：前三个 + 「等 N 个」。
-
-    列全的话，十个工具就占掉半条索引行，把产物挤到截断线外面去。
-    """
-    head = "、".join(actions[:3])
-    return head + (f" 等 {len(actions)} 个" if len(actions) > 3 else "")
 
 
 # 工具返回的读数里，这三个键装的是产物引用。步的流水与工具卡上的产物行
@@ -357,13 +353,28 @@ def open_tokens(session: Session) -> int:
     return _position_tokens(session, topic_start(session), (len(session.messages), 0))
 
 
-def _local_title(session: Session, start: tuple[int, int], end: tuple[int, int], steps: list[Step]) -> str:
-    """本地拼标题：有用户原话就用原话，否则列工具，再否则报位置。
+def _usable_ask(text: str) -> bool:
+    """用户原话能不能当标题。
 
-    这三条是旧 `build_local_event` 留下的规则，实测够用：模型没写标题时，
-    「用户要什么」比「用了什么工具」更能说明这一段在干什么。
+    「A」「继续」「ok」这类回复没有信息量，拿来当标题等于没起名字。
+    判据是长度与内容：至少四个字符，并且含汉字或由两个以上的词组成。
     """
-    asks = _user_texts(session, start, end)
+    value = " ".join(text.split())
+    if len(value) < 4:
+        return False
+    if any("\u4e00" <= char <= "\u9fff" for char in value):
+        return True
+    return len(value.split()) >= 2
+
+
+def _local_title(session: Session, start: tuple[int, int], end: tuple[int, int], steps: list[Step]) -> str:
+    """本地拼标题：有可用的用户原话就用原话，否则用产物与工具，再否则报位置。
+
+    「用户要什么」比「用了什么工具」更能说明这一段在干什么，但只在这一句
+    真的有内容时成立。实测单字回复会把三条主题都起成「A」，所以先过
+    `_usable_ask`。
+    """
+    asks = [text for text in _user_texts(session, start, end) if _usable_ask(text)]
     if asks:
         return _fit_title(
             "／".join(asks[:TITLE_ASKS]),
@@ -374,6 +385,14 @@ def _local_title(session: Session, start: tuple[int, int], end: tuple[int, int],
         for name in step.tools:
             if name not in actions:
                 actions.append(name)
+    artifacts: list[str] = []
+    for step in steps:
+        for item in step.artifacts:
+            if item not in artifacts:
+                artifacts.append(item)
+    if artifacts:
+        suffix = "、" + "、".join(actions[:2]) if actions else ""
+        return _fit_title(artifacts[0] + suffix, "")
     if actions:
         suffix = "" if len(actions) <= 3 else f" 等 {len(actions)} 个"
         return _fit_title("工具：" + "、".join(actions[:3]), suffix)
@@ -383,18 +402,14 @@ def _local_title(session: Session, start: tuple[int, int], end: tuple[int, int],
 def _local_summary(steps: list[Step], start: tuple[int, int], end: tuple[int, int]) -> str:
     """本地拼结论：「N 步，产物 K 个，未决 J 项」。
 
-    顺序是「最不能丢的在前」：产物与未决是下一步真的要用到的东西，
-    工具名最好补（流水里本来就有）。
+    顺序是「最不能丢的在前」：产物与未决是下一步真的要用到的东西。
+    工具名不进结论——流水里本来就有，结论的位置留给产物、数字与失败原因。
     """
     if not steps:
         return f"覆盖第 {start[0] + 1}–{end[0]} 条消息"
-    actions: list[str] = []
     artifacts: list[str] = []
     issues: list[str] = []
     for step in steps:
-        for name in step.tools:
-            if name not in actions:
-                actions.append(name)
         for item in step.artifacts:
             if item not in artifacts:
                 artifacts.append(item)
@@ -406,8 +421,8 @@ def _local_summary(steps: list[Step], start: tuple[int, int], end: tuple[int, in
         pieces.append("产物 " + "、".join(artifacts[:5]))
     if issues:
         pieces.append("未决 " + "；".join(issues[:3]))
-    if actions:
-        pieces.append("调用 " + _tool_list(actions))
+    if not artifacts and not issues and steps[-1].result:
+        pieces.append(steps[-1].result[:STEP_RESULT_MAX])
     return "；".join(pieces)[:EVENT_SUMMARY_MAX]
 
 
@@ -467,6 +482,8 @@ def seal_topic(
     session.topic_title = ""
     session.topic_summary = ""
     session.topic_handoff = ""
+    session_title = session.pending_session_title.strip()
+    session.pending_session_title = ""
     written = bool(title)
     if not steps and not written:
         if not force:
@@ -508,6 +525,13 @@ def seal_topic(
     ]
     for position, item in enumerate(session.pending_steps, 1):
         item.seq = position
+    # 会话名只在第一条事件封存时定：模型给了就用它的，没给就用这一个主题的标题。
+    # 之后不再改——会话名回答的是「这件事是什么」，换主题不该换名字。
+    if not session_title and not session.events:
+        session_title = event.title
+    if session_title and session.title_source in ("default", "placeholder"):
+        session.title = _short(session_title, SESSION_TITLE_MAX)
+        session.title_source = "auto"
     session.add_event(event)
     session.sanitize_events()
     return event
@@ -538,11 +562,13 @@ def seal_range(
     )
 
 
-def _render_step_raw(session: Session, step: Step) -> str:
+def _render_step_raw(session: Session, step: Step, with_reasoning: bool = False) -> str:
     """一步的原文：那一次工具调用到底打印了什么。
 
     这是 Step 级召回存在的理由——旧设计只能召回到「事件」这一层，读到的是
     摘要；这里能一路回到某一次 `bash` 的输出正文。
+
+    推理默认不给：它是当时的推演，跨轮之后由任务状态与结论承载。
     """
     from .context import render_part
 
@@ -553,7 +579,7 @@ def _render_step_raw(session: Session, step: Step) -> str:
         parts = message.parts[step.part_start : step.part_end]
     else:
         parts = message.parts
-    blocks = [render_part(part) for part in parts]
+    blocks = [render_part(part, with_reasoning) for part in parts]
     text = "\n\n".join(block for block in blocks if block)
     return text or "（这一步没有可读的原文）"
 
@@ -572,12 +598,14 @@ def render_event_detail(
     offset: int = 0,
     limit: int = EVENT_RECALL_LIMIT,
     step: int = 0,
+    with_reasoning: bool = False,
 ) -> str:
     """一条事件的详情；`step` 给定时只给那一步的原文。
 
     `offset` 只作用于原文：流水与结论就那么几行，翻页翻掉它们没有意义。
+    原文按 token 预算截断，行数只是分页手段。
     """
-    from .context import render_between, render_step_line
+    from .context import page_lines, render_between, render_step_line
 
     if step:
         found = next((item for item in event.steps if item.seq == step), None)
@@ -587,17 +615,18 @@ def render_event_detail(
         # 分页对这一步同样有效：一次 `bash` 的输出可以很长，召回它不该比
         # 当初读它更贵。参数说明里承诺的是「原文按 offset / limit 分页」，
         # 只对整段生效而漏掉单步，模型按说明传了 limit 也拦不住。
-        rows = _render_step_raw(session, found).splitlines()
-        page = rows[offset : offset + limit]
-        done = offset + len(page)
+        rows = _render_step_raw(session, found, with_reasoning).splitlines()
+        page, next_offset, remaining = page_lines(
+            rows, offset, limit, EVENT_RECALL_MAX_TOKENS
+        )
         lines = [
             f"{event.id} 第 {step} 步：{found.intent}",
             f"结果：{found.result or '（没有记录）'}",
             "原文：",
             *page,
         ]
-        if len(rows) > done:
-            lines.append(f"（还有 {len(rows) - done} 行，用 offset={done} 继续）")
+        if remaining > 0:
+            lines.append(f"（还有 {remaining} 行，用 offset={next_offset} 继续）")
         return "\n".join(lines)
 
     start = _start_of(session, event)
@@ -616,11 +645,13 @@ def render_event_detail(
     if event.issues:
         lines.append("未决：" + "；".join(event.issues[:5]))
     lines.append("原文：")
-    rows = render_between(session, start, event.cut).splitlines()
-    lines.extend(rows[offset : offset + limit])
-    done = offset + min(limit, max(0, len(rows) - offset))
-    if len(rows) > done:
-        lines.append(f"（还有 {len(rows) - done} 行，用 offset={done} 继续）")
+    rows = render_between(session, start, event.cut, with_reasoning).splitlines()
+    page, next_offset, remaining = page_lines(
+        rows, offset, limit, EVENT_RECALL_MAX_TOKENS
+    )
+    lines.extend(page)
+    if remaining > 0:
+        lines.append(f"（还有 {remaining} 行，用 offset={next_offset} 继续）")
     return "\n".join(lines)
 
 
@@ -635,7 +666,9 @@ class CloseTopicTool(Tool):
             "最后一条消息里出现「本主题已 N 步」时，就是在提醒你看这件事。\n"
             "调完之后：**这一步结束时封存**，这一段的原文不再随请求发出，"
             "只留标题、结论与流水；要看细节用 recall_event。所以结论里要点名产物"
-            "（handle、路径、关键数字），下一个主题要用到的东西写进 handoff。\n"
+            "（handle、路径、关键数字），并写清**放弃过哪条路、为什么**——"
+            "思考过程不随原文取回，这类依据只能写在结论里。"
+            "下一个主题要用到的东西写进 handoff。\n"
             "它自己不算一步。同一个目标还没做完就别调——切成两半会让两个主题都读不通。"
         ),
         parameters={
@@ -650,7 +683,7 @@ class CloseTopicTool(Tool):
                     "description": (
                         f"不超过 {EVENT_SUMMARY_MAX} 字，这个主题的结论："
                         "做出了什么（handle、路径、关键数字，写不准就写「未产出」，不要编）、"
-                        "还差什么。不写就用本地拼的「N 步、产物、未决」。"
+                        "放弃过什么、还差什么。不写就用本地拼的「N 步、产物、未决」。"
                     ),
                 },
                 "handoff": {
@@ -658,6 +691,14 @@ class CloseTopicTool(Tool):
                     "description": (
                         f"不超过 {EVENT_HANDOFF_MAX} 字，后续依赖这个主题的什么："
                         "哪个产物、哪个数字、哪条限制。没有依赖就写「无」。"
+                    ),
+                },
+                "session_title": {
+                    "type": "string",
+                    "description": (
+                        f"不超过 {SESSION_TITLE_MAX} 字，整个会话的名字。"
+                        "只在第一次封存时用得上：它回答的是「这件事是什么」，"
+                        "不是这一段做了什么。会话已经有名字时不传。"
                     ),
                 },
             },
@@ -700,6 +741,9 @@ class CloseTopicTool(Tool):
         session.topic_title = title
         session.topic_summary = str(arguments.get("summary") or "").strip()[:EVENT_SUMMARY_MAX]
         session.topic_handoff = str(arguments.get("handoff") or "").strip()[:EVENT_HANDOFF_MAX]
+        session.pending_session_title = (
+            str(arguments.get("session_title") or "").strip()[:SESSION_TITLE_MAX]
+        )
         session.touch()
         artifacts: list[str] = []
         for item in session.pending_steps:
@@ -726,7 +770,8 @@ class RecallEventTool(Tool):
             "不带参数时列出全部主题；带 event 编号时给出该主题的流水、结论与原文。"
             "带 step 时只给那一步的原文（工具输出正文）。"
             "封存之后只有摘要留在上下文里，要核对参数或原始输出时用它。"
-            "原文按 offset / limit 分页，默认 120 行。"
+            "默认不含思考过程，要当时的推演传 reasoning=true。"
+            "原文按 offset / limit 分页，默认 120 行，每次最多 4000 token。"
         ),
         parameters={
             "type": "object",
@@ -740,6 +785,10 @@ class RecallEventTool(Tool):
                 "limit": {
                     "type": "integer",
                     "description": f"最多返回多少行，默认 {EVENT_RECALL_LIMIT}",
+                },
+                "reasoning": {
+                    "type": "boolean",
+                    "description": "是否带上当时的思考过程，默认 false",
                 },
             },
             "required": [],
@@ -781,7 +830,12 @@ class RecallEventTool(Tool):
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             return ToolResult(output="参数 limit 应当是正整数", failed=True)
         detail = render_event_detail(
-            session, event, offset=offset, limit=min(limit, 400), step=step
+            session,
+            event,
+            offset=offset,
+            limit=min(limit, 400),
+            step=step,
+            with_reasoning=arguments.get("reasoning") is True,
         )
         return ToolResult(
             output=detail,

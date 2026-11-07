@@ -936,6 +936,10 @@ class Session:
 
     id: str = field(default_factory=new_session_id)
     title: str = "New Session"
+    # 标题是谁写的。`default` 是占位、`placeholder` 是首句截断、`auto` 是模型
+    # 按主题起的、`user` 是手改。封存时只替换前两种：模型起的名字写一次就够，
+    # 人改过的名字不能被下一轮覆盖。
+    title_source: str = "default"
     messages: list[Message] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -961,6 +965,12 @@ class Session:
     topic_title: str = ""
     topic_summary: str = ""
     topic_handoff: str = ""
+    # 模型顺手给整个会话起的名字（`close_topic` 的 session_title）。
+    # 与主题名分开：主题是这一段，会话名是整件事。只在内存里，封存时取用。
+    pending_session_title: str = ""
+    # 上一轮为什么停下（`exhausted` / `error` / `tool_failed` / `cancelled`）。
+    # 空串表示正常跑完。整轮的停因记在这里，不记在最后一段主题上。
+    last_exit_reason: str = ""
     # 已经用 load_tools 装入的领域工具族。核心工具不受它影响，
     # 装在会话上而不是注册表上：注册表按「根 / 子 agent」共享两份，
     # 记在那里会让一个会话装过的工具漏到另一个会话。
@@ -1104,6 +1114,7 @@ class Session:
         return {
             "id": self.id,
             "title": self.title,
+            "title_source": self.title_source,
             "messages": [message.to_dict() for message in self.messages],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -1127,6 +1138,7 @@ class Session:
             "seed_end": self.seed_end,
             "status": self.status,
             "status_note": self.status_note,
+            "last_exit_reason": self.last_exit_reason,
             "spawned_at": self.spawned_at,
         }
 
@@ -1155,8 +1167,18 @@ class Session:
             seed_end=int(data.get("seed_end") or 0),
             status=str(data.get("status") or "idle"),
             status_note=str(data.get("status_note") or ""),
+            last_exit_reason=str(data.get("last_exit_reason") or ""),
             spawned_at=float(data.get("spawned_at") or 0.0),
         )
+        # 标题来源只在新记录里写着。旧记录一律按「有没有被起过名」推断：
+        # 默认标题说明它从没被改过，可以自动起；别的标题当成人写的，不覆盖。
+        raw_source = str(data.get("title_source") or "").strip()
+        if raw_source in ("default", "placeholder", "auto", "user"):
+            session.title_source = raw_source
+        elif session.title and session.title != "New Session":
+            # 旧记录分不清是手改的还是首句截的，按人写的处理：宁可少改一次，
+            # 也不能把用户 /rename 起的名字覆盖掉。
+            session.title_source = "user"
         for raw in data.get("messages") or []:
             session.messages.append(Message.from_dict(raw))
         raw_events = data.get("events")

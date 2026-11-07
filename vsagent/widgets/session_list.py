@@ -15,16 +15,17 @@ from textual.containers import VerticalScroll
 from textual.message import Message as TextualMessage
 from textual.widgets import Static
 
+from .. import palette
 from ..core.models import Session
 from .messages_pane import SESSION_STATUS_TEXT
 
 # 任务状态在列表里只用一处颜色区分：运行中是强调色，失败与中断各一档语义色，
 # 完成是低饱和绿，其余一律次要文字。整列都上色会让「哪一行还在跑」这件事看不出来。
 _STATUS_COLOR = {
-    "running": "#4A9EFF",
-    "done": "#4CAF50",
-    "failed": "#C62828",
-    "cancelled": "#FFB300",
+    "running": palette.ACCENT,
+    "done": palette.OK,
+    "failed": palette.ERROR,
+    "cancelled": palette.WARN,
 }
 
 
@@ -95,15 +96,15 @@ class SessionRow(Static):
             text.append("  " * self._depth)
         text.append(
             fit(self._title, inner - reserve),
-            style="bold #E0E0E0" if self.has_class("-current") else "#E0E0E0",
+            style=f"bold {palette.TEXT_1}" if self.has_class("-current") else palette.TEXT_1,
         )
         text.append("  ")
         text.append(
             SESSION_STATUS_TEXT.get(self._status, self._status),
-            style=_STATUS_COLOR.get(self._status, "#5A5A5A"),
+            style=_STATUS_COLOR.get(self._status, palette.TEXT_3),
         )
         if self._meta:
-            text.append(f"  {self._meta}", style="#4A4A4A")
+            text.append(f"  {self._meta}", style=palette.TEXT_4)
         return text
 
     def on_click(self) -> None:
@@ -117,17 +118,17 @@ class NewTaskRow(Static):
     在这里直接建会话的话，点了又什么都不输，列表里会多一个空壳。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     NewTaskRow {
         height: 1;
         padding: 0 1;
-        color: #8B949E;
+        color: $vsa-text-2;
     }
     NewTaskRow:hover {
-        background: #1A1A1A;
-        color: #E0E0E0;
+        background: $vsa-layer;
+        color: $vsa-text-1;
     }
-    """
+    """)
 
     class Pressed(TextualMessage):
         """用户点了这一行。"""

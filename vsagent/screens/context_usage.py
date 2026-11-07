@@ -10,6 +10,7 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
+from .. import palette
 from ..widgets.status_bar import LAYER_LABELS, format_tokens
 
 # 条的最大格数。面板宽 72 列时，条 24 + 间隔 2 + 类别 10 + 数字 7 还余下十几列，
@@ -56,9 +57,9 @@ def bar_line(label: str, value: int, maximum: int) -> Text:
     filled = max(1, min(BAR_WIDTH, filled))
     label_pad = " " * max(0, 10 - cell_len(label))
     line = Text()
-    line.append("█" * filled, style="#4A9EFF")
-    line.append("░" * (BAR_WIDTH - filled), style="#2A2A2A")
-    line.append(f"  {label}{label_pad}{format_tokens(value):>7}", style="#E0E0E0")
+    line.append("█" * filled, style=palette.ACCENT)
+    line.append("░" * (BAR_WIDTH - filled), style=palette.LINE_SOFT)
+    line.append(f"  {label}{label_pad}{format_tokens(value):>7}", style=palette.TEXT_1)
     return line
 
 

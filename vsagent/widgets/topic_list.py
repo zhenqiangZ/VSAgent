@@ -12,6 +12,7 @@ from textual.containers import VerticalScroll
 from textual.message import Message as TextualMessage
 from textual.widgets import Static
 
+from .. import palette
 from ..core.agent.topics import TopicView
 from .session_list import fit
 from .topic_card import STATUS_COLOR, STATUS_MARK, topic_state
@@ -51,7 +52,7 @@ class TopicRow(Static):
         # 等待确认画成半圆：这一轮卡在一个没人回答的确认上，与还在跑的不一样。
         state = topic_state(topic)
         mark = STATUS_MARK.get(state, "○")
-        color = STATUS_COLOR.get(state, "#5A5A5A")
+        color = STATUS_COLOR.get(state, palette.TEXT_3)
         # 序号 3 格、状态 2 格（空格加字形），其余都给标题。短标题补空格，
         # 状态字形才能一律停在最右边那一列；不补的话每一行的字形位置都不一样，
         # 一列竖着扫下去看不出哪一条还在跑。
@@ -60,9 +61,9 @@ class TopicRow(Static):
         text = Text()
         text.append(
             f"{topic.index:02d} ",
-            style="#4A9EFF" if topic.status == "running" else "#4A4A4A",
+            style=palette.ACCENT if topic.status == "running" else palette.TEXT_4,
         )
-        text.append(title, style="#E0E0E0")
+        text.append(title, style=palette.TEXT_1)
         text.append(" " * (title_width - cell_len(title)))
         text.append(f" {mark}", style=color)
         return text

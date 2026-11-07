@@ -1,59 +1,36 @@
 /* 配色
  *
- * 全部装饰、分层与文字走同一条灰阶，语义色只有四个。
- * 正文不使用语义色：强调由字重承担。
+ * 色值在 `vsagent/palette.py`，这份文件只引用 `$vsa-*` 变量，改配色改那一个模块。
+ * 变量由 `VSAgentApp.get_css_variables` 注入，widget 的 `DEFAULT_CSS` 用的是同一份：
+ * Textual 的变量按样式表隔离，只在这里声明的话那边看不见。
+ *
+ * 全部装饰、分层与文字走同一条灰阶。正文不使用语义色：强调由字重承担。
  * 设计说明见 docs/design.md 第七节。
- *
- *   #000000  屏幕底
- *   #0A0A0A  栏底（状态栏、侧栏、输入区块、弹窗里的输入框）
- *   #1A1A1A  分层底（用户消息、选中项、普通提示、弹窗本体）
- *   #2A2A2A  装饰线（未聚焦的指示线、启动界面聚焦时的抬亮）
- *   #333333  分隔线（侧栏左边界、弹窗里的框线）
- *   #4A4A4A  四级文字（快捷键提示、侧栏开关、弹窗里的元信息）
- *   #5A5A5A  三级文字（状态栏、模式提示、历史提示、弹窗里的提示行）
- *   #8B949E  次要文字（分节标题、系统事件、状态行、弹窗里的说明）
- *   #E0E0E0  主文字（正文、列表标题、悬停时的文字）
- *
- *   #4A9EFF  蓝：焦点与选中
- *   #2E7D32  绿：完成
- *   #FFB300  橙：等待
- *   #C62828  红：失败
- *
- * 纯白只留给输入光标那个方块：它落在空格上时只有底色看得见，
- * 比主文字再亮一档才能在一行文字里认出当前格。
- * 语义色底上的文字同理，不参与灰阶。
  */
 
 /* 全局 */
 Screen {
-    background: #000000;
+    background: $vsa-screen;
 }
 
 /* 弹窗类屏幕：弹窗本体在屏幕内水平垂直居中，遮罩半透明以透出下一层界面 */
 ModalScreen {
     align: center middle;
-    background: #000000 60%;
+    background: $vsa-screen 60%;
 }
 
 /* Home 屏幕：内容水平居中、垂直大致居中，底部状态栏贴在最下方 */
 #home-frame {
     width: 100%;
     height: 100%;
-    background: #000000;
+    background: $vsa-screen;
 }
 
-/* 左栏是任务导航，中间是输入框与最近任务。左栏不抢焦点：点它才切会话，
-   键盘仍然留在输入框里。左边界由 `Splitter` 那一列画。 */
+/* 一栏到底：输入框在中间居中，最近任务紧跟在下面。左栏删掉之后这一层只为
+   让 `#home-center` 拿到剩余高度。 */
 #home-body {
     width: 100%;
     height: 1fr;
-}
-
-#home-side {
-    width: 34;
-    height: 100%;
-    padding: 1 1;
-    background: #0A0A0A;
 }
 
 #home-center {
@@ -62,13 +39,33 @@ ModalScreen {
     align: center middle;
 }
 
-/* 最近任务：一行一条，最多四条；更多看左栏。高度封顶，矮终端里不把输入框顶上去。 */
+/* 最近任务：运行中的排最前，其余按时间排，最多六条。高度封顶，
+   矮终端里不把输入框顶上去。 */
 #home-recent {
     width: 82;
     max-width: 100%;
     height: auto;
-    max-height: 6;
+    max-height: 8;
     margin-top: 1;
+}
+
+/* 分节标题与「+ 新建任务」同一行：标题在左，入口在右。 */
+#home-recent .rail-section {
+    width: 100%;
+    height: 1;
+}
+
+#home-recent .rail-title {
+    width: 1fr;
+    height: 1;
+    color: $vsa-text-4;
+}
+
+/* 入口按内容宽度排，剩下的列全给标题。不写这一条时它按默认 `1fr` 抢满整行，
+   标题被挤成 1 列。 */
+#home-recent .new-task-row {
+    width: auto;
+    color: $vsa-text-2;
 }
 
 /* 输入框下方的快捷入口：三个任务模板，点一下填进输入框，不提交。
@@ -84,18 +81,18 @@ ModalScreen {
     width: auto;
     height: 1;
     margin-right: 2;
-    color: #4A4A4A;
+    color: $vsa-text-4;
 }
 
 .quick-task {
     width: auto;
     height: 1;
     margin-right: 2;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 .quick-task:hover {
-    color: #4A9EFF;
+    color: $vsa-accent;
 }
 
 /* 左栏的分节标题：与上面那段留一行空白，第一段不留（列表顶部本来就贴着栏边）。
@@ -104,7 +101,7 @@ ModalScreen {
 .rail-section {
     height: 1;
     margin-top: 1;
-    color: #5A5A5A;
+    color: $vsa-text-3;
     text-style: bold;
 }
 
@@ -113,21 +110,21 @@ ModalScreen {
 }
 
 .rail-row:hover {
-    background: #1A1A1A;
+    background: $vsa-layer;
 }
 
 .rail-row.-current {
-    background: #1A1A1A;
+    background: $vsa-layer;
 }
 
 .rail-empty {
     height: 1;
     padding: 0 1;
-    color: #4A4A4A;
+    color: $vsa-text-4;
 }
 
 .topic-row:hover {
-    background: #1A1A1A;
+    background: $vsa-layer;
 }
 
 /* 字标：与输入框同宽、逐行居中。`home.py` 把每行补齐到同一宽度再拼，
@@ -135,7 +132,7 @@ ModalScreen {
 #home-logo {
     width: 82;
     max-width: 100%;
-    color: #E0E0E0;
+    color: $vsa-text-1;
     text-align: center;
     height: auto;
 }
@@ -148,31 +145,28 @@ ModalScreen {
     margin-top: 1;
     margin-bottom: 1;
     text-align: center;
-    color: #5A5A5A;
+    color: $vsa-text-3;
 }
 
 #home-box {
     width: 82;
     max-width: 100%;
     height: auto;
-    background: #1A1A1A;
+    background: $vsa-layer;
     margin-top: 0;
 }
 
-/* 文本框自身也加一条聚焦规则，让 Textual 在焦点变化时重算整块子树 */
-#home-box:focus-within {
-    background: #2A2A2A;
-}
-
-/* 左侧竖条：聚焦时点亮成蓝线，未聚焦时接近框底色 */
+/* 左侧竖条：聚焦时点亮成蓝线，未聚焦时接近框底色。
+   聚焦类由 `HomeScreen.on_descendant_focus` 添加：写成 `:focus-within` 的话，
+   区块连同输入区、状态行与操作提示会一起重算样式。 */
 #home-accent-bar {
     width: 1;
     height: 100%;
-    background: #2A2A2A;
+    background: $vsa-line-soft;
 }
 
-#home-box:focus-within #home-accent-bar {
-    background: #4A9EFF;
+#home-accent-bar.-focused {
+    background: $vsa-accent;
 }
 
 #home-box-main {
@@ -190,7 +184,7 @@ ModalScreen {
 #home-prompt-mark {
     width: auto;
     height: 1;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 /* 输入框随内容换行增高，到高度上界后由自身滚动掩盖最早的内容 */
@@ -200,19 +194,13 @@ ModalScreen {
     max-height: 6;
     padding: 0 1;
     border: none;
-    background: #1A1A1A;
-    color: #E0E0E0;
+    background: $vsa-layer;
+    color: $vsa-text-1;
     scrollbar-size-vertical: 0;
 }
 
 #home-input .text-area--placeholder {
-    color: #5A5A5A;
-}
-
-/* 输入区跟着区块一起在聚焦时提亮。`#home-box:focus-within` 把区块底色抬到 #2A2A2A，
-   而输入区自己写的是 #1A1A1A，不提亮的话焦点一进到输入框，输入区就比周围暗出一档 */
-#home-box:focus-within #home-input {
-    background: #2A2A2A;
+    color: $vsa-text-3;
 }
 
 #home-info {
@@ -231,11 +219,11 @@ ModalScreen {
     width: auto;
     height: 1;
     margin-right: 2;
-    color: #5A5A5A;
+    color: $vsa-text-3;
 }
 
 .home-action:hover {
-    color: #E0E0E0;
+    color: $vsa-text-1;
 }
 
 /* 发送那一格靠右：它对应的动作是回车，摆在末位读起来像一句收尾。 */
@@ -243,24 +231,26 @@ ModalScreen {
     width: 1fr;
     margin-right: 0;
     text-align: right;
-    color: #4A4A4A;
+    color: $vsa-text-4;
 }
 
+/* 快捷键提示紧跟输入框，靠左：它讲的是输入框里的操作，靠右会跟
+   「Enter 发送」那一格抢注意力。 */
 #home-help {
     width: 82;
     max-width: 100%;
     height: 1;
     padding: 0 2;
-    text-align: right;
-    color: #4A4A4A;
+    text-align: left;
+    color: $vsa-text-4;
 }
 
 #home-footer {
     width: 100%;
     height: 2;
     padding: 0 2 1 2;
-    color: #4A4A4A;
-    background: #000000;
+    color: $vsa-text-4;
+    background: $vsa-screen;
 }
 
 #home-footer-left {
@@ -287,7 +277,7 @@ ModalScreen {
     width: 30;
     height: 100%;
     padding: 0 1;
-    background: #0A0A0A;
+    background: $vsa-rail;
 }
 
 #chat-sessions {
@@ -297,7 +287,7 @@ ModalScreen {
 
 #chat-topics {
     height: 1fr;
-    border-top: solid #1A1A1A;
+    border-top: solid $vsa-layer;
 }
 
 /* 中间那一栏：对话与输入框。两者同宽同左边界，输入框不再横贯整屏。 */
@@ -312,10 +302,10 @@ ModalScreen {
     padding: 0 1;
     /* 轨道与屏幕底色同色所以不显形，条本身取三级文字那一档：在纯黑底上看得见，
        又不会比正文更抢眼。悬停与拖动各提一档，告诉用户手指点在了什么上面 */
-    scrollbar-background: #000000;
-    scrollbar-color: #5A5A5A;
-    scrollbar-color-hover: #8B949E;
-    scrollbar-color-active: #E0E0E0;
+    scrollbar-background: $vsa-screen;
+    scrollbar-color: $vsa-text-3;
+    scrollbar-color-hover: $vsa-text-2;
+    scrollbar-color-active: $vsa-text-1;
 }
 
 /* 上下文侧栏：默认隐藏，/sidebar 打开后占 30 列，中间那一栏让出这块宽度。
@@ -323,7 +313,7 @@ ModalScreen {
 #side-panel {
     width: 30;
     height: 100%;
-    background: #0A0A0A;
+    background: $vsa-rail;
     padding: 0 1;
     display: none;
 }
@@ -334,7 +324,7 @@ ModalScreen {
 
 #side-panel .side-title {
     height: 1;
-    color: #E0E0E0;
+    color: $vsa-text-1;
     text-style: bold;
 }
 
@@ -343,7 +333,7 @@ ModalScreen {
     margin-top: 1;
     /* 分节标题是结构标签，不是交互元素，用次要文字那一档加粗；
        亮蓝留给当前选中的条目。 */
-    color: #8B949E;
+    color: $vsa-text-2;
     text-style: bold;
 }
 
@@ -354,12 +344,12 @@ ModalScreen {
 
 #side-panel .side-line {
     height: auto;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #side-panel .side-body {
     height: auto;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 /* 输入框区块：与状态栏同一层底色，底部四行连成一条，屏幕上方是消息、下方是操作区。
@@ -368,7 +358,7 @@ ModalScreen {
    与消息区的分界由 1 列宽的竖线（聚焦转蓝）与下方状态行承担 */
 #editor-pane {
     height: auto;
-    background: #0A0A0A;
+    background: $vsa-rail;
     /* 上下不留内边距：竖线的首行要与输入文字那一行同一行。
        左内边距 3 列让输入的文字落在 x=5，与消息正文从同一列开始；
        竖线占它左边那一列（x=3），落在消息正文左侧的空档里 */
@@ -390,14 +380,14 @@ ModalScreen {
 #editor-accent {
     width: 1;
     height: 100%;
-    background: #2A2A2A;
+    background: $vsa-line-soft;
 }
 
 /* 指示线由 EditorPane 在焦点进出时自己添加类。走 :focus-within 的话，
    规则命中的是 `#editor-pane` 自己，区块连同输入区与状态行一起重算样式再重绘，
    焦点每进出一次就闪一下。 */
 #editor-accent.-focused {
-    background: #4A9EFF;
+    background: $vsa-accent;
 }
 
 #editor-main {
@@ -406,7 +396,7 @@ ModalScreen {
 }
 
 /* 输入区显式铺区块那层底色。不写的话会用到 TextArea 自带的 `background: $surface`，
-   主题换成 gruvbox 之后 `$surface` 是 #3C3836，比区块的 #0A0A0A 亮出一大截，
+   主题换成 gruvbox 之后 `$surface` 是 #3C3836，比区块的 $vsa-rail 亮出一大截，
    输入区看起来像单独铺了一块灰。
 
    左内边距 1 列把光标与竖线隔开：方块光标贴到竖线上时两段颜色连成一片，
@@ -423,21 +413,21 @@ ModalScreen {
     max-height: 6;
     padding: 0 1;
     border: none;
-    background: #0A0A0A;
-    color: #E0E0E0;
+    background: $vsa-rail;
+    color: $vsa-text-1;
     scrollbar-size-vertical: 0;
 }
 
-/* 方块光标：白底、深色字。光标落在空格上时只有底色看得见，所以底色必须是白的那一层。
-   启动界面的输入框一起改，两处光标保持同一副样子 */
+/* 方块光标：白底、深色字。光标落在空格上时只有底色看得见，所以底色必须是白的那一层；
+   字取栏底那一档黑。启动界面的输入框一起改，两处光标保持同一副样子 */
 #editor-input .text-area--cursor,
 #home-input .text-area--cursor {
-    color: #0A0A0A;
-    background: #FFFFFF;
+    color: $vsa-rail;
+    background: $vsa-cursor;
 }
 
 #editor-input .text-area--placeholder {
-    color: #5A5A5A;
+    color: $vsa-text-3;
 }
 
 /* 状态行：Agent 与推理强度靠左，输入模式靠右；左侧内边距与输入区一致，
@@ -459,34 +449,34 @@ ModalScreen {
 #editor-agent {
     width: auto;
     height: 1;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #editor-effort {
     width: auto;
     height: 1;
     padding-left: 1;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #editor-hint {
     width: 1fr;
     height: 1;
     text-align: right;
-    color: #5A5A5A;
+    color: $vsa-text-3;
 }
 
 /* 消息区顶端那条"上方还有多少条"的提示：占一行、灰字居中，滚到它附近就开始补更早的消息 */
 #history-hint {
     height: 1;
-    color: #5A5A5A;
+    color: $vsa-text-3;
     text-align: center;
 }
 
 /* 消息样式：两侧用同一档主文字。用户那一侧靠一块浅底区分，
    不再单独调亮文字——底色已经足够说明这是谁说的 */
 .message-user {
-    color: #E0E0E0;
+    color: $vsa-text-1;
     margin-bottom: 1;
 }
 
@@ -496,7 +486,7 @@ ModalScreen {
 }
 
 .message-assistant {
-    color: #E0E0E0;
+    color: $vsa-text-1;
     margin-bottom: 1;
 }
 
@@ -514,16 +504,16 @@ ModalScreen {
 .part-subtask,
 .part-retry,
 .part-compaction {
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 .part-error {
-    color: #C62828;
+    color: $vsa-error;
 }
 
 /* 正文不使用强调色：收尾总结靠字重与上方留白，与普通回复分开 */
 .part-summary {
-    color: #E0E0E0;
+    color: $vsa-text-1;
     text-style: bold;
     margin-top: 1;
 }
@@ -543,8 +533,8 @@ ModalScreen {
    这一行的每一段都是背景信息，没有哪一段需要抢注意力。 */
 #status-bar {
     height: 1;
-    background: #0A0A0A;
-    color: #5A5A5A;
+    background: $vsa-rail;
+    color: $vsa-text-3;
     layout: horizontal;
     padding: 0 1;
 }
@@ -556,7 +546,7 @@ ModalScreen {
     text-wrap: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    color: #5A5A5A;
+    color: $vsa-text-3;
 }
 
 /* 占比数字左右各留一格，点开它的命中区域不至于只有两个字符宽。 */
@@ -569,14 +559,14 @@ ModalScreen {
 /* 上下文占比可以点开看每一项的用量：悬停时铺一层浅底，告诉用户这一块能点。
    数字的颜色由 Rich Text 自己给，CSS 的 color 盖不过它。 */
 #status-usage:hover {
-    background: #1A1A1A;
+    background: $vsa-layer;
 }
 
 #status-keys {
     width: auto;
     height: 1;
     padding-left: 2;
-    color: #4A4A4A;
+    color: $vsa-text-4;
 }
 
 /* 侧栏开关：未展开时与快捷键提示同一档暗色，展开时用主文字那一档。
@@ -586,15 +576,15 @@ ModalScreen {
     width: auto;
     height: 1;
     padding-left: 2;
-    color: #4A4A4A;
+    color: $vsa-text-4;
 }
 
 #side-toggle:hover {
-    color: #E0E0E0;
+    color: $vsa-text-1;
 }
 
 #side-toggle.-open {
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 /* 命令面板 */
@@ -604,13 +594,13 @@ ModalScreen {
     max-width: 80;
     height: auto;
     max-height: 20;
-    background: #1A1A1A 92%;
-    border: tall #4A9EFF;
+    background: $vsa-layer 92%;
+    border: tall $vsa-accent;
     padding: 0 1;
 }
 
 #palette-title {
-    color: #4A9EFF;
+    color: $vsa-accent;
     height: 1;
 }
 
@@ -620,7 +610,7 @@ ModalScreen {
 }
 
 #palette-hint {
-    color: #5A5A5A;
+    color: $vsa-text-3;
     height: 1;
 }
 
@@ -641,8 +631,8 @@ ModalScreen {
     max-width: 90;
     height: auto;
     max-height: 26;
-    background: #1A1A1A 92%;
-    border: tall #4A9EFF;
+    background: $vsa-layer 92%;
+    border: tall $vsa-accent;
     padding: 0 1;
 }
 
@@ -652,7 +642,7 @@ ModalScreen {
 #diff-title,
 #connection-title,
 #message-title {
-    color: #4A9EFF;
+    color: $vsa-accent;
     height: 1;
     text-style: bold;
 }
@@ -665,7 +655,7 @@ ModalScreen {
 #rename-hint,
 #connection-hint,
 #message-hint {
-    color: #5A5A5A;
+    color: $vsa-text-3;
     height: 1;
 }
 
@@ -675,7 +665,7 @@ ModalScreen {
 }
 
 .message-line {
-    color: #E0E0E0;
+    color: $vsa-text-1;
     height: auto;
 }
 
@@ -691,19 +681,19 @@ ContextUsageScreen {
     height: auto;
     max-height: 22;
     margin-bottom: 1;
-    background: #1A1A1A 92%;
-    border: tall #4A9EFF;
+    background: $vsa-layer 92%;
+    border: tall $vsa-accent;
     padding: 0 1;
 }
 
 #context-usage-title {
-    color: #4A9EFF;
+    color: $vsa-accent;
     height: 1;
     text-style: bold;
 }
 
 #context-usage-window {
-    color: #8B949E;
+    color: $vsa-text-2;
     height: 1;
     margin-bottom: 1;
 }
@@ -713,7 +703,7 @@ ContextUsageScreen {
 }
 
 #context-usage-hint {
-    color: #5A5A5A;
+    color: $vsa-text-3;
     height: 1;
     margin-top: 1;
 }
@@ -734,14 +724,14 @@ ContextUsageScreen {
 #session-list ListItem.-highlight,
 #theme-list ListItem.-highlight,
 #tools-list ListItem.-highlight {
-    background: #2A2A2A;
-    color: #E0E0E0;
+    background: $vsa-line-soft;
+    color: $vsa-text-1;
 }
 
 #session-list ListItem.-hovered,
 #theme-list ListItem.-hovered,
 #tools-list ListItem.-hovered {
-    background: #2A2A2A;
+    background: $vsa-line-soft;
 }
 
 /* 弹窗里的滚动条与消息区同一套三档。默认档取主题的 $scrollbar，是一道偏蓝的窄条，
@@ -752,10 +742,10 @@ ContextUsageScreen {
 #theme-list,
 #tools-list,
 #message-body {
-    scrollbar-background: #1A1A1A;
-    scrollbar-color: #5A5A5A;
-    scrollbar-color-hover: #8B949E;
-    scrollbar-color-active: #E0E0E0;
+    scrollbar-background: $vsa-layer;
+    scrollbar-color: $vsa-text-3;
+    scrollbar-color-hover: $vsa-text-2;
+    scrollbar-color-active: $vsa-text-1;
 }
 
 /* 会话列表：两行一条，标题与元信息分开配色 */
@@ -785,11 +775,11 @@ ContextUsageScreen {
 
 .theme-row {
     height: 1;
-    color: #E0E0E0;
+    color: $vsa-text-1;
 }
 
 .theme-row.-current {
-    color: #4A9EFF;
+    color: $vsa-accent;
     text-style: bold;
 }
 
@@ -799,7 +789,7 @@ ContextUsageScreen {
 
 .tool-row-title {
     height: 1;
-    color: #E0E0E0;
+    color: $vsa-text-1;
     text-wrap: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -809,18 +799,18 @@ ContextUsageScreen {
    说明是打开这个面板要看的东西，开着的那一行取次要文字那一档，整句读得清 */
 .tool-row-meta {
     height: 1;
-    color: #8B949E;
+    color: $vsa-text-2;
     text-wrap: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
 .tool-row.-off .tool-row-title {
-    color: #5A5A5A;
+    color: $vsa-text-3;
 }
 
 .tool-row.-off .tool-row-meta {
-    color: #4A4A4A;
+    color: $vsa-text-4;
 }
 
 .session-row {
@@ -829,19 +819,19 @@ ContextUsageScreen {
 
 .session-row-title {
     height: 1;
-    color: #E0E0E0;
+    color: $vsa-text-1;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
 .session-row-title.-current {
-    color: #4A9EFF;
+    color: $vsa-accent;
     text-style: bold;
 }
 
 .session-row-meta {
     height: 1;
-    color: #5A5A5A;
+    color: $vsa-text-3;
     overflow: hidden;
     text-overflow: ellipsis;
 }
@@ -853,12 +843,12 @@ ContextUsageScreen {
 
 /* /model 表单：四行输入，标签浅灰、错误行用提示色 */
 .connection-label {
-    color: #8B949E;
+    color: $vsa-text-2;
     height: 1;
 }
 
 #connection-error {
-    color: #C62828;
+    color: $vsa-error;
     height: 1;
 }
 
@@ -867,14 +857,14 @@ ContextUsageScreen {
 #connection-form Input,
 #rename-dialog Input,
 #spawn-dialog Input {
-    background: #0A0A0A;
-    border: tall #333333;
+    background: $vsa-rail;
+    border: tall $vsa-line;
 }
 
 #connection-form Input:focus,
 #rename-dialog Input:focus,
 #spawn-dialog Input:focus {
-    border: tall #4A9EFF;
+    border: tall $vsa-accent;
 }
 
 /* 询问弹窗：照 macOS 授权面板的版式。
@@ -888,29 +878,29 @@ ContextUsageScreen {
     height: auto;
     max-height: 30;
     padding: 1 2;
-    background: #1A1A1A 96%;
-    border: round #333333;
+    background: $vsa-layer 96%;
+    border: round $vsa-line;
 }
 
 #permission-eyebrow {
-    color: #8B949E;
+    color: $vsa-text-2;
     height: 1;
 }
 
 #permission-title {
-    color: #E0E0E0;
+    color: $vsa-text-1;
     height: 1;
     text-style: bold;
     margin-top: 1;
 }
 
 #permission-detail {
-    color: #8B949E;
+    color: $vsa-text-2;
     height: 1;
 }
 
 #permission-label {
-    color: #8B949E;
+    color: $vsa-text-2;
     height: 1;
     margin-top: 1;
 }
@@ -919,7 +909,7 @@ ContextUsageScreen {
    超过八行自己滚动，弹窗不会被撑破；滚动条压到一列宽，否则读长命令时
    默认两列的滚动条会挤掉正文右侧。 */
 #permission-argument {
-    background: #101010;
+    background: $vsa-sunken;
     padding: 0 1;
     height: auto;
     min-height: 3;
@@ -928,7 +918,7 @@ ContextUsageScreen {
 }
 
 #permission-argument-text {
-    color: #E0E0E0;
+    color: $vsa-text-1;
     height: auto;
 }
 
@@ -941,19 +931,19 @@ ContextUsageScreen {
 
 #permission-reason-icon {
     width: 2;
-    color: #FFB300;
+    color: $vsa-warn;
     height: auto;
 }
 
 #permission-reason {
     width: 1fr;
-    color: #8B949E;
+    color: $vsa-text-2;
     height: auto;
 }
 
 /* 分隔线：一行反白横线裁到弹窗宽度，颜色取分隔线那一档 */
 #permission-divider {
-    color: #2A2A2A;
+    color: $vsa-line-soft;
     height: 1;
     margin-top: 1;
 }
@@ -975,27 +965,27 @@ ContextUsageScreen {
 /* 拒绝是次要操作，只用灰色文字；全部允许的范围更大，用强调色但不填底，
    避免它与「允许一次」抢同一个视觉重心 */
 #permission-deny {
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #permission-all {
-    color: #4A9EFF;
+    color: $vsa-accent;
 }
 
 #permission-allow {
-    background: #4A9EFF;
-    color: #0A0A0A;
+    background: $vsa-accent;
+    color: $vsa-rail;
     text-style: bold;
 }
 
 #permission-hint {
-    color: #5A5A5A;
+    color: $vsa-text-3;
     height: auto;
 }
 
 /* 帮助界面 */
 .help-section {
-    color: #4A9EFF;
+    color: $vsa-accent;
     text-style: bold;
     margin-top: 1;
     height: 1;
@@ -1003,12 +993,12 @@ ContextUsageScreen {
 
 #help-keys,
 #help-commands {
-    color: #E0E0E0;
+    color: $vsa-text-1;
     height: auto;
 }
 
 #help-hint {
-    color: #5A5A5A;
+    color: $vsa-text-3;
     height: 1;
 }
 
@@ -1030,7 +1020,7 @@ ContextUsageScreen {
 #side-artifacts {
     height: auto;
     max-height: 7;
-    background: #0A0A0A;
+    background: $vsa-rail;
     border: none;
     padding: 0;
 }
@@ -1038,16 +1028,16 @@ ContextUsageScreen {
 #side-artifacts > .option-list--option {
     height: 1;
     padding: 0;
-    color: #4A9EFF;
+    color: $vsa-accent;
 }
 
 #side-artifacts > .option-list--option-highlighted {
-    background: #1A1A1A;
-    color: #E0E0E0;
+    background: $vsa-layer;
+    color: $vsa-text-1;
 }
 
 #side-artifacts > .option-list--option-disabled {
-    color: #5A5A5A;
+    color: $vsa-text-3;
 }
 
 /* 右栏的子 agent 列表。宽度沿用 #side-panel 的 30 列：
@@ -1055,7 +1045,7 @@ ContextUsageScreen {
 #side-agents {
     height: auto;
     max-height: 10;
-    background: #0A0A0A;
+    background: $vsa-rail;
     border: none;
     padding: 0;
 }
@@ -1063,12 +1053,12 @@ ContextUsageScreen {
 #side-agents > .option-list--option {
     height: 2;
     padding: 0;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #side-agents > .option-list--option-highlighted {
-    background: #1A1A1A;
-    color: #E0E0E0;
+    background: $vsa-layer;
+    color: $vsa-text-1;
 }
 
 #side-agents-title {
@@ -1079,28 +1069,28 @@ ContextUsageScreen {
    悬停时文字转主文字那一档——这里没有「选中」的含义，不用蓝色。 */
 #subagent-banner {
     height: 1;
-    background: #1A1A1A;
-    color: #8B949E;
+    background: $vsa-layer;
+    color: $vsa-text-2;
     padding: 0 1;
 }
 
 #subagent-banner:hover {
-    background: #1A1A1A;
-    color: #E0E0E0;
+    background: $vsa-layer;
+    color: $vsa-text-1;
 }
 
 /* 「仅创建」留下的任务：整条可点，橙色表示它在等人决定要不要开始 */
 #subagent-start {
     height: 1;
     display: none;
-    background: #1A1A1A;
-    color: #FFB300;
+    background: $vsa-layer;
+    color: $vsa-warn;
     padding: 0 1;
 }
 
 #subagent-start:hover {
-    background: #1A1A1A;
-    color: #E0E0E0;
+    background: $vsa-layer;
+    color: $vsa-text-1;
 }
 
 /* 派发模态 */
@@ -1112,14 +1102,14 @@ SpawnAgentScreen {
     width: 72;
     height: auto;
     max-height: 90%;
-    background: #1A1A1A 92%;
-    border: solid #333333;
+    background: $vsa-layer 92%;
+    border: solid $vsa-line;
     padding: 1 2;
 }
 
 #spawn-title {
     height: 1;
-    color: #E0E0E0;
+    color: $vsa-text-1;
     text-style: bold;
 }
 
@@ -1128,7 +1118,7 @@ SpawnAgentScreen {
 .spawn-label {
     height: 1;
     margin-top: 1;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #spawn-range {
@@ -1142,38 +1132,38 @@ SpawnAgentScreen {
 #spawn-arrow {
     width: 3;
     content-align: center middle;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #spawn-total {
     width: 1fr;
     content-align: right middle;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #spawn-preview {
     height: auto;
-    color: #8B949E;
+    color: $vsa-text-2;
 }
 
 #spawn-task {
     height: 7;
-    background: #0A0A0A;
-    border: solid #333333;
-    scrollbar-background: #0A0A0A;
-    scrollbar-color: #5A5A5A;
-    scrollbar-color-hover: #8B949E;
-    scrollbar-color-active: #E0E0E0;
+    background: $vsa-rail;
+    border: solid $vsa-line;
+    scrollbar-background: $vsa-rail;
+    scrollbar-color: $vsa-text-3;
+    scrollbar-color-hover: $vsa-text-2;
+    scrollbar-color-active: $vsa-text-1;
 }
 
 #spawn-error {
     height: 1;
-    color: #C62828;
+    color: $vsa-error;
 }
 
 #spawn-hint {
     height: 2;
-    color: #5A5A5A;
+    color: $vsa-text-3;
 }
 
 #spawn-buttons {
@@ -1186,23 +1176,23 @@ SpawnAgentScreen {
    主按钮把框线换成主文字那一档，不另造一个蓝 */
 #spawn-buttons Button {
     margin-left: 2;
-    background: #1A1A1A;
-    color: #E0E0E0;
-    border: tall #333333;
+    background: $vsa-layer;
+    color: $vsa-text-1;
+    border: tall $vsa-line;
 }
 
 #spawn-buttons Button:hover {
-    background: #2A2A2A;
-    border: tall #4A4A4A;
+    background: $vsa-line-soft;
+    border: tall $vsa-text-4;
 }
 
 #spawn-buttons Button.-primary {
-    background: #4A9EFF;
-    color: #0A0A0A;
-    border: tall #4A9EFF;
+    background: $vsa-accent;
+    color: $vsa-rail;
+    border: tall $vsa-accent;
 }
 
 #spawn-buttons Button.-primary:hover {
-    background: #4A9EFF;
-    border: tall #E0E0E0;
+    background: $vsa-accent;
+    border: tall $vsa-text-1;
 }

@@ -16,6 +16,7 @@ from textual.containers import Container, Horizontal
 from textual.message import Message as TextualMessage
 from textual.widgets import Static
 
+from .. import palette
 from ..core.agent.topics import TopicView
 from ..core.models import Step
 
@@ -29,6 +30,7 @@ STATUS_MARK = {
     "failed": "✕",
     "interrupted": "■",
     "running": "●",
+    "pending": "○",
     "unsealed": "○",
     "waiting": "◐",
 }
@@ -38,17 +40,19 @@ STATUS_LABEL = {
     "failed": "失败",
     "interrupted": "已中断",
     "running": "进行中",
+    "pending": "未开始",
     "unsealed": "未封存",
     "waiting": "等待确认",
 }
 
 STATUS_COLOR = {
-    "completed": "#4CAF50",
-    "failed": "#C62828",
-    "interrupted": "#FFB300",
-    "running": "#4A9EFF",
-    "unsealed": "#5A5A5A",
-    "waiting": "#FFB300",
+    "completed": palette.OK,
+    "failed": palette.ERROR,
+    "interrupted": palette.WARN,
+    "running": palette.ACCENT,
+    "pending": palette.TEXT_3,
+    "unsealed": palette.TEXT_3,
+    "waiting": palette.WARN,
 }
 
 
@@ -125,10 +129,10 @@ def detail_color(topic: TopicView) -> str:
     一行里两种颜色读起来像两句话。
     """
     if topic.issues:
-        return "#C62828"
+        return palette.ERROR
     if topic.status == "running":
-        return "#4A9EFF"
-    return "#8B949E"
+        return palette.ACCENT
+    return palette.TEXT_2
 
 
 def detail_text(topic: TopicView, open_now: bool) -> str:
@@ -180,23 +184,23 @@ class TopicHeader(Container):
     本来就不在画面上，这个按钮没有可作用的对象。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     TopicHeader {
         height: auto;
         padding: 0 2;
         margin: 1 0 0 0;
-        background: #000000;
+        background: $vsa-screen;
     }
     /* 挂在消息区那一层的行要自己补上助手消息的左内边距：消息里的行本来就在
        两列之后，两种挂法都从同一列开始，主题头才不会一深一浅。 */
     TopicHeader.-pane-row { margin-left: 2; }
     TopicHeader .topic-title { width: 1fr; height: auto; }
     TopicHeader .topic-detail { width: 1fr; height: auto; }
-    TopicHeader .topic-tools { width: 1fr; height: 1; color: #5A5A5A; }
-    TopicHeader .topic-tools:hover { color: #E0E0E0; }
+    TopicHeader .topic-tools { width: 1fr; height: 1; color: $vsa-text-3; }
+    TopicHeader .topic-tools:hover { color: $vsa-text-1; }
     TopicHeader .topic-detail.-hidden,
     TopicHeader .topic-tools.-hidden { display: none; }
-    """
+    """)
 
     def __init__(self, topic: TopicView, pane: MessagesPane) -> None:
         super().__init__()
@@ -243,17 +247,17 @@ class TopicHeader(Container):
         """第一行标题与计数。"""
         topic = self.topic
         line = Text()
-        line.append("▾ " if open_now else "▸ ", style="#5A5A5A")
-        line.append(f"{topic.index:02d} ", style="#4A9EFF")
+        line.append("▾ " if open_now else "▸ ", style=palette.TEXT_3)
+        line.append(f"{topic.index:02d} ", style=palette.ACCENT)
         line.append(short(topic.title, TITLE_LIMIT) or "新主题", style="bold")
         status = topic_state(topic)
         line.append(f"  {STATUS_MARK[status]} {STATUS_LABEL[status]}", style=STATUS_COLOR[status])
         if topic.steps:
-            line.append(f" · {len(topic.steps)} 步", style="#5A5A5A")
+            line.append(f" · {len(topic.steps)} 步", style=palette.TEXT_3)
         if topic.calls:
-            line.append(f" · {topic.calls} 次调用", style="#5A5A5A")
+            line.append(f" · {topic.calls} 次调用", style=palette.TEXT_3)
         if topic.artifacts:
-            line.append(f" · {len(topic.artifacts)} 个产物", style="#5A5A5A")
+            line.append(f" · {len(topic.artifacts)} 个产物", style=palette.TEXT_3)
         return line
 
     def detail_text(self, open_now: bool) -> str:
@@ -272,10 +276,10 @@ class TopicHeader(Container):
 class ArtifactChip(Static):
     """一个可点的产物名。"""
 
-    DEFAULT_CSS = """
-    ArtifactChip { width: auto; height: 1; color: #4A9EFF; margin-right: 2; }
-    ArtifactChip:hover { color: #E0E0E0; text-style: underline; }
-    """
+    DEFAULT_CSS = palette.css("""
+    ArtifactChip { width: auto; height: 1; color: $vsa-accent; margin-right: 2; }
+    ArtifactChip:hover { color: $vsa-text-1; text-style: underline; }
+    """)
 
     class Picked(TextualMessage):
         """用户点了某个产物。"""
@@ -299,7 +303,7 @@ class ArtifactRow(Horizontal):
     收起主题时它仍然在：收起的是过程，产物是结果，正是收起来之后最想看到的那一行。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     ArtifactRow {
         height: 1;
         padding: 0 2;
@@ -307,9 +311,9 @@ class ArtifactRow(Horizontal):
     }
     /* 与主题头同一套挂法：挂在消息区那一层时补上那两列。 */
     ArtifactRow.-pane-row { margin-left: 4; }
-    ArtifactRow .artifact-label { width: auto; height: 1; color: #5A5A5A; margin-right: 1; }
+    ArtifactRow .artifact-label { width: auto; height: 1; color: $vsa-text-3; margin-right: 1; }
     ArtifactRow.-hidden { display: none; }
-    """
+    """)
 
     def __init__(self, topic: TopicView) -> None:
         super().__init__()
@@ -350,16 +354,16 @@ class StepRow(Static):
     那一步在流水里也有一行。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     StepRow {
         height: 1;
         padding: 0 2;
         /* 比主题头深一级，比工具卡浅一级：缩进就是三层的关系。 */
         margin: 0 0 0 2;
-        color: #8B949E;
+        color: $vsa-text-2;
     }
     StepRow.-pane-row { margin-left: 4; }
-    """
+    """)
 
     def __init__(
         self, step: Step, seconds: float, pane: MessagesPane, status: str
@@ -381,11 +385,11 @@ class StepRow(Static):
     def render_step(self, open_now: bool) -> Text:
         step = self.step
         line = Text()
-        line.append("▾ " if open_now else "▸ ", style="#5A5A5A")
-        line.append(f"{step.seq:02d} ", style="#5A5A5A")
-        line.append(short(step.intent or "、".join(step.tools), LINE_LIMIT), style="#8B949E")
+        line.append("▾ " if open_now else "▸ ", style=palette.TEXT_3)
+        line.append(f"{step.seq:02d} ", style=palette.TEXT_3)
+        line.append(short(step.intent or "、".join(step.tools), LINE_LIMIT), style=palette.TEXT_2)
         if self.seconds:
-            line.append(f" · {format_seconds(self.seconds)}", style="#5A5A5A")
+            line.append(f" · {format_seconds(self.seconds)}", style=palette.TEXT_3)
         if self.status == "failed":
             line.append("  ✕ 失败", style=STATUS_COLOR["failed"])
         elif self.status in ("running", "waiting", "pending"):
@@ -393,7 +397,7 @@ class StepRow(Static):
             # 一行里再加「执行中」就是把同一件事说两遍。
             line.append(f"  {STATUS_MARK[self.status]}", style=STATUS_COLOR[self.status])
         else:
-            line.append("  ✓", style="#5A5A5A")
+            line.append("  ✓", style=palette.TEXT_3)
         return line
 
     def on_click(self, event: events.Click) -> None:

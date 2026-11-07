@@ -5,6 +5,8 @@ from textual.containers import Horizontal
 from textual.message import Message as TextualMessage
 from textual.widgets import Static
 
+from .. import palette
+
 # 右侧入口：标签与它要执行的命令名。顺序按使用频率排，帮助放最后。
 LINKS: tuple[tuple[str, str], ...] = (
     ("模型", "model"),
@@ -41,29 +43,29 @@ class TopBar(Horizontal):
     这一条撑成两行，而它提供的信息量不值两行。
     """
 
-    DEFAULT_CSS = """
+    DEFAULT_CSS = palette.css("""
     TopBar {
         width: 100%;
         height: 1;
-        background: #0A0A0A;
+        background: $vsa-rail;
     }
     TopBar .top-brand {
         width: 1fr;
         height: 1;
         padding: 0 1;
-        color: #E0E0E0;
+        color: $vsa-text-1;
         text-style: bold;
     }
     .top-link {
         width: auto;
         height: 1;
         padding: 0 1;
-        color: #8B949E;
+        color: $vsa-text-2;
     }
     .top-link:hover {
-        color: #4A9EFF;
+        color: $vsa-accent;
     }
-    """
+    """)
 
     def compose(self) -> ComposeResult:
         yield Static("VSAgent", classes="top-brand", markup=False)

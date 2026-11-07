@@ -108,8 +108,13 @@ class ScrollingTextArea(TextArea):
             self.app.cursor_position = self.cursor_screen_offset
 
 
-class PromptInput(ScrollingTextArea):
-    """输入框：焦点进出时不重画整块，滚动跟着光标走。"""
+class ComposerInput(ScrollingTextArea):
+    """多行输入框：焦点进出时不重画整块，滚动跟着光标走。
+
+    聊天界面与启动界面共用这一份。两处输入区的外观都不随焦点变化，焦点变化要
+    点亮的是输入区外面那条竖条，由外层容器处理 `DescendantFocus` / `DescendantBlur`
+    去加类，所以这几次不带区域的重画只是把整块输入区白白标成脏区域。
+    """
 
     def _on_focus(self, event: events.Focus) -> None:
         """获得焦点时不重画整块输入区。
@@ -127,21 +132,22 @@ class PromptInput(ScrollingTextArea):
     def _on_blur(self, event: events.Blur) -> None:
         """失去焦点时不重画整块输入区，理由同 `_on_focus`。
 
-        焦点从输入框挪到消息区是"点一下聊天界面"这条路上字节数的主要来源：
-        实测这一块整块重画占掉那一次点击 3587 字节里的绝大一部分。
+        在聊天界面里，焦点从输入框挪到消息区是"点一下聊天界面"这条路上字节数的
+        主要来源：实测这一块整块重画占掉那一次点击 3587 字节里的绝大一部分。
         """
         event.prevent_default()
         self.has_focus = False
         if self.parent is not None:
             self.parent.post_message(events.DescendantBlur(self))
 
-    def focus(self, scroll_visible: bool = True) -> PromptInput:
+    def focus(self, scroll_visible: bool = True) -> ComposerInput:
         """把焦点交给输入框，不先重画整块。
 
         `Widget.focus`（`widget.py:4596`）在排聚焦回调之前调一次不带区域的
         `self.refresh()`，把输入区整块标成脏区域；真正的焦点变化由排出的那个回调
-        完成，样式上没有任何东西依赖这一次提前重画。应用里所有"把焦点交给输入框"
-        都走这里：`EditorPane.on_mount` 与 `focus_input`。
+        完成，样式上没有任何东西依赖这一次提前重画。应用里所有把焦点交给输入框的
+        地方都走这里：两个界面的 `on_mount`、`EditorPane.focus_input`，以及首页点
+        「新建任务」与快捷模板之后。
         """
         self.screen.set_focus(self, scroll_visible=scroll_visible)
         return self
@@ -202,7 +208,7 @@ class EditorPane(Container):
                 # 换主题就换一个样子，在 gruvbox 下与底色混成同色、在 textual-dark 下亮出一档，
                 # 看着像那一行变灰。运行中改这个开关不会立刻生效：`render_line` 有一层行缓存，
                 # 键里不含这个字段，也没有清缓存的钩子。只能在构造时传。
-                yield PromptInput(id="editor-input", highlight_cursor_line=False)
+                yield ComposerInput(id="editor-input", highlight_cursor_line=False)
                 # 状态行只在输入框有焦点时出现：失焦时用户是在读消息，
                 # 「哪个 Agent、哪个模型」不当紧，占着那一行只是把消息区挤短。
                 with Horizontal(id="editor-status", classes="-hidden"):
@@ -270,9 +276,9 @@ class EditorPane(Container):
         return self.query_one("#editor-status", Horizontal)
 
     @property
-    def input(self) -> PromptInput:
+    def input(self) -> ComposerInput:
         """返回内部的多行输入框。"""
-        return self.query_one("#editor-input", PromptInput)
+        return self.query_one("#editor-input", ComposerInput)
 
     @property
     def text(self) -> str:

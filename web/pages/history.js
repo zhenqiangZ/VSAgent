@@ -111,6 +111,9 @@
   let stepOpen = new Set();
   // 左栏主题条下面挂着的步。与正文的展开状态彼此独立：左栏是导航，正文是阅读。
   const railOpen = new Set();
+  // 实时卡片里已经画过一次的步。按「会话 + 主题序号 + 步号」记：
+  // 步号在主题内从 1 起，不带主题序号的话下一个主题的第一步会被当成旧的。
+  const seenSteps = new Set();
   let activeTopic = "";
   let live = null;
   let liveTimer = null;
@@ -617,8 +620,11 @@
       }
       case "summary": {
         const details = el("details", "part part-reasoning part-summary");
+        details.open = true;
         details.appendChild(el("summary", "", "这一轮停在哪儿"));
-        details.appendChild(el("div", "reason-body", part.text || ""));
+        const body = el("div", "reason-body");
+        body.innerHTML = window.vsMarkdown.renderMarkdown(part.text || "");
+        details.appendChild(body);
         return details;
       }
       case "file": {
@@ -1222,6 +1228,66 @@
   // 运行中的主题
   // ------------------------------------------------------------------
 
+  // 这一步是不是第一次出现。实时卡片在步数变化时会整块重画，
+  // 不按步号去重的话，每两秒的重画会让整段一直在重播淡入。
+  function freshRow(row, seq) {
+    const key = `${activeId}:${live.topicIndex}:${seq}`;
+    if (!seenSteps.has(key)) {
+      seenSteps.add(key);
+      row.classList.add("is-new");
+    }
+    return row;
+  }
+
+  // 一行已完成的步。
+  function completedStepRow(step) {
+    const row = el("li", `step-row is-open${step.status === "failed" ? " is-failed" : ""}`);
+    const head = el("div", "step-head static");
+    head.appendChild(el("span", "step-no", String(step.seq).padStart(2, "0")));
+    head.appendChild(el("span", "step-intent", step.intent || "（没有记录）"));
+    head.appendChild(
+      el(
+        "span",
+        `step-status ${step.status === "failed" ? "is-failed" : "is-done"}`,
+        step.status === "failed" ? "失败" : "完成"
+      )
+    );
+    row.appendChild(head);
+    if (step.result) {
+      // 运行中的流水只给一行：整段结果在主题封存之后的主卡片里看。
+      row.appendChild(el("div", "step-result", oneLine(step.result, 100)));
+    }
+    return freshRow(row, step.seq);
+  }
+
+  // 流水行上写的那一句「这一步在干什么」。建行与刷新都走它，
+  // 两处各写一份的话，改了一处的措辞另一处还是旧的。
+  function currentLabel(current) {
+    if (current.phase === "waiting") return `等待确认：${current.tool}`;
+    if (current.phase === "tool") return `正在执行 ${current.tool}`;
+    return "模型正在生成";
+  }
+
+  function clockNode(seconds) {
+    const clock = el("span", "step-time", formatDuration(seconds));
+    clock.title = "从这一次调用开始到现在";
+    return clock;
+  }
+
+  // 一行正在进行的步。`seq` 由调用方给：这一步还没记进快照的 steps。
+  function currentStepRow(current, seq) {
+    const row = el("li", "step-row is-open is-current");
+    const head = el("div", "step-head static");
+    head.appendChild(el("span", "step-no", String(seq).padStart(2, "0")));
+    head.appendChild(el("span", "step-intent", currentLabel(current)));
+    const elapsed = live.updatedAt ? live.updatedAt - current.since : 0;
+    if (elapsed > 0) head.appendChild(clockNode(elapsed));
+    head.appendChild(el("span", "step-status is-running", "进行中"));
+    row.appendChild(head);
+    if (current.preview) row.appendChild(el("div", "step-result", current.preview));
+    return freshRow(row, seq);
+  }
+
   function liveCard() {
     // 运行中的这一块不折叠：它的内容就是「现在在做什么」，没有收起来的理由。
     const card = el("section", "topic-card is-live is-open");
@@ -1247,50 +1313,8 @@
 
     const body = el("div", "topic-body is-open");
     const list = el("ol", "step-list live-steps");
-    for (const step of live.steps) {
-      const row = el("li", `step-row is-open ${step.status === "failed" ? "is-failed" : ""}`);
-      const rowHead = el("div", "step-head static");
-      rowHead.appendChild(el("span", "step-no", String(step.seq).padStart(2, "0")));
-      rowHead.appendChild(el("span", "step-intent", step.intent || "（没有记录）"));
-      rowHead.appendChild(
-        el(
-          "span",
-          `step-status ${step.status === "failed" ? "is-failed" : "is-done"}`,
-          step.status === "failed" ? "失败" : "完成"
-        )
-      );
-      row.appendChild(rowHead);
-      if (step.result) {
-        // 运行中的流水只给一行：整段结果在主题封存之后的主卡片里看。
-        row.appendChild(el("div", "step-result", oneLine(step.result, 100)));
-      }
-      list.appendChild(row);
-    }
-    const current = live.current;
-    if (current) {
-      const row = el("li", "step-row is-open is-current");
-      const rowHead = el("div", "step-head static");
-      rowHead.appendChild(el("span", "step-no", String((live.steps.length || 0) + 1).padStart(2, "0")));
-      const label =
-        current.phase === "waiting"
-          ? `等待确认：${current.tool}`
-          : current.phase === "tool"
-            ? `正在执行 ${current.tool}`
-            : "模型正在生成";
-      rowHead.appendChild(el("span", "step-intent", label));
-      if (current.since && live.updatedAt) {
-        const elapsed = live.updatedAt - current.since;
-        if (elapsed > 0) {
-          const clock = el("span", "step-time", formatDuration(elapsed));
-          clock.title = "从这一次调用开始到现在";
-          rowHead.appendChild(clock);
-        }
-      }
-      rowHead.appendChild(el("span", "step-status is-running", "进行中"));
-      row.appendChild(rowHead);
-      if (current.preview) row.appendChild(el("div", "step-result", current.preview));
-      list.appendChild(row);
-    }
+    for (const step of live.steps) list.appendChild(completedStepRow(step));
+    if (live.current) list.appendChild(currentStepRow(live.current, live.steps.length + 1));
     body.appendChild(list);
     card.appendChild(body);
     updateLiveNow(card);
@@ -1346,6 +1370,60 @@
     }
   }
 
+  // 把「进行中」那一行改写成已完成的步。原地改而不是换一张卡：
+  // 状态色才有机会从蓝过渡到绿，滚动位置与悬停状态也不受影响。
+  function markStepDone(row, step) {
+    row.classList.remove("is-current");
+    row.classList.toggle("is-failed", step.status === "failed");
+    const head = row.querySelector(".step-head");
+    head.querySelector(".step-intent").textContent = step.intent || "（没有记录）";
+    const pill = head.querySelector(".step-status");
+    pill.className = `step-status ${step.status === "failed" ? "is-failed" : "is-done"}`;
+    pill.textContent = step.status === "failed" ? "失败" : "完成";
+    const clock = head.querySelector(".step-time");
+    if (clock) clock.remove();
+    let result = row.querySelector(".step-result");
+    if (step.result) {
+      if (!result) {
+        result = el("div", "step-result");
+        row.appendChild(result);
+      }
+      result.textContent = oneLine(step.result, 100);
+    } else if (result) {
+      result.remove();
+    }
+  }
+
+  // 当前步没变，只是它在做什么变了（模型生成 → 调工具 → 等确认）。
+  function refreshCurrentRow(row, current) {
+    const head = row.querySelector(".step-head");
+    const intent = head.querySelector(".step-intent");
+    const label = currentLabel(current);
+    if (intent.textContent !== label) intent.textContent = label;
+    // 时钟每次轮询重算：它写的是「从这一次调用开始到现在」。
+    const clock = head.querySelector(".step-time");
+    const elapsed = current.since && live.updatedAt ? live.updatedAt - current.since : 0;
+    if (elapsed > 0) {
+      if (clock) {
+        clock.textContent = formatDuration(elapsed);
+      } else {
+        head.insertBefore(clockNode(elapsed), head.querySelector(".step-status"));
+      }
+    } else if (clock) {
+      clock.remove();
+    }
+    let result = row.querySelector(".step-result");
+    if (current.preview) {
+      if (!result) {
+        result = el("div", "step-result");
+        row.appendChild(result);
+      }
+      result.textContent = current.preview;
+    } else if (result) {
+      result.remove();
+    }
+  }
+
   function updateLiveCard() {
     const card = root.querySelector('[data-live="1"]');
     if (!card) {
@@ -1365,15 +1443,33 @@
     const titleNode = card.querySelector(".topic-name");
     if (titleNode && live.title) titleNode.textContent = live.title;
     updateLiveNow(card);
+
     const list = card.querySelector(".live-steps");
     if (!list) return;
-    // 步数变了才重画流水；否则每两秒重建整段会让滚动位置抖动。
-    const rows = list.querySelectorAll(".step-row").length;
-    const expected = live.steps.length + (live.current ? 1 : 0);
-    if (rows !== expected) {
-      const fresh = liveCard();
-      card.replaceWith(fresh);
+    const currentRow = list.querySelector(".is-current");
+    const done = list.querySelectorAll(".step-row").length - (currentRow ? 1 : 0);
+    // 快照里的步只增不减；变少只可能是换了主题，这种情况整块重画。
+    if (done > live.steps.length) {
+      card.replaceWith(liveCard());
+      return;
     }
+    if (currentRow && done === live.steps.length - 1) {
+      markStepDone(currentRow, live.steps[done]);
+      if (live.current) list.appendChild(currentStepRow(live.current, live.steps.length + 1));
+      return;
+    }
+    if (done < live.steps.length) {
+      // 一次补了不止一步（页面被切走一段时间）：中间那几步的身份对不上，
+      // 整块重画更省事。
+      card.replaceWith(liveCard());
+      return;
+    }
+    if (!live.current) {
+      // 当前步已经结束：进行中的那一行不该再留。
+      if (currentRow) card.replaceWith(liveCard());
+      return;
+    }
+    if (currentRow) refreshCurrentRow(currentRow, live.current);
   }
 
   async function pollLive() {
@@ -1625,6 +1721,7 @@
     runOpen.clear();
     stepOpen.clear();
     railOpen.clear();
+    seenSteps.clear();
     live = null;
     activeTopic = "";
     startLive();

@@ -80,6 +80,7 @@ from .core.paths import Migration, migrate_legacy_config
 from .core.project_scan import merge_agents_md, scan_project
 from .core.session_manager import SessionManager
 from .env import load_env
+from .palette import CSS_VARIABLES
 from .screens.chat import ChatScreen
 from .screens.connection_form import ConnectionFormScreen
 from .screens.diff_overlay import DiffOverlayScreen
@@ -109,6 +110,15 @@ class VSAgentApp(App[None]):
     TOAST_SECONDS = 3.0
     # 关掉 Textual 自带的命令面板，改用本项目实现的 CommandPalette
     ENABLE_COMMAND_PALETTE = False
+
+    def get_css_variables(self) -> dict[str, str]:
+        """Textual 的样式变量，加上本项目调色板那一份。
+
+        `app.tcss` 里的 `$vsa-*` 从这里来，改配色只改 `palette.py`。widget 的
+        `DEFAULT_CSS` 走 `palette.css()`：Textual 的变量按样式表隔离，这一份到不了
+        那边。
+        """
+        return {**super().get_css_variables(), **CSS_VARIABLES}
 
     def __init__(
         self,

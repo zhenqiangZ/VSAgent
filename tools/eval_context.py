@@ -140,6 +140,7 @@ def build_at(
     prefix: str,
     specs: list[dict],
     memory: str,
+    profile: str = "",
 ):
     """把消息截到第 `index` 条，装配一次。
 
@@ -154,6 +155,7 @@ def build_at(
         prefix,
         tools=specs,
         memory_text=memory,
+        profile_text=profile,
         task_text=task_text,
     )
 
@@ -260,6 +262,7 @@ def measure_window(
     prefix: str,
     specs: list[dict],
     memory: str,
+    profile: str = "",
 ) -> dict:
     """在一份会话上跑某个窗口：逐条追加消息，量前缀命中与压缩次数。"""
     assembler = ContextAssembler(window)
@@ -274,7 +277,12 @@ def measure_window(
         sliced.task_state = session.task_state
         try:
             built = assembler.build(
-                sliced, prefix, tools=specs, memory_text=memory, task_text=task_text
+                sliced,
+                prefix,
+                tools=specs,
+                memory_text=memory,
+                profile_text=profile,
+                task_text=task_text,
             )
         except ContextAssemblyError:
             failed += 1
@@ -316,13 +324,14 @@ def sweep_table(
     windows: tuple[int, ...],
     label: str,
     families: tuple[str, ...] = (),
+    profile: str = "",
 ) -> int:
     """把若干窗口的结果排成一张表。"""
     budget = ContextAssembler(windows[0]).budget(specs)
     print(label)
     print(
         f"固定开销：稳定前缀 {estimate_tokens(prefix)}　工具定义 {budget.tools_tokens}"
-        f"　常驻记忆 {estimate_tokens(memory)}"
+        f"　常驻记忆 {estimate_tokens(memory) + estimate_tokens(profile)}"
     )
     print(
         "工具清单："
@@ -331,7 +340,7 @@ def sweep_table(
     print("窗口　　前缀命中　换占位步　丢过组　装不下　总输入")
     starred = False
     for window in windows:
-        result = measure_window(session, window, prefix, specs, memory)
+        result = measure_window(session, window, prefix, specs, memory, profile)
         rate = f"{result['rate'] * 100:>6.1f}%"
         if result["failed"]:
             # 有装不下的步时，命中率只覆盖装得下的那些，不能与其它行直接比。
@@ -745,7 +754,14 @@ def main() -> int:
         families = parse_families(args.families)
         specs = tool_specs(store, families)
         return sweep_table(
-            target, prefix, specs, store.resident_text(), windows, label, families
+            target,
+            prefix,
+            specs,
+            store.project_text(),
+            windows,
+            label,
+            families,
+            profile=store.profile_text(),
         )
 
     session = manager.get_session(args.session)
@@ -760,7 +776,8 @@ def main() -> int:
     store.load()
     families = parse_families(args.families)
     specs = tool_specs(store, families)
-    memory = store.resident_text()
+    memory = store.project_text()
+    profile = store.profile_text()
 
     budget = ContextAssembler(window).budget(specs)
     print(f"会话　{session.id}　{session.title or '（无标题）'}")
@@ -768,7 +785,7 @@ def main() -> int:
         f"窗口 {window}　消息 {len(session.messages)} 条"
         f"　可用 {budget.available}"
         f"　工具定义 {budget.tools_tokens}"
-        f"　常驻记忆 {len(memory)} 字符"
+        f"　常驻记忆 {len(memory) + len(profile)} 字符"
     )
     print("条数　装配　recent　evidence　history　移出　降级")
 
@@ -777,7 +794,7 @@ def main() -> int:
         if index % step and index != len(session.messages):
             continue
         try:
-            built = build_at(session, index, window, prefix, specs, memory)
+            built = build_at(session, index, window, prefix, specs, memory, profile)
         except ContextAssemblyError as error:
             print(f"{index:>5}　装不下：{error}")
             continue

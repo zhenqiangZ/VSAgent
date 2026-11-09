@@ -16,6 +16,7 @@ from .context import (
 )
 from .event_log import (TOPIC_SOFT_LIMIT, EventRuntime, event_boundary,
                         open_tokens, record_step, seal_range, seal_topic)
+from . import intent
 from .toolset import family_of, hidden_names, prune_families
 from .hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from .permission import PermissionDecision, PermissionPolicy, Verdict
@@ -44,8 +45,10 @@ CLOSING_STEPS = 3
 # `close_topic` 是模型判断，实测一条主题能走到 21 步（`evt_0009`），
 # 全靠它收不住。封存不花请求，封完原文让位、结论留下。
 TOPIC_STEP_LIMIT = 20
-# 收束阶段只放行这几个工具：写产物、收主题、记任务状态，外加回看原文。
-CLOSING_TOOLS = frozenset({"write_run", "close_topic", "task", "read_turn", "recall_event"})
+# 收束阶段只放行这几个工具：写产物、收主题、记任务状态，外加回看原文与历史。
+CLOSING_TOOLS = frozenset(
+    {"write_run", "close_topic", "task", "read_turn", "recall_event", "search_history"}
+)
 # Stop 钩子最多让一轮多走这么多次，单独计数，不吃 MAX_STEPS 的额度
 MAX_STOP_RETRIES = 2
 # 可以重试的错误最多重发这么多次
@@ -68,6 +71,10 @@ PERMISSION_TIMEOUT = 300.0
 # 熔断比「每步都试一次」好：摘要失败通常是接口或模型那一侧的问题，
 # 每一步重试一次只是在每一步都多等一个超时。
 MAX_SUMMARY_FAILURES = 3
+# 记忆排序时参考的当前路径条数：当前受体加最近几件产物。
+# 再多就会把「什么才算贴着当前任务」冲淡，而登记表里几十条产物的路径
+# 也装不进一次记忆检索的词表。
+CONTEXT_PATH_LIMIT = 6
 # 用环境变量覆盖步数上限时的名字
 MAX_STEPS_ENV = "VSA_MAX_STEPS"
 # 留着多少步的上下文度量。`/context` 只显示最近 10 步，留 40 步是为了
@@ -536,8 +543,18 @@ class AgentLoop:
         """
         return EventRuntime(session=session)
 
+    def _profile_text(self) -> str:
+        """用户习惯那一段；没装配记忆时是空串。
+
+        与项目情况分开取：习惯只在用户改口时变，装在系统提示之后，
+        一轮之内字节稳定；项目情况随问题变，装在工作区那头。
+        """
+        if self.memory is None:
+            return ""
+        return self.memory.profile_text()
+
     def _memory_text(self, session: Session) -> str:
-        """常驻注入的记忆正文；没装配记忆时是空串。
+        """项目情况那一段；没装配记忆时是空串。
 
         每次发问都现取一次：记忆可能在会话中途被 remember 改过，
         缓存一份的话要额外记得在哪里失效，不如现取。
@@ -547,16 +564,63 @@ class AgentLoop:
         """
         if self.memory is None:
             return ""
-        return self.memory.resident_text(query=self._memory_query(session))
+        return self.memory.project_text(
+            query=self._memory_query(session),
+            context_paths=self._context_paths(),
+        )
+
+    def _context_paths(self) -> list[str]:
+        """当前受体与最近几件产物的路径，用来判断一条记忆是不是贴着当前任务。
+
+        登记表没装配时给空表：这时所有条目按相关度与新旧排，
+        不会因为「当前路径取不到」把某一类全部压下去。
+        """
+        if self.ledger is None:
+            return []
+        items = list(self.ledger.entries())
+        paths: list[str] = []
+        current = self.ledger.current_receptor()
+        if current is not None:
+            for entry in items:
+                if entry.handle == current and entry.path is not None:
+                    paths.append(str(entry.path))
+                    break
+        for entry in reversed(items):
+            if entry.path is None:
+                continue
+            text = str(entry.path)
+            if text not in paths:
+                paths.append(text)
+            if len(paths) >= CONTEXT_PATH_LIMIT:
+                break
+        return paths
+
+    def _intent_text(self, session: Session) -> str:
+        """按最后一条用户消息给一行「可能在问哪几类来源」。
+
+        只在有命中时返回，且只点名来源、不点名工具：工具名写进提示等于在
+        提示里存一份工具清单，工具改名或调整分组之后就过期了。
+        """
+        hint = intent.detect(self._last_user_text(session))
+        text = intent.render(hint)
+        if text:
+            self.bus.publish(
+                "intent.hint",
+                {
+                    "session_id": session.id,
+                    "sources": list(hint.sources),
+                    "matched": list(hint.matched),
+                },
+            )
+        return text
 
     @staticmethod
-    def _memory_query(session: Session) -> str:
-        """检索词：最后一条用户消息 + 任务目标。
+    def _last_user_text(session: Session) -> str:
+        """最后一条用户消息里的文字；没有时是空串。
 
-        只看最后一条：更早的用户消息已经由 RECENT 或事件代表，
-        而记忆要回答的是「现在这件事需要知道什么」。
+        记忆检索与来源提示读的是同一段，共用一个函数：各写一份的话，
+        两边的「最后一条」迟早不是同一条。
         """
-        pieces: list[str] = []
         for message in reversed(session.messages):
             if message.role != "user":
                 continue
@@ -566,8 +630,20 @@ class AgentLoop:
                 if part.type is PartType.TEXT and part.text
             )
             if text.strip():
-                pieces.append(text.strip())
-                break
+                return text.strip()
+        return ""
+
+    @classmethod
+    def _memory_query(cls, session: Session) -> str:
+        """检索词：最后一条用户消息 + 任务目标。
+
+        只看最后一条：更早的用户消息已经由 RECENT 或事件代表，
+        而记忆要回答的是「现在这件事需要知道什么」。
+        """
+        pieces: list[str] = []
+        text = cls._last_user_text(session)
+        if text:
+            pieces.append(text)
         if session.task_state.goal:
             pieces.append(session.task_state.goal)
         return " ".join(pieces)
@@ -615,6 +691,7 @@ class AgentLoop:
         prefix: str,
         with_tools: bool = True,
         steps_left: int | None = None,
+        hint_text: str = "",
     ) -> ContextBundle:
         """按分层装配这一步发给模型的消息。
 
@@ -632,6 +709,8 @@ class AgentLoop:
             prefix,
             tools=self.tool_specs(session) if with_tools else [],
             memory_text=self._memory_text(session),
+            profile_text=self._profile_text(),
+            hint_text=hint_text,
             task_text=self._task_text(session),
             digest_text=self._digest_text(),
             env_text=self._env_text(),
@@ -655,6 +734,7 @@ class AgentLoop:
         正常收尾；其余取值表示这一轮是停下来的，调用方据此补一份收尾总结。
         """
         started = time.time()
+        hint_text = self._intent_text(session)
         step = 0
         tool_steps = 0
         stop_retries = 0
@@ -674,7 +754,7 @@ class AgentLoop:
             self._publish(message, Part(type=PartType.STEP_START, text=f"{step} · {self.config.model}"))
             prefix = stable_prefix(workspace, session)
             try:
-                context = self._assemble(session, prefix, steps_left=steps_left)
+                context = self._assemble(session, prefix, steps_left=steps_left, hint_text=hint_text)
             except ContextAssemblyError as error:
                 # 装不下就明说，不静默截断：模型在缺了材料的情况下继续往下做，
                 # 比停下来让用户知道「要腾地方」糟得多。
@@ -696,15 +776,15 @@ class AgentLoop:
                 if self._seal_range(session, kind="auto", upto=covered, force=True):
                     # 装不下是必须解决的约束：这一段的原文必须让位。
                     session.compact_upto = max(session.compact_upto, covered)
-                    context = self._assemble(session, prefix, steps_left=steps_left)
+                    context = self._assemble(session, prefix, steps_left=steps_left, hint_text=hint_text)
                 elif await self._summarize(session, message, context.dropped_upto):
-                    context = self._assemble(session, prefix, steps_left=steps_left)
+                    context = self._assemble(session, prefix, steps_left=steps_left, hint_text=hint_text)
             elif context.dropped_upto > 0:
                 # 判据是「上下文里有没有已经不在的内容」，不是「这一步新丢了没有」：
                 # 用户手动 /compact 推的边界不在当步产生新移出，但那一段同样要摘要；
                 # 已经收进摘要的会由 `_summarize` 自己判掉，只留一条界面记录。
                 if await self._summarize(session, message, context.dropped_upto):
-                    context = self._assemble(session, prefix, steps_left=steps_left)
+                    context = self._assemble(session, prefix, steps_left=steps_left, hint_text=hint_text)
             self._trace_context(session, context)
             before = dict(message.tokens)
             calls = await self._ask_model(
@@ -857,6 +937,11 @@ class AgentLoop:
         )
         if dropped:
             self.bus.publish("status.update", {"session_id": session.id})
+        # 抽取排在封存之后：五条封存路径都在这里汇合，不必各接一次。
+        # 开关默认关闭，没打开时这一行立即返回。
+        from ..memory import extractor as memory_extractor
+
+        memory_extractor.submit(event, self.memory, session_id=session.id)
         return event
 
     def _record_step(

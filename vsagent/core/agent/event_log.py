@@ -770,6 +770,7 @@ class RecallEventTool(Tool):
             "不带参数时列出全部主题；带 event 编号时给出该主题的流水、结论与原文。"
             "带 step 时只给那一步的原文（工具输出正文）。"
             "封存之后只有摘要留在上下文里，要核对参数或原始输出时用它。"
+            "默认读当前会话；session_id 指向别的会话，跨会话检索的命中行里带着它。"
             "默认不含思考过程，要当时的推演传 reasoning=true。"
             "原文按 offset / limit 分页，默认 120 行，每次最多 4000 token。"
         ),
@@ -777,6 +778,10 @@ class RecallEventTool(Tool):
             "type": "object",
             "properties": {
                 "event": {"type": "string", "description": "主题编号，例如 evt_0003"},
+                "session_id": {
+                    "type": "string",
+                    "description": "另一个会话的编号，例如 ses_0019；不带时读当前会话",
+                },
                 "step": {
                     "type": "integer",
                     "description": "只看这一步的原文；步号在流水里每行开头",
@@ -797,18 +802,38 @@ class RecallEventTool(Tool):
     )
     session_argument = "session"
 
+    def __init__(self, sessions: Any = None) -> None:
+        # 跨会话取回要按编号找会话，读的是 SessionManager 的内存表。
+        # 不传时只能读当前会话；带 session_id 的调用会明确报装配问题。
+        self.sessions = sessions
+
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """列清单、读一个主题，或读某一步。"""
         session = arguments.get("session")
+        wanted_session = str(arguments.get("session_id") or "").strip()
+        if wanted_session:
+            if self.sessions is None:
+                return ToolResult(
+                    output="读别的会话要会话管理器，这一份装配没有它。这是程序侧的问题，重试无用。",
+                    failed=True,
+                )
+            target = self.sessions.get_session(wanted_session)
+            if target is None:
+                return ToolResult(
+                    output=f"没有 {wanted_session} 这个会话。", failed=True
+                )
+            session = target
         events: list[Event] = list(session.events)
         if not events:
-            return ToolResult(output="这份会话还没有主题记录。")
+            where = f"{wanted_session} " if wanted_session else "这份会话"
+            return ToolResult(output=f"{where}还没有主题记录。")
         wanted = str(arguments.get("event") or "").strip()
         if not wanted:
             from .context import event_line
 
+            title = f"{wanted_session} 的主题：" if wanted_session else "本会话的主题："
             return ToolResult(
-                output="\n".join(["本会话的主题：", *(event_line(item) for item in events)])
+                output="\n".join([title, *(event_line(item) for item in events)])
             )
         event = next((item for item in events if item.id == wanted), None)
         if event is None:
@@ -839,10 +864,14 @@ class RecallEventTool(Tool):
         )
         return ToolResult(
             output=detail,
-            meta={"event": event.id, "cut": list(event.cut)},
+            meta={"event": event.id, "session": session.id, "cut": list(event.cut)},
         )
 
 
-def domain_tools() -> list[Tool]:
-    """内核事件工具，装配顺序：写在前、读在后。"""
-    return [CloseTopicTool(), RecallEventTool()]
+def domain_tools(sessions: Any = None) -> list[Tool]:
+    """内核事件工具，装配顺序：写在前、读在后。
+
+    `sessions` 是 `SessionManager`（只读用）：跨会话检索的命中行带着会话编号，
+    取回时靠它找到那个会话。不传时 `recall_event` 只读当前会话。
+    """
+    return [CloseTopicTool(), RecallEventTool(sessions)]

@@ -8,6 +8,8 @@
 | `index_web` | `VSA_CORPUS_INDEX_WEB=0/1` | 开 | `search_web` 的摘要自动入库 |
 | `embed` | `VSA_CORPUS_EMBED=0/1` | 开 | 语义通道（S3） |
 | 模型名 | `VSA_EMBED_MODEL` | 见 `embed.DEFAULT_MODEL` | 换模型触发整表重建 |
+| `rerank` | `VSA_RERANK=0/1` | 关 | 晚交互精排，打开前先跑对照 |
+| 精排模型 | `VSA_RERANK_MODEL` | 见 `DEFAULT_RERANK_MODEL` | 约 130MB，需显式下载 |
 
 环境变量优先，与 `env.py:load_env(override=False)` 同一条规则：真实环境变量压过文件。
 **每次调用现读**，改完立即生效；文件缺失或写坏按默认值跑，不报错——一个开关文件
@@ -28,9 +30,12 @@ from .paths import CONFIG_DIRECTORY
 __all__ = [
     "CORPUS_FILE",
     "DEFAULT_EMBED_MODEL",
+    "DEFAULT_RERANK_MODEL",
     "ENV_EMBED",
     "ENV_EMBED_MODEL",
     "ENV_INDEX_WEB",
+    "ENV_RERANK",
+    "ENV_RERANK_MODEL",
     "CorpusConfig",
     "config_path",
     "load",
@@ -41,15 +46,21 @@ CORPUS_FILE = "corpus.toml"
 ENV_INDEX_WEB = "VSA_CORPUS_INDEX_WEB"
 ENV_EMBED = "VSA_CORPUS_EMBED"
 ENV_EMBED_MODEL = "VSA_EMBED_MODEL"
+ENV_RERANK = "VSA_RERANK"
+ENV_RERANK_MODEL = "VSA_RERANK_MODEL"
+
+DEFAULT_RERANK_MODEL = "lightonai/mLateOn"
 
 
 @dataclass(frozen=True)
 class CorpusConfig:
-    """当前生效的三个值。`source` 只在报错/显示时用来说明从哪读到的。"""
+    """当前生效的五个值。`source` 只在报错/显示时用来说明从哪读到的。"""
 
     index_web: bool = True
     embed: bool = True
     embed_model: str = DEFAULT_EMBED_MODEL
+    rerank: bool = False
+    rerank_model: str = DEFAULT_RERANK_MODEL
     source: str = "默认值"
 
 
@@ -78,6 +89,10 @@ def load(root: Path | None = None) -> CorpusConfig:
     index_web = _flag(values.get("index_web"), default=True)
     embed = _flag(values.get("embed"), default=True)
     model = str(values.get("embed_model") or "").strip() or DEFAULT_EMBED_MODEL
+    rerank = _flag(values.get("rerank"), default=False)
+    rerank_model = (
+        str(values.get("rerank_model") or "").strip() or DEFAULT_RERANK_MODEL
+    )
 
     env_index = _flag(os.environ.get(ENV_INDEX_WEB), default=None)
     if env_index is not None:
@@ -91,8 +106,23 @@ def load(root: Path | None = None) -> CorpusConfig:
     if env_model:
         model = env_model
         source = ENV_EMBED_MODEL
+    env_rerank = _flag(os.environ.get(ENV_RERANK), default=None)
+    if env_rerank is not None:
+        rerank = env_rerank
+        source = ENV_RERANK
+    env_rerank_model = (os.environ.get(ENV_RERANK_MODEL) or "").strip()
+    if env_rerank_model:
+        rerank_model = env_rerank_model
+        source = ENV_RERANK_MODEL
 
-    return CorpusConfig(index_web=index_web, embed=embed, embed_model=model, source=source)
+    return CorpusConfig(
+        index_web=index_web,
+        embed=embed,
+        embed_model=model,
+        rerank=rerank,
+        rerank_model=rerank_model,
+        source=source,
+    )
 
 
 def _flag(value: object, *, default: bool | None) -> bool | None:

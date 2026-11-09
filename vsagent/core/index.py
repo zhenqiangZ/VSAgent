@@ -39,6 +39,7 @@ __all__ = [
     "open_readonly",
     "reindex",
     "rows_by_id",
+    "source_ids_of",
     "source_row",
     "stats",
     "upsert_source",
@@ -295,6 +296,7 @@ def lexical(
     *,
     limit: int = CHANNEL_LIMIT,
     only: tuple[str, ...] | None = None,
+    source_ids: tuple[str, ...] = (),
 ) -> dict[str, list[int]]:
     """两路词法召回的 chunk id（各自按相关度排序）。
 
@@ -302,10 +304,17 @@ def lexical(
     跑了也是空结果，白白多一次全表扫。
 
     `only` 给评测用：`("fts",)` 就是「词法单路」，与线上两路的结果分开量。
+    `source_ids` 非空时只在这几份源里召回，供网页按选中的语料检索。
     """
     expression = _fts_query(query)
     if not expression:
         return {}
+    clause = ""
+    extra: tuple[str, ...] = ()
+    if source_ids:
+        marks = ",".join("?" for _ in source_ids)
+        clause = f" AND rowid IN (SELECT id FROM chunks WHERE source_id IN ({marks}))"
+        extra = tuple(source_ids)
     found: dict[str, list[int]] = {}
     for name, table in (("fts", "chunks_fts"), ("cjk", "chunks_cjk")):
         if only is not None and name not in only:
@@ -314,9 +323,9 @@ def lexical(
             continue
         try:
             rows = conn.execute(
-                f"SELECT rowid FROM {table} WHERE {table} MATCH ? "
+                f"SELECT rowid FROM {table} WHERE {table} MATCH ?{clause} "
                 f"ORDER BY bm25({table}) LIMIT ?",
-                (expression, limit),
+                (expression, *extra, limit),
             ).fetchall()
         except sqlite3.OperationalError:
             # 语法被拒（极少数构造）时这一路不参与，另一路照跑——不能整次检索失败。
@@ -342,6 +351,17 @@ def rows_by_id(conn: sqlite3.Connection, ids: list[int]) -> dict[int, sqlite3.Ro
         list(ids),
     ).fetchall()
     return {int(row["id"]): row for row in rows}
+
+
+def source_ids_of(conn: sqlite3.Connection, ids: list[int]) -> dict[int, str]:
+    """块 id → 源 id。语义那一路要先取回再按源筛，筛的时候只需要这两个字段。"""
+    if not ids:
+        return {}
+    marks = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, source_id FROM chunks WHERE id IN ({marks})", list(ids)
+    ).fetchall()
+    return {int(row["id"]): str(row["source_id"]) for row in rows}
 
 
 def neighbors(conn: sqlite3.Connection, row: sqlite3.Row, *, span: int = 1) -> list[sqlite3.Row]:

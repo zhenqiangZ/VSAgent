@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 from . import index
+from .onnx_gpu import providers as execution_providers
 from .paths import config_home
 
 __all__ = [
@@ -50,11 +51,13 @@ __all__ = [
     "download_hint",
     "encode_passages",
     "encode_query",
+    "FastEmbedProvider",
     "index_missing",
     "index_source",
     "min_score",
     "missing_reason",
     "models_dir",
+    "provider",
     "purge_other_models",
     "search",
 ]
@@ -165,7 +168,10 @@ def _encoder(model: str):
     # `local_files_only=True`：这里只负责**加载**。缺文件时宁可报错，也不能在
     # 一次检索里顺手拉 220MB——那会让一次查询卡住几分钟，用户还以为程序死了。
     encoder = TextEmbedding(
-        model_name=model, cache_dir=str(models_dir()), local_files_only=True
+        model_name=model,
+        cache_dir=str(models_dir()),
+        providers=execution_providers(),
+        local_files_only=True,
     )
     _CACHE[model] = encoder
     return encoder
@@ -182,16 +188,41 @@ def _prefixes(model: str) -> tuple[str, str]:
     return "", ""
 
 
+class FastEmbedProvider:
+    """本地的 ONNX 嵌入。
+
+    `name` 只用于显示与日志；向量表的 `model` 列仍然写原始模型名。
+    加 `local/` 前缀会让已有的 783 个块全部失效，而当前只有一个实现，
+    这个前缀没有任何读者，先把接口留在这里。
+    """
+
+    name = "local"
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+    def embed_query(self, text: str) -> list[float]:
+        prefix, _ = _prefixes(self.model)
+        return _encode([prefix + text[:MAX_QUERY_CHARS]], self.model)[0]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        _, prefix = _prefixes(self.model)
+        return _encode([prefix + text for text in texts], self.model)
+
+
+def provider(model: str) -> FastEmbedProvider:
+    """取一个嵌入实现。现在只有本地这一种，接口留给以后换实现。"""
+    return FastEmbedProvider(model)
+
+
 def encode_query(text: str, model: str) -> list[float]:
     """把查询编成一个归一化向量。"""
-    prefix, _ = _prefixes(model)
-    return _encode([prefix + text[:MAX_QUERY_CHARS]], model)[0]
+    return provider(model).embed_query(text)
 
 
 def encode_passages(texts: list[str], model: str) -> list[list[float]]:
     """把一批文档编成归一化向量。"""
-    _, prefix = _prefixes(model)
-    return _encode([prefix + text for text in texts], model)
+    return provider(model).embed_documents(texts)
 
 
 def _encode(texts: list[str], model: str) -> list[list[float]]:
@@ -443,7 +474,7 @@ def _snapshot(endpoint: str, model: str) -> bool:
         "import sys\n"
         "from huggingface_hub import snapshot_download\n"
         "snapshot_download(sys.argv[1], cache_dir=sys.argv[2],\n"
-        "                  allow_patterns=['*.onnx', '*.json', '*.txt', '*.model'])\n"
+        "                  allow_patterns=['*.onnx', '*.onnx_data', '*.json', '*.txt', '*.model'])\n"
     )
     print(f"  从 {endpoint} 取 …")
     try:
@@ -486,7 +517,10 @@ def download(model: str = DEFAULT_MODEL) -> int:
     try:
         # 用**离线加载**验一遍：文件不全时这里会当场失败，而不是等到第一次检索。
         encoder = TextEmbedding(
-            model_name=model, cache_dir=str(models_dir()), local_files_only=True
+            model_name=model,
+            cache_dir=str(models_dir()),
+            providers=execution_providers(),
+            local_files_only=True,
         )
     except Exception as error:  # noqa: BLE001 - 下载失败要说人话，不能甩一段栈
         print(f"下载完成但加载失败（{type(error).__name__}: {error}）")

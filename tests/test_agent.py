@@ -59,15 +59,23 @@ from vsagent.core.agent.permission import (  # noqa: E402
     save_disabled,
 )
 from vsagent.core.agent.memory import (  # noqa: E402
+    MAX_ENTRIES,
+    MAX_PREFERENCES,
     MEMORY_DIR_NAME,
     RESIDENT_LIMIT,
+    SUPERSEDE_OVERLAP,
+    MemoryEntry,
     MemoryError,
     MemoryKind,
     MemoryStore,
     RecallTool,
     RememberTool,
     memory_root,
+    overlap,
 )
+from vsagent.core.agent.history import SearchHistoryTool  # noqa: E402
+from vsagent.core.agent import intent as intent_rules  # noqa: E402
+from vsagent.core.agent.intent import HINT_LIMIT, IntentHint  # noqa: E402
 from vsagent.core.agent.context import (  # noqa: E402
     CONTEXT_RATIO,
     DEGRADE_ORDER,
@@ -134,6 +142,7 @@ from vsagent.core.agent.prompt import (  # noqa: E402
     MEMORY_NOTICE,
     MODEL_OUTPUT_LIMIT,
     OMISSION_MARK,
+    PROFILE_NOTICE,
     REASONING_PLACEHOLDER,
     RULES_DIR_ENV,
     SUMMARY_INSTRUCTION,
@@ -15583,6 +15592,159 @@ async def check_websearch() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+async def check_knowledge_store() -> None:
+    """knowledge 包：融合、聚组、检索结果形状、源被删之后的退化。"""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from vsagent.core import chunker as chunker_module
+    from vsagent.core import corpus as corpus_module
+    from vsagent.core import corpus_config as corpus_config_module
+    from vsagent.core import index as index_module
+    from vsagent.core import knowledge
+
+    root = _Path(tempfile.mkdtemp(prefix="vsa-knowledge-"))
+    store = root / "corpus"
+    original_root = corpus_module.corpus_root
+    original_config = corpus_config_module.load
+    corpus_module.corpus_root = lambda: store
+    corpus_config_module.load = lambda _root=None: corpus_config_module.CorpusConfig(
+        index_web=False, embed=False
+    )
+    try:
+        # ---- 一、RRF：一路第一是 1/(k+1)，两路都命中的相加 ----
+        fused = knowledge.fuse({"a": [7, 8], "b": [8, 9]})
+        check(abs(fused[7] - 1 / 61) < 1e-12, "一路第一名的分是 1/(k+1)")
+        check(abs(fused[8] - (1 / 62 + 1 / 61)) < 1e-12, "两路都命中的分相加")
+
+        # ---- 二、检索：引用号、章节、页码、诊断读数 ----
+        source_id = "doc:0123456789"
+        directory = store / "doc" / "0123456789"
+        directory.mkdir(parents=True, exist_ok=True)
+        chunks = [
+            chunker_module.Chunk("方法 / 对接", 2, 3, 3, 1, "我们用 4HJO 做对接，盒子 22A。"),
+            chunker_module.Chunk("方法 / 对接", 2, 3, 3, 2, "IC50 由四参数模型拟合。"),
+            chunker_module.Chunk("结果", 1, 5, 5, 3, "命中三个化合物。"),
+        ]
+        conn = index_module.connect()
+        try:
+            index_module.upsert_source(
+                conn, index_module.source_row(source_id, "doc", directory, {}), chunks
+            )
+        finally:
+            conn.close()
+
+        result = knowledge.search(knowledge.KnowledgeQuery(text="4HJO", limit=5))
+        check(len(result.hits) == 1, f"同一节聚成一组：{len(result.hits)}")
+        check(result.groups == 1, "组数与命中组一致")
+        check(result.channels.get("fts", 0) >= 1, "词法那一路跑过")
+        hit = result.hits[0]
+        check(hit.id.startswith("doc#0123456789"), f"引用号带源号：{hit.id}")
+        check("§对接" in hit.id, f"引用号带章节：{hit.id}")
+        check("p.3" in hit.id, f"引用号带页码：{hit.id}")
+        check(hit.source_id == source_id and hit.kind == "doc", "命中带源与类型")
+        check("4HJO" in hit.text, "命中正文里有关键词")
+        check(isinstance(hit.score, float) and hit.score > 0, "分数是正的浮点")
+
+        empty = None
+        try:
+            knowledge.search(knowledge.KnowledgeQuery(text="   "))
+        except ValueError as error:
+            empty = str(error)
+        check(empty is not None, "空检索词直接抛出")
+
+        unknown = None
+        try:
+            knowledge.search(knowledge.KnowledgeQuery(text="4HJO", scope="memory"))
+        except ValueError as error:
+            unknown = str(error)
+        check(unknown is not None and "memory" in unknown, "未接线的范围直接抛出")
+
+        # ---- 三、源被删：索引里还有块，检索结果应当为空并标明原因 ----
+        shutil.rmtree(directory)
+        gone = knowledge.search(knowledge.KnowledgeQuery(text="4HJO"))
+        check(gone.hits == [] and gone.reason == "stale", f"源删掉之后标 stale：{gone.reason}")
+        check(gone.hits_total >= 1, "底层命中数仍然报出来")
+    finally:
+        corpus_module.corpus_root = original_root
+        corpus_config_module.load = original_config
+        shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_rerank_order() -> None:
+    """精排：位次参与聚组排序，候选集不变，诊断读数如实。"""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from vsagent.core import chunker as chunker_module
+    from vsagent.core import corpus as corpus_module
+    from vsagent.core import corpus_config as corpus_config_module
+    from vsagent.core import index as index_module
+    from vsagent.core import knowledge
+    from vsagent.core.knowledge import providers
+
+    root = _Path(tempfile.mkdtemp(prefix="vsa-rerank-"))
+    store = root / "corpus"
+    original_root = corpus_module.corpus_root
+    original_config = corpus_config_module.load
+    original_rerank = providers.rerank
+    corpus_module.corpus_root = lambda: store
+    try:
+        def build(rerank: bool):
+            return corpus_config_module.CorpusConfig(
+                index_web=False, embed=False, rerank=rerank
+            )
+
+        corpus_config_module.load = lambda _root=None: build(False)
+        chunks = []
+        for serial, (source_id, text) in enumerate(
+            (("doc:aaaaaaaaaa", "apple banana cherry"), ("doc:bbbbbbbbbb", "apple dragonfruit"))
+        ):
+            directory = store / "doc" / source_id.split(":", 1)[1]
+            directory.mkdir(parents=True, exist_ok=True)
+            chunks.append(
+                chunker_module.Chunk("正文", 1, 1, 1, 1, text),
+            )
+            conn = index_module.connect()
+            try:
+                index_module.upsert_source(
+                    conn,
+                    index_module.source_row(
+                        source_id, "doc", directory, {"title": f"文档 {serial}"}
+                    ),
+                    [chunks[-1]],
+                )
+            finally:
+                conn.close()
+
+        before = knowledge.search(knowledge.KnowledgeQuery(text="apple", limit=5))
+        check(len(before.hits) == 2, f"两组都命中：{len(before.hits)}")
+        check(not before.rerank, "没开精排时不标记")
+
+        def reverse(query, texts, *, top_n, model=None):
+            count = len(texts)
+            return [(index, float(index + 1)) for index in reversed(range(count))][:top_n]
+
+        providers.rerank = reverse
+        corpus_config_module.load = lambda _root=None: build(True)
+        after = knowledge.search(knowledge.KnowledgeQuery(text="apple", limit=5))
+        check(after.rerank, "开了精排之后如实标记")
+        check(
+            after.hits[0].id != before.hits[0].id,
+            f"精排把第一组换掉了：{before.hits[0].id} → {after.hits[0].id}",
+        )
+        check(
+            {hit.id for hit in after.hits} == {hit.id for hit in before.hits},
+            "候选集不变，只换顺序",
+        )
+        check(after.hits[0].score > 0, "分数仍然是 RRF 分，不是精排原分")
+    finally:
+        corpus_module.corpus_root = original_root
+        corpus_config_module.load = original_config
+        providers.rerank = original_rerank
+        shutil.rmtree(root, ignore_errors=True)
+
+
 async def check_corpus() -> None:
     """语料链：解析 → 结构切分 → 双词法索引 → 三个工具，以及「重建两次一致」。"""
     import re as _re
@@ -18325,7 +18487,7 @@ async def check_memory() -> None:
     text = fresh.resident_text()
     check("受体来自 P00533" in text, "有引用的事实进常驻正文")
     check(
-        text.splitlines()[0].startswith("- 受体来自 P00533"),
+        text.splitlines()[0].startswith("- [事实] 受体来自 P00533"),
         f"有引用的排在前面：{text.splitlines()[0]!r}",
     )
     check(fresh.resident_text(limit=1) == "", "额度只够一行的一小截时，宁可什么都不装")
@@ -18406,6 +18568,51 @@ async def check_memory_supersede() -> None:
     check(other.is_live() and newer.is_live(), "同一引用上的不同事实共存")
     check(len(store.recall("")) == 2, "两条互不相干的事实都在")
 
+    # 三条互不相干的事实共用一个引用：带更新词的新条目只让最相近的一条失效。
+    pocket = store.remember("口袋中心在 12,8,20", refs=["receptor.pdb"])
+    library = store.remember("配体库在 lib.sdf", refs=["receptor.pdb"])
+    pocket_v2 = store.remember("口袋中心改为 14,8,22", refs=["receptor.pdb"])
+    check(not pocket.is_live(), "更新词只让最相近的那条失效")
+    check(library.is_live() and newer.is_live(), "同引用上的其他事实不受牵连")
+    check(pocket_v2.supersedes == [pocket.id], "取代条数是一")
+    check(
+        pocket.superseded_rule.startswith("overlap:"),
+        f"审计字段记下判据：{pocket.superseded_rule}",
+    )
+    check(
+        overlap("口袋中心改为 14,8,22", "配体库在 lib.sdf") < SUPERSEDE_OVERLAP,
+        "重合度低于下限时不取代",
+    )
+    check(
+        overlap("口袋中心改为 14,8,22", "口袋中心在 12,8,20") >= SUPERSEDE_OVERLAP,
+        "同一件事重合度过线",
+    )
+    bare_targets, bare_rule = store._supersede_targets(
+        "受体改为别的文件", [], None, time.time()
+    )
+    check(bare_targets == [] and bare_rule == "", "没有引用时隐式取代不成立")
+
+    # 隐式取代只对事实生效：经验说的是「某个条件下会怎样」，
+    # 文字相近、共用引用、带更新词，都不足以说明旧的那条不再成立。
+    exp_old = store.remember(
+        "用 AD4 力场对接前要先算亲和力图",
+        kind=MemoryKind.EXPERIENCE,
+        refs=["receptor.pdb"],
+    )
+    exp_new = store.remember(
+        "用 AD4 力场对接改为先算亲和力图",
+        kind=MemoryKind.EXPERIENCE,
+        refs=["receptor.pdb"],
+    )
+    check(exp_old.is_live() and exp_new.is_live(), "经验不会被隐式取代")
+    exp_v2 = store.remember(
+        "AD4 改为走 vina 的 ad4 力场",
+        kind=MemoryKind.EXPERIENCE,
+        refs=["receptor.pdb"],
+        supersedes=[exp_new.id],
+    )
+    check(not exp_new.is_live() and exp_new.superseded_by == exp_v2.id, "经验仍可显式取代")
+
     # 显式 supersede：模型自己判断哪条旧了。
     manual = store.remember(
         "配体库换成 ligandset_v2.sdf", refs=["receptor.pdb"], supersedes=[other.id]
@@ -18431,13 +18638,17 @@ async def check_memory_supersede() -> None:
         store.remember("长" * 600)
     except MemoryError as error:
         too_long = str(error)
-    check(too_long is not None and "拆" in too_long, f"超长条目被拒并给出做法：{too_long}")
+    check(too_long is not None and "分成" in too_long, f"超长条目被拒并给出做法：{too_long}")
 
     # 失效的条目写盘后还能读回来，字段不丢。
     revived = MemoryStore(root)
     revived.load()
     check(revived.entries[first.id].superseded_by == newer.id, "失效关系随盘保留")
     check(revived.entries[first.id].valid_to > 0, "valid_to 也留着")
+    check(
+        revived.entries[first.id].superseded_rule.startswith("overlap:"),
+        "取代判据随盘保留",
+    )
     check(revived.entries[user_entry.id].unverified, "unverified 随盘保留")
     check(len(revived.all_entries(include_revoked=True)) == len(revived.entries), "--all 能看全部")
     check(
@@ -18471,7 +18682,7 @@ async def check_memory_resident() -> None:
     text = store.resident_text(query="配体库有多少个分子")
     check(estimate_tokens(text) <= RESIDENT_LIMIT, f"常驻正文不超过上限：{estimate_tokens(text)}")
     check("ligandset_v3" in text, "与问题相关的那条被选进常驻")
-    check(text.splitlines()[0].startswith("- 配体库"), "相关的那条排在最前")
+    check(text.splitlines()[0].startswith("- [事实] 配体库"), "相关的那条排在最前")
     check(len(text.splitlines()) < 20, f"不是把全部条目都塞进去：{len(text.splitlines())} 条")
 
     rest = [entry for entry in store.recall("", limit=100) if entry.id != target.id]
@@ -18489,6 +18700,618 @@ async def check_memory_resident() -> None:
     picked = store.recall("关键参数 盒子", limit=5)
     check(picked and picked[0].id == verified.id, "有凭据的排在口述前面")
     check(any(entry.id == guessed.id for entry in picked), "口述的仍然召得回来")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_memory_kind() -> None:
+    """三类记忆：习惯不要求引用、恒常驻、不进相关度；经验分数更低。"""
+    root = PROBE / "memory_kind"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    receptor = root / "receptor.pdb"
+    receptor.write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    store = MemoryStore(root)
+
+    pref = store.remember(
+        "回答先给结论，再解释推理", kind=MemoryKind.PREFERENCE, source="user"
+    )
+    check(not pref.refs, "习惯不要求引用")
+    text = store.resident_text()
+    check("[习惯]" in text, f"习惯进了常驻：{text!r}")
+    check(text.splitlines()[0].startswith("- [习惯]"), "习惯排在最前")
+
+    for index in range(20):
+        store.remember(
+            f"第 {index} 条项目事实：中间记录很多，用来把常驻额度占满" + "细" * 40,
+            refs=["receptor.pdb"],
+        )
+    filled = store.resident_text(query="配体库有多少个分子")
+    check(estimate_tokens(filled) <= RESIDENT_LIMIT, "习惯与事实合计仍守上限")
+    check("[习惯]" in filled, "额度占满后习惯仍在常驻")
+
+    hits = store.recall("结论")
+    check(
+        all(entry.kind is not MemoryKind.PREFERENCE for entry in hits),
+        "关键词检索不返回习惯",
+    )
+    prefs = store.recall(kind=MemoryKind.PREFERENCE)
+    check([entry.id for entry in prefs] == [pref.id], "按类型能取到习惯")
+
+    fact_same = store.remember("回答先给结论，再解释推理")
+    check(fact_same.id != pref.id, "同一句文字可以作为事实与习惯各存一条")
+
+    wrong = None
+    try:
+        store.remember("新的说法", kind=MemoryKind.FACT, supersedes=[pref.id])
+    except MemoryError as error:
+        wrong = str(error)
+    check(wrong is not None and "类型" in wrong, f"跨类型取代被拒：{wrong}")
+
+    for index in range(MAX_PREFERENCES - 1):
+        store.remember(
+            f"习惯 {index}：先看数据再给判断",
+            kind=MemoryKind.PREFERENCE,
+            source="user",
+        )
+    rejected = None
+    try:
+        store.remember(
+            "第九条习惯：另一条长期做法", kind=MemoryKind.PREFERENCE, source="user"
+        )
+    except MemoryError as error:
+        rejected = str(error)
+    check(rejected is not None and "forget" in rejected, f"第 9 条习惯被拒：{rejected}")
+
+    now = time.time()
+    fact_entry = store.remember("盒子超过 30A 时对接分数更差", refs=["receptor.pdb"])
+    exp_entry = store.remember(
+        "盒子超过 30A 时对接分数更差（经验）",
+        kind=MemoryKind.EXPERIENCE,
+        refs=["receptor.pdb"],
+    )
+    check(
+        store._score(exp_entry, ["盒子"], now) < store._score(fact_entry, ["盒子"], now),
+        "同一关键词命中时经验分数更低",
+    )
+    check("[经验]" in store.render_line(exp_entry), "经验在渲染里带标记")
+    check("[习惯]" in store.render_line(pref), "习惯在渲染里带标记")
+    check("[事实]" in store.render_line(fact_entry), "事实在渲染里带标记")
+    check("[习惯]" not in store.render_line(fact_entry), "事实不带习惯标记")
+
+    low = MemoryEntry(id="mem_low", text="盒子 22A", confidence=0.5, updated_at=now)
+    high = MemoryEntry(id="mem_high", text="盒子 22A", confidence=1.0, updated_at=now)
+    ratio = store._score(low, ["盒子"], now) / store._score(high, ["盒子"], now)
+    check(abs(ratio - 0.75) < 1e-9, f"可信度直接进分数：0.5 是 1.0 的 {ratio:.2f} 倍")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_memory_vectors() -> None:
+    """记忆向量：指纹对账、同义召回、词法答不出时语义接住。"""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from vsagent.core import embed as embed_module
+    from vsagent.core.memory import vectors
+
+    root = _Path(tempfile.mkdtemp(prefix="vsa-memvec-"))
+    store = MemoryStore(root)
+
+    def vector(text: str) -> list[float]:
+        import math
+
+        raw = [0.0, 0.0, 0.0]
+        if "残基" in text or "氨基酸" in text:
+            raw[0] = 1.0
+        if "盒子" in text:
+            raw[1] = 1.0
+        if "配体" in text:
+            raw[2] = 1.0
+        norm = math.sqrt(sum(value * value for value in raw)) or 1.0
+        return [value / norm for value in raw]
+
+    original_passages = embed_module.encode_passages
+    original_query = embed_module.encode_query
+    original_score = embed_module.min_score
+    embed_module.encode_passages = lambda texts, _model: [vector(text) for text in texts]
+    embed_module.encode_query = lambda text, _model: vector(text)
+    embed_module.min_score = lambda: 0.3
+    try:
+        store.remember("人源表皮生长因子受体的一级结构长度是 1210 个氨基酸。", source="user")
+        store.remember("对接盒子的中心取配体几何中心。", source="user")
+        store.remember("配体库共五千个分子。", source="user")
+
+        conn = vectors.connect(store.root)
+        try:
+            before = conn.execute("SELECT COUNT(*) FROM memory_vectors").fetchone()[0]
+        finally:
+            conn.close()
+        check(before == 0, "还没检索时一条向量都不写")
+
+        plain = store.recall("有多少个残基")
+        check(plain == [], "纯词法答不出同义改写")
+
+        hits = store.recall("有多少个残基", model="fake/model")
+        check(bool(hits) and "氨基酸" in hits[0].text, f"语义接住了同义问法：{hits[:1]}")
+
+        conn = vectors.connect(store.root)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM memory_vectors").fetchone()[0]
+        finally:
+            conn.close()
+        check(count == 3, f"三条都补了向量：{count}")
+
+        store.recall("有多少个残基", model="fake/model")
+        conn = vectors.connect(store.root)
+        try:
+            again = conn.execute(
+                "SELECT COUNT(*) FROM memory_vectors WHERE model = 'fake/model'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        check(again == 3, "内容没变时一条都不重算")
+
+        entry = next(item for item in store.entries.values() if "氨基酸" in item.text)
+        entry.text = "人源表皮生长因子受体的一级结构长度是 1210 个残基。"
+        store.save()
+        conn = vectors.connect(store.root)
+        try:
+            digest_before = conn.execute(
+                "SELECT text_hash FROM memory_vectors WHERE memory_id = ?", (entry.id,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        store.semantic_scores("有多少个残基", "fake/model")
+        conn = vectors.connect(store.root)
+        try:
+            digest_after = conn.execute(
+                "SELECT text_hash FROM memory_vectors WHERE memory_id = ?", (entry.id,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        check(digest_before != digest_after, "正文改过的那条重算了向量")
+    finally:
+        embed_module.encode_passages = original_passages
+        embed_module.encode_query = original_query
+        embed_module.min_score = original_score
+        shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_history_search() -> None:
+    """历史检索：标题、结论、产物、流水都能查到；没有命中与空会话各有说明。"""
+    session = Session(id="ses_history")
+    session.events = [
+        Event(
+            id="evt_0001",
+            topic_index=1,
+            title="准备受体",
+            summary="拿到 4HJO 的 A 链，产物 receptor#1",
+            steps=[Step(seq=1, intent="取结构 4HJO", result="成功，receptor#1")],
+            step_start=1,
+            step_end=3,
+        ),
+        Event(
+            id="evt_0002",
+            topic_index=2,
+            title="定口袋",
+            summary="口袋中心 12,8,20，产物 pocket#1",
+            steps=[Step(seq=1, intent="检测口袋", result="找到 3 个口袋")],
+            step_start=3,
+            step_end=6,
+        ),
+        Event(
+            id="evt_0003",
+            topic_index=3,
+            title="准备配体库",
+            summary="ETKDGv3 生成三维构象",
+            steps=[Step(seq=1, intent="准备配体", result="成功，ligandset#2")],
+            step_start=6,
+            step_end=9,
+        ),
+    ]
+    tool = SearchHistoryTool()
+    by_title = await tool.run({"session": session, "query": "口袋"})
+    check("evt_0002" in by_title.output, f"标题命中：{by_title.output}")
+    check("evt_0001" not in by_title.output, "不相关的主题不出现")
+    check(by_title.meta["events"] == ["evt_0002"], "meta 给出命中的主题编号")
+
+    by_artifact = await tool.run({"session": session, "query": "ligandset"})
+    check("evt_0003" in by_artifact.output, "产物名也能查到")
+
+    by_result = await tool.run({"session": session, "query": "ETKDGv3"})
+    check("evt_0003" in by_result.output, "结论里的词也能查到")
+
+    limited = await tool.run({"session": session, "query": "准备", "limit": 1})
+    check(
+        sum(1 for line in limited.output.splitlines() if line.startswith("evt_")) == 1,
+        f"limit 生效：{limited.output}",
+    )
+
+    missing = await tool.run({"session": session, "query": "冷冻电镜"})
+    check(not missing.failed and missing.output.startswith("没有与"), f"没有命中时明说：{missing.output}")
+
+    empty = await tool.run({"session": Session(id="ses_empty"), "query": "口袋"})
+    check("还没有封存过主题" in empty.output, "空会话给出说明")
+
+    blank = await tool.run({"session": session, "query": "  "})
+    check(blank.failed, "空查询直接拒绝")
+
+    # 跨会话：同一个词在别的会话里也能查到，命中行带会话编号；子 agent 不查。
+    other = Session(id="ses_other", title="EGFR 抑制剂筛选", updated_at=2.0)
+    other.events = [
+        Event(
+            id="evt_0001",
+            topic_index=1,
+            title="结合位点比对",
+            summary="口袋残基里有 L858R",
+            step_start=1,
+            step_end=4,
+        )
+    ]
+    child = Session(id="ses_child", title="子任务", parent_id="ses_other", updated_at=3.0)
+    child.events = [
+        Event(id="evt_0001", topic_index=1, title="口袋复查", summary="子会话里的口袋")
+    ]
+    session.updated_at = 1.0
+    manager = SessionManager(state_path=Path(".probe/history-scope/state.toml"))
+    manager.sessions = {item.id: item for item in (session, other, child)}
+
+    wired = SearchHistoryTool(manager)
+    across = await wired.run({"session": session, "query": "口袋", "scope": "all"})
+    check("ses_other · evt_0001" in across.output, f"跨会话命中带会话编号：{across.output}")
+    check("ses_history · evt_0002" in across.output, "本会话的命中也在里面")
+    check("ses_child" not in across.output, "子 agent 的会话不出现")
+    check(
+        across.meta["hits"] == [
+            {"session": "ses_history", "event": "evt_0002"},
+            {"session": "ses_other", "event": "evt_0001"},
+        ],
+        f"meta 给出会话与主题两段编号：{across.meta}",
+    )
+
+    bare = await SearchHistoryTool().run({"session": session, "query": "口袋"})
+    current = await wired.run({"session": session, "query": "口袋"})
+    check(bare.output == current.output, "不传 scope 时输出与没有会话管理器时逐字节相同")
+
+    unwired = await SearchHistoryTool().run({"session": session, "query": "口袋", "scope": "all"})
+    check(unwired.failed and "没有装配会话管理器" in unwired.output, "没装配时明说，不退回本会话")
+
+    bad_scope = await wired.run({"session": session, "query": "口袋", "scope": "everywhere"})
+    check(bad_scope.failed and "current 或 all" in bad_scope.output, "scope 只认两个值")
+
+    # 一个会话里同一件事出现十次时，每个会话最多占 3 个名额。
+    big = Session(id="ses_big", updated_at=1.0)
+    big.events = [
+        Event(
+            id=f"evt_{index:04d}",
+            topic_index=index,
+            title=f"口袋复查第 {index} 次",
+            summary="同一个口袋反复看",
+        )
+        for index in range(1, 11)
+    ]
+    small = Session(id="ses_small", updated_at=2.0)
+    small.events = [
+        Event(id="evt_0001", topic_index=1, title="口袋中心", summary="另一个会话的口袋")
+    ]
+    manager.sessions = {item.id: item for item in (big, small)}
+    capped = await wired.run({"session": big, "query": "口袋", "scope": "all", "limit": 8})
+    check(
+        sum(1 for line in capped.output.splitlines() if line.startswith("ses_big ·")) == 3,
+        f"每个会话最多 3 条：{capped.output}",
+    )
+    check("ses_small · evt_0001" in capped.output, "小会话的那一条没有被长会话挤掉")
+
+    # 取回：跨会话命中带 session_id，recall_event 要按它找到那个会话的原文。
+    readable = Session(id="ses_readable", title="旧会话")
+    readable.add_message(Message(role="user")).add_part(
+        Part(type=PartType.TEXT, text="查一下 4HJO 的口袋")
+    )
+    readable.add_message(Message(role="assistant")).add_part(
+        Part(type=PartType.TEXT, text="口袋中心在 12,8,20")
+    )
+    readable_event = seal_range(readable, upto=2, title="4HJO 口袋", summary="中心 12,8,20")
+    assert readable_event is not None
+    manager.sessions = {readable.id: readable}
+    reader = RecallEventTool(manager)
+    detail = await reader.execute(
+        {"session_id": "ses_readable", "event": readable_event.id}, session=session
+    )
+    check("12,8,20" in detail.output, f"按 session_id 取回那个会话的原文：{detail.output}")
+    check(detail.meta["session"] == "ses_readable", "meta 记下读的是哪个会话")
+
+    no_such = await reader.execute(
+        {"session_id": "ses_missing", "event": "evt_0001"}, session=session
+    )
+    check(no_such.failed and "没有 ses_missing" in no_such.output, "会话编号不存在时说清楚")
+
+    unwired_read = await RecallEventTool().execute(
+        {"session_id": "ses_readable", "event": "evt_0001"}, session=session
+    )
+    check(unwired_read.failed and "会话管理器" in unwired_read.output, "没装配时取回直接拒绝")
+
+
+async def check_context_profile() -> None:
+    """记忆分两层：习惯单独一条消息、项目情况在头部；预算上限能封顶。"""
+    session = Session(id="ses_profile")
+    session.messages = [
+        Message(role="user", parts=[Part(type=PartType.TEXT, text="看看受体")])
+    ]
+    profile = "- [习惯] 回答先给结论"
+    memory = "- [事实] 当前受体在 receptor.pdb"
+    built = ContextAssembler(128_000).build(
+        session, "SYSTEM-PREFIX", memory_text=memory, profile_text=profile
+    )
+    contents = [item["content"] for item in built.messages]
+    check(contents[0] == "SYSTEM-PREFIX", "系统提示仍是第一条")
+    check(contents[1].startswith(PROFILE_NOTICE), f"习惯紧跟系统提示：{contents[1]!r}")
+    check(profile in contents[1], "习惯正文在那一层")
+    check(
+        any(MEMORY_NOTICE in text and memory in text for text in contents),
+        "项目情况在头部那一段",
+    )
+    check(
+        contents.index(contents[1]) < next(i for i, text in enumerate(contents) if MEMORY_NOTICE in text),
+        "习惯排在项目情况之前",
+    )
+    check(built.usage[Layer.PROFILE_MEMORY] > 0, "习惯层的用量记上了")
+    check(built.usage[Layer.PROJECT_MEMORY] > 0, "项目情况层的用量记上了")
+
+    changed = ContextAssembler(128_000).build(
+        session, "SYSTEM-PREFIX", memory_text="- [事实] 换了一份受体", profile_text=profile
+    )
+    check(changed.messages[1]["content"] == built.messages[1]["content"], "问题变了习惯那一段不变")
+
+    os.environ["VSA_CONTEXT_BUDGET"] = "12000"
+    try:
+        capped = ContextAssembler(128_000).build(
+            session, "SYSTEM-PREFIX", memory_text=memory, profile_text=profile
+        )
+        check(sum(capped.usage.values()) <= 12000, "封顶之后总用量不超过上限")
+    finally:
+        os.environ.pop("VSA_CONTEXT_BUDGET", None)
+
+    os.environ["VSA_CONTEXT_BUDGET"] = "500"
+    try:
+        check(
+            ContextAssembler(128_000).budget().available == 500,
+            "上限直接决定可用额度",
+        )
+        raised = None
+        try:
+            ContextAssembler(128_000).build(session, "SYSTEM-PREFIX")
+        except ContextAssemblyError as error:
+            raised = error
+        check(raised is not None, "上限小到装不下时明确报错")
+    finally:
+        os.environ.pop("VSA_CONTEXT_BUDGET", None)
+
+    os.environ["VSA_CONTEXT_BUDGET"] = "不是数字"
+    try:
+        check(ContextAssembler(128_000).budget().available > 12000, "写错时按不封顶处理")
+    finally:
+        os.environ.pop("VSA_CONTEXT_BUDGET", None)
+
+
+async def check_intent_hint() -> None:
+    """来源提示：四个来源各认一条词、顺序固定、无命中不加字、系统提示不变。"""
+    check(intent_rules.detect("这个进度到哪了").sources == ("task",), "任务进度那类")
+    check(intent_rules.detect("我说过的约定别忘了").sources == ("memory",), "记忆那类")
+    check(intent_rules.detect("找一下这篇论文的原文").sources == ("corpus",), "语料那类")
+    check(intent_rules.detect("上次讨论过的那个方案").sources == ("history",), "历史那类")
+    check(
+        intent_rules.detect("按文献里的方法，上次的受体").sources == ("corpus", "history"),
+        "两类同时出现时按固定顺序",
+    )
+    check(intent_rules.detect("今天天气怎么样").sources == (), "没有关键词就不猜")
+    check(intent_rules.render(IntentHint()) == "", "没有命中时是空串")
+
+    hint = intent_rules.render(intent_rules.detect("上次那个结合位点的文献怎么说"))
+    check(hint.startswith("（可能相关的来源："), f"提示的形状：{hint}")
+    check("recall_event" not in hint and "search_corpus" not in hint, "不点名工具")
+    check(estimate_tokens(hint) <= HINT_LIMIT, f"提示不超过上限：{estimate_tokens(hint)}")
+
+    session = Session(id="ses_intent")
+    session.messages = [
+        Message(role="user", parts=[Part(type=PartType.TEXT, text="上次那个结合位点")])
+    ]
+    plain = ContextAssembler(128_000).build(session, "SYSTEM-PREFIX")
+    same = ContextAssembler(128_000).build(session, "SYSTEM-PREFIX", hint_text="")
+    check(plain.messages == same.messages, "不传提示时装配结果一个字节都不变")
+    hinted = ContextAssembler(128_000).build(session, "SYSTEM-PREFIX", hint_text=hint)
+    check(hinted.messages[0] == plain.messages[0], "系统提示不因提示而变")
+    check(hinted.messages[-2]["content"] == hint, "提示紧贴在最后一条用户消息之前")
+    check(hinted.messages[-1]["content"] != hint, "用户消息仍在最后")
+
+
+async def check_memory_recall_fuse() -> None:
+    """两路合并：语义单独能接住改写，两路都命中时排最前，当前任务的记忆先出。"""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from vsagent.core import embed as embed_module
+
+    root = _Path(tempfile.mkdtemp(prefix="vsa-memfuse-"))
+    store = MemoryStore(root)
+
+    def vector(text: str) -> list[float]:
+        raw = [0.0, 0.0, 0.0]
+        if "残基" in text or "氨基酸" in text:
+            raw[0] = 1.0
+        if "盒子" in text:
+            raw[1] = 1.0
+        if "配体" in text:
+            raw[2] = 1.0
+        norm = math.sqrt(sum(value * value for value in raw)) or 1.0
+        return [value / norm for value in raw]
+
+    original_passages = embed_module.encode_passages
+    original_query = embed_module.encode_query
+    original_score = embed_module.min_score
+    embed_module.encode_passages = lambda texts, _model: [vector(text) for text in texts]
+    embed_module.encode_query = lambda text, _model: vector(text)
+    embed_module.min_score = lambda: 0.3
+    try:
+        store.remember("人源受体的长度是 1210 个氨基酸。", source="user")
+        store.remember("对接盒子中心取配体几何中心。", source="user")
+        store.remember("配体库共五千个分子。", source="user")
+
+        only_semantic = store.recall("有多少个残基", model="fake/model")
+        check(only_semantic and "氨基酸" in only_semantic[0].text, "语义单独接住改写")
+
+        both = store.recall("盒子 残基", model="fake/model")
+        check(both and "盒子" in both[0].text, f"两路都命中的排最前：{both[:1]}")
+    finally:
+        embed_module.encode_passages = original_passages
+        embed_module.encode_query = original_query
+        embed_module.min_score = original_score
+        shutil.rmtree(root, ignore_errors=True)
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "a.pdb").write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    (root / "b.pdb").write_text("ATOM      1  N   ALA B   1\n", encoding="utf-8")
+    store = MemoryStore(root)
+    store.remember("受体 A 的口袋中心是 1,2,3", refs=["a.pdb"])
+    target = store.remember("受体 B 的口袋中心是 4,5,6", refs=["b.pdb"])
+    hits = store.recall("口袋中心", limit=5, context_paths=[str(root / "b.pdb")])
+    check(hits and hits[0].id == target.id, f"贴着当前受体的排前面：{[item.text for item in hits]}")
+    shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_memory_conflicts() -> None:
+    """冲突标记：两条都保留、双向可见、删掉一方后提示消失。"""
+    root = PROBE / "memory_conflicts"
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "receptor.pdb").write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    store = MemoryStore(root)
+
+    old = store.remember("盒子中心在 12,8,20", refs=["receptor.pdb"])
+    new = store.remember("盒子中心在 14,8,22", refs=["receptor.pdb"], conflicts=[old.id])
+    check(new.conflicts == [old.id], "新条目记下冲突对象")
+    check(old.conflicts == [new.id], "旧条目也记下对方（双向）")
+    check(old.is_live() and new.is_live(), "两条都保持有效")
+    check("冲突" in store.render_line(old) and new.id in store.render_line(old), "渲染带冲突提示")
+    check(len(store.recall("盒子中心")) == 2, "两条都召得回来")
+
+    revived = MemoryStore(root)
+    revived.load()
+    check(revived.entries[old.id].conflicts == [new.id], "冲突随盘保留")
+
+    store.forget(new.id)
+    check(old.conflicts == [], "删掉一方后对方的标记也清掉")
+    check("冲突" not in store.render_line(old), "渲染里不再提冲突")
+
+    unknown = None
+    try:
+        store.remember("另一条", conflicts=["mem_不存在"])
+    except MemoryError as error:
+        unknown = str(error)
+    check(unknown is not None and "不存在" in unknown, f"指向不存在的编号被拒：{unknown}")
+
+    tool = RememberTool(store)
+    result = await tool.run({"text": "盒子中心在 16,8,24", "conflicts": [old.id]})
+    check("已记住" in result.output, "工具层接受 conflicts 参数")
+    check(old.conflicts and old.conflicts[0] in store.entries, "工具写入的冲突也是双向的")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+async def check_memory_extract() -> None:
+    """抽取：字段校验五条规则、类型收敛、引用过滤、去重与队列。"""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from vsagent.core.memory import extractor
+
+    root = _Path(tempfile.mkdtemp(prefix="vsa-extract-"))
+    receptor = root / "receptor.pdb"
+    receptor.write_text("ATOM      1  N   ALA A   1\n", encoding="utf-8")
+    store = MemoryStore(root)
+    event = Event(
+        id="evt_0001",
+        title="准备受体",
+        summary="拿到 4HJO 的 A 链",
+        steps=[
+            Step(seq=1, intent="取结构", result="完成 · 7VFS", artifacts=["artifact#1"]),
+            Step(seq=2, intent="准备受体", result="失败：缺少 box"),
+        ],
+    )
+    prompt = extractor.prompt_for(event)
+    check("准备受体" in prompt and "1. 取结构" in prompt, "提示里有标题与步骤")
+    check("停因" not in prompt, "没有停因时不写那一行")
+
+    payload = {
+        "memories": [
+            {"text": "", "kind": "fact"},
+            {"text": "今天先到这里", "kind": "fact"},
+            {"text": "长" * 600, "kind": "fact"},
+            {"text": "受体来自 4HJO 的 A 链，坐标在 receptor.pdb", "kind": "fact",
+             "refs": ["receptor.pdb", "missing.pdb", "receptor#1"], "confidence": 0.9},
+            {"text": "回答先给结论，引用要带 doc# 编号", "kind": "preference"},
+            {"text": "受体来自 4HJO 的 A 链，坐标在 receptor.pdb", "kind": "fact"},
+        ]
+    }
+    result = extractor.apply(store, event, payload, session_id="ses_test")
+    check(result["written"] == 2, f"只写两条：{result}")
+    check(result["dropped"] == 4, f"空、无实据、超长、重复各丢一条：{result}")
+
+    written = store.recall("4HJO")
+    check(len(written) == 1, "同一条事实只写了一次")
+    entry = written[0]
+    check(entry.refs == ["receptor.pdb"], f"引用只留盘上存在的：{entry.refs}")
+    check(entry.source == "local-extractor", "来源写成抽取器")
+    check(abs(entry.confidence - 0.9) < 1e-9, "可信度沿用模型给的数")
+    check(entry.session_id == "ses_test", "记下会话编号")
+
+    preference = [item for item in store.entries.values() if "先给结论" in item.text]
+    check(preference and preference[0].kind is MemoryKind.FACT, "抽取不写用户习惯")
+
+    dead_refs = extractor.apply(
+        store,
+        event,
+        {"memories": [{"text": "没有引用的一条：参数 22A", "kind": "fact", "confidence": 0.9}]},
+    )
+    check(dead_refs["written"] == 1, "没有可核对引用时仍然写入")
+    guess = [item for item in store.entries.values() if "22A" in item.text][0]
+    check(guess.confidence <= 0.3, f"没有引用时可信度压到 0.3：{guess.confidence}")
+
+    import threading
+
+    started = threading.Event()
+    gate = threading.Event()
+
+    def block() -> None:
+        started.set()
+        gate.wait(2.0)
+
+    work = extractor.ExtractionQueue(capacity=1)
+    work.submit("a", block)
+    check(started.wait(1.0), "后台线程开始跑第一条")
+    work.submit("b", lambda: None)
+    work.submit("c", lambda: None)
+    check(work.dropped == 1, f"容量满了丢最新的：{work.dropped}")
+    gate.set()
+    work.stop()
+
+    called: list[str] = []
+    started_again = threading.Event()
+    held = threading.Event()
+    done = threading.Event()
+
+    def hold() -> None:
+        started_again.set()
+        held.wait(2.0)
+
+    queue = extractor.ExtractionQueue(capacity=2)
+    queue.submit("k", hold)
+    check(started_again.wait(1.0), "第二条线程开始跑")
+    queue.submit("k", lambda: (called.append("second"), done.set()))
+    held.set()
+    check(done.wait(2.0), "同一会话的新任务替换旧任务")
+    check(called == ["second"], f"只跑了新的那条：{called}")
+    queue.stop()
 
     shutil.rmtree(root, ignore_errors=True)
 
@@ -22334,6 +23157,8 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("opentargets", check_opentargets),
     ("websearch", check_websearch),
     ("corpus", check_corpus),
+    ("knowledge-store", check_knowledge_store),
+    ("rerank-order", check_rerank_order),
     ("embed", check_embed),
     ("structure-parse", check_structure_parse),
     ("structure-tools", check_structure_tools),
@@ -22351,6 +23176,14 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("memory", check_memory),
     ("memory-supersede", check_memory_supersede),
     ("memory-resident", check_memory_resident),
+    ("memory-kind", check_memory_kind),
+    ("memory-conflicts", check_memory_conflicts),
+    ("memory-recall-fuse", check_memory_recall_fuse),
+    ("history-search", check_history_search),
+    ("context-profile", check_context_profile),
+    ("intent-hint", check_intent_hint),
+    ("memory-extract", check_memory_extract),
+    ("memory-vectors", check_memory_vectors),
     ("task-state", check_task_state),
     ("subagent", check_subagent),
     ("subagent-ui", check_subagent_ui),

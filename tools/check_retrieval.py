@@ -4,6 +4,7 @@
 python tools/check_retrieval.py                 # 读 corpus/eval/questions.jsonl
 python tools/check_retrieval.py --list          # 只看评测集概况，不跑
 python tools/check_retrieval.py --questions x.jsonl --k 5
+python tools/check_retrieval.py --json          # 同一份读数编码成 JSON（网页端起子进程时用）
 ```
 
 评测集一行一条 JSON：
@@ -41,6 +42,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from vsagent.core import corpus, embed, index  # noqa: E402
 from vsagent.core.agent.domain import corpus as corpus_tools  # noqa: E402
+from vsagent.core.knowledge import providers  # noqa: E402
 
 DEFAULT_QUESTIONS = PROJECT_ROOT / "corpus" / "eval" / "questions.jsonl"
 
@@ -149,12 +151,22 @@ def evaluate(conn, items: list[dict], channels_wanted: tuple[str, ...], model: s
     }
 
 
-def evaluate_groups(conn, items: list[dict], channels_wanted: tuple[str, ...], model: str) -> dict:
+def evaluate_groups(
+    conn,
+    items: list[dict],
+    channels_wanted: tuple[str, ...],
+    model: str,
+    rerank: bool = False,
+    rerank_model: str = "",
+) -> dict:
     """按**工具的真实输出**再量一遍：融合 → 分组 → 600 字预算 → 前 8 组。
 
     块级指标看「检索到没有」，组级看「模型真的看到什么」：同一篇的碎片会被并成
     一组，片段还会被预算截断——块级命中而片段里没有答案，是真实存在的一档。
     分组用的是线上同一个 `_group`，不另写一份。
+
+    `rerank` 打开时在聚组之前插一次晚交互精排，与线上 `knowledge.search`
+    的位置一致；模型没下载时精排返回空表，这一轮按原顺序算。
     """
     hit = answer = 0
     chars = 0
@@ -172,7 +184,17 @@ def evaluate_groups(conn, items: list[dict], channels_wanted: tuple[str, ...], m
         order = sorted(fused, key=lambda chunk_id: (-fused[chunk_id], chunk_id))
         candidates = [(cid, fused[cid]) for cid in order[: index.CHANNEL_LIMIT]]
         rows = index.rows_by_id(conn, [cid for cid, _ in candidates])
-        groups = corpus_tools._group(conn, [(c, s) for c, s in candidates if c in rows], rows)
+        alive = [(c, s) for c, s in candidates if c in rows]
+        ranks = None
+        if rerank and len(alive) > 1:
+            texts = [str(rows[cid]["text"]) for cid, _ in alive]
+            ranked = providers.rerank(
+                item["q"], texts, top_n=len(texts), model=rerank_model or None
+            )
+            if ranked:
+                alive = [alive[index] for index, _ in ranked]
+                ranks = {cid: position for position, (cid, _) in enumerate(alive, 1)}
+        groups = corpus_tools._group(conn, alive, rows, ranks=ranks)
         top = groups[: GROUP_LIMIT]
         sources = [group["source_id"] for group in top]
         found = any(ref in sources for ref in item["refs"])
@@ -272,16 +294,39 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--questions", type=Path, default=DEFAULT_QUESTIONS)
     parser.add_argument("--model", default="", help="默认取 corpus.toml / VSA_EMBED_MODEL")
     parser.add_argument("--list", action="store_true", help="只打印评测集概况")
+    parser.add_argument("--rerank", action="store_true", help="加一列晚交互精排后的组级读数")
+    parser.add_argument("--rerank-model", default="", help="精排模型，默认取 corpus_config")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="把终端那几行读数编码成 JSON 打到标准输出（网页端起子进程时用它）",
+    )
     args = parser.parse_args(argv)
 
     items = load_questions(args.questions)
+    report: dict = {
+        "questions": {"path": str(args.questions), "count": len(items)},
+        "combos": {},
+        "gates": [],
+        "failures": [],
+        "ok": False,
+    }
+
+    def say(line: str = "") -> None:
+        """终端那一行。`--json` 时一个字都不往标准输出写，免得污染 JSON。"""
+        if not args.json:
+            print(line)
+
     if args.list:
         tags: dict[str, int] = {}
         for item in items:
             tags[str(item.get("tag") or "未标记")] = tags.get(str(item.get("tag") or "未标记"), 0) + 1
-        print(f"评测集 {args.questions}：{len(items)} 条")
+        report["questions"]["tags"] = tags
+        say(f"评测集 {args.questions}：{len(items)} 条")
         for tag, count in sorted(tags.items()):
-            print(f"  {tag}: {count}")
+            say(f"  {tag}: {count}")
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
         return 0
 
     from vsagent.core import corpus_config
@@ -289,48 +334,96 @@ def main(argv: list[str]) -> int:
     config = corpus_config.load()
     model = args.model or config.embed_model
     semantic = embed.missing_reason(model)
+    report["corpus"] = {"model": model, "semanticMissing": semantic}
     if semantic:
-        print(f"！{semantic}\n")
+        say(f"！{semantic}\n")
 
     # 先量延迟：第一条必须是**真的冷启动**（加载模型）。放到评测之后再量，
     # 模型早就被 evaluate 加载过了，「首次」会变成一个假的 16ms。
     latency = measure_latency(items, model)
+    report["latency"] = latency
 
     conn = index.connect()
+    results: dict[str, dict] = {}
     try:
         stats = index.stats(conn)
-        print(f"语料：{stats['sources']} 个源 / {stats['chunks']} 个块；评测集 {len(items)} 条")
-        print(f"模型：{model}（向量覆盖 {embed.coverage(conn, model):.0%}）\n")
+        coverage = embed.coverage(conn, model)
+        report["corpus"].update(
+            {"sources": stats["sources"], "chunks": stats["chunks"], "coverage": coverage}
+        )
+        say(f"语料：{stats['sources']} 个源 / {stats['chunks']} 个块；评测集 {len(items)} 条")
+        say(f"模型：{model}（向量覆盖 {coverage:.0%}）\n")
 
-        results = {}
         for label, wanted in COMBOS:
             if "vec" in wanted and semantic:
                 continue
             results[label] = evaluate(conn, items, wanted, model)
-            print(render(label, results[label]))
+            say(render(label, results[label]))
+        report["combos"] = results
         if "三路" in results:
             grouped = evaluate_groups(conn, items, ("fts", "cjk", "vec"), model)
-            print(
+            report["group"] = grouped
+            say(
                 f"  组级 top{GROUP_LIMIT}  标注源命中={grouped['recall']:.3f}  "
                 f"答案在片段里={grouped['answer']:.3f}  平均 {grouped['chars']:.0f} 字"
             )
+            if args.rerank:
+                rerank_model = args.rerank_model or config.rerank_model
+                reason = providers.missing_reason(rerank_model)
+                if reason:
+                    say(f"  精排：{reason}")
+                    report["rerank"] = {"model": rerank_model, "reason": reason}
+                else:
+                    reranked = evaluate_groups(
+                        conn,
+                        items,
+                        ("fts", "cjk", "vec"),
+                        model,
+                        rerank=True,
+                        rerank_model=rerank_model,
+                    )
+                    report["rerank"] = {
+                        "model": rerank_model,
+                        "recall": reranked["recall"],
+                        "answer": reranked["answer"],
+                        "chars": reranked["chars"],
+                        "gainRecall": reranked["recall"] - grouped["recall"],
+                        "gainAnswer": reranked["answer"] - grouped["answer"],
+                    }
+                    say(f"  精排 {rerank_model}")
+                    say(
+                        f"  精排后      标注源命中={reranked['recall']:.3f}"
+                        f"（{reranked['recall'] - grouped['recall']:+.3f}）  "
+                        f"答案在片段里={reranked['answer']:.3f}"
+                        f"（{reranked['answer'] - grouped['answer']:+.3f}）  "
+                        f"平均 {reranked['chars']:.0f} 字"
+                    )
     finally:
         conn.close()
 
     lexical = results.get("双词法")
     three = results.get("三路")
-    print()
+    say()
     failures: list[str] = []
 
     if three is None:
-        print("门禁 1/2：无法判定——语义通道没启用，只跑了词法。")
+        say("门禁 1/2：无法判定——语义通道没启用，只跑了词法。")
         failures.append("语义通道未启用")
+        report["gates"].append({"name": "门禁 1", "ok": False, "skipped": True})
     else:
         gain = three["recall"] - lexical["recall"]
         verdict = "通过" if gain >= GATE_RECALL_GAIN else "未通过"
-        print(
+        say(
             f"门禁 1（三路 recall@{TOP_K} 比双词法高 ≥{GATE_RECALL_GAIN:.0%}）："
             f"{gain:+.3f} → {verdict}"
+        )
+        report["gates"].append(
+            {
+                "name": "门禁 1",
+                "ok": gain >= GATE_RECALL_GAIN,
+                "value": gain,
+                "threshold": GATE_RECALL_GAIN,
+            }
         )
         if gain < GATE_RECALL_GAIN:
             failures.append("门禁 1")
@@ -339,44 +432,71 @@ def main(argv: list[str]) -> int:
             slice_lexical = subset(items, lexical, tag)
             slice_three = subset(items, three, tag)
             if not slice_lexical or not slice_three:
-                print(f"  {title}：评测集里没有这一类，跳过")
+                say(f"  {title}：评测集里没有这一类，跳过")
                 continue
             drop = slice_lexical["recall"] - slice_three["recall"]
             if tag == "identifier":
                 ok = drop <= GATE_IDENTIFIER_DROP
-                print(
+                say(
                     f"门禁 2（{title} recall@{TOP_K} 掉幅 ≤{GATE_IDENTIFIER_DROP:.0%}）："
                     f"{drop:+.3f}（n={slice_three['n']}）→ {'通过' if ok else '未通过'}"
+                )
+                report["gates"].append(
+                    {
+                        "name": "门禁 2",
+                        "ok": ok,
+                        "value": drop,
+                        "threshold": GATE_IDENTIFIER_DROP,
+                        "n": slice_three["n"],
+                    }
                 )
                 if not ok:
                     failures.append("门禁 2")
             else:
-                print(
+                say(
                     f"  {title}：双词法 {slice_lexical['recall']:.3f} → "
                     f"三路 {slice_three['recall']:.3f}（n={slice_three['n']}）"
                 )
+                report.setdefault("slices", {})[tag] = {
+                    "lexical": slice_lexical["recall"],
+                    "three": slice_three["recall"],
+                    "n": slice_three["n"],
+                }
 
     ok_latency = latency["p95"] < GATE_LATENCY
-    print(
+    say(
         f"门禁 3（单次检索 <{GATE_LATENCY:.0f}s）：热态 p95={latency['p95'] * 1000:.0f}ms、"
         f"均值={latency['mean'] * 1000:.0f}ms；首次={latency['cold'] * 1000:.0f}ms（含加载模型）"
         f" → {'通过' if ok_latency else '未通过'}"
+    )
+    report["gates"].append(
+        {
+            "name": "门禁 3",
+            "ok": ok_latency,
+            "value": latency["p95"],
+            "threshold": GATE_LATENCY,
+        }
     )
     if not ok_latency:
         failures.append("门禁 3")
 
     size = footprint()
-    print(
+    report["footprint"] = size
+    say(
         f"  体积参考：依赖 {size['packages'] / 1024 / 1024:.0f}MB + 模型 "
         f"{size['model'] / 1024 / 1024:.0f}MB（exe 增量需真打包量，见方案稿 §8.4）"
     )
 
-    print()
+    report["failures"] = failures
+    report["ok"] = not failures
+    say()
     if failures:
-        print(f"结论：{len(failures)} 条没通过 —— {'、'.join(failures)}")
-        return 1
-    print("结论：三条门禁全过。")
-    return 0
+        say(f"结论：{len(failures)} 条没通过 —— {'、'.join(failures)}")
+    else:
+        say("结论：三条门禁全过。")
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

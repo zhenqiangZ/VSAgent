@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -25,6 +26,10 @@ from pathlib import Path
 from typing import Any
 
 from ... import corpus, corpus_config, embed, index
+from ...knowledge.fusion import RRF_K, fuse
+from ...knowledge.fusion import group as _group
+from ...knowledge.models import KnowledgeHit, KnowledgeQuery
+from ...knowledge.search import search as knowledge_search
 from ...parse import ParseError, SUPPORTED_SUFFIXES
 from ..tools import Tool, ToolResult, ToolSpec
 
@@ -42,16 +47,6 @@ __all__ = [
 
 DEFAULT_LIMIT = 8
 MAX_LIMIT = 20
-
-RRF_K = 60
-"""RRF 的平滑常数。60 是原论文的经验值：名次差在 1～3 名之间时排序温和，
-不会让某一路的第 1 名无条件压过另一路的前 10 个。"""
-
-SAME_GROUP_CHARS = 600
-"""同一节最多拼多少字给模型看。8 组 × 600 ≈ 4800 字，在压缩线以内。"""
-
-GROUP_CHUNK_CHARS = 400
-"""组内单块的上限。超过就截断——组的意义是「同节上下文」，不是把整节搬过来。"""
 
 MAX_IMPORTS = 50
 """一次最多导入多少个文件。再多就该分批——一次调用把上下文和界面都撑爆。"""
@@ -142,13 +137,20 @@ class ImportDocumentsTool(Tool):
         )
 
 
-def _import_one(path: Path, root: Path | None = None) -> dict[str, Any]:
+def _import_one(
+    path: Path, root: Path | None = None, on_stage: Any = None
+) -> dict[str, Any]:
     """一个文件走完整条管线。**失败只影响这一个文件。**
 
     `root` 是语料根。应用里传 `None`（按代码位置定位到仓根）；网页服务有自己
     的 `corpus_root`（判据会在临时目录上跑），这时必须传进来，否则入库会写进
     仓根那份语料——投递到 A、入库进 B，盘上看起来像丢了一份。
+
+    `on_stage(name, detail)` 报进度，网页端拿它写任务台账。解析与切块由
+    `index.chunks_for` 一次做完，所以「切块」这一声是在它返回之后才发的，
+    带的是块数；拆成两声要另写一条解析路径，而那正是「只有一条路」要避免的。
     """
+    _stage(on_stage, "解析")
     try:
         digest = _sha256(path)
     except OSError as error:
@@ -176,6 +178,7 @@ def _import_one(path: Path, root: Path | None = None) -> dict[str, Any]:
             "name": path.name,
             "reason": f"解析时出了预料之外的错（{type(error).__name__}: {error}）",
         }
+    _stage(on_stage, "切块", f"{len(chunks)} 块")
 
     title = _title_of(document, path)
     original = f"{corpus.FILE_PREFIX}{path.suffix.lower()}"
@@ -210,6 +213,7 @@ def _import_one(path: Path, root: Path | None = None) -> dict[str, Any]:
 
     # 写索引这一段排队：网页端的「入库」与 TUI 里的导入是同一个进程的两个线程，
     # 谁也不该在 SQLite 的写锁上白等十秒。
+    _stage(on_stage, "写索引")
     with index.writing():
         conn = index.connect(root)
         try:
@@ -218,6 +222,7 @@ def _import_one(path: Path, root: Path | None = None) -> dict[str, Any]:
             )
             # 向量与词法索引分开算：没装 fastembed 时这一段返回 enabled=False，
             # 导入本身照样成功——语义通道是可选增强，不是入库的前置条件。
+            _stage(on_stage, "向量")
             vectors = _embed_source(conn, f"doc:{source_id}")
         finally:
             conn.close()
@@ -238,7 +243,9 @@ def _import_one(path: Path, root: Path | None = None) -> dict[str, Any]:
     }
 
 
-def ingest_files(paths: list[Path], root: Path | None = None) -> list[dict[str, Any]]:
+def ingest_files(
+    paths: list[Path], root: Path | None = None, on_stage: Any = None
+) -> list[dict[str, Any]]:
     """把一批文件逐个走完整条入库管线，返回每个文件的结果。
 
     **网页端的「入库」与 TUI 里的 `import_documents` 共用这一个入口**：网页那边
@@ -247,8 +254,16 @@ def ingest_files(paths: list[Path], root: Path | None = None) -> list[dict[str, 
 
     只做逐个调度：失败按文件隔离（`_import_one` 内部已经兜住），一个坏文件
     不该让同批的另外九个白导。条数上限由调用方先切（`MAX_IMPORTS`）。
+
+    `on_stage(name, detail)` 是给网页端任务台账用的进度回调，TUI 那条路不传。
     """
-    return [_import_one(path, root) for path in paths]
+    return [_import_one(path, root, on_stage) for path in paths]
+
+
+def _stage(callback: Any, name: str, detail: str = "") -> None:
+    """报一次阶段。没有回调就什么也不做。"""
+    if callback is not None:
+        callback(name, detail)
 
 
 def _sha256(path: Path) -> str:
@@ -390,54 +405,25 @@ class SearchCorpusTool(Tool):
         if not query:
             return ToolResult(output="query 不能为空", failed=True)
         limit = _clamp(arguments.get("limit"), DEFAULT_LIMIT, 1, MAX_LIMIT)
-
-        conn = index.connect()
-        try:
-            config = corpus_config.load()
-            channels = index.lexical(conn, query)
-            coverage = 0.0
-            # 模型没装/没下载时**静默降级**：技术细节进 meta，不进正文——
-            # 模型看到的应该是「本地没有」，而不是一段 pip install 指引。
-            # 覆盖率也一并报 0：这一路没跑，报个 100% 只会让人以为语义召回声效正常。
-            if config.embed and not embed.missing_reason(config.embed_model):
-                coverage = embed.coverage(conn, config.embed_model)
-                semantic = embed.search(
-                    conn, query, config.embed_model, limit=index.CHANNEL_LIMIT
-                )
-                if semantic:
-                    channels["vec"] = [chunk_id for chunk_id, _ in semantic]
-            fused = fuse(channels)
-            if not fused:
-                return ToolResult(
-                    output=(
-                        f"本地语料里没有匹配「{query}」的内容。\n"
-                        "换几个更具体的词（术语、方法名、编号）再试；本地确实没有的话，"
-                        "可以用 search_web 联网查（计费），或 import_documents 把文献导进来。"
-                    ),
-                    meta={
-                        "count": 0,
-                        "hits": 0,
-                        "reason": "empty",
-                        "channels": list(channels),
-                        "vector_coverage": coverage,
-                    },
-                )
-
-            order = sorted(fused, key=lambda cid: (-fused[cid], cid))
-            candidates = [(cid, fused[cid]) for cid in order[: index.CHANNEL_LIMIT]]
-            rows = index.rows_by_id(conn, [cid for cid, _ in candidates])
-            # 源被删掉的那些直接从候选里去掉：删除是「换名进 .trash/」，索引不知道，
-            # 这里按目录存在性对一次账。
-            alive = [
-                (cid, score)
-                for cid, score in candidates
-                if cid in rows and _alive(rows[cid])
-            ]
-            groups = _group(conn, alive, rows)
-        finally:
-            conn.close()
-
-        if not groups:
+        result = await asyncio.to_thread(
+            knowledge_search, KnowledgeQuery(text=query, scope="corpus", limit=limit)
+        )
+        if result.reason == "empty":
+            return ToolResult(
+                output=(
+                    f"本地语料里没有匹配「{query}」的内容。\n"
+                    "换几个更具体的词（术语、方法名、编号）再试；本地确实没有的话，"
+                    "可以用 search_web 联网查（计费），或 import_documents 把文献导进来。"
+                ),
+                meta={
+                    "count": 0,
+                    "hits": 0,
+                    "reason": "empty",
+                    "channels": list(result.channels),
+                    "vector_coverage": result.vector_coverage,
+                },
+            )
+        if result.reason == "stale":
             return ToolResult(
                 output=(
                     f"本地语料里没有匹配「{query}」的内容"
@@ -447,131 +433,32 @@ class SearchCorpusTool(Tool):
                     "count": 0,
                     "hits": 0,
                     "reason": "stale",
-                    "channels": list(channels),
-                    "vector_coverage": coverage,
+                    "channels": list(result.channels),
+                    "vector_coverage": result.vector_coverage,
                 },
             )
-
-        chosen = groups[:limit]
         return ToolResult(
-            output=_render_search(query, chosen, total_groups=len(groups)),
+            output=_render_search(query, result.hits, total_groups=result.groups),
             meta={
-                "count": len(chosen),
-                "groups": len(groups),
-                "hits": len(fused),
-                "channels": {name: len(ids) for name, ids in channels.items()},
-                "vector_coverage": coverage,
-                "refs": [group["ref"] for group in chosen],
+                "count": len(result.hits),
+                "groups": result.groups,
+                "hits": result.hits_total,
+                "channels": result.channels,
+                "vector_coverage": result.vector_coverage,
+                "rerank": result.rerank,
+                "refs": [hit.id for hit in result.hits],
             },
         )
 
 
-def fuse(channels: dict[str, list[int]]) -> dict[int, float]:
-    """RRF：`Σ 1/(k + rank)`。**不把 BM25 分数与别的分数相加**——量纲不同。"""
-    scores: dict[int, float] = {}
-    for ids in channels.values():
-        for rank, chunk_id in enumerate(ids, start=1):
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (RRF_K + rank)
-    return scores
-
-
-def _alive(row: Any) -> bool:
-    """这个块的源还在不在盘上。
-
-    删除在语料侧是「换名进 `.trash/`」，索引侧不通知任何人。这里查一下目录：
-    目录没了就跳过——对用户来说删除就是「查不到」，不必等下一次重建。
-    """
-    try:
-        return corpus.source_dir(str(row["kind"]), str(row["source_id"]).split(":", 1)[1]).is_dir()
-    except (ValueError, IndexError):
-        return False
-
-
-def _group(
-    conn: Any, scored: list[tuple[int, float]], rows: dict[int, Any]
-) -> list[dict[str, Any]]:
-    """按「源 + 章节」聚组，并把命中块的前后邻块并进来。
-
-    不做这一步的话，top 8 会变成「同一页的五个碎片 + 三篇无关论文」——
-    RRF 只看块，而人看的是「这一段出自哪里」。
-    """
-    scores = dict(scored)
-    groups: dict[tuple[str, str], dict[str, Any]] = {}
-
-    for chunk_id, _score in scored:
-        row = rows.get(chunk_id)
-        if row is None:
-            continue
-        key = (str(row["source_id"]), str(row["section"]))
-        entry = groups.setdefault(
-            key,
-            {"best": 0.0, "rows": {}, "kind": str(row["kind"]), "title": str(row["title"])},
-        )
-        entry["best"] = max(entry["best"], scores.get(chunk_id, 0.0))
-        entry["rows"][int(row["chunk_no"])] = row
-        for neighbor in index.neighbors(conn, row):
-            entry["rows"].setdefault(int(neighbor["chunk_no"]), neighbor)
-
-    out: list[dict[str, Any]] = []
-    for (source_id, section), entry in groups.items():
-        ordered = [entry["rows"][number] for number in sorted(entry["rows"])]
-        kind, sid = source_id.split(":", 1)
-        out.append(
-            {
-                "score": entry["best"],
-                "ref": _citation(kind, sid, section, ordered),
-                "source_id": source_id,
-                "kind": kind,
-                "title": entry["title"],
-                "section": section,
-                "text": _joined(ordered),
-            }
-        )
-    out.sort(key=lambda group: (-group["score"], group["source_id"], group["section"]))
-    return out
-
-
-def _joined(rows: list[Any]) -> str:
-    """组内各块拼起来，**按 chunk_no 去重并按顺序**，总长受预算限制。"""
-    pieces: list[str] = []
-    seen: set[str] = set()
-    total = 0
-    for row in rows:
-        text = str(row["text"]).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        snippet = text[:GROUP_CHUNK_CHARS]
-        if total + len(snippet) > SAME_GROUP_CHARS:
-            break
-        pieces.append(snippet)
-        total += len(snippet)
-    return "\n…\n".join(pieces)
-
-
-def _citation(kind: str, source_id: str, section: str, rows: list[Any]) -> str:
-    """`doc#ab12cd34ef §2.1 In vitro assay p.2`。
-
-    节用路径的**最后一段**：`§2 Methods / 2.1 In vitro assay` 读起来太长，
-    而引用只需要能对回原文的那一节。
-    """
-    ref = f"{kind}#{source_id}"
-    leaf = section.split(" / ")[-1].strip()
-    if leaf:
-        ref += f" §{leaf}"
-    pages = [int(row["page"]) for row in rows if int(row["page"])]
-    if pages and kind == "doc":
-        low, high = min(pages), max(pages)
-        ref += f" p.{low}" if low == high else f" p.{low}-{high}"
-    return ref
-
-
-def _render_search(query: str, groups: list[dict[str, Any]], *, total_groups: int) -> str:
+def _render_search(
+    query: str, groups: list[KnowledgeHit], *, total_groups: int
+) -> str:
     lines = [f"本地语料检索「{query}」：{total_groups} 组命中，列出 {len(groups)} 组。"]
     for group in groups:
         lines.append("")
-        lines.append(f"  {group['ref']}  {group['title']}")
-        for piece in group["text"].split("\n…\n"):
+        lines.append(f"  {group.id}  {group.title}")
+        for piece in group.text.split("\n…\n"):
             # 块内还有换行，逐行缩进；只缩第一行的话第二行会顶到最左边，读起来像两段。
             lines.extend(f"    {line}" for line in piece.splitlines())
     if total_groups > len(groups):

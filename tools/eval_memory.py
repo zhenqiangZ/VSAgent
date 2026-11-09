@@ -105,14 +105,14 @@ def load_cases(path: Path) -> list[dict]:
     return cases
 
 
-def run_cases(store: MemoryStore, cases: list[dict], k: int) -> int:
-    """跑召回集：recall@k 与 stale 比例。"""
+def run_cases(store: MemoryStore, cases: list[dict], k: int, model: str = "") -> int:
+    """跑召回集：recall@k 与 stale 比例。`model` 非空时加一路语义召回。"""
     hits = 0
     stale_hits = 0
     total_hits = 0
     missed: list[str] = []
     for case in cases:
-        found = store.recall(case["q"], limit=k)
+        found = store.recall(case["q"], limit=k, model=model)
         total_hits += len(found)
         stale_hits += sum(1 for entry in found if entry.state == "stale" or entry.unverified)
         text = "\n".join(entry.text for entry in found)
@@ -140,6 +140,7 @@ def main() -> int:
     parser.add_argument("--root", default=str(PROJECT_ROOT), help="项目根，默认当前仓")
     parser.add_argument("--cases", default="", help="人工标注的 JSONL 评测集")
     parser.add_argument("--k", type=int, default=5, help="recall@k 的 k")
+    parser.add_argument("--semantic", action="store_true", help="加一路语义召回再量一遍")
     args = parser.parse_args()
 
     store = MemoryStore(Path(args.root))
@@ -152,8 +153,17 @@ def main() -> int:
         print("\n给一份 --cases 才跑召回指标（格式见本文件开头）。")
         return 0
     cases = load_cases(Path(args.cases))
+    model = ""
+    if args.semantic:
+        from vsagent.core import corpus_config, embed
+
+        config = corpus_config.load()
+        if config.embed and not embed.missing_reason(config.embed_model):
+            model = config.embed_model
+        else:
+            print("！语义通道不可用，按纯词法跑。")
     print()
-    return run_cases(store, cases, args.k)
+    return run_cases(store, cases, args.k, model=model)
 
 
 if __name__ == "__main__":

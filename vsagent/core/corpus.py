@@ -35,6 +35,7 @@ from .paths import project_root
 __all__ = [
     "CONTENT_FILE",
     "FILE_PREFIX",
+    "FOLDERS_FILE",
     "LABELS_FILE",
     "META_FILE",
     "TEXT_FILE",
@@ -45,19 +46,25 @@ __all__ = [
     "corpus_root",
     "doc_dir",
     "normalize_url",
+    "read_folders",
     "read_json",
+    "read_labels",
     "read_web_page",
     "source_dir",
     "source_ref",
     "web_dir",
     "web_id",
+    "write_folders",
     "write_json",
+    "write_labels",
     "write_web_page",
 ]
 
 CONTENT_FILE = "content.md"
 META_FILE = "meta.json"
 LABELS_FILE = "labels.json"
+FOLDERS_FILE = "folders.json"
+"""语料根的文件夹清单。只做一层，每份语料用 `labels.json` 的 `folderId` 指向它。"""
 TEXT_FILE = "text.jsonl"
 """文献的逐页原文：每行 `{"page": 7, "text": "…"}`。`read_source` 读它。"""
 
@@ -250,3 +257,53 @@ def read_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     """原子写一份 JSON（`indent=2`、中文不转义）。"""
     atomic_write_text(Path(path), json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def read_labels(directory: Path) -> dict[str, Any]:
+    """读一份语料的 `labels.json`；没有或读不出来时给空字典。
+
+    这个文件里除了显示名，还装着标签、收藏与文件夹。读取失败按「没有组织数据」
+    处理，不让一份坏 JSON 挡住整页——原件与索引都还在，显示名退回 `meta.json`。
+    """
+    try:
+        return read_json(Path(directory) / LABELS_FILE)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_labels(directory: Path, labels: dict[str, Any]) -> Path | None:
+    """写一份语料的 `labels.json`；内容为空时删掉文件。返回写到的路径。
+
+    空字典时删除而不是写 `{}`：改名清空之后 `labels.json` 不存在，与「从来没有
+    改过名」是同一种状态，判据与页面都不必再区分「空文件」与「没有文件」。
+    """
+    path = Path(directory) / LABELS_FILE
+    if labels:
+        write_json(path, labels)
+        return path
+    path.unlink(missing_ok=True)
+    return None
+
+
+def read_folders(root: Path) -> list[dict[str, Any]]:
+    """读语料根的 `folders.json`，返回文件夹清单。
+
+    只认带 `id` 与 `name` 的对象；其余字段原样带出（页面现在只用 `order`）。
+    """
+    try:
+        data = read_json(Path(root) / FOLDERS_FILE)
+    except (OSError, ValueError):
+        return []
+    raw = data.get("folders")
+    if not isinstance(raw, list):
+        return []
+    return [
+        item
+        for item in raw
+        if isinstance(item, dict) and str(item.get("id") or "") and str(item.get("name") or "")
+    ]
+
+
+def write_folders(root: Path, folders: list[dict[str, Any]]) -> None:
+    """写 `folders.json`。**只做一层**，不建层级、不做拖拽排序。"""
+    write_json(Path(root) / FOLDERS_FILE, {"folders": folders})

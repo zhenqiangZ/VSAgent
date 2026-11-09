@@ -14,6 +14,7 @@ from .core.agent.domain.campaign import AssessCampaignTool
 from .core.agent.domain.survey import SurveyStructuresTool
 from .core.agent.event_log import domain_tools as event_tools
 from .core.agent.event_log import render_event_detail
+from .core.agent.history import SearchHistoryTool
 from .core.agent.domain.corpus import ingest_files
 from .core.agent.domain.export import (
     OpenViewerTool,
@@ -27,7 +28,8 @@ from .core.agent.host import AgentHost
 from .core.agent.hypothesis import HypothesisTool
 from .core.agent.ledger import LedgerError, SessionLedger
 from .core.agent.loop import AgentLoop, max_steps_from_env
-from .core.agent.memory import MemoryStore, RecallTool, RememberTool
+from .core.agent.memory import MemoryKind, MemoryStore, RecallTool, RememberTool
+from .core.memory import MemoryError as MemoryStoreError
 from .core.agent.spawn import AgentStatusTool, SpawnAgentTool
 from .core.agent.task import TaskTool
 from .core.agent.permission import (
@@ -412,8 +414,12 @@ class VSAgentApp(App[None]):
         registry.register(SurveyStructuresTool())
         # 取回被归档/被移出的原文。与任务状态同理：会话由内核注入。
         registry.register(ReadTurnTool())
+        # 按内容查已封存的主题。事件层只能按编号翻，用户说「上次那个」时
+        # 模型手上没有编号；这个工具先给编号，原文仍由 recall_event 取。
+        # 会话管理器只读传入：`scope=all` 要查别的会话，写入仍归应用。
+        registry.register(SearchHistoryTool(self.session_manager))
         # 事件收口与召回：把做完的一段压成标题 + 摘要，需要细节再按编号取回。
-        for tool in event_tools():
+        for tool in event_tools(self.session_manager):
             registry.register(tool)
         # 按族加载领域工具：核心那一批常驻，其余由模型自己装。
         registry.register(LoadToolsTool())
@@ -652,6 +658,50 @@ class VSAgentApp(App[None]):
             # 不先写盘，新会话在网页上就是 404。
             self.save_state()
             future.set_result({"sessionId": session.id, "created": created})
+        except Exception as error:  # 转交给 HTTP 线程：不转的话它只会等到超时
+            future.set_exception(error)
+
+    def _memory_action(self, action: str, entry_id: str) -> dict[str, object]:
+        """网页端归档或恢复一条记忆：把动作交回事件循环线程。
+
+        与 `_submit_task` 同一种形状。`MemoryStore` 是进程内的字典，HTTP 线程
+        直接改会与模型那一轮并发写同一份文件；这里只等结果。
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return {"error": "应用还没有准备好，稍后再试", "status": 503}
+        future: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+        loop.call_soon_threadsafe(self._memory_action_in_loop, future, action, entry_id)
+        return future.result(timeout=5.0)
+
+    def _memory_action_in_loop(
+        self,
+        future: concurrent.futures.Future[dict[str, object]],
+        action: str,
+        entry_id: str,
+    ) -> None:
+        """在事件循环线程里归档或恢复。状态码在这里定，路由只照抄。"""
+        try:
+            store = self._build_memory()
+            if action == "archive":
+                if entry_id not in store.entries:
+                    future.set_result({"error": f"没有这条记忆：{entry_id}", "status": 404})
+                    return
+                entry = store.archive(entry_id)
+            elif action == "restore":
+                if entry_id in store.entries:
+                    future.set_result({"error": "这条已经在记忆里了", "status": 409})
+                    return
+                if not any(item.id == entry_id for item in store.archived_entries()):
+                    future.set_result({"error": f"归档里没有这一条：{entry_id}", "status": 404})
+                    return
+                entry = store.restore(entry_id)
+            else:
+                future.set_result({"error": f"不认识的动作：{action}", "status": 400})
+                return
+            future.set_result({"ok": True, "id": entry.id, "action": action})
+        except MemoryStoreError as error:
+            future.set_result({"error": str(error), "status": 409})
         except Exception as error:  # 转交给 HTTP 线程：不转的话它只会等到超时
             future.set_exception(error)
 
@@ -952,12 +1002,19 @@ class VSAgentApp(App[None]):
         self.push_screen(MessageScreen("项目记忆", lines))
 
     def _command_remember(self, arguments: str) -> None:
-        """把一段文字写进项目记忆。"""
+        """把一段文字写进项目记忆；`--pref` 记成用户长期习惯。"""
         text = arguments.strip()
         if not text:
-            self.show_toast("用法：/remember 一段事实", "warning")
+            self.show_toast("用法：/remember 一段事实；/remember --pref 一条长期做法", "warning")
             return
-        entry = self._build_memory().remember(text, source="user")
+        kind = MemoryKind.FACT
+        if text.startswith("--pref"):
+            text = text[len("--pref") :].strip()
+            kind = MemoryKind.PREFERENCE
+            if not text:
+                self.show_toast("用法：/remember --pref 一条长期做法", "warning")
+                return
+        entry = self._build_memory().remember(text, kind=kind, source="user")
         self.show_toast(f"已记住（{entry.id}）", "success")
 
     def _command_forget(self, arguments: str) -> None:

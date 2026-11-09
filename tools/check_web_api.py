@@ -513,6 +513,148 @@ def run_event_checks(base, state_path, session_id):
     )
 
 
+def write_synthetic_trace(path, session_id, messages):
+    """造一份最小的 trace。
+
+    只写分析要用的四类事件：消息写入、轮末、装配读数与状态。时间戳按消息顺序
+    铺开，每一轮的装配读数落在该轮的起止之间。判据要核的是「接口有没有把
+    trace 里的数读进来」，不是 trace 写得好不好。
+    """
+    base = 1_700_000_000.0
+    lines = []
+    for index, message in enumerate(messages):
+        at = base + index * 10
+        lines.append(
+            {
+                "at": at,
+                "event": "message.add",
+                "payload": {"session_id": session_id, "message_id": message.id},
+            }
+        )
+        if message.role != "assistant":
+            continue
+        lines.append(
+            {
+                "at": at + 5,
+                "event": "turn.done",
+                "payload": {"session_id": session_id, "message_id": message.id},
+            }
+        )
+        lines.append(
+            {
+                "at": at + 2,
+                "event": "context.metrics",
+                "payload": {
+                    "session_id": session_id,
+                    "step": 1,
+                    "input": 1000,
+                    "cached": 800,
+                    "output": 100,
+                    "cache_hit": 0.8,
+                    "total": 1100,
+                    "window_used": 0.1,
+                    "degraded": [],
+                    "events": 1,
+                    "evidence_entries": 0,
+                    "usage": {
+                        "prefix": 100,
+                        "memory": 0,
+                        "task": 0,
+                        "event": 50,
+                        "recent": 200,
+                        "evidence": 0,
+                    },
+                },
+            }
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_analysis_checks(base, state_path, session_id):
+    """会话分析：轮数、trace 有无、逐步读数与文本截断。
+
+    先确认没有 trace 时的形状，再补一份 trace 看读数有没有接上。两种状态都
+    要能打开页面：只有最近跑过的会话才有 trace，翻旧会话是常态。
+    """
+    session = load_reference(state_path)[session_id]
+    users = [message for message in session.messages if message.role == "user"]
+    trace_path = state_path.parent / "logs" / f"{session_id}.jsonl"
+    if trace_path.exists():
+        trace_path.unlink()
+
+    status, payload = request(f"{base}/api/sessions/{session_id}/analysis")
+    check(
+        "分析接口能读到这个会话",
+        status == 200 and payload.get("session", {}).get("id") == session_id,
+        f"状态 {status}，会话 {payload.get('session', {}).get('id')}",
+    )
+    check(
+        "没有 trace 时轮数仍按用户消息算",
+        len(payload.get("turns") or []) == len(users),
+        f"分析 {len(payload.get('turns') or [])} 轮，用户消息 {len(users)} 条",
+    )
+    check(
+        "没有 trace 时标明逐步读数缺失",
+        payload.get("hasTrace") is False and payload.get("traceBytes") == 0,
+        f"hasTrace={payload.get('hasTrace')}，traceBytes={payload.get('traceBytes')}",
+    )
+    check(
+        "没有 trace 时不逐轮重复「缺装配记录」",
+        not any(
+            "没有 trace 装配记录" in item["text"] for item in payload.get("issues") or []
+        ),
+        f"{len(payload.get('issues') or [])} 条异常",
+    )
+    check(
+        "分析里的原话与正文不超过 600 字",
+        all(
+            len(turn["answer_text"]) <= 600 and len(turn["user_text"]) <= 600
+            for turn in payload.get("turns") or []
+        ),
+        f"最长 {max((len(turn['answer_text']) for turn in payload.get('turns') or []), default=0)} 字",
+    )
+    check(
+        "分析的 token 合计与状态文件一致",
+        payload["session"]["tokens"]["input"] + payload["session"]["tokens"]["output"]
+        == session.total_tokens(),
+        f"分析 {payload['session']['tokens']['input'] + payload['session']['tokens']['output']}，"
+        f"状态文件 {session.total_tokens()}",
+    )
+
+    write_synthetic_trace(trace_path, session_id, session.messages)
+    status, payload = request(f"{base}/api/sessions/{session_id}/analysis")
+    first = next((turn for turn in payload.get("turns") or [] if turn["has_reply"]), None)
+    check(
+        "有 trace 时逐步读数跟着来",
+        status == 200
+        and payload.get("hasTrace") is True
+        and bool(first and first["metrics"]),
+        f"状态 {status}，首轮 {len(first['metrics']) if first else 0} 条装配记录",
+    )
+    check(
+        "逐步读数取自 trace 的 context.metrics",
+        bool(first and first["metrics"])
+        and first["metrics"][0]["input"] == 1000
+        and first["cache_hit"] == 0.8,
+        f"输入 {first['metrics'][0]['input'] if first and first['metrics'] else '—'}，"
+        f"命中 {first['cache_hit'] if first else '—'}",
+    )
+    check(
+        "每一步都带出上下文六层的占用",
+        bool(first and first["metrics"])
+        and set(first["metrics"][0]["usage"])
+        == {"prefix", "memory", "task", "event", "recent", "evidence"},
+        f"{sorted(first['metrics'][0]['usage']) if first and first['metrics'] else '—'}",
+    )
+
+    status, _ = request(f"{base}/api/sessions/ses_9999/analysis")
+    check("不存在的会话没有分析", status == 404, f"状态 {status}")
+
+
 def run_live_checks(base, state_path, session_id):
     """实时快照：没有文件、正在跑、过期三态，以及编号不合法时挡住。
 
@@ -1318,6 +1460,550 @@ def run_ingest_checks(base, corpus_dir):
         server.server_close()
 
 
+def run_write_guard_checks(base):
+    """每条标了 `writes` 的路由，缺自定义头时都要回 403。
+
+    按 `SPEC` 逐条走而不是手写一串路径：新加一个写入口忘了接守卫，这条当场
+    报出来。前缀路由按它声明的路径原样 POST，处理器第一行就是守卫。
+    """
+    from vsagent.core.web.routes import SPEC
+
+    misses = []
+    for route in SPEC.json_routes:
+        if not route.writes:
+            continue
+        status, body = post_json(f"{base}{route.path}", {})
+        if status != 403:
+            misses.append(f"{route.path} → {status}")
+    check(
+        "所有写路由缺 X-VSA-Request 时都回 403",
+        not misses,
+        "；".join(misses) or f"{sum(1 for r in SPEC.json_routes if r.writes)} 条",
+    )
+
+    # Origin 不对时同样拒绝。只挑一条有代表性的：守卫是同一份代码。
+    status, body = post_json(
+        f"{base}/api/library/folders",
+        {"name": "x"},
+        {**WRITE_HEADER, "Origin": "https://evil.example"},
+    )
+    check(
+        "Origin 与 Host 不同时同样 403",
+        status == 403 and "跨站" in str(body.get("error", "")),
+        f"{status} {body.get('error', '')}",
+    )
+
+
+def run_knowledge_read_checks(base, corpus_dir):
+    """M1 的五个只读接口：形状、筛选、分页边界、非法参数。"""
+    status, stats = request(f"{base}/api/corpus/stats")
+    check(
+        "统计接口：源数、块数、向量覆盖、占用",
+        status == 200
+        and stats.get("sources", 0) >= 3
+        and stats.get("chunks", 0) > 0
+        and 0.0 <= float(stats.get("vectorCoverage") or 0) <= 1.0
+        and stats.get("bytes", 0) > 0,
+        f"{status} {stats}",
+    )
+
+    status, listing = request(f"{base}/api/library?kind=doc&sort=title")
+    titles = [item["title"] for item in listing.get("items") or []]
+    check(
+        "语料列表按类型筛选、按标题排序",
+        status == 200
+        and titles == sorted(titles)
+        and all(item["kind"] == "doc" for item in listing.get("items") or []),
+        f"{titles}",
+    )
+
+    status, listing = request(f"{base}/api/library?q={urllib.parse.quote('测试文献')}")
+    check(
+        "语料列表按关键词过滤（标题或地址）",
+        status == 200
+        and len(listing.get("items") or []) == 1
+        and listing["items"][0]["id"] == "doc:aaaaaaaaaa",
+        f"{[item['id'] for item in listing.get('items') or []]}",
+    )
+
+    status, paged = request(f"{base}/api/library?limit=1&offset=1")
+    check(
+        "语料列表分页：一页一条，总数不变",
+        status == 200
+        and len(paged.get("items") or []) == 1
+        and paged.get("limit") == 1
+        and paged.get("offset") == 1
+        and paged.get("total", 0) >= 3,
+        f"{status} total={paged.get('total')} 本页 {len(paged.get('items') or [])}",
+    )
+
+    status, capped = request(f"{base}/api/library?limit=99999")
+    check(
+        "语料列表的 limit 被夹到上限",
+        status == 200 and capped.get("limit") == 500,
+        f"{status} limit={capped.get('limit')}",
+    )
+
+    status, payload = request(f"{base}/api/library/doc:aaaaaaaaaa")
+    check(
+        "语料详情：元数据、标签、块数与文件",
+        status == 200
+        and payload.get("id") == "doc:aaaaaaaaaa"
+        and payload.get("title") == "测试文献"
+        and payload.get("chunks", 0) > 0
+        and any(item.get("name") == "source.md" for item in payload.get("files") or []),
+        f"{status} {payload.get('title')} {payload.get('chunks')} 块",
+    )
+
+    status, payload = request(f"{base}/api/library/doc:ffffffffff")
+    check("不存在的语料回 404", status == 404, f"{status} {payload.get('error', '')}")
+
+    status, payload = request(f"{base}/api/library/doc:ZZZ")
+    check("语料标识形状不对回 400", status == 400, f"{status} {payload.get('error', '')}")
+
+    status, payload = request(
+        f"{base}/api/library/doc:cccccccccc/chunks?q=Paragraph%2044&limit=5"
+    )
+    hits = payload.get("items") or []
+    check(
+        "切块可以按关键词过滤",
+        status == 200
+        and hits
+        and all("Paragraph 44" in item["text"] for item in hits)
+        and 0 < payload.get("total", 0) <= 5,
+        f"{status} total={payload.get('total')} 本页 {len(hits)}",
+    )
+
+    status, payload = request(f"{base}/api/knowledge/search?q=epidermal&mode=lexical&limit=2")
+    corpus = payload.get("corpus") or []
+    check(
+        "知识检索：条数受 limit 约束，带上名次与诊断",
+        status == 200
+        and len(corpus) <= 2
+        and all("ranks" in item and "sourceId" in item for item in corpus)
+        and "channels" in (payload.get("diagnostics") or {}),
+        f"{status} {len(corpus)} 组 {payload.get('diagnostics')}",
+    )
+
+    status, payload = request(f"{base}/api/knowledge/search?q=epidermal&mode=nope")
+    check(
+        "检索模式写错回 400，不退回默认值",
+        status == 400 and "模式" in str(payload.get("error", "")),
+        f"{status} {payload.get('error', '')}",
+    )
+
+    status, payload = request(f"{base}/api/knowledge/search?q=epidermal&source=doc:aaaaaaaaaa")
+    check(
+        "按源限定检索：命中只来自选中的那一份",
+        status == 200
+        and all(item["sourceId"] == "doc:aaaaaaaaaa" for item in payload.get("corpus") or []),
+        f"{[item['sourceId'] for item in payload.get('corpus') or []]}",
+    )
+
+    # 切块面板给的是索引里那一份，检索读的也是那一份。命中正文是组内片段（每块
+    # 至多 400 字，多块用换行省略号拼起来），所以拿第一段去比前缀：重切一遍的话
+    # 这里对不上。
+    hit = next(iter(payload.get("corpus") or []), None)
+    if hit:
+        snippet = hit["text"].split("\n…\n")[0]
+        _, detail = request(f"{base}/api/library/{hit['sourceId']}/chunks?limit=100")
+        texts = [item["text"] for item in detail.get("items") or []]
+        check(
+            "切块面板与检索读的是同一份正文",
+            any(text.startswith(snippet) for text in texts),
+            f"命中片段 {len(snippet)} 字，面板 {len(texts)} 块",
+        )
+
+    status, payload = request(f"{base}/api/knowledge/search?q=epidermal&source=bad")
+    check("源标识写错回 400", status == 400, f"{status} {payload.get('error', '')}")
+
+    status, payload = request(f"{base}/api/knowledge/search?q=")
+    check("空检索词回 400", status == 400, f"{status} {payload.get('error', '')}")
+
+    status, payload = request(f"{base}/api/ingestion/jobs")
+    check(
+        "入库任务清单能查（独立服务也读同一份台账）",
+        status == 200 and isinstance(payload.get("jobs"), list),
+        f"{status} {len(payload.get('jobs') or [])} 条",
+    )
+
+    # 引用核对给出三种状态（`ok` / `stale` / `missing`），页面按它分组。换算只写
+    # 在 `entry_state` 一处，漏掉 `stale` 时「文件变了」会显示成「有效」。
+    from vsagent.core.memory.models import MemoryEntry, MemoryKind
+    from vsagent.core.web.services.memory import entry_state
+
+    def state_of(state):
+        return entry_state(MemoryEntry(id="mem_x", kind=MemoryKind.FACT, text="x", state=state))
+
+    check(
+        "记忆状态：引用已变与引用丢失分得开",
+        state_of("stale") == "stale" and state_of("missing") == "missing",
+        f"stale → {state_of('stale')}，missing → {state_of('missing')}",
+    )
+
+
+def run_knowledge_write_checks(corpus_dir):
+    """M2–M6：标签、文件夹、记忆归档、关联、入库任务、使用记录。
+
+    这一组要一个**带记忆与入库回调的进程内服务**：独立服务按章程把这三类写
+    入口回 503，能验的只有「拒绝」，验不到真正的写入。工作区指到 `.probe`
+    下的临时目录，记忆夹具由这里造。
+    """
+    import threading
+
+    from vsagent.core import index as index_module
+    from vsagent.core.agent.domain.corpus import ingest_files
+    from vsagent.core.memory import MemoryError as MemoryStoreError
+    from vsagent.core.memory import MemoryStore
+    from vsagent.core.web.routes import WebServer
+
+    workspace = PROJECT_ROOT / ".probe" / "web-workspace"
+    shutil.rmtree(workspace, ignore_errors=True)
+    memory_dir = workspace / ".vsmemory"
+    memory_dir.mkdir(parents=True)
+
+    doc_path = str(corpus_dir / "doc" / "aaaaaaaaaa" / "source.md")
+    gone_path = str(workspace / "gone.pdf")
+    entries = {
+        "entries": [
+            {
+                "id": "mem_20260101000000_aaaaaa",
+                "kind": "fact",
+                "text": "测试文献里提到 EGFR 抑制剂。",
+                "refs": [doc_path],
+                "created_at": 1767225600.0,
+                "updated_at": 1767225600.0,
+                "state": "ok",
+            },
+            {
+                "id": "mem_20260101000000_bbbbbb",
+                "kind": "experience",
+                "text": "同一篇文献的另一条记录，引用了一份已经不在的文件。",
+                "refs": [doc_path, gone_path],
+                "created_at": 1767225601.0,
+                "updated_at": 1767225601.0,
+                "state": "ok",
+            },
+        ]
+    }
+    (memory_dir / "entries.json").write_text(
+        json.dumps(entries, ensure_ascii=False), encoding="utf-8"
+    )
+
+    def memory_action(action, entry_id):
+        """应用侧那个回调的最小版本：在同一个进程里改 `MemoryStore`。"""
+        store = MemoryStore(workspace)
+        store.load()
+        try:
+            getattr(store, action)(entry_id)
+        except MemoryStoreError as error:
+            return {"error": str(error), "status": 409}
+        return {"id": entry_id, "action": action, "ok": True}
+
+    port = free_port()
+    server = WebServer(
+        ("127.0.0.1", port),
+        STATE_COPY,
+        FIXTURE_DIR,
+        PROJECT_ROOT / "web",
+        corpus_root=corpus_dir,
+        ingest=ingest_files,
+        workspace_root=workspace,
+        memory_action=memory_action,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    local = f"http://127.0.0.1:{port}"
+
+    def version():
+        conn = index_module.connect(corpus_dir)
+        try:
+            row = conn.execute("SELECT value FROM kv WHERE key = 'vectors'").fetchone()
+            return row[0] if row else ""
+        finally:
+            conn.close()
+
+    try:
+        # ---- 标签与文件夹：只写 labels.json / folders.json ----
+        before = version()
+        status, payload = post_json(
+            f"{local}/api/library/doc:aaaaaaaaaa/labels",
+            {"tags": ["egfr", "文献"], "favorite": True},
+            WRITE_HEADER,
+        )
+        labels = json.loads(
+            (corpus_dir / "doc" / "aaaaaaaaaa" / "labels.json").read_text(encoding="utf-8")
+        )
+        check(
+            "写标签落在 labels.json，索引版本号不变",
+            status == 200
+            and labels.get("tags") == ["egfr", "文献"]
+            and labels.get("favorite") is True
+            and version() == before,
+            f"{status} {labels} 版本 {before!r} → {version()!r}",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/library/folders", {"name": "论文"}, WRITE_HEADER
+        )
+        created = payload.get("folder") or {}
+        status2, listing = request(f"{local}/api/library/folders")
+        check(
+            "新建文件夹并读回",
+            status == 200
+            and created.get("name") == "论文"
+            and any(item["id"] == created.get("id") for item in listing.get("folders") or []),
+            f"{status} {created} / {listing.get('folders')}",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/library/folders", {"name": "论文"}, WRITE_HEADER
+        )
+        check("重名文件夹回 409", status == 409, f"{status} {payload.get('error', '')}")
+
+        # ---- 记忆：列表、详情、归档、恢复 ----
+        status, payload = request(f"{local}/api/memory")
+        check(
+            "记忆列表：两条、计数与类型分组",
+            status == 200
+            and len(payload.get("entries") or []) == 2
+            and (payload.get("counts") or {}).get("live") == 2
+            and (payload.get("counts") or {}).get("byKind", {}).get("fact") == 1,
+            f"{status} {payload.get('counts')}",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/memory/mem_20260101000000_aaaaaa/archive", {}, WRITE_HEADER
+        )
+        live = json.loads((memory_dir / "entries.json").read_text(encoding="utf-8"))
+        archived = json.loads((memory_dir / "archive.json").read_text(encoding="utf-8"))
+        check(
+            "归档：entries.json 少一条、archive.json 多一条",
+            status == 200
+            and [item["id"] for item in live["entries"]] == ["mem_20260101000000_bbbbbb"]
+            and [item["id"] for item in archived["entries"]] == ["mem_20260101000000_aaaaaa"],
+            f"{status} 活 {len(live['entries'])} 归档 {len(archived['entries'])}",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/memory/mem_20260101000000_aaaaaa/restore", {}, WRITE_HEADER
+        )
+        live = json.loads((memory_dir / "entries.json").read_text(encoding="utf-8"))
+        archived = json.loads((memory_dir / "archive.json").read_text(encoding="utf-8"))
+        check(
+            "恢复：两份文件回到原状",
+            status == 200
+            and len(live["entries"]) == 2
+            and archived["entries"] == [],
+            f"{status} 活 {len(live['entries'])} 归档 {len(archived['entries'])}",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/memory/mem_20260101000000_aaaaaa/restore", {}, WRITE_HEADER
+        )
+        check("重复恢复回 409", status == 409, f"{status} {payload.get('error', '')}")
+
+        # ---- 关联：文献 ↔ 记忆 ----
+        status, payload = request(f"{local}/api/knowledge/doc/aaaaaaaaaa/relations")
+        check(
+            "文献 → 记忆：两条引用都查得到",
+            status == 200
+            and {item["id"] for item in payload.get("memory") or []}
+            == {"mem_20260101000000_aaaaaa", "mem_20260101000000_bbbbbb"},
+            f"{status} {[item['id'] for item in payload.get('memory') or []]}",
+        )
+
+        status, payload = request(
+            f"{local}/api/knowledge/memory/mem_20260101000000_bbbbbb/relations"
+        )
+        check(
+            "记忆 → 文献：一条落在语料库、一条标 missing",
+            status == 200
+            and [item["sourceId"] for item in payload.get("documents") or []]
+            == ["doc:aaaaaaaaaa"]
+            and [item["state"] for item in payload.get("missing") or []] == ["missing"]
+            and not payload.get("external"),
+            f"{status} 文献 {payload.get('documents')} 丢失 {payload.get('missing')}",
+        )
+
+        status, payload = request(f"{local}/api/knowledge/doc/ffffffffff/relations")
+        check("关联查询里不存在的文献回 404", status == 404, f"{status}")
+
+        # ---- 使用记录：追加不改索引、不改状态文件 ----
+        state_before = STATE_COPY.read_bytes()
+        index_before = (corpus_dir / ".index" / "library.db").stat().st_mtime_ns
+        status, payload = post_json(
+            f"{local}/api/knowledge/usage",
+            {"query": "epidermal", "mode": "lexical", "hits": 3, "ms": 12, "empty": False},
+            WRITE_HEADER,
+        )
+        usage_file = corpus_dir / ".usage" / "search.jsonl"
+        rows = [
+            json.loads(line)
+            for line in usage_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        check(
+            "追加使用记录：写进 .usage，索引与状态文件都不动",
+            status == 200
+            and rows[-1]["query"] == "epidermal"
+            and rows[-1]["hits"] == 3
+            and STATE_COPY.read_bytes() == state_before
+            and (corpus_dir / ".index" / "library.db").stat().st_mtime_ns == index_before,
+            f"{status} {rows[-1] if rows else None}",
+        )
+
+        status, payload = request(f"{local}/api/knowledge/analytics")
+        check(
+            "使用记录汇总：次数与 p95",
+            status == 200 and payload.get("count", 0) >= 1 and "p95" in payload,
+            f"{status} {payload}",
+        )
+
+        # ---- 入库任务：四个阶段与台账 ----
+        inbox = corpus_dir / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "staged.md").write_text("# 阶段测试\n\nKRAS G12C 共价抑制剂。\n", encoding="utf-8")
+        status, payload = post_json(
+            f"{local}/api/library/ingest", {"names": ["staged.md"]}, WRITE_HEADER
+        )
+        job_id = str(payload.get("jobId") or "")
+        deadline = time.time() + 60
+        job = {}
+        while time.time() < deadline:
+            _, job = request(f"{local}/api/ingestion/jobs/{job_id}")
+            if job.get("status") != "running":
+                break
+            time.sleep(0.05)
+        stages = list(job.get("stages") or [])
+        check(
+            "入库任务：四个阶段都走过，结束状态是完成",
+            status == 202
+            and job.get("status") == "done"
+            and {"解析", "切块", "写索引", "向量"} <= set(stages),
+            f"{status} {stages} / {job.get('status')}",
+        )
+
+        status, payload = post_json(
+            f"{local}/api/ingestion/jobs/{job_id}/retry", {}, WRITE_HEADER
+        )
+        check("重试已完成的任务回 409", status == 409, f"{status} {payload.get('error', '')}")
+
+        # 上一次进程留下的 running：重启对账要把它标成中断。判据直接改任务文件的
+        # pid，因为「另一个进程」在同一个测试进程里造不出来。
+        from vsagent.core.web.jobs import JobStore
+
+        stale = JobStore(corpus_dir).create("ingest", note="遗留", total=1, meta={"names": []})
+        stale_path = corpus_dir / ".jobs" / f"{stale['id']}.json"
+        raw = json.loads(stale_path.read_text(encoding="utf-8"))
+        raw["pid"] = 0
+        stale_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        changed = JobStore(corpus_dir).mark_interrupted()
+        _, stale_job = request(f"{local}/api/ingestion/jobs/{stale['id']}")
+        check(
+            "进程留下的 running 在下次启动时标成中断",
+            changed >= 1 and stale_job.get("status") == "interrupted",
+            f"改了 {changed} 条，状态 {stale_job.get('status')}",
+        )
+
+        status, payload = request(f"{local}/api/ingestion/jobs/{job_id}")
+        check(
+            "入库任务详情：带每个文件的结果",
+            status == 200
+            and (payload.get("result") or {}).get("results")
+            and payload["result"]["results"][0]["status"] == "new",
+            f"{status} {(payload.get('result') or {}).get('results')}",
+        )
+
+        # ---- 评测：脚本不存在时任务失败，错误带子进程的末行 ----
+        status, payload = post_json(
+            f"{local}/api/knowledge/evaluation/runs",
+            {"questions": str(workspace / "no-such.jsonl")},
+            WRITE_HEADER,
+        )
+        eval_id = str(payload.get("jobId") or "")
+        deadline = time.time() + 120
+        job = {}
+        while time.time() < deadline:
+            _, job = request(f"{local}/api/knowledge/evaluation/runs/{eval_id}")
+            if job.get("status") != "running":
+                break
+            time.sleep(0.1)
+        check(
+            "评测跑不起来时任务状态是 failed，错误带子进程输出",
+            status == 202
+            and job.get("status") == "failed"
+            and "退出码" in str(job.get("error") or ""),
+            f"{status} {job.get('status')} {job.get('error', '')[:60]}",
+        )
+
+        status, payload = request(f"{local}/api/knowledge/evaluation/runs")
+        check(
+            "评测记录清单里有这一条",
+            status == 200 and any(item["id"] == eval_id for item in payload.get("jobs") or []),
+            f"{status} {len(payload.get('jobs') or [])} 条",
+        )
+    finally:
+        server.jobs.stop_own()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+def run_standalone_refusal_checks(base):
+    """独立服务下，只有应用进程能做的写入口要明确回 503。"""
+    status, payload = post_json(
+        f"{base}/api/memory/mem_20260101000000_aaaaaa/archive", {}, WRITE_HEADER
+    )
+    check(
+        "独立服务不归档记忆：明确 503",
+        status == 503 and "记忆" in str(payload.get("error", "")),
+        f"{status} {payload.get('error', '')}",
+    )
+
+    status, payload = post_json(
+        f"{base}/api/ingestion/jobs/job_20260101000000_aaaaaa/retry", {}, WRITE_HEADER
+    )
+    check(
+        "独立服务不重试入库：明确 503",
+        status == 503 and "入库" in str(payload.get("error", "")),
+        f"{status} {payload.get('error', '')}",
+    )
+
+
+def run_orphan_checks(corpus_dir):
+    """删掉的源在 `reindex` 之后不留孤儿行，回收站里重名不覆盖。"""
+    from vsagent.core.web.routes import _trash_target
+
+    index.reindex(corpus_dir)
+    conn = index.connect(corpus_dir)
+    try:
+        chunks = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE source_id = ?", ("web:bbbbbbbbbb",)
+        ).fetchone()[0]
+        vectors = conn.execute(
+            "SELECT COUNT(*) FROM vectors WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    check(
+        "删掉的源 reindex 之后块与向量都不留孤儿",
+        chunks == 0 and vectors == 0,
+        f"{chunks} 块 / {vectors} 条孤儿向量",
+    )
+
+    trash = corpus_dir / ".trash"
+    trash.mkdir(parents=True, exist_ok=True)
+    first = _trash_target(trash, "web", "bbbbbbbbbb")
+    first.mkdir()
+    second = _trash_target(trash, "web", "bbbbbbbbbb")
+    check(
+        "回收站里重名不覆盖（第二次换一个名字）",
+        second != first and not second.exists(),
+        f"{first.name} → {second.name}",
+    )
+
+
 def run_concurrency_check(base, state_path, pristine):
     """一边重写状态文件一边请求接口，核对没有一次读到写了一半的内容。
 
@@ -1590,11 +2276,17 @@ def main():
         run_checks(base, state_path, runs_dir, link_session, other_session)
         run_summary_field_checks(base, event_session)
         run_event_checks(base, state_path, event_session)
+        run_analysis_checks(base, state_path, event_session)
         run_live_checks(base, state_path, event_session)
         run_survey_checks(base)
         run_library_checks(base)
         run_chunk_checks(base)
+        run_orphan_checks(CORPUS_DIR)
         run_ingest_checks(base, CORPUS_DIR)
+        run_write_guard_checks(base)
+        run_knowledge_read_checks(base, CORPUS_DIR)
+        run_knowledge_write_checks(CORPUS_DIR)
+        run_standalone_refusal_checks(base)
         run_concurrency_check(base, state_path, pristine)
         run_broken_state_check(base, state_path, pristine)
         run_task_checks(base, pristine)

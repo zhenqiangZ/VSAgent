@@ -251,11 +251,17 @@ class VSAgentApp(App[None]):
             runs_dir=runs_dir(),
             web_root=web_root(),
             # 网页上的「入库」转交到这里：写索引的仍然是这个进程，网页自己不碰库。
-            # 与模型调 `import_documents` 走的是同一个 `ingest_files`。
-            ingest=lambda files, root: ingest_files(files, root=root),
+            # 与模型调 `import_documents` 走的是同一个 `ingest_files`；第三个参数
+            # 是任务台账要的阶段进度，网页拿它显示「解析 / 切块 / 写索引 / 向量」。
+            ingest=lambda files, root, on_stage=None: ingest_files(
+                files, root=root, on_stage=on_stage
+            ),
             # 提交任务同样转交回来。这里取的是绑定方法，`self.host` 在调用那一刻
             # 才读，所以装配顺序不必调整。
             submit=self._submit_task,
+            # 记忆的归档与恢复：`MemoryStore` 在这个进程里，网页不能直接改。
+            workspace_root=self.root,
+            memory_action=self._memory_action,
         )
 
     def _build_loop(self, session: Session, ledger: SessionLedger) -> AgentLoop:

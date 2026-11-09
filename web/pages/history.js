@@ -25,6 +25,10 @@
       </aside>
       <section class="history-detail">
         <header id="session-head" class="is-hidden"></header>
+        <nav id="detail-tabs" class="detail-tabs is-hidden" role="tablist" aria-label="会话视图">
+          <button class="detail-tab is-active" type="button" data-view="conversation" role="tab" aria-selected="true">对话</button>
+          <button class="detail-tab" type="button" data-view="analysis" role="tab" aria-selected="false">分析</button>
+        </nav>
         <div class="workbench">
           <nav id="topic-rail" aria-label="主题导航"></nav>
           <div class="conversation-column">
@@ -33,6 +37,7 @@
           </div>
           <aside id="artifact-pane" aria-label="任务产物"></aside>
         </div>
+        <section id="analysis-pane" class="analysis-pane is-hidden" role="tabpanel"></section>
       </section>
     </div>
   `;
@@ -122,6 +127,14 @@
   // 内容画到这一个上。
   let loadToken = 0;
 
+  // 详情区当前是「对话」还是「分析」。切换会话时保持不变：正在读分析的人
+  // 点下一条会话，看到的应当也是分析。
+  let detailView = "conversation";
+  // 分析按会话缓存。一次分析要读几十兆的 trace，来回切标签不该重新算一遍。
+  const analysisCache = new Map();
+  let analysisLoadToken = 0;
+  let selectedTurn = 0;
+
   // 产物面板与专注模式。这两项跟着人走、不跟着会话走：宽度是屏幕的事，
   // 专注是此刻要不要被打扰的事，换一个任务不该把它们复位。
   const ARTIFACT_KEY = "vsa.history.artifacts";
@@ -172,6 +185,23 @@
     const line = String(text || "").split("\n").find((item) => item.trim()) || "";
     const trimmed = line.trim();
     return trimmed.length > limit ? `${trimmed.slice(0, limit)}…` : trimmed;
+  }
+
+  function escapeHtml(value) {
+    return String(value === null || value === undefined ? "" : value).replace(
+      /[&<>"]/g,
+      (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[char])
+    );
+  }
+
+  function formatPct(value) {
+    return `${((value || 0) * 100).toFixed(1)}%`;
+  }
+
+  // 没有 trace 时消息自带的时间戳会跨过两次输入之间的空闲，不能当成耗时。
+  function secondsText(seconds, hasTrace, hasReply) {
+    if (!hasTrace || !hasReply || !(seconds > 0)) return "—";
+    return formatDuration(seconds) || `${seconds.toFixed(1)} 秒`;
   }
 
   // ------------------------------------------------------------------
@@ -401,7 +431,18 @@
       }
       if (node.eventCount) bits.push(`${node.eventCount} 个主题`);
       bits.push(`${node.messageCount} 条`, formatTime(node.updatedAt), node.modelId || "未指定模型");
-      item.appendChild(el("div", "session-meta", bits.join(" · ")));
+      const metaRow = el("div", "session-meta-row");
+      metaRow.appendChild(el("div", "session-meta", bits.join(" · ")));
+      // 每一行都能直接看分析：不先进会话再切标签，翻十几条会话时少一次点击。
+      const analysis = el("button", "session-analysis", "分析");
+      analysis.type = "button";
+      analysis.title = "看这个会话的轮次、token、工具与异常";
+      analysis.addEventListener("click", (event) => {
+        event.stopPropagation();
+        selectSession(node.id, "", "analysis");
+      });
+      metaRow.appendChild(analysis);
+      item.appendChild(metaRow);
       item.addEventListener("click", () => selectSession(node.id));
       list.appendChild(item);
 
@@ -1687,6 +1728,404 @@
   }
 
   // ------------------------------------------------------------------
+  // 分析：轮、步、token、工具、主题与异常
+  // ------------------------------------------------------------------
+
+  const ANALYSIS_STATUS = {
+    done: "完成",
+    running: "进行中",
+    failed: "失败",
+    cancelled: "中断",
+    "no-reply": "无回复",
+  };
+
+  const ANALYSIS_LEVEL = {
+    error: ["错误", "is-error"],
+    warn: ["警告", "is-warn"],
+    info: ["提示", "is-info"],
+  };
+
+  // 上下文六层。名字与 `core/agent/context.py` 的 `usage` 键一致，
+  // 颜色由 `--layer-*` 给出；顺序就是装配顺序。
+  const ANALYSIS_LAYERS = [
+    ["prefix", "前缀"],
+    ["memory", "记忆"],
+    ["task", "任务"],
+    ["event", "事件"],
+    ["recent", "最近"],
+    ["evidence", "证据"],
+  ];
+
+  function setDetailView(view) {
+    detailView = view;
+    if (!root) return;
+    const detail = root.querySelector(".history-detail");
+    if (detail) detail.classList.toggle("is-analysis", view === "analysis");
+    const pane = root.querySelector("#analysis-pane");
+    if (pane) pane.classList.toggle("is-hidden", view !== "analysis");
+    for (const tab of root.querySelectorAll(".detail-tab")) {
+      const active = tab.dataset.view === view;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", String(active));
+    }
+    if (view === "analysis") loadAnalysis();
+  }
+
+  function analysisSection(title, body) {
+    const box = el("section", "analysis-section");
+    box.appendChild(el("h3", "analysis-title", title));
+    box.appendChild(body);
+    return box;
+  }
+
+  function analysisCard(label, value, note) {
+    const card = el("div", "analysis-card");
+    card.appendChild(el("div", "analysis-card-label", label));
+    card.appendChild(el("div", "analysis-card-value", value));
+    if (note) card.appendChild(el("div", "analysis-card-note", note));
+    return card;
+  }
+
+  function analysisTable(head, rows) {
+    const wrap = el("div", "lib-table-wrap");
+    const table = el("table", "lib-table analysis-table");
+    table.innerHTML = `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody>`;
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function turnTable(data) {
+    const rows = data.turns
+      .map((turn) => {
+        const text = oneLine(turn.user_text, 60) || "（空消息）";
+        return `<tr class="is-clickable" data-turn="${turn.index}">
+          <td class="is-num">${turn.index}</td>
+          <td>${escapeHtml(text)}</td>
+          <td class="is-num">${secondsText(turn.seconds, data.hasTrace, turn.has_reply)}</td>
+          <td class="is-num">${turn.steps.length}</td>
+          <td class="is-num">${turn.tools.length}</td>
+          <td class="is-num">${turn.failed || ""}</td>
+          <td class="is-num">${formatNumber(turn.reasoning_chars)}</td>
+          <td class="is-num">${formatNumber(turn.tokens.input)}</td>
+          <td class="is-num">${formatNumber(turn.tokens.cached)}</td>
+          <td class="is-num">${formatNumber(turn.tokens.uncached)}</td>
+          <td class="is-num">${formatNumber(turn.tokens.output)}</td>
+          <td class="is-num">${formatPct(turn.cache_hit)}</td>
+          <td class="is-num">${turn.cost ? `$${turn.cost.toFixed(4)}` : "—"}</td>
+          <td>${escapeHtml(ANALYSIS_STATUS[turn.status] || turn.status || "未知")}</td>
+        </tr>`;
+      })
+      .join("");
+    const wrap = analysisTable(
+      `<th class="is-num">轮</th><th>用户消息</th><th class="is-num">耗时</th>
+       <th class="is-num">步</th><th class="is-num">工具</th><th class="is-num">失败</th>
+       <th class="is-num">推理字</th><th class="is-num">输入</th><th class="is-num">缓存</th>
+       <th class="is-num">新增</th><th class="is-num">输出</th><th class="is-num">命中</th>
+       <th class="is-num">费用</th><th>结束</th>`,
+      rows
+    );
+    for (const row of wrap.querySelectorAll("tbody tr")) {
+      row.addEventListener("click", () => selectTurn(Number(row.dataset.turn)));
+    }
+    return wrap;
+  }
+
+  function stepTable(turn) {
+    if (!turn.steps.length) return el("p", "analysis-empty", "这一轮没有记下步。");
+    const rows = turn.steps
+      .map((step) => {
+        const metric = step.metric;
+        return `<tr>
+          <td class="is-num">${step.no}</td>
+          <td class="is-num">${step.seconds === null ? "—" : step.seconds.toFixed(1)}</td>
+          <td>${step.tools.length ? escapeHtml(step.tools.join("、")) : '<span class="analysis-tag">无工具</span>'}</td>
+          <td class="is-num">${formatNumber(step.reasoning)}</td>
+          <td class="is-num">${metric ? formatNumber(metric.input) : "—"}</td>
+          <td class="is-num">${metric ? formatNumber(metric.cached) : "—"}</td>
+          <td class="is-num">${metric ? formatNumber(metric.uncached) : "—"}</td>
+          <td class="is-num">${metric ? formatNumber(metric.output) : "—"}</td>
+          <td class="is-num">${metric ? formatPct(metric.hit) : "—"}</td>
+          <td>${metric && metric.degraded.length ? escapeHtml(metric.degraded.join("、")) : ""}</td>
+        </tr>`;
+      })
+      .join("");
+    return analysisTable(
+      `<th class="is-num">步</th><th class="is-num">耗时</th><th>工具</th>
+       <th class="is-num">推理字</th><th class="is-num">输入</th><th class="is-num">缓存</th>
+       <th class="is-num">新增</th><th class="is-num">输出</th><th class="is-num">命中</th><th>降级</th>`,
+      rows
+    );
+  }
+
+  function toolTable(turn) {
+    if (!turn.tools.length) return el("p", "analysis-empty", "这一轮没有调用工具。");
+    const rows = turn.tools
+      .map(
+        (tool) => `<tr>
+          <td class="is-mono">${escapeHtml(tool.name)}</td>
+          <td>${
+            tool.status === "failed"
+              ? '<span class="analysis-tag is-error">失败</span>'
+              : '<span class="analysis-tag is-ok">成功</span>'
+          }</td>
+          <td class="is-num">${formatNumber(tool.chars)}</td>
+          <td class="is-mono">${escapeHtml(tool.keys.join(", "))}</td>
+          <td>${escapeHtml(tool.error || tool.permission)}</td>
+        </tr>`
+      )
+      .join("");
+    return analysisTable(
+      `<th>工具</th><th>状态</th><th class="is-num">输出字符</th><th>参数键</th><th>失败原因 / 许可</th>`,
+      rows
+    );
+  }
+
+  function layerPanel(turn) {
+    const rows = turn.steps
+      .map((step) => {
+        const usage = (step.metric && step.metric.usage) || {};
+        const total = ANALYSIS_LAYERS.reduce((sum, [key]) => sum + (usage[key] || 0), 0);
+        return { step, usage, total };
+      })
+      .filter((item) => item.total > 0);
+    if (!rows.length) {
+      return el("p", "analysis-empty", "这一轮没有装配记录，读不到上下文分层。");
+    }
+    const box = el("div", "analysis-layers");
+    const legend = el("div", "analysis-layer-legend");
+    for (const [key, name] of ANALYSIS_LAYERS) {
+      const item = el("span", "", name);
+      item.insertBefore(el("i", `is-${key}`), item.firstChild);
+      legend.appendChild(item);
+    }
+    box.appendChild(legend);
+    for (const { step, usage, total } of rows) {
+      const row = el("div", "analysis-layer-row");
+      row.appendChild(el("span", "analysis-layer-step", `第 ${step.no} 步`));
+      const bar = el("span", "analysis-layer-bar");
+      for (const [key, name] of ANALYSIS_LAYERS) {
+        const value = usage[key] || 0;
+        if (!value) continue;
+        const piece = el("i", `is-${key}`);
+        piece.style.width = `${(value / total) * 100}%`;
+        piece.title = `${name} ${formatNumber(value)}`;
+        bar.appendChild(piece);
+      }
+      row.appendChild(bar);
+      row.appendChild(el("span", "analysis-layer-total", formatNumber(total)));
+      box.appendChild(row);
+    }
+    return box;
+  }
+
+  function turnDetail(data, index) {
+    const turn = data.turns.find((item) => item.index === index);
+    const box = el("section", "analysis-section");
+    box.appendChild(el("h3", "analysis-title", `第 ${index} 轮`));
+    if (!turn) {
+      box.appendChild(el("p", "analysis-empty", "这一轮的记录不在本次分析里。"));
+      return box;
+    }
+    box.appendChild(el("div", "analysis-question", turn.user_text || "（空消息）"));
+
+    const bits = [
+      ["耗时", secondsText(turn.seconds, data.hasTrace, turn.has_reply)],
+      ["步", String(turn.steps.length)],
+      ["工具", `${turn.tools.length}（失败 ${turn.failed}）`],
+      ["推理", `${formatNumber(turn.reasoning_chars)} 字`],
+      ["正文", `${formatNumber(turn.text_chars)} 字`],
+      ["输入", formatNumber(turn.tokens.input)],
+      ["缓存", `${formatNumber(turn.tokens.cached)}（${formatPct(turn.tokens.input ? turn.tokens.cached / turn.tokens.input : 0)}）`],
+      ["输出", formatNumber(turn.tokens.output)],
+      ["费用", turn.cost ? `$${turn.cost.toFixed(4)}` : "—"],
+      ["结束", ANALYSIS_STATUS[turn.status] || turn.status || "未知"],
+    ];
+    const kv = el("div", "analysis-kv");
+    for (const [label, value] of bits) {
+      const item = el("span", "", `${label} `);
+      item.appendChild(el("b", "", value));
+      kv.appendChild(item);
+    }
+    box.appendChild(kv);
+
+    if (turn.answer_text) {
+      const answer = el("div", "analysis-answer");
+      const cut = turn.text_chars > turn.answer_text.length;
+      answer.textContent = cut ? `${turn.answer_text}…` : turn.answer_text;
+      box.appendChild(answer);
+    }
+
+    box.appendChild(el("h4", "analysis-subtitle", "上下文分层"));
+    box.appendChild(layerPanel(turn));
+    box.appendChild(el("h4", "analysis-subtitle", "逐步明细"));
+    box.appendChild(stepTable(turn));
+    box.appendChild(el("h4", "analysis-subtitle", "工具调用"));
+    box.appendChild(toolTable(turn));
+    return box;
+  }
+
+  function selectTurn(index) {
+    const data = analysisCache.get(activeId);
+    if (!data || !root) return;
+    selectedTurn = index;
+    for (const row of root.querySelectorAll(".analysis-table tbody tr[data-turn]")) {
+      row.classList.toggle("is-selected", Number(row.dataset.turn) === index);
+    }
+    const box = root.querySelector("#an-turn-detail");
+    if (!box) return;
+    box.classList.remove("is-hidden");
+    box.innerHTML = "";
+    box.appendChild(turnDetail(data, index));
+    box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  function topicsTable(data) {
+    if (!data.events.length) return el("p", "analysis-empty", "这个会话还没有封存的主题。");
+    const rows = data.events
+      .map(
+        (event) => `<tr>
+          <td class="is-mono">${escapeHtml(event.id)}</td>
+          <td>${escapeHtml(event.title)}</td>
+          <td class="is-num">${event.step_start}–${event.step_end}</td>
+          <td>${escapeHtml(TOPIC_STATUS[event.status] || event.status || "—")}</td>
+          <td class="is-num">${event.artifacts.length}</td>
+          <td>${escapeHtml(oneLine(event.issues.join("；"), 120))}</td>
+          <td>${event.degraded ? "本地拼" : ""}</td>
+        </tr>`
+      )
+      .join("");
+    return analysisTable(
+      `<th>编号</th><th>标题</th><th class="is-num">步区间</th><th>状态</th>
+       <th class="is-num">产物</th><th>问题</th><th>降级</th>`,
+      rows
+    );
+  }
+
+  function issuesTable(data) {
+    if (!data.issues.length) return el("p", "analysis-empty", "没有发现异常。");
+    const order = { error: 0, warn: 1, info: 2 };
+    const items = [...data.issues].sort(
+      (left, right) => (order[left.level] ?? 3) - (order[right.level] ?? 3)
+    );
+    const rows = items
+      .map((item) => {
+        const [label, className] = ANALYSIS_LEVEL[item.level] || ["提示", "is-info"];
+        return `<tr>
+          <td><span class="analysis-tag ${className}">${label}</span></td>
+          <td>${escapeHtml(item.text)}</td>
+        </tr>`;
+      })
+      .join("");
+    return analysisTable("<th>级别</th><th>说明</th>", rows);
+  }
+
+  function analysisNote() {
+    const note = el("p", "analysis-note");
+    note.innerHTML = [
+      "耗时取 trace 时间戳之差（用户消息写入到 turn.done），不含两次输入之间的空闲。",
+      "token 与费用取助手消息自带的 tokens / cost；逐步的输入、缓存、输出取 trace 的 context.metrics。",
+      "缓存命中 = cached / input，逐步取该步的读数，整轮取各步算术平均。",
+      "上下文分层取每一步装配的 usage，分段宽度按该步六层之和折算。",
+      "没有 trace 时逐步读数留空，轮数、token 与主题统计仍来自状态文件。",
+    ]
+      .map(escapeHtml)
+      .join("<br>");
+    return note;
+  }
+
+  function renderAnalysis(data) {
+    const pane = root.querySelector("#analysis-pane");
+    if (!pane) return;
+    pane.innerHTML = "";
+    const summary = data.session;
+
+    const cards = el("div", "analysis-cards");
+    cards.appendChild(analysisCard("轮数", formatNumber(summary.turns), `${summary.steps} 步`));
+    cards.appendChild(
+      analysisCard(
+        "工具调用",
+        formatNumber(summary.tools),
+        `失败 ${summary.failed} 次${summary.refused ? `（收束拒绝 ${summary.refused}）` : ""}`
+      )
+    );
+    cards.appendChild(
+      analysisCard(
+        "输入 token",
+        formatNumber(summary.tokens.input),
+        `缓存复用 ${formatPct(summary.cache_reuse)}`
+      )
+    );
+    cards.appendChild(
+      analysisCard(
+        "输出 token",
+        formatNumber(summary.tokens.output),
+        `新增输入 ${formatNumber(summary.tokens.uncached)}`
+      )
+    );
+    cards.appendChild(
+      analysisCard("费用", `$${summary.cost.toFixed(4)}`, summary.model || "未指定模型")
+    );
+    cards.appendChild(
+      analysisCard(
+        "活跃时长",
+        data.hasTrace ? formatDuration(summary.active_seconds) || "—" : "—",
+        data.hasTrace
+          ? summary.last_exit_reason
+            ? `上次停在 ${summary.last_exit_reason}`
+            : "按 trace 时间戳累加"
+          : "没有 trace，读不到"
+      )
+    );
+    pane.appendChild(cards);
+
+    pane.appendChild(
+      el(
+        "p",
+        "analysis-note",
+        data.hasTrace
+          ? `trace ${formatBytes(data.traceBytes)}，统计于 ${formatTime(data.generated_at)}。`
+          : "这个会话没有 trace 记录，缓存命中、分层占用与逐步耗时都读不到；轮数、token 与主题统计来自状态文件。"
+      )
+    );
+
+    pane.appendChild(analysisSection("逐轮总览", turnTable(data)));
+    const detail = el("div", "analysis-turn-detail is-hidden");
+    detail.id = "an-turn-detail";
+    pane.appendChild(detail);
+    pane.appendChild(analysisSection("主题", topicsTable(data)));
+    pane.appendChild(analysisSection("异常", issuesTable(data)));
+    pane.appendChild(analysisSection("口径", analysisNote()));
+
+    if (selectedTurn) selectTurn(selectedTurn);
+  }
+
+  async function loadAnalysis() {
+    if (!activeId || !root) return;
+    const sessionId = activeId;
+    const pane = root.querySelector("#analysis-pane");
+    const cached = analysisCache.get(sessionId);
+    if (cached) {
+      renderAnalysis(cached);
+      return;
+    }
+    const token = ++analysisLoadToken;
+    pane.innerHTML = "";
+    pane.appendChild(el("p", "empty-hint", "正在统计这个会话…"));
+    try {
+      const data = await fetchJson(
+        `/api/sessions/${encodeURIComponent(sessionId)}/analysis`
+      );
+      if (token !== analysisLoadToken || !root || sessionId !== activeId) return;
+      analysisCache.set(sessionId, data);
+      renderAnalysis(data);
+    } catch (error) {
+      if (token !== analysisLoadToken || !root || sessionId !== activeId) return;
+      pane.innerHTML = "";
+      pane.appendChild(el("p", "empty-hint", `读取分析失败：${error.message}`));
+    }
+  }
+
+  // ------------------------------------------------------------------
   // 选择与取数
   // ------------------------------------------------------------------
 
@@ -1702,13 +2141,16 @@
     artifacts = shelf;
     const session = sessions.find((item) => item.id === sessionId);
     renderHead({ ...(session || {}), title: list.title || (session && session.title) || "" });
+    const tabs = root.querySelector("#detail-tabs");
+    if (tabs) tabs.classList.remove("is-hidden");
     renderTopicRail();
     renderArtifactPane();
     renderConversation();
     return true;
   }
 
-  async function selectSession(sessionId, focusEvent) {
+  async function selectSession(sessionId, focusEvent, view) {
+    if (view) detailView = view;
     activeId = sessionId;
     loadToken += 1;
     const token = loadToken;
@@ -1716,6 +2158,7 @@
     task = null;
     compactUpto = 0;
     artifacts = null;
+    selectedTurn = 0;
     segments.clear();
     segmentLoads.clear();
     runOpen.clear();
@@ -1732,6 +2175,8 @@
     root.querySelector("#chat-composer").classList.remove("is-hidden");
 
     root.querySelector("#session-head").classList.add("is-hidden");
+    root.querySelector("#detail-tabs").classList.add("is-hidden");
+    root.querySelector("#analysis-pane").classList.add("is-hidden");
     const box = root.querySelector("#conversation");
     box.innerHTML = "";
     box.appendChild(el("p", "empty-hint", "正在读取会话…"));
@@ -1763,6 +2208,7 @@
         if (card) card.scrollIntoView({ block: "start" });
       }
       await pollLive();
+      setDetailView(detailView);
     } catch (error) {
       if (token !== loadToken) return;
       box.innerHTML = "";
@@ -1774,9 +2220,14 @@
     if (!activeId) return;
     loadToken += 1;
     const token = loadToken;
+    // 分析里含 token 与异常统计，跑完一轮之后旧的那份就对不上了。
+    analysisCache.delete(activeId);
     // 已封存的主题不会变，旧的正文段可以留着；新主题按需再取。
     try {
-      if (await loadDetail(activeId, token)) return;
+      if (await loadDetail(activeId, token)) {
+        if (detailView === "analysis") loadAnalysis();
+        return;
+      }
     } catch (error) {
       if (token !== loadToken) return;
       const box = root.querySelector("#conversation");
@@ -1809,6 +2260,10 @@
     segments.clear();
     live = null;
     loadToken = 0;
+    detailView = "conversation";
+    analysisCache.clear();
+    analysisLoadToken = 0;
+    selectedTurn = 0;
     loadChrome();
 
     container.querySelector("#session-search").addEventListener("input", (event) => {
@@ -1819,6 +2274,9 @@
       await loadSessions();
       if (activeId) await refreshSession();
     });
+    for (const tab of container.querySelectorAll(".detail-tab")) {
+      tab.addEventListener("click", () => setDetailView(tab.dataset.view));
+    }
 
     const onVisible = () => {
       if (document.visibilityState === "visible") pollLive();
@@ -1850,7 +2308,8 @@
     await loadSessions();
     if (param) {
       const wanted = query && query.get("event");
-      await selectSession(param, wanted || "");
+      const tab = query && query.get("tab") === "analysis" ? "analysis" : "";
+      await selectSession(param, wanted || "", tab);
     }
 
     return {
@@ -1867,6 +2326,7 @@
         );
         root = null;
         loadToken += 1;
+        analysisLoadToken += 1;
       },
     };
   }

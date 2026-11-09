@@ -39,9 +39,17 @@ from tomllib import TOMLDecodeError
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlparse
 
-from .. import corpus, corpus_config, index, live
-from ..paths import SURVEY_DIRECTORY, config_home
+from .. import corpus, knowledge_refs, live
+from ..agent.report import build as build_report
+from ..agent.report import read_trace
+from ..agent.trace import log_directory_for
+from ..paths import SURVEY_DIRECTORY, config_home, project_root
 from ..session_manager import SessionManager
+from .jobs import JobStore
+from .services import evaluation as evaluation_service
+from .services import library as library_service
+from .services import memory as memory_service
+from .services import search as search_service
 
 # 状态文件是原子换名写出的（`SessionManager.save_to_toml`）。但读的人仍可能
 # 卡在「临时文件已写好、换名还没做」的空窗里读到上一版，或者遇到别的进程
@@ -66,19 +74,17 @@ REQUEST_HEADER = "X-VSA-Request"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 """一次上传请求体的上限（含所有文件）。单文件 50MB 对文献够用；再多请分批。"""
 
-CHUNK_PAGE = 40
-"""切块列表一页多少块。一个 200 页的 PDF 可能有几百块，整包发出去是几 MB 的
-JSON；40 块约一屏半，翻页也不费事。"""
+CHUNK_PAGE = library_service.CHUNK_PAGE
+"""切块列表一页多少块。取值与说明在 `services/library.py`。"""
 
-CHUNK_PAGE_MAX = 100
-"""一页最多给多少块。再大就回到「一次几 MB」，而页面也读不完。"""
+CHUNK_PAGE_MAX = library_service.CHUNK_PAGE_MAX
+"""一页最多给多少块。取值与说明在 `services/library.py`。"""
 
 MAX_JSON_BYTES = 64 * 1024
 """改名这类 JSON 请求体的上限。给得宽是因为标题可能很长，但没必要无上限。"""
 
-UPLOAD_SUFFIXES = (".pdf", ".md", ".txt")
-"""投递口收的扩展名。与 `parse.SUPPORTED_SUFFIXES` 同口径——这里先挡一道，
-是为了让用户在网页上就看见「不支持」，而不是等入库时才失败。"""
+UPLOAD_SUFFIXES = library_service.UPLOAD_SUFFIXES
+"""投递口收的扩展名。与 `parse.SUPPORTED_SUFFIXES` 同口径。"""
 
 LIBRARY_ITEM = re.compile(r"^(doc|web):([0-9a-f]{10})$")
 """`<kind>:<id>/<action>` 里那一段的身份。**路径由 id 拼，不接受用户给的路径。**"""
@@ -86,6 +92,18 @@ LIBRARY_ITEM = re.compile(r"^(doc|web):([0-9a-f]{10})$")
 MAX_TASK_CHARS = 8000
 """一次提交的任务正文上限。终端里粘一整篇文献也就几万字，这里给到 8000 字；
 再长的交给 `import_documents`，不该从任务框里塞进去。"""
+
+MAX_TAGS = 10
+"""一份语料最多几个标签。标签是用来筛的，攒到几十个时筛选栏自己就成了一堵墙。"""
+
+MAX_TAG_CHARS = 40
+"""单个标签的字数上限。"""
+
+MAX_BATCH_DELETE = 50
+"""一次批量删除最多几份。再多就分几次：一次挪五十个目录已经够慢。"""
+
+FOLDER_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+"""文件夹编号的形状。它只用来在 `labels.json` 里指认，不进路径。"""
 
 LEDGER_DIRECTORY = "ledgers"
 """登记表快照所在目录，与 `ledger.ledger_root()` 同一个名字。"""
@@ -370,10 +388,17 @@ def slice_messages(session, start: tuple[int, int], end: tuple[int, int]) -> lis
     一条 assistant 消息装着整轮的所有往返，所以区间端点要落在**单元**上：
     只按消息下标切，会把上一条主题的工具调用一起带进来。裁完没有单元的消息
     不返回——页面上一条空消息只会让人以为内容丢了。
+
+    末条消息也在循环里：区间两端可以落在同一条 assistant 消息内部（主题就是
+    在一条消息中间结束的），按 `range(first, last)` 写会连这条消息的前半段一起
+    丢掉。`end[1]` 为 0 时那一条截出空列表，自然跳过。
     """
-    first, last = start[0], min(end[0], len(session.messages))
+    if not session.messages:
+        return []
+    first = start[0]
+    last = min(end[0], len(session.messages) - 1)
     sliced: list[dict] = []
-    for index in range(first, last):
+    for index in range(first, last + 1):
         message = session.messages[index]
         low = start[1] if index == start[0] else 0
         high = end[1] if index == end[0] else len(message.parts)
@@ -504,192 +529,25 @@ def content_type_for(path: Path) -> str:
 # ---------------------------------------------------------------------------
 # 语料库（S2）
 # ---------------------------------------------------------------------------
-def archive_directory() -> Path:
-    """查询归档的目录。真相在 `domain/rsearch.search_dir()`，这里只读它的位置。
-
-    从 `core/web` 导入 `core/agent/domain` 会把依赖方向倒过来（网页端不该认识
-    领域工具），所以这一处按同一个约定拼路径，注释指回那个函数。
-    """
-    return config_home() / "search"
-
-
-def library_payload(root: Path) -> dict:
-    """语料库列表 + 待入库数 + 占用 + 开关现状。**只读，不动任何文件。**"""
-    items: list[dict] = []
-    for kind in ("doc", "web"):
-        base = root / kind
-        if not base.is_dir():
-            continue
-        for entry in sorted(base.iterdir()):
-            if not entry.is_dir():
-                continue
-            item = _library_item(kind, entry)
-            if item is not None:
-                items.append(item)
-    items.sort(key=lambda item: (-float(item["addedAt"] or 0), item["id"]))
-
-    counts = _index_counts(root)
-    for item in items:
-        item["chunks"], item["vectors"] = counts.get(item["id"], (0, 0))
-
-    inbox = _inbox_files(root)
-    settings = corpus_config.load(root.parent)
-    return {
-        "items": items,
-        "inbox": {"count": len(inbox), "names": [path.name for path in inbox[:20]]},
-        "archive": {"count": len(list(archive_directory().glob("web-*.json")))},
-        "stats": {
-            "sources": len(items),
-            "chunks": sum(item["chunks"] for item in items),
-            "bytes": sum(item["size"] for item in items),
-        },
-        "config": {
-            "indexWeb": settings.index_web,
-            "embed": settings.embed,
-            "embedModel": settings.embed_model,
-            # 浏览器里只显示，不能改：改配置是写操作（方案稿 §10）。
-            "source": settings.source,
-        },
-    }
-
-
-def chunks_payload(
-    root: Path, kind: str, source_id: str, *, offset: int = 0, limit: int = CHUNK_PAGE
-) -> dict:
-    """一份源的切块。**只读**：索引以 `mode=ro` 打开，取不到就给空表。
-
-    给的是**索引里那一份**，不是按原件重新切一遍：用户要看的就是「检索看到的
-    东西」。重新切会得到另一份（哪怕这次逐字相同），而两边的差异恰恰是最该被
-    看见的——重切出来的那份不会解释为什么检索命中了别的段落。
-    """
-    source = f"{kind}:{source_id}"
-    conn = index.open_readonly(root)
-    if conn is None:
-        return {"items": [], "total": 0, "offset": offset, "limit": limit, "reason": "索引还没建"}
-    try:
-        total = int(
-            conn.execute("SELECT COUNT(*) FROM chunks WHERE source_id = ?", (source,)).fetchone()[0]
-        )
-        rows = conn.execute(
-            "SELECT chunk_no, section, level, page, page_end, chars, text FROM chunks "
-            "WHERE source_id = ? ORDER BY chunk_no LIMIT ? OFFSET ?",
-            (source, limit, offset),
-        ).fetchall()
-    except Exception:  # noqa: BLE001 - 库坏了不该让整页 500
-        return {"items": [], "total": 0, "offset": offset, "limit": limit, "reason": "索引读不出来"}
-    finally:
-        conn.close()
-    return {
-        "items": [
-            {
-                "no": int(row["chunk_no"]),
-                "section": str(row["section"] or ""),
-                "level": int(row["level"]),
-                "page": int(row["page"]),
-                "pageEnd": int(row["page_end"]),
-                "chars": int(row["chars"]),
-                "text": str(row["text"]),
-            }
-            for row in rows
-        ],
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-    }
-
-
-def _library_item(kind: str, entry: Path) -> dict | None:
-    """一份源在列表里的一行。读 `meta.json` 与 `labels.json`，**不读原件内容**。"""
-    meta_path = entry / corpus.META_FILE
-    try:
-        meta = corpus.read_json(meta_path)
-    except (OSError, ValueError):
-        # 半截 meta（写到一半）不该让整页 500：列出来并标成「元数据缺失」。
-        meta = {}
-    labels: dict[str, Any] = {}
-    try:
-        labels = corpus.read_json(entry / corpus.LABELS_FILE)
-    except (OSError, ValueError):
-        labels = {}
-
-    source_id = f"{kind}:{entry.name}"
-    display = str(labels.get("display_title") or "").strip()
-    size = 0
-    for item in entry.rglob("*"):
-        try:
-            if item.is_file():
-                size += item.stat().st_size
-        except OSError:
-            continue
-    added = meta.get("added_at")
-    if not isinstance(added, (int, float)):
-        try:
-            added = entry.stat().st_mtime
-        except OSError:
-            added = 0.0
-    return {
-        "id": source_id,
-        "kind": kind,
-        "ref": f"{kind}#{entry.name}",
-        "title": display or str(meta.get("title") or entry.name),
-        "displayTitle": display,
-        "rawTitle": str(meta.get("title") or ""),
-        "locator": str(meta.get("url") or meta.get("file") or ""),
-        "pages": int(meta.get("pages") or 0),
-        "structure": str(meta.get("structure") or ""),
-        "depth": str(meta.get("depth") or ""),
-        "chars": int(meta.get("chars") or 0),
-        "size": size,
-        "addedAt": float(added),
-        "status": "ok" if meta else "bad-meta",
-        # `chunks` / `vectors` 由 `library_payload` 从只读索引里补上。
-        "chunks": 0,
-        "vectors": 0,
-    }
-
-
-def _index_counts(root: Path) -> dict[str, tuple[int, int]]:
-    """`source_id -> (块数, 向量数)`。索引不可读时给空表——列表照常显示。"""
-    conn = index.open_readonly(root)
-    if conn is None:
-        return {}
-    counts: dict[str, tuple[int, int]] = {}
-    try:
-        for row in conn.execute("SELECT source_id, COUNT(*) FROM chunks GROUP BY source_id"):
-            counts[str(row[0])] = (int(row[1]), 0)
-        for row in conn.execute(
-            "SELECT c.source_id, COUNT(*) FROM vectors v JOIN chunks c ON c.id = v.chunk_id "
-            "GROUP BY c.source_id"
-        ):
-            known = counts.get(str(row[0]), (0, 0))
-            counts[str(row[0])] = (known[0], int(row[1]))
-    except Exception:  # noqa: BLE001 - 读数缺了不该让页面挂掉
-        return {}
-    finally:
-        conn.close()
-    return counts
-
-
-def _inbox_files(root: Path) -> list[Path]:
-    inbox = root / "inbox"
-    if not inbox.is_dir():
-        return []
-    return sorted(
-        item
-        for item in inbox.iterdir()
-        if item.is_file() and item.suffix.lower() in UPLOAD_SUFFIXES
-    )
+# 取数都在 `services/library.py`，这里保留同名入口给判据与旧调用点。
+archive_directory = library_service.archive_directory
+library_payload = library_service.library_payload
+chunks_payload = library_service.chunks_payload
+_inbox_files = library_service._inbox_files
 
 
 def _item_identity(rest: str, action: str) -> tuple[str, str]:
     """`doc:ab12cd34ef/rename` → `(doc, ab12cd34ef)`。
 
     后缀对不上就是 404：`/api/library/doc:xxx/whatever` 不该落到某个默认动作上。
+    `action` 为空串时整段就是身份（详情接口用这一种）。
     """
-    suffix = f"/{action}"
-    if not rest.endswith(suffix):
-        raise HttpError(404, f"不认识的语料操作：{rest}")
-    matched = LIBRARY_ITEM.match(rest[: -len(suffix)])
+    suffix = f"/{action}" if action else ""
+    if suffix:
+        if not rest.endswith(suffix):
+            raise HttpError(404, f"不认识的语料操作：{rest}")
+        rest = rest[: -len(suffix)]
+    matched = LIBRARY_ITEM.match(rest)
     if matched is None:
         raise HttpError(400, "语料标识要写成 doc:xxxxxxxxxx 或 web:xxxxxxxxxx")
     return matched.group(1), matched.group(2)
@@ -917,13 +775,33 @@ def _inbox_selection(request: "WebHandler", payload: dict) -> list[Path]:
     return picked
 
 
-def _run_ingest(server: "WebServer", files: list[Path]) -> None:
-    """后台把一批文件入库，一条一条更新进度。异常按文件隔离。"""
+def _run_ingest(server: "WebServer", files: list[Path], job_id: str = "") -> None:
+    """后台把一批文件入库，一条一条更新进度。异常按文件隔离。
+
+    `job_id` 是任务台账里那一条。四个阶段（解析 / 切块 / 写索引 / 向量）由
+    `ingest_files` 的 `on_stage` 回调报上来；这条线程是 daemon，服务停下时
+    没人能中断它，所以状态由 `JobStore.stop_own()` 在关闭时改成中断。
+    """
+    jobs = server.jobs
+    results: list[dict] = []
+    seen: list[str] = []
+
+    def stage(name: str, detail: str = "") -> None:
+        if not job_id:
+            return
+        if not seen or seen[-1] != name:
+            seen.append(name)
+        jobs.update(job_id, stage=name, stages=list(seen), note=detail or name)
+
     try:
         for position, path in enumerate(files, 1):
+            if job_id:
+                jobs.update(job_id, note=path.name)
             try:
                 # 语料根一起交过去：判据在临时目录上跑，入库不能写回仓根那份。
-                outcomes = server.ingest([path], server.corpus_root) if server.ingest else []
+                outcomes = (
+                    server.ingest([path], server.corpus_root, stage) if server.ingest else []
+                )
             except Exception as error:  # noqa: BLE001 - 一个坏文件不该带走整批
                 outcomes = [
                     {
@@ -932,15 +810,37 @@ def _run_ingest(server: "WebServer", files: list[Path]) -> None:
                         "reason": f"{type(error).__name__}: {error}",
                     }
                 ]
+            results.extend(outcomes)
             with server.ingest_lock:
                 server.ingest_state["results"].extend(outcomes)
                 server.ingest_state["done"] = position
+            if job_id:
+                jobs.update(job_id, progress={"done": position, "total": len(files)})
+        if job_id:
+            failed = [item for item in results if item["status"] == "failed"]
+            jobs.update(
+                job_id,
+                status="done",
+                stage="完成",
+                result={"results": results},
+                error="；".join(
+                    f"{item['name']}：{item.get('reason', '')}" for item in failed[:3]
+                ),
+            )
+    except Exception as error:  # noqa: BLE001 - 这条线程没有上级，错误只能写进任务
+        if job_id:
+            jobs.update(
+                job_id,
+                status="failed",
+                stage="失败",
+                error=f"{type(error).__name__}: {error}",
+            )
     finally:
         with server.ingest_lock:
             server.ingest_state["running"] = False
 
 
-def _library_ingest(request: "WebHandler", _rest: str) -> dict:
+def _library_ingest(request: "WebHandler", _rest: str) -> tuple[dict, int]:
     """把 inbox 里的文件送进语料库。
 
     **写索引的仍然是应用那个进程**：网页只是把「入库」这个动作转交给它，自己
@@ -968,11 +868,99 @@ def _library_ingest(request: "WebHandler", _rest: str) -> dict:
             "done": 0,
             "results": [],
         }
+    job = server.jobs.create(
+        "ingest",
+        note="入库",
+        total=len(files),
+        meta={"names": [path.name for path in files]},
+    )
     threading.Thread(
-        target=_run_ingest, args=(server, files), name="vsagent-ingest", daemon=True
+        target=_run_ingest,
+        args=(server, files, job["id"]),
+        name="vsagent-ingest",
+        daemon=True,
     ).start()
-    # 202：受理了，但切块与向量还在后台跑。页面靠轮询 `/api/library` 的 `ingest` 收结果。
-    return {"started": len(files), "names": [path.name for path in files]}, 202
+    # 202：受理了，但切块与向量还在后台跑。页面靠轮询 `/api/library` 的 `ingest`
+    # 看当场进度，靠 `/api/ingestion/jobs` 看四个阶段与历史。
+    return {
+        "started": len(files),
+        "names": [path.name for path in files],
+        "jobId": job["id"],
+    }, 202
+
+
+def _ingestion_list(request: "WebHandler", _rest: str) -> dict:
+    """入库任务清单，新的在前。**只读台账文件**，不碰索引。"""
+    return {"jobs": request.server.jobs.list(kind="ingest", limit=50)}
+
+
+def _ingestion_detail(request: "WebHandler", rest: str) -> dict:
+    """单条入库任务：阶段、进度、每个文件的结果。"""
+    job_id = rest.strip("/")
+    if "/" in job_id:
+        raise HttpError(404, f"入库任务下面没有这个接口：{rest}")
+    job = request.server.jobs.get(job_id)
+    if job is None or str(job.get("kind")) != "ingest":
+        raise HttpError(404, f"没有这条入库任务：{job_id}")
+    return job
+
+
+def _ingestion_retry(request: "WebHandler", rest: str) -> tuple[dict, int]:
+    """重试一条失败或中断的入库任务。
+
+    文件从 inbox 里重新取：成功的那几个已经被 `_import_one` 删掉，所以只重试
+    还在的那几个。一个都不在了就明说「重新上传一次」，不凭空造一份。
+    """
+    _guard_write(request)
+    server = request.server
+    if server.ingest is None:
+        raise HttpError(
+            503,
+            "这个进程不负责入库：用 python -m vsagent 启动应用之后再重试，"
+            "或者在 TUI 里让模型 import_documents。",
+        )
+    job_id = rest.strip("/")
+    if not job_id.endswith("/retry"):
+        raise HttpError(404, f"入库任务下面没有这个动作：{rest}")
+    job_id = job_id[: -len("/retry")].strip("/")
+    if "/" in job_id:
+        raise HttpError(404, f"入库任务下面没有这个动作：{rest}")
+    job = server.jobs.get(job_id)
+    if job is None or str(job.get("kind")) != "ingest":
+        raise HttpError(404, f"没有这条入库任务：{job_id}")
+    if job["status"] not in ("failed", "interrupted"):
+        raise HttpError(409, f"这一条是 {job['status']}，不用重试")
+
+    inbox = server.corpus_root / "inbox"
+    names = [str(item) for item in (job.get("meta") or {}).get("names") or []]
+    files = [inbox / name for name in names if name and (inbox / name).is_file()]
+    if not files:
+        raise HttpError(
+            400, "原始文件已经不在 inbox 里了：重新上传一次再入库。"
+        )
+
+    with server.ingest_lock:
+        if server.ingest_state["running"]:
+            raise HttpError(409, "上一批还在入库，等它结束再点")
+        server.ingest_state = {
+            "running": True,
+            "total": len(files),
+            "done": 0,
+            "results": [],
+        }
+    retry = server.jobs.create(
+        "ingest",
+        note="重试",
+        total=len(files),
+        meta={"names": [path.name for path in files], "retryOf": job_id},
+    )
+    threading.Thread(
+        target=_run_ingest,
+        args=(server, files, retry["id"]),
+        name="vsagent-ingest",
+        daemon=True,
+    ).start()
+    return {"jobId": retry["id"], "job": retry}, 202
 
 
 def _library_rename(request: "WebHandler", rest: str) -> dict:
@@ -1027,7 +1015,7 @@ def _library_delete(request: "WebHandler", rest: str) -> dict:
 
     trash = request.server.corpus_root / ".trash"
     trash.mkdir(parents=True, exist_ok=True)
-    target = trash / f"{kind}-{source_id}-{int(time.time())}"
+    target = _trash_target(trash, kind, source_id)
     try:
         os.replace(directory, target)
     except OSError as error:
@@ -1037,6 +1025,170 @@ def _library_delete(request: "WebHandler", rest: str) -> dict:
         "deleted": True,
         "trash": str(target.relative_to(request.server.corpus_root)),
     }
+
+
+def _trash_target(trash: Path, kind: str, source_id: str) -> Path:
+    """回收站里的目标目录名。**不覆盖已有的那一份**。
+
+    名字带上秒级时间戳，同一秒删两份时靠编号区分；删过又恢复、同一秒再删时
+    会撞上同名目录，这时加序号。直接 `os.replace` 到已存在的非空目录会抛出，
+    到空目录则会静默替换掉上一次那份。
+    """
+    base = f"{kind}-{source_id}-{int(time.time())}"
+    candidate = trash / base
+    if not candidate.exists():
+        return candidate
+    for index in range(2, 1000):
+        candidate = trash / f"{base}-{index}"
+        if not candidate.exists():
+            return candidate
+    raise HttpError(409, f"{base} 的重名目录已经太多了，先清理 corpus/.trash/")
+
+
+def _library_labels(request: "WebHandler", rest: str) -> dict:
+    """`<kind>:<id>/labels`：写标签、收藏、文件夹。
+
+    **只写 `labels.json`**。这三样都是组织数据，与索引无关：写完之后版本号不变，
+    也不需要重新切块。`display_title` 原样保留，改名与标签共用一份文件。
+    """
+    _guard_write(request)
+    kind, source_id = _item_identity(rest, "labels")
+    directory = _source_directory(request.server.corpus_root, kind, source_id)
+    if not (directory / corpus.META_FILE).is_file():
+        raise HttpError(404, f"没有这一份：{kind}#{source_id}")
+    payload = _json_body(request)
+    labels = corpus.read_labels(directory)
+
+    if "tags" in payload:
+        raw = payload["tags"]
+        if not isinstance(raw, list):
+            raise HttpError(400, "tags 要是一个字符串数组")
+        tags: list[str] = []
+        for item in raw:
+            tag = " ".join(str(item).split())
+            if not tag:
+                continue
+            if len(tag) > MAX_TAG_CHARS:
+                raise HttpError(400, f"标签「{tag}」超过 {MAX_TAG_CHARS} 字")
+            if tag not in tags:
+                tags.append(tag)
+        if len(tags) > MAX_TAGS:
+            raise HttpError(400, f"一份语料最多 {MAX_TAGS} 个标签，这次给了 {len(tags)} 个")
+        if tags:
+            labels["tags"] = tags
+        else:
+            labels.pop("tags", None)
+
+    if "favorite" in payload:
+        if payload["favorite"]:
+            labels["favorite"] = True
+        else:
+            labels.pop("favorite", None)
+
+    if "folderId" in payload:
+        folder_id = str(payload.get("folderId") or "").strip()
+        if folder_id:
+            known = {str(item.get("id")) for item in corpus.read_folders(request.server.corpus_root)}
+            if folder_id not in known:
+                raise HttpError(400, f"没有这个文件夹：{folder_id}")
+            labels["folderId"] = folder_id
+        else:
+            labels.pop("folderId", None)
+
+    corpus.write_labels(directory, labels)
+    return {"id": f"{kind}:{source_id}", "labels": labels}
+
+
+def _library_batch_delete(request: "WebHandler", _rest: str) -> dict:
+    """一次删多份网页来源。**只认 `web:`**：文献由用户显式导入，批量删掉之后
+    恢复要重新导入，代价不对等。
+
+    逐个挪进 `.trash/`，结果按条给。中途某个失败不影响其余几条——与入库
+    「一个坏文件不带走整批」同一个处理。
+    """
+    _guard_write(request)
+    payload = _json_body(request)
+    raw = payload.get("ids")
+    if not isinstance(raw, list) or not raw:
+        raise HttpError(400, "ids 要是一个非空数组")
+    if len(raw) > MAX_BATCH_DELETE:
+        raise HttpError(413, f"一次最多删 {MAX_BATCH_DELETE} 份，这次给了 {len(raw)} 份")
+    picked: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        matched = LIBRARY_ITEM.match(text)
+        if matched is None:
+            raise HttpError(400, f"语料标识要写成 doc:xxxxxxxxxx 或 web:xxxxxxxxxx：{text}")
+        if matched.group(1) != "web":
+            raise HttpError(400, f"批量删除只认网页来源：{text}")
+        if text not in picked:
+            picked.append(text)
+
+    root = request.server.corpus_root
+    trash = root / ".trash"
+    trash.mkdir(parents=True, exist_ok=True)
+    results: list[dict] = []
+    for text in picked:
+        kind, source_id = text.split(":", 1)
+        directory = _source_directory(root, kind, source_id)
+        if not directory.is_dir():
+            results.append({"id": text, "deleted": False, "reason": "已经不在了"})
+            continue
+        target = _trash_target(trash, kind, source_id)
+        try:
+            os.replace(directory, target)
+        except OSError as error:
+            results.append({"id": text, "deleted": False, "reason": f"挪不进回收站：{error}"})
+            continue
+        results.append(
+            {
+                "id": text,
+                "deleted": True,
+                "trash": str(target.relative_to(root)),
+            }
+        )
+    return {"results": results, "deleted": sum(1 for item in results if item["deleted"])}
+
+
+def _library_folders(request: "WebHandler", _rest: str) -> dict:
+    """`GET /api/library/folders`：文件夹清单。"""
+    return {"folders": corpus.read_folders(request.server.corpus_root)}
+
+
+def _library_folder_create(request: "WebHandler", _rest: str) -> dict:
+    """`POST /api/library/folders`：新建一个文件夹。
+
+    编号可以由调用方给（`research` 这种），不给就按顺序生成 `folder-1`。
+    重名与重号都回 409：文件夹只有一个名字，重名之后筛选栏里会出现两条一样的。
+    """
+    _guard_write(request)
+    payload = _json_body(request)
+    name = " ".join(str(payload.get("name") or "").split())
+    if not name:
+        raise HttpError(400, "文件夹名称不能为空")
+    if len(name) > 40:
+        raise HttpError(400, "文件夹名称最多 40 字")
+    folders = corpus.read_folders(request.server.corpus_root)
+    if any(str(item.get("name")) == name for item in folders):
+        raise HttpError(409, f"已经有叫「{name}」的文件夹了")
+
+    folder_id = str(payload.get("id") or "").strip()
+    if folder_id:
+        if FOLDER_ID.match(folder_id) is None:
+            raise HttpError(400, "文件夹编号要由小写字母、数字、下划线或连字符组成，最长 32 位")
+        if any(str(item.get("id")) == folder_id for item in folders):
+            raise HttpError(409, f"已经有编号 {folder_id} 的文件夹了")
+    else:
+        used = {str(item.get("id")) for item in folders}
+        index = len(folders) + 1
+        while f"folder-{index}" in used:
+            index += 1
+        folder_id = f"folder-{index}"
+
+    folder = {"id": folder_id, "name": name, "order": len(folders)}
+    folders.append(folder)
+    corpus.write_folders(request.server.corpus_root, folders)
+    return {"folder": folder, "folders": folders}
 
 
 # ---------------------------------------------------------------------------
@@ -1051,12 +1203,16 @@ class JsonRoute:
     `prefix` 为真时按前缀匹配，`handler` 收路径剩下的那一段；
     否则要求整段相等，`handler` 收不到参数。`method` 决定它接哪个动词——
     GET 与 POST 混在一张表里，是为了让「全部端点」仍然只有一处可读。
+
+    `writes` 标记这条路由会改盘上的东西。判据按它逐条验「缺 `X-VSA-Request`
+    时回 403」：漏标一条，那个写入口就不会被检查到。
     """
 
     path: str
     handler: Callable[[Any, str], Any]
     prefix: bool = False
     method: str = "GET"
+    writes: bool = False
 
     def matches(self, path: str, method: str) -> bool:
         if self.method != method:
@@ -1272,10 +1428,37 @@ def _session_live(request: "WebHandler", session_id: str) -> dict:
     return {**data, "present": True}
 
 
-def _session_detail(request: "WebHandler", rest: str) -> dict:
-    """会话本身与它下面的四个只读视图：`/events`、`/segment`、`/artifacts`、`/live`。
+ANALYSIS_TEXT_LIMIT = 600
+"""分析里保留多少字原话与正文。
 
-    四条共用一个前缀路由，是因为它们都以会话编号开头；拆成四条前缀路由时，
+整份正文动辄几十万字，一次分析要把它发给页面没有用处；一段引子够定位到
+是哪一轮、说了什么。原文在会话页里照样能读。
+"""
+
+
+def _session_analysis(request: "WebHandler", session) -> dict:
+    """一个会话的分析：轮、步、token、工具、主题与异常。
+
+    trace 按会话分文件写在状态文件旁边，里面是每一步的装配读数与工具调用现场，
+    状态文件里没有这些。没有 trace 时仍然给轮与主题的统计，页面按 `hasTrace`
+    标明逐步读数缺失。
+    """
+    path = log_directory_for(request.server.state_path) / f"{session.id}.jsonl"
+    if path.is_file():
+        trace = read_trace(path, session.id)
+        size = path.stat().st_size
+    else:
+        trace = []
+        size = 0
+    payload = build_report(session, trace, text_limit=ANALYSIS_TEXT_LIMIT)
+    payload["traceBytes"] = size
+    return payload
+
+
+def _session_detail(request: "WebHandler", rest: str) -> dict:
+    """会话本身与它下面的五个只读视图：`/events`、`/segment`、`/artifacts`、`/live`、`/analysis`。
+
+    几条共用一个前缀路由，是因为它们都以会话编号开头；拆成多条前缀路由时，
     `/api/sessions/` 会先把它们全都接住，谁先谁后都一样。
     """
     segments = [item for item in rest.split("/") if item]
@@ -1305,6 +1488,8 @@ def _session_detail(request: "WebHandler", rest: str) -> dict:
             return _session_segment(request, session)
         if action == "artifacts":
             return _session_artifacts(request, session)
+        if action == "analysis":
+            return _session_analysis(request, session)
     raise HttpError(404, f"会话下面没有这个接口：{'/'.join(segments[1:])}")
 
 
@@ -1427,11 +1612,29 @@ def _survey(request: "WebHandler", rest: str) -> dict:
 def _library(request: "WebHandler", _rest: str) -> dict:
     """语料库列表。只读：列表、待入库数、占用、开关现状与入库进度。
 
-    `ingest` 是**内存里的进度**，不落盘：它只描述「这一批跑到哪了」，页面靠
+    `q` / `kind` / `status` / `sort` / `offset` / `limit` 都可省略；一个都不给时
+    返回全部，与 M0 之前的行为一致。`limit` 不传就不分页——判据与旧页面按
+    「一次拿到全部」写的，默认值一改，它们的条数断言就会跟着变。
+
+    `ingest` 是**内存里的进度**，不写盘：它只描述「这一批跑到哪了」，页面靠
     轮询这一项把按钮从「入库中」变回「入库」。服务重启后这批任务就没了，
     而盘上的语料是完整的——进度不该被当成持久状态。
     """
-    payload = library_payload(request.server.corpus_root)
+    query = parse_qs(urlsplit(request.path).query)
+    offset = _query_int(query, "offset", 0, 0, 1_000_000)
+    raw_limit = (query.get("limit") or [""])[0].strip()
+    limit = None if not raw_limit else _query_int(
+        query, "limit", library_service.LIBRARY_PAGE_MAX, 1, library_service.LIBRARY_PAGE_MAX
+    )
+    payload = library_payload(
+        request.server.corpus_root,
+        query=(query.get("q") or [""])[0].strip(),
+        kind=(query.get("kind") or [""])[0].strip(),
+        status=(query.get("status") or [""])[0].strip(),
+        sort=(query.get("sort") or ["added"])[0].strip() or "added",
+        offset=offset,
+        limit=limit,
+    )
     state = request.server.ingest_state
     with request.server.ingest_lock:
         payload["ingest"] = {
@@ -1455,7 +1658,7 @@ def _query_int(query: dict, name: str, default: int, low: int, high: int) -> int
 
 
 def _library_chunks(request: "WebHandler", rest: str) -> dict:
-    """`<kind>:<id>/chunks?offset=&limit=`：只读地把切块列出来。
+    """`<kind>:<id>/chunks?offset=&limit=&q=`：只读地把切块列出来。
 
     给的是索引里那份文本（检索看到的就是它），不是按原件重切一遍。分页是为了
     不让一次响应变成几 MB——切块本身没有大小上限，一份长文献几百块很正常。
@@ -1468,22 +1671,322 @@ def _library_chunks(request: "WebHandler", rest: str) -> dict:
     offset = _query_int(query, "offset", 0, 0, 1_000_000)
     limit = _query_int(query, "limit", CHUNK_PAGE, 1, CHUNK_PAGE_MAX)
     payload = chunks_payload(
-        request.server.corpus_root, kind, source_id, offset=offset, limit=limit
+        request.server.corpus_root,
+        kind,
+        source_id,
+        offset=offset,
+        limit=limit,
+        query=(query.get("q") or [""])[0].strip(),
     )
     payload["id"] = f"{kind}:{source_id}"
     return payload
+
+
+def _library_detail(request: "WebHandler", rest: str) -> dict:
+    """`<kind>:<id>`：一份源的详情。
+
+    `/api/library/<kind>:<id>/chunks` 与它共用一条前缀路由：两者都以身份开头，
+    拆成两条前缀路由时，谁先谁后都会把对方接住。
+    """
+    if rest.endswith("/chunks"):
+        return _library_chunks(request, rest)
+    if "/" in rest:
+        raise HttpError(404, f"不认识的语料操作：{rest}")
+    kind, source_id = _item_identity(rest, "")
+    payload = library_service.source_detail(request.server.corpus_root, kind, source_id)
+    if payload is None:
+        raise HttpError(404, f"没有这一份：{kind}#{source_id}")
+    return payload
+
+
+def _corpus_stats(request: "WebHandler", _rest: str) -> dict:
+    """整库读数：源数、块数、向量覆盖、元数据缺失条数与占用。"""
+    return library_service.corpus_stats(request.server.corpus_root)
+
+
+def _knowledge_search(request: "WebHandler", _rest: str) -> dict:
+    """`/api/knowledge/search?q=&mode=&limit=&source=`：语料与记忆两段结果。
+
+    `mode` 只认 `hybrid` / `lexical` / `semantic`；写错了当场回 400，
+    不退回默认值——一个拼错的参数让页面看起来「搜到了」，比报错更难查。
+    `source` 是逗号分隔的源标识，用来把检索限在选中的几份语料里。
+    """
+    query = parse_qs(urlsplit(request.path).query)
+    term = (query.get("q") or [""])[0].strip()
+    if not term:
+        raise HttpError(400, "检索词不能为空")
+    mode = (query.get("mode") or ["hybrid"])[0].strip() or "hybrid"
+    if mode not in search_service.MODES:
+        raise HttpError(400, f"不认识的检索模式：{mode}；可用 {'、'.join(search_service.MODES)}")
+    limit = _query_int(query, "limit", SEARCH_LIMIT, 1, 20)
+    raw_sources = (query.get("source") or [""])[0].strip()
+    source_ids: tuple[str, ...] = ()
+    if raw_sources:
+        picked = [item.strip() for item in raw_sources.split(",") if item.strip()]
+        for item in picked:
+            if LIBRARY_ITEM.match(item) is None:
+                raise HttpError(400, f"源标识要写成 doc:xxxxxxxxxx 或 web:xxxxxxxxxx：{item}")
+        source_ids = tuple(picked)
+    return search_service.knowledge_payload(
+        request.server.workspace_root,
+        term,
+        limit=limit,
+        mode=mode,
+        source_ids=source_ids,
+        corpus_root=request.server.corpus_root,
+    )
+
+
+MEMORY_ID = re.compile(r"^mem_[0-9]{14}_[0-9a-f]{6}$")
+"""记忆编号的形状，与 `memory.new_memory_id` 一致。它只用来查字典，不进路径。"""
+
+
+def _knowledge_relations(request: "WebHandler", rest: str) -> dict:
+    """`/api/knowledge/<type>/<id>/relations`：文献与记忆之间的引用关系。
+
+    两侧都要能查：从文献出发看「哪几条记忆引用了它」，从记忆出发看「它引用的
+    文件里哪些在语料库中」。引用是文件路径，语料是 `doc:<哈希>`，换算在
+    `knowledge_refs` 里。
+
+    记忆引用的路径分三种：语料库里的一篇（`documents`）、库外仍然存在的文件
+    （`external`）、已经不在盘上的（`missing`）。后两种不报错——引用本来就是
+    用户写下的，文件被移走不该让整条记忆查不了。
+    """
+    parts = [item for item in rest.strip("/").split("/") if item]
+    if len(parts) != 3 or parts[2] != "relations":
+        raise HttpError(404, f"不认识的关联查询：{rest}")
+    kind, ident = parts[0], parts[1]
+    if kind == "doc":
+        return _doc_relations(request.server, ident)
+    if kind == "memory":
+        return _memory_relations(request.server, ident)
+    raise HttpError(404, f"关联查询只认 doc 与 memory：{kind}")
+
+
+def _doc_relations(server: "WebServer", ident: str) -> dict:
+    """一篇文献 → 引用它的记忆。"""
+    source_id = ident[len("doc:") :] if ident.startswith("doc:") else ident
+    if LIBRARY_ITEM.match(f"doc:{source_id}") is None:
+        raise HttpError(400, "文献标识要写成 doc:xxxxxxxxxx 或直接给那 10 位哈希")
+    handle = f"doc:{source_id}"
+    info = knowledge_refs.documents(server.corpus_root).get(handle)
+    if info is None:
+        raise HttpError(404, f"语料库里没有这篇文献：{handle}")
+
+    store = memory_service.load_store(server.workspace_root)
+    rows = list(store.entries.values()) + store.archived_entries()
+    linked = [
+        {
+            "id": entry.id,
+            "kind": entry.kind.value,
+            "text": entry.text,
+            "state": memory_service.entry_state(entry),
+            "refs": [ref for ref in entry.refs if knowledge_refs.source_of(server.corpus_root, ref) == handle],
+        }
+        for entry in rows
+        if any(knowledge_refs.source_of(server.corpus_root, ref) == handle for ref in entry.refs)
+    ]
+    linked.sort(key=lambda item: (-len(item["refs"]), item["id"]))
+    return {
+        "type": "doc",
+        "id": source_id,
+        "sourceId": handle,
+        "ref": info["ref"],
+        "title": info["title"],
+        "memory": linked,
+    }
+
+
+def _memory_relations(server: "WebServer", entry_id: str) -> dict:
+    """一条记忆 → 它引用的文献，加上共享同一篇文献的其他记忆。"""
+    if MEMORY_ID.match(entry_id) is None:
+        raise HttpError(400, "记忆编号要写成 mem_xxxxxxxxxxxxxx_xxxxxx")
+    store = memory_service.load_store(server.workspace_root)
+    entry = store.entries.get(entry_id)
+    archived = False
+    if entry is None:
+        entry = next((item for item in store.archived_entries() if item.id == entry_id), None)
+        archived = entry is not None
+    if entry is None:
+        raise HttpError(404, f"没有这条记忆：{entry_id}")
+
+    catalogue = knowledge_refs.documents(server.corpus_root)
+    documents: list[dict] = []
+    external: list[dict] = []
+    missing: list[dict] = []
+    for ref in entry.refs:
+        handle = knowledge_refs.source_of(server.corpus_root, ref)
+        if handle:
+            info = catalogue[handle]
+            documents.append(
+                {
+                    "sourceId": handle,
+                    "ref": info["ref"],
+                    "title": info["title"],
+                    "path": ref,
+                    "state": "ok",
+                }
+            )
+            continue
+        exists = Path(ref).expanduser().exists() if ref else False
+        row = {"path": ref, "state": "ok" if exists else "missing"}
+        (external if exists else missing).append(row)
+
+    related: list[dict] = []
+    handles = {item["sourceId"] for item in documents}
+    if handles:
+        rows = list(store.entries.values()) + store.archived_entries()
+        for other in rows:
+            if other.id == entry.id:
+                continue
+            shared = {
+                knowledge_refs.source_of(server.corpus_root, ref) for ref in other.refs
+            } & handles
+            if not shared:
+                continue
+            related.append(
+                {
+                    "id": other.id,
+                    "kind": other.kind.value,
+                    "text": other.text,
+                    "state": memory_service.entry_state(other),
+                    "shared": sorted(shared),
+                }
+            )
+        related.sort(key=lambda item: (-len(item["shared"]), item["id"]))
+
+    return {
+        "type": "memory",
+        "id": entry.id,
+        "kind": entry.kind.value,
+        "text": entry.text,
+        "state": "archived" if archived else memory_service.entry_state(entry),
+        "documents": documents,
+        "external": external,
+        "missing": missing,
+        "memory": related,
+    }
+
+
+def _memory_list(request: "WebHandler", _rest: str) -> dict:
+    """`/api/memory?kind=&state=&q=`：活的与归档的都在一份清单里。"""
+    query = parse_qs(urlsplit(request.path).query)
+    return memory_service.list_entries(
+        request.server.workspace_root,
+        kind=(query.get("kind") or [""])[0].strip(),
+        state=(query.get("state") or [""])[0].strip(),
+        query=(query.get("q") or [""])[0].strip(),
+    )
+
+
+def _memory_detail(request: "WebHandler", rest: str) -> dict:
+    """`/api/memory/<id>`：单条。归档里的也能打开。"""
+    entry_id = rest.strip("/")
+    if "/" in entry_id:
+        raise HttpError(404, f"记忆下面没有这个接口：{rest}")
+    if MEMORY_ID.match(entry_id) is None:
+        raise HttpError(400, "记忆编号的形状不对")
+    payload = memory_service.entry_detail(request.server.workspace_root, entry_id)
+    if payload is None:
+        raise HttpError(404, f"没有这条记忆：{entry_id}")
+    return payload
+
+
+def _memory_action(request: "WebHandler", rest: str) -> dict:
+    """`/api/memory/<id>/archive` 与 `/restore`：转交给应用进程。
+
+    网页进程不写 `entries.json`：那个 `MemoryStore` 由应用持有，两边同时写会
+    互相覆盖。独立运行的服务没有可转交的对象，明确回 503。
+    """
+    _guard_write(request)
+    segments = [item for item in rest.split("/") if item]
+    if len(segments) != 2 or segments[1] not in ("archive", "restore"):
+        raise HttpError(404, f"不认识的记忆操作：{rest}")
+    entry_id = segments[0]
+    if MEMORY_ID.match(entry_id) is None:
+        raise HttpError(400, "记忆编号的形状不对")
+    server = request.server
+    if server.memory_action is None:
+        raise HttpError(
+            503,
+            "这个进程不负责改记忆：用 python -m vsagent 启动应用之后再操作，"
+            "或者在终端里用 /memory。",
+        )
+    outcome = server.memory_action(segments[1], entry_id)
+    status = int(outcome.get("status") or 200)
+    if status != 200:
+        raise HttpError(status, str(outcome.get("error") or "操作失败"))
+    return {"id": entry_id, "action": segments[1], "ok": True}
+
+
+def _evaluation_start(request: "WebHandler", _rest: str) -> tuple[dict, int]:
+    """起一次检索评测，当场回 202 与任务编号。
+
+    评测在子进程里跑：它要加载嵌入模型、跑几十条查询，放在服务进程里会把
+    网页卡住几十秒。
+    """
+    _guard_write(request)
+    payload = _json_body(request)
+    try:
+        job = evaluation_service.start_run(
+            project_root(),
+            request.server.jobs,
+            questions=str(payload.get("questions") or "").strip(),
+            model=str(payload.get("model") or "").strip(),
+            rerank=bool(payload.get("rerank")),
+        )
+    except ValueError as error:
+        raise HttpError(400, str(error)) from error
+    return {"jobId": job["id"], "job": job}, 202
+
+
+def _evaluation_list(request: "WebHandler", _rest: str) -> dict:
+    """历次评测，新的在前。"""
+    return {"jobs": request.server.jobs.list(kind="evaluation", limit=50)}
+
+
+def _evaluation_detail(request: "WebHandler", rest: str) -> dict:
+    """单次评测的完整报告。"""
+    job_id = rest.strip("/")
+    if "/" in job_id:
+        raise HttpError(404, f"评测下面没有这个接口：{rest}")
+    job = request.server.jobs.get(job_id)
+    if job is None or str(job.get("kind")) != "evaluation":
+        raise HttpError(404, f"没有这次评测：{job_id}")
+    return job
+
+
+def _usage_append(request: "WebHandler", _rest: str) -> dict:
+    """追加一行搜索记录。**不改索引，不改状态文件。**"""
+    _guard_write(request)
+    try:
+        item = search_service.append_usage(
+            request.server.corpus_root, _json_body(request)
+        )
+    except ValueError as error:
+        raise HttpError(400, str(error)) from error
+    return {"record": item}
+
+
+def _analytics(request: "WebHandler", _rest: str) -> dict:
+    """使用记录汇总：次数、p95、模式分布、空结果率。"""
+    return search_service.analytics(request.server.corpus_root)
 
 
 def _library_item_action(request: "WebHandler", rest: str) -> dict:
     """`<kind>:<id>/rename` 与 `<kind>:<id>/delete` 的分发。
 
     两个动作的路径形状一样，所以共用一条前缀路由；认不出来的动作回 404，
-    不落到某个默认动作上。
+    不落到某个默认动作上。守卫写在这里而不是每个分支里：判据按 `SPEC` 里
+    标了 `writes` 的路由逐条验 403，漏一处那条就验不到。
     """
+    _guard_write(request)
     if rest.endswith("/rename"):
         return _library_rename(request, rest)
     if rest.endswith("/delete"):
         return _library_delete(request, rest)
+    if rest.endswith("/labels"):
+        return _library_labels(request, rest)
     raise HttpError(404, f"不认识的语料操作：{rest}")
 
 
@@ -1527,13 +2030,80 @@ SPEC = RouteSpec(
         JsonRoute("/api/search", _search),
         JsonRoute("/api/survey/", _survey, prefix=True),
         JsonRoute("/api/library", _library),
-        JsonRoute("/api/library/upload", _library_upload, method="POST"),
+        JsonRoute("/api/corpus/stats", _corpus_stats),
+        JsonRoute(
+            "/api/ingestion/jobs/",
+            _ingestion_detail,
+            prefix=True,
+        ),
+        JsonRoute("/api/ingestion/jobs", _ingestion_list),
+        JsonRoute(
+            "/api/ingestion/jobs/",
+            _ingestion_retry,
+            prefix=True,
+            method="POST",
+            writes=True,
+        ),
+        JsonRoute("/api/knowledge/search", _knowledge_search),
+        # 评测的详情路由放在列表之前：前缀 `/api/knowledge/evaluation/runs/` 也会
+        # 匹配到空尾巴，顺序反了会把列表请求当成一次编号为空的详情。
+        JsonRoute(
+            "/api/knowledge/evaluation/runs/",
+            _evaluation_detail,
+            prefix=True,
+        ),
+        JsonRoute("/api/knowledge/evaluation/runs", _evaluation_list),
+        JsonRoute(
+            "/api/knowledge/evaluation/runs",
+            _evaluation_start,
+            method="POST",
+            writes=True,
+        ),
+        JsonRoute(
+            "/api/knowledge/usage",
+            _usage_append,
+            method="POST",
+            writes=True,
+        ),
+        JsonRoute("/api/knowledge/analytics", _analytics),
+        # 前缀路由放最后：`/api/knowledge/search` 与评测那几条都是精确路径，
+        # 顺序反了会被这一条先吃掉。
+        JsonRoute("/api/knowledge/", _knowledge_relations, prefix=True),
+        JsonRoute("/api/memory", _memory_list),
+        JsonRoute("/api/memory/", _memory_detail, prefix=True),
+        JsonRoute(
+            "/api/memory/",
+            _memory_action,
+            prefix=True,
+            method="POST",
+            writes=True,
+        ),
+        JsonRoute("/api/library/folders", _library_folders),
+        JsonRoute(
+            "/api/library/folders",
+            _library_folder_create,
+            method="POST",
+            writes=True,
+        ),
+        JsonRoute(
+            "/api/library/batch/delete",
+            _library_batch_delete,
+            method="POST",
+            writes=True,
+        ),
+        JsonRoute("/api/library/upload", _library_upload, method="POST", writes=True),
         # 放在前缀路由之前：`/api/library/ingest` 也会被 `/api/library/` 前缀匹配到，
         # 那条是给 `<kind>:<id>/<action>` 用的，顺序反了会先撞上它。
-        JsonRoute("/api/library/ingest", _library_ingest, method="POST"),
-        JsonRoute("/api/library/", _library_chunks, prefix=True, method="GET"),
-        JsonRoute("/api/library/", _library_item_action, prefix=True, method="POST"),
-        JsonRoute("/api/tasks", _create_task, method="POST"),
+        JsonRoute("/api/library/ingest", _library_ingest, method="POST", writes=True),
+        JsonRoute("/api/library/", _library_detail, prefix=True, method="GET"),
+        JsonRoute(
+            "/api/library/",
+            _library_item_action,
+            prefix=True,
+            method="POST",
+            writes=True,
+        ),
+        JsonRoute("/api/tasks", _create_task, method="POST", writes=True),
     ),
     raw_routes=(
         RawRoute(ARTIFACT_PATTERN, serve_artifact),
@@ -1561,10 +2131,15 @@ class WebServer(ThreadingHTTPServer):
         spec: RouteSpec = SPEC,
         corpus_root: Path | None = None,
         max_upload: int = MAX_UPLOAD_BYTES,
-        ingest: Callable[[list[Path], Path], list[dict[str, Any]]] | None = None,
+        # 入库回调的形状：`(files, root, on_stage)`。第三项是进度回调，
+        # 独立实现可以不收（判据里的假实现就只收两个）。
+        ingest: Callable[..., list[dict[str, Any]]] | None = None,
         surveys_root: Path | None = None,
         ledgers_root: Path | None = None,
         submit: Callable[[str, str], dict[str, Any]] | None = None,
+        workspace_root: Path | None = None,
+        memory_action: Callable[[str, str], dict[str, Any]] | None = None,
+        reconcile_jobs: bool = True,
     ) -> None:
         super().__init__(address, WebHandler)
         self.state_path = state_path
@@ -1572,6 +2147,11 @@ class WebServer(ThreadingHTTPServer):
         self.web_root = web_root
         self.spec = spec
         self.corpus_root = Path(corpus_root) if corpus_root is not None else corpus.corpus_root()
+        # 记忆挂在项目根下（`.vsmemory/`），与语料根不是同一个位置：`--corpus`
+        # 指向别处时，记忆仍然属于这个项目。判据把两者一起指到临时目录。
+        self.workspace_root = (
+            Path(workspace_root) if workspace_root is not None else project_root()
+        )
         # 结构全景的根与语料根同一个道理：判据要在一个临时目录上跑，
         # 否则会读到、也可能动到用户家目录里那一份。
         self.surveys_root = (
@@ -1592,6 +2172,9 @@ class WebServer(ThreadingHTTPServer):
         # 提交任务同样只能转交：真正写状态文件的是应用进程里的那个事件循环。
         # 独立运行的服务没有这一项（None），`/api/tasks` 会明确回 503。
         self.submit = submit
+        # 记忆的归档与恢复要改 `entries.json`，而那个 `MemoryStore` 在应用进程里。
+        # 网页只把动作交过去，独立运行时没有可交的对象，回 503。
+        self.memory_action = memory_action
         self.ingest_lock = threading.Lock()
         self.ingest_state: dict[str, Any] = {
             "running": False,
@@ -1599,6 +2182,14 @@ class WebServer(ThreadingHTTPServer):
             "done": 0,
             "results": [],
         }
+        # 任务台账与语料同根。启动时先把别的进程留下的 running 标成中断：
+        # 进程被关掉时没有人能执行清理，只能在这里对账。
+        #
+        # **只有能起任务的进程才对账**：独立运行的只读服务也读同一份台账，
+        # 让它去改状态的话，应用进程正在跑的那一条会被它标成中断。
+        self.jobs = JobStore(self.corpus_root)
+        if reconcile_jobs:
+            self.jobs.mark_interrupted()
 
 
 class WebHandler(BaseHTTPRequestHandler):

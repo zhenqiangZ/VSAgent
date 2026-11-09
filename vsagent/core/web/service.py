@@ -134,16 +134,27 @@ class WebService:
         corpus_root: Path | None = None,
         ingest: Callable[[list[Path], Path], list[dict[str, Any]]] | None = None,
         submit: Callable[[str, str], dict[str, Any]] | None = None,
+        workspace_root: Path | None = None,
+        memory_action: Callable[[str, str], dict[str, Any]] | None = None,
+        reconcile_jobs: bool = True,
     ) -> None:
         self.state_path = Path(state_path)
         self.runs_dir = Path(runs_dir)
         self.web_root = Path(web_root)
         self.corpus_root = None if corpus_root is None else Path(corpus_root)
+        # 记忆挂在项目根下，与语料根分开传：`--corpus` 指到别处时，
+        # 记忆仍然属于这个项目。
+        self.workspace_root = None if workspace_root is None else Path(workspace_root)
         # 入库要转交给**持有写权的那个进程**。应用装配时传进来；命令行壳不传，
         # 网页上的「入库」在那里会明确回 503。
         self.ingest = ingest
         # 提交任务同一条道理：写状态文件的是应用的事件循环，网页只把文本交过去。
         self.submit = submit
+        # 记忆的归档与恢复同样只能转交：`MemoryStore` 在应用进程里。
+        self.memory_action = memory_action
+        # 只有能起任务的进程才对账任务台账。命令行壳也读同一份台账，
+        # 让它去改状态会把应用进程正在跑的那一条标成中断。
+        self.reconcile_jobs = reconcile_jobs
         self.preferred_port = port
         self.spec = SPEC if spec is None else spec
         self._server: WebServer | None = None
@@ -169,6 +180,9 @@ class WebService:
                 corpus_root=self.corpus_root,
                 ingest=self.ingest,
                 submit=self.submit,
+                workspace_root=self.workspace_root,
+                memory_action=self.memory_action,
+                reconcile_jobs=self.reconcile_jobs,
             )
             thread = threading.Thread(
                 target=server.serve_forever,
@@ -188,6 +202,9 @@ class WebService:
             self._thread = None
         if server is None:
             return
+        # 还在跑的任务先标成中断：跑任务的线程是 daemon，停不下来，
+        # 能做的只有把状态写对，下次打开时不会显示一个永远不动的进度条。
+        server.jobs.stop_own()
         server.shutdown()
         server.server_close()
         if thread is not None:

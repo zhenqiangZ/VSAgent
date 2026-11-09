@@ -69,6 +69,10 @@ function parseHash() {
   };
 }
 
+// 旧地址改成新地址。语料页并进知识中心之后，旧书签还指着 `#/library`；
+// 让它落回会话历史会让人以为「语料没了」，直接换成知识中心。
+const PAGE_ALIAS = { library: "knowledge" };
+
 let mounted = null;
 // 页面模块把状态放在自己的闭包里（`root`、`loadToken`、`sessions` 都是模块级的），
 // 两个挂载同时进行会互相覆盖：前一个还在取数据，后一个已经把它的 `loadToken`
@@ -91,6 +95,12 @@ async function mountFor(hash) {
   if (hash === mountedHash) return;
 
   const { page, param, segments, query } = parseHash();
+  const alias = PAGE_ALIAS[page];
+  if (alias) {
+    // `replace` 不留下一条历史：用户按后退不会在两个地址之间来回跳。
+    window.location.replace(`#/${alias}`);
+    return;
+  }
   const module = window.vsPages[page] || window.vsPages.history;
 
   for (const link of document.querySelectorAll(".nav-link")) {

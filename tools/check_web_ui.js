@@ -21,6 +21,8 @@ const PYTHON = process.env.VSA_PYTHON || (process.platform === "win32"
 const FIXTURE = path.join(ROOT, ".probe", "web-ui-runs");
 const SURVEY_FIXTURE = path.join(ROOT, ".probe", "web-ui-surveys");
 const LEDGER_FIXTURE = path.join(ROOT, ".probe", "web-ui-ledgers");
+const CORPUS_FIXTURE = path.join(ROOT, ".probe", "web-ui-corpus");
+const WORKSPACE_FIXTURE = path.join(ROOT, ".probe", "web-ui-workspace");
 const STATE_DIR = path.join(ROOT, ".probe", "web-ui-state");
 const STATE_PATH = path.join(STATE_DIR, "state.toml");
 const SURVEY_ID = "Q15858-survey-ui000001";
@@ -131,6 +133,52 @@ function buildRun(targetDir, sessionId) {
   execFileSync(PYTHON, args, { stdio: "ignore" });
 }
 
+// 给分析视图造一份最小的 trace：每条助手消息一次装配记录，上下文六层都有数。
+// 判据要核的是「页面有没有把 usage 画出来」，不是 trace 写得好不好。
+function writeTrace(sessionId, messages) {
+  const base = 1700000000;
+  const lines = [];
+  messages.forEach((message, index) => {
+    const at = base + index * 10;
+    lines.push({
+      at,
+      event: "message.add",
+      payload: { session_id: sessionId, message_id: message.id },
+    });
+    if (message.role !== "assistant") return;
+    lines.push({
+      at: at + 5,
+      event: "turn.done",
+      payload: { session_id: sessionId, message_id: message.id },
+    });
+    lines.push({
+      at: at + 2,
+      event: "context.metrics",
+      payload: {
+        session_id: sessionId,
+        step: 1,
+        input: 1000,
+        cached: 800,
+        output: 100,
+        cache_hit: 0.8,
+        total: 1100,
+        window_used: 0.1,
+        degraded: [],
+        events: 1,
+        evidence_entries: 0,
+        usage: { prefix: 300, memory: 100, task: 50, event: 200, recent: 250, evidence: 100 },
+      },
+    });
+  });
+  const dir = path.join(STATE_DIR, "logs");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `${sessionId}.jsonl`),
+    lines.map((line) => JSON.stringify(line)).join("\n") + "\n",
+    "utf8"
+  );
+}
+
 // 对接夹具：数组顺序、分数顺序、id 顺序三者故意互不相同。
 //   delta 有 `rank: 1`，分数却是最差的 -7.00 —— 排序时 rank 压过分数；
 //   其余三个没有 rank，按分数从低到高（-9.00 / -8.20 / -7.50）。
@@ -233,6 +281,9 @@ function prepareState() {
   ).trim();
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.rmSync(path.join(STATE_DIR, "live"), { recursive: true, force: true });
+  // trace 也清掉：分析视图要核对「没有 trace 时的样子」，上一轮留下的那一份
+  // 会让它读到逐步读数，两种状态的断言互相矛盾。
+  fs.rmSync(path.join(STATE_DIR, "logs"), { recursive: true, force: true });
   // 登记表也清空：上一轮留下的那几份会让首页的产物数不是 0，与接口对不上。
   fs.rmSync(LEDGER_FIXTURE, { recursive: true, force: true });
   fs.copyFileSync(source, STATE_PATH);
@@ -256,9 +307,101 @@ function startServer() {
       "--runs", FIXTURE,
       "--surveys", SURVEY_FIXTURE,
       "--ledgers", LEDGER_FIXTURE,
+      // 语料与记忆都用夹具：判据要断言「表里有几行」，仓根那份真实语料天天在变。
+      "--corpus", CORPUS_FIXTURE,
+      "--workspace", WORKSPACE_FIXTURE,
       "--port", String(PORT),
     ],
-    { stdio: ["ignore", out, out] }
+    {
+      stdio: ["ignore", out, out],
+      // 语义通道关掉：这一条验的是页面怎么画，不是嵌入模型。开着的话一次检索
+      // 要先加载模型（GPU 被占时直接失败），判据会变成在测那台机器的显卡。
+      env: { ...process.env, VSA_CORPUS_EMBED: "0" },
+    }
+  );
+}
+
+// 知识中心的夹具：两份文献、一份网页、一个带索引的库、两条记忆。
+// 索引由 `index.reindex` 现建，切块面板才有东西可翻。
+function prepareKnowledgeFixture() {
+  fs.rmSync(CORPUS_FIXTURE, { recursive: true, force: true });
+  fs.rmSync(WORKSPACE_FIXTURE, { recursive: true, force: true });
+
+  const doc = path.join(CORPUS_FIXTURE, "doc", "aaaaaaaaaa");
+  fs.mkdirSync(doc, { recursive: true });
+  const short = "# 测试文献\n\nEpidermal growth factor receptor is a kinase.\n";
+  fs.writeFileSync(path.join(doc, "source.md"), short, "utf8");
+  fs.writeFileSync(
+    path.join(doc, "meta.json"),
+    JSON.stringify({
+      id: "aaaaaaaaaa", kind: "doc", title: "测试文献", file: "source.md",
+      pages: 1, structure: "markdown", chars: short.length, depth: "full", added_at: 1,
+    }),
+    "utf8"
+  );
+
+  const long = path.join(CORPUS_FIXTURE, "doc", "bbbbbbbbbb");
+  fs.mkdirSync(long, { recursive: true });
+  let body = "# 长文献\n\n";
+  for (let no = 1; no <= 12; no += 1) {
+    body += `## 第 ${no} 节\n\nEpidermal growth factor receptor signalling in lung cancer.\n\n`;
+  }
+  fs.writeFileSync(path.join(long, "source.md"), body, "utf8");
+  fs.writeFileSync(
+    path.join(long, "meta.json"),
+    JSON.stringify({
+      id: "bbbbbbbbbb", kind: "doc", title: "长文献", file: "source.md",
+      pages: 1, structure: "markdown", chars: body.length, depth: "full", added_at: 2,
+    }),
+    "utf8"
+  );
+
+  const web = path.join(CORPUS_FIXTURE, "web", "cccccccccc");
+  fs.mkdirSync(web, { recursive: true });
+  const page = "# 测试网页\n\nSome notes about inhibitors.\n";
+  fs.writeFileSync(path.join(web, "content.md"), page, "utf8");
+  fs.writeFileSync(
+    path.join(web, "meta.json"),
+    JSON.stringify({
+      id: "cccccccccc", kind: "web", title: "测试网页",
+      url: "https://example.test/page", depth: "full", added_at: 3,
+    }),
+    "utf8"
+  );
+
+  fs.mkdirSync(path.join(CORPUS_FIXTURE, "inbox"), { recursive: true });
+  execFileSync(
+    PYTHON,
+    [
+      "-c",
+      "import sys; sys.path.insert(0, sys.argv[1]); from vsagent.core import index; index.reindex(sys.argv[2])",
+      ROOT,
+      CORPUS_FIXTURE,
+    ],
+    { stdio: "ignore" }
+  );
+
+  const memory = path.join(WORKSPACE_FIXTURE, ".vsmemory");
+  fs.mkdirSync(memory, { recursive: true });
+  const ref = path.join(doc, "source.md");
+  fs.writeFileSync(
+    path.join(memory, "entries.json"),
+    JSON.stringify({
+      entries: [
+        {
+          id: "mem_20260101000000_aaaaaa", kind: "fact",
+          text: "测试文献里提到 EGFR 抑制剂。", refs: [ref],
+          created_at: 1767225600, updated_at: 1767225600, state: "ok",
+        },
+        {
+          id: "mem_20260101000000_bbbbbb", kind: "experience",
+          text: "同一篇文献的另一条记录，引用了一份已经不在的文件。",
+          refs: [ref, path.join(WORKSPACE_FIXTURE, "gone.pdf")],
+          created_at: 1767225601, updated_at: 1767225601, state: "ok",
+        },
+      ],
+    }),
+    "utf8"
   );
 }
 
@@ -804,6 +947,114 @@ async function checkHistoryPage(page, listing, biggestId) {
   );
   await page.fill("#session-search", "");
   await page.waitForTimeout(200);
+
+  // 分析视图：每一行都有入口，切过去之后轮数与 token 要和接口一致。
+  const rowEntries = await page.locator("#session-list .session-analysis").count();
+  check(
+    "会话列表每一行都有分析入口",
+    rowEntries === listing.sessions.length,
+    `${rowEntries} 个入口，${listing.sessions.length} 条会话`
+  );
+
+  await page
+    .locator(`#session-list li[data-session-id="${biggestId}"] .session-analysis`)
+    .click();
+  await page.waitForFunction(
+    () => document.getElementById("analysis-pane")?.classList.contains("is-hidden") === false,
+    undefined,
+    { timeout: 30000 }
+  );
+  const workbenchHidden = await page
+    .locator(".workbench")
+    .evaluate((node) => getComputedStyle(node).display === "none");
+  check(
+    "行内「分析」切到分析视图，对话三栏收起",
+    workbenchHidden,
+    `workbench 隐藏=${workbenchHidden}`
+  );
+
+  const analysis = await getJson(`/api/sessions/${biggestId}/analysis`);
+  await page.waitForFunction(
+    (count) =>
+      document.querySelectorAll("#analysis-pane .analysis-table tbody tr[data-turn]").length ===
+      count,
+    analysis.turns.length,
+    { timeout: 60000 }
+  );
+  const turnRows = await page
+    .locator("#analysis-pane .analysis-table tbody tr[data-turn]")
+    .count();
+  check(
+    "分析里的轮数与接口一致",
+    turnRows === analysis.turns.length,
+    `页面 ${turnRows} 轮，接口 ${analysis.turns.length} 轮`
+  );
+
+  const inputCard = await page
+    .locator("#analysis-pane .analysis-card")
+    .filter({ hasText: "输入 token" })
+    .locator(".analysis-card-value")
+    .textContent();
+  check(
+    "分析卡片上的输入 token 与接口一致",
+    inputCard.trim() === analysis.session.tokens.input.toLocaleString("zh-CN"),
+    `页面 ${inputCard.trim()}，接口 ${analysis.session.tokens.input}`
+  );
+
+  const topicStatuses = await page
+    .locator("#analysis-pane .analysis-section")
+    .nth(1)
+    .locator(".analysis-table tbody tr td:nth-child(4)")
+    .evaluateAll((nodes) => nodes.map((node) => node.textContent.trim()));
+  const wantTopicStatus = analysis.events.map(
+    (event) => TOPIC_STATUS_TEXT[event.status || "completed"] || "已完成"
+  );
+  check(
+    "分析里的主题状态与接口一致",
+    JSON.stringify(topicStatuses) === JSON.stringify(wantTopicStatus),
+    `页面 ${topicStatuses.slice(0, 3).join("/")}，接口 ${wantTopicStatus.slice(0, 3).join("/")}`
+  );
+
+  await page.locator("#analysis-pane .analysis-table tbody tr[data-turn]").first().click();
+  await page.waitForFunction(
+    () => document.getElementById("an-turn-detail")?.classList.contains("is-hidden") === false,
+    undefined,
+    { timeout: 10000 }
+  );
+  const turnDetail = await page.locator("#an-turn-detail").evaluate((node) => ({
+    question: node.querySelector(".analysis-question")?.textContent || "",
+    tables: node.querySelectorAll(".analysis-table").length,
+  }));
+  check(
+    "点一轮展开它的步与工具",
+    Boolean(turnDetail.question) && turnDetail.tables === 2,
+    `问题 ${turnDetail.question.length} 字，表格 ${turnDetail.tables} 张`
+  );
+
+  // 补一份 trace 再看上下文分层：六层各占一段，每一步一条。
+  writeTrace(biggestId, detail.messages);
+  await page.locator("#session-refresh").click();
+  await page.waitForFunction(
+    () => document.querySelectorAll("#an-turn-detail .analysis-layer-row").length > 0,
+    undefined,
+    { timeout: 60000 }
+  );
+  const layers = await page.locator("#an-turn-detail").evaluate((node) => ({
+    legend: node.querySelectorAll(".analysis-layer-legend i").length,
+    rows: node.querySelectorAll(".analysis-layer-row").length,
+    segments: node.querySelectorAll(".analysis-layer-bar i").length,
+  }));
+  check(
+    "分析带出每轮的上下文分层",
+    layers.legend === 6 && layers.rows > 0 && layers.segments === layers.rows * 6,
+    `图例 ${layers.legend} 层，${layers.rows} 步，${layers.segments} 段`
+  );
+
+  await page.locator('.detail-tab[data-view="conversation"]').click();
+  const workbenchBack = await page
+    .locator(".workbench")
+    .evaluate((node) => getComputedStyle(node).display !== "none");
+  check("切回对话，三栏回到页面上", workbenchBack, `workbench 显示=${workbenchBack}`);
 
   return detail;
 }
@@ -1941,9 +2192,122 @@ async function checkSearchBox(page, sessionId) {
   await page.waitForSelector("#session-head .head-actions", { timeout: 30000 });
 }
 
+// 知识中心：三个标签、详情抽屉、检索结果、记忆列表。
+// 抽屉与状态标签是 M0 的两个共用组件，这一条同时验它们的样式类真的挂上了。
+async function checkKnowledgePage(page) {
+  // 旧地址 `#/library` 要换成知识中心：语料页删掉之后，书签不能落到会话历史。
+  await openView(page, "#/library", 60000);
+  const aliasHash = await page.evaluate(() => window.location.hash);
+  const aliasTable = await page.locator("#kn-rows").count();
+  check(
+    "旧地址 #/library 换成知识中心",
+    aliasHash === "#/knowledge" && aliasTable === 1,
+    `${aliasHash}，语料表 ${aliasTable} 个`
+  );
+
+  await openView(page, "#/knowledge", 60000);
+  await page.waitForSelector("#kn-rows tr", { timeout: 30000 });
+
+  const tabs = await page.locator(".knowledge-tab").count();
+  check("知识中心三个标签都在", tabs === 3, `${tabs} 个`);
+
+  const rows = await page.locator("#kn-rows tr").count();
+  check("语料表列出夹具里的三份", rows === 3, `${rows} 行`);
+
+  await page.locator("#kn-rows tr", { hasText: "测试文献" }).first().click();
+  await page.waitForSelector(".detail-panel.is-open", { timeout: 10000 });
+  await page.waitForFunction(
+    () => (document.querySelector(".detail-panel-title")?.textContent || "") !== "正在读取…",
+    undefined,
+    { timeout: 10000 }
+  );
+  const title = (await page.locator(".detail-panel-title").textContent()).trim();
+  check("点一行打开详情抽屉并读到标题", title === "测试文献", title);
+
+  await page.waitForSelector(".detail-panel .knowledge-chunk", { timeout: 10000 });
+  const chunks = await page.locator(".detail-panel .knowledge-chunk").count();
+  check("抽屉里列出索引里的切块", chunks > 0, `${chunks} 块`);
+
+  // 改名：只写 labels.json，列表与抽屉标题都要跟着变。
+  await page.locator(".knowledge-actions button", { hasText: "改显示名" }).click();
+  await page.waitForSelector("#kn-rename[open]", { timeout: 5000 });
+  await page.fill("#kn-rename-input", "改过的文献名");
+  await page.locator("#kn-rename-ok").click();
+  await page.waitForFunction(
+    () => (document.querySelector(".detail-panel-title")?.textContent || "") === "改过的文献名",
+    undefined,
+    { timeout: 10000 }
+  );
+  const dialogClosed = await page.evaluate(() => !document.querySelector("#kn-rename")?.open);
+  const renamed = await page.locator("#kn-rows tr", { hasText: "改过的文献名" }).count();
+  check(
+    "改名后抽屉、列表都换上新名字，对话框收起",
+    dialogClosed && renamed === 1,
+    `对话框${dialogClosed ? "已收起" : "还开着"}，列表命中 ${renamed} 行`
+  );
+
+  // 改回夹具里的名字：后面的判据还按「测试文献」找这一行。
+  await page.locator(".knowledge-actions button", { hasText: "改显示名" }).click();
+  await page.waitForSelector("#kn-rename[open]", { timeout: 5000 });
+  await page.fill("#kn-rename-input", "测试文献");
+  await page.locator("#kn-rename-ok").click();
+  await page.waitForFunction(
+    () => (document.querySelector(".detail-panel-title")?.textContent || "") === "测试文献",
+    undefined,
+    { timeout: 10000 }
+  );
+  const restored = await page.locator("#kn-rows tr", { hasText: "测试文献" }).count();
+  check("再改一次能回到原名", restored === 1, `列表命中 ${restored} 行`);
+
+  await page.locator(".detail-panel-close").click();
+  const stillOpen = await page.locator(".detail-panel.is-open").count();
+  check("关闭按钮收起抽屉", stillOpen === 0, `is-open 剩 ${stillOpen} 个`);
+
+  // 检索标签
+  await page.locator('.knowledge-tab[data-tab="search"]').click();
+  await page.fill("#kn-search-q", "epidermal");
+  await page.locator("#kn-search-go").click();
+  await page.waitForSelector("#kn-results .knowledge-result", { timeout: 20000 });
+  const results = await page.locator("#kn-results .knowledge-result").count();
+  check("检索标签给出结果卡", results > 0, `${results} 张`);
+  const ranks = await page.locator(".knowledge-rank").count();
+  check("结果卡带每一路的名次", ranks > 0, `${ranks} 个名次标签`);
+
+  const diag = (await page.locator("#kn-diag").textContent()).trim();
+  check("诊断行给出通道与耗时", diag.includes("词法") && diag.includes("ms"), diag);
+
+  const evalButton = await page.locator("#kn-eval-run").count();
+  const evalBody = await page.locator("#kn-eval-body").count();
+  check(
+    "检索标签里有评测区",
+    evalButton === 1 && evalBody === 1,
+    `按钮 ${evalButton} 个 / 区块 ${evalBody} 个`
+  );
+
+  // 记忆标签
+  await page.locator('.knowledge-tab[data-tab="memory"]').click();
+  await page.waitForSelector(".knowledge-memory-item", { timeout: 10000 });
+  const memories = await page.locator(".knowledge-memory-item").count();
+  check("记忆标签列出两条", memories === 2, `${memories} 条`);
+  const badges = await page.locator(".knowledge-memory-item .status-badge").count();
+  check("记忆卡带状态标签", badges === 2, `${badges} 个`);
+
+  await page.locator(".knowledge-memory-item").first().click();
+  await page.waitForSelector(".detail-panel.is-open", { timeout: 10000 });
+  await page.waitForFunction(
+    () => (document.querySelector(".detail-panel-body")?.textContent || "").includes("引用"),
+    undefined,
+    { timeout: 10000 }
+  );
+  const body = (await page.locator(".detail-panel-body").textContent()).trim();
+  check("记忆详情里有引用与时间", body.includes("引用") && body.includes("创建"), body.slice(0, 40));
+  await page.locator(".detail-panel-close").click();
+}
+
 async function main() {
   fs.mkdirSync(path.join(ROOT, ".probe"), { recursive: true });
   prepareSurveys();
+  prepareKnowledgeFixture();
   const { source: sourceState, seeded: threeStateId } = prepareState();
   console.log(`状态文件副本来自 ${sourceState}，三态会话是 ${threeStateId}`);
   const server = startServer();
@@ -1988,6 +2352,7 @@ async function main() {
     await checkThreeStates(page, threeStateId);
     await checkSearchBox(page, biggest.id);
     await checkStructurePage(page, session.runId, biggest.id);
+    await checkKnowledgePage(page);
 
     // 新形状与旧形状各走一遍。新形状那份按 meta 现算期望值，不写死几个徽标。
     const legacy = await checkPocketSourceBadges(page, "legacy", false, null);

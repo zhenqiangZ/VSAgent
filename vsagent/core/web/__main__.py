@@ -34,6 +34,12 @@ def main() -> None:
         help="语料根目录（默认按代码位置定位到仓根下的 corpus/）",
     )
     parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="项目根（记忆目录 .vsmemory 在这里，默认按代码位置定位）",
+    )
+    parser.add_argument(
         "--max-upload",
         type=int,
         default=None,
@@ -69,6 +75,7 @@ def main() -> None:
     extra = {}
     if args.max_upload is not None:
         extra["max_upload"] = args.max_upload
+    workspace = args.workspace.resolve() if args.workspace else root
     server = WebServer(
         (HOST, port),
         Path(state_path).resolve(),
@@ -77,12 +84,16 @@ def main() -> None:
         corpus_root=args.corpus.resolve() if args.corpus else None,
         surveys_root=args.surveys.resolve() if args.surveys else None,
         ledgers_root=args.ledgers.resolve() if args.ledgers else None,
+        workspace_root=workspace,
+        # 独立进程不起任务，只读台账；对账留给应用进程。
+        reconcile_jobs=False,
         **extra,
     )
     print(f"状态文件 {server.state_path}")
     print(f"运行目录 {server.runs_dir}")
     print(f"网页目录 {server.web_root}")
     print(f"语料目录 {server.corpus_root}")
+    print(f"项目根 {server.workspace_root}")
     print(f"全景目录 {server.surveys_root}")
     print(f"登记表目录 {server.ledgers_root}")
     print(f"http://{HOST}:{port}/")

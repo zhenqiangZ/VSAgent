@@ -177,6 +177,9 @@
   let base = "";
   let runs = [];
   let currentRunId = "";
+  // 每次 `loadRun` 领一个号。异步回来的那一帧与号对不上，就说明页面已经卸载、
+  // 或者又换了一份运行，不能再碰视口——卸载时 `disposeViewer` 已经把插件置空。
+  let loadSeq = 0;
   let meta = null;
   let mode = "pockets";
   let activePocketId = null;
@@ -186,6 +189,12 @@
   let allChains = [];
   let visibleChains = new Set();
   let ligandIndexes = [];
+
+  // 卸载或换运行之后，停在 await 里的绘制链不能再碰视口：插件已经销毁，
+  // 再调会抛「视口还没有初始化」。每个绘制函数进来时领一次号，await 回来核一次。
+  function stale(token) {
+    return token !== loadSeq || !root;
+  }
 
   function colorOfMolecule(index) {
     return MOLECULE_COLORS[index % MOLECULE_COLORS.length];
@@ -748,12 +757,15 @@
   // 用户分不清哪条是哪条。这里改成「每条可见链一个表示、一个颜色」，
   // 底色只在一条链都没有时兜底（正常不会发生）。
   async function paintReceptor(highlight) {
+    const token = loadSeq;
     const chains = shownChains();
     await window.vsViewer.showChains([], BASE_COLOR, "cartoon", {}, 0);
+    if (stale(token)) return;
     if (chains.length) {
       const assignment = {};
       for (const chain of chains) assignment[chain] = chainColor(chain);
       await window.vsViewer.colorChains(assignment, "cartoon", {}, 0);
+      if (stale(token)) return;
     }
 
     if (!highlight) return;
@@ -761,6 +773,7 @@
       color: highlight.color,
       ...POCKET_STICK,
     }, 0);
+    if (stale(token)) return;
     if (highlight.surface) {
       await window.vsViewer.addResidueRepresentation(highlight.residues, "molecular-surface", {
         color: POCKET_SURFACE_COLOR,
@@ -785,11 +798,13 @@
   }
 
   async function selectPocket(pocketId, scope = pocketScope) {
+    const token = loadSeq;
     activePocketId = pocketId;
     pocketScope = scope;
     renderPocketScope();
     if (pocketId === null) {
       await paintReceptor(null);
+      if (stale(token)) return;
       await focusShownChains();
       renderPocketList();
       return;
@@ -798,12 +813,14 @@
     const pocket = pocketList().find((item) => item.id === pocketId);
     if (!pocket) {
       await paintReceptor(null);
+      if (stale(token)) return;
       await focusShownChains();
       renderPocketList();
       return;
     }
     const residues = Array.isArray(pocket.residues) ? pocket.residues : [];
     await paintReceptor({ residues, color: POCKET_COLOR, surface: true });
+    if (stale(token)) return;
     if (pocketScope === "local" && residues.length) {
       // 局部取景：多给一段边距，相机不会贴进卡通里，近裁剪面也切不开口袋。
       await window.vsViewer.focusResidues("pocket-focus", residues, 6, 12);
@@ -815,7 +832,10 @@
   }
 
   async function drawMolecules() {
+    const token = loadSeq;
+    if (stale(token)) return;
     await window.vsViewer.clearInteractions();
+    if (stale(token)) return;
     const detail = detailMoleculeId;
     const visible = detail ? new Set([detail]) : visibleMolecules;
     const detailMolecule = detail
@@ -830,6 +850,7 @@
       highlight = { residues: contacts, color: CONTACT_COLOR, surface: false };
     }
     await paintReceptor(highlight);
+    if (stale(token)) return;
 
     // 配体位姿：逐个给表示或抹掉。每个位姿都是一个独立结构。
     const ranked = rankedMolecules();
@@ -844,6 +865,7 @@
       } else {
         await window.vsViewer.clearRepresentations(item.structureIndex);
       }
+      if (stale(token)) return;
     }
 
     if (detail && contacts.length) {
@@ -851,6 +873,7 @@
         color: CONTACT_COLOR,
         ...CONTACT_STICK,
       }, 0);
+      if (stale(token)) return;
     }
 
     const refs = [];
@@ -865,6 +888,8 @@
   }
 
   async function drawInteractions(molecule) {
+    const token = loadSeq;
+    if (stale(token)) return;
     const items = molecule && Array.isArray(molecule.interactions)
       ? molecule.interactions
       : [];
@@ -872,6 +897,7 @@
     if (!ligand || !items.length) return;
 
     await window.vsViewer.showInteractions(items, ligand.structureIndex);
+    if (stale(token)) return;
 
     // 残基按作用类型着色。同一残基有多种作用时保留第一种颜色，完整列表在侧栏。
     const groups = new Map();
@@ -893,13 +919,16 @@
         { color: INTERACTION_COLORS[kind] || "#8a8f98", size: 0.16 },
         0
       );
+      if (stale(token)) return;
     }
   }
 
   // 结构总览：不挂口袋高亮，只按链上色。
   async function drawStructure() {
+    const token = loadSeq;
     activePocketId = null;
     await paintReceptor(null);
+    if (stale(token)) return;
     await focusShownChains();
     renderChainList();
   }
@@ -1034,6 +1063,7 @@
   }
 
   async function loadRun(runId, options = {}) {
+    const token = ++loadSeq;
     currentRunId = runId;
     base = `/runs/${encodeURIComponent(runId)}/`;
     window.__ready = false;
@@ -1046,6 +1076,7 @@
     root.querySelector("#fatal").classList.add("is-hidden");
 
     meta = JSON.parse(await fetchText(`${base}meta.json`));
+    if (token !== loadSeq || !root) return;
     mode = "pockets";
     activePocketId = null;
     visibleMolecules = new Set();
@@ -1058,6 +1089,11 @@
     renderSessionLink(runs.find((item) => item.id === runId));
 
     await window.vsViewer.initViewer(viewerEl, { background: "#eef2f7" });
+    if (token !== loadSeq || !root) {
+      // 卸载发生在初始化中间：插件已经建起来了，得由这里收掉，否则没人认领。
+      window.vsViewer.disposeViewer();
+      return;
+    }
     window.__snapshot = renderSnapshot;
 
     await window.vsViewer.loadStructure({ url: `${base}${meta.structure}`, format: "pdb" });
@@ -1075,6 +1111,7 @@
 
     const ranked = rankedMolecules();
     for (const molecule of ranked) {
+      if (token !== loadSeq || !root) return;
       // 没有 pose 的记录只用于列表/详情，不往 Mol* 里塞一个 undefined URL。
       if (!molecule.pose) continue;
       const index = await window.vsViewer.loadStructure({
@@ -1084,6 +1121,7 @@
       ligandIndexes.push({ moleculeId: molecule.id, structureIndex: index });
       await window.vsViewer.clearRepresentations(index);
     }
+    if (token !== loadSeq || !root) return;
 
     // 判据要按「页面自己认为该看哪几个结构」去复现取景，不能自己拼引用。
     window.__ligandRefs = () =>
@@ -1135,6 +1173,8 @@
     // 浏览器在首次布局之前给的画布尺寸与最终尺寸不同。深链接已经取过景，
     // 这里再 focusShownChains 会把口袋局部视图或分子详情顶掉。
     requestAnimationFrame(() => {
+      // 这一帧回来时页面可能已经卸载或换了运行：视口已经被销毁，再调就抛错。
+      if (token !== loadSeq || !root) return;
       window.vsViewer.handleResize();
       if (!framed) focusShownChains();
     });
@@ -1165,6 +1205,9 @@
 
     return {
       unmount() {
+        // 号先涨：等在 await 里的绘制链回来时看到号变了就退出。只把 root 置空
+        // 挡不住「下一个页面已经挂上来」的那一段——那时 root 又非空了。
+        loadSeq += 1;
         window.vsViewer.disposeViewer();
         root = null;
       },

@@ -63,6 +63,12 @@ def main() -> None:
         help="语料根目录（默认按代码位置定位到仓根下的 corpus/）",
     )
     parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=PROJECT_ROOT,
+        help="项目根（记忆目录 .vsmemory 在这里，默认按代码位置定位）",
+    )
+    parser.add_argument(
         "--surveys",
         type=Path,
         default=None,
@@ -85,11 +91,16 @@ def main() -> None:
         corpus_root=args.corpus.resolve() if args.corpus else None,
         surveys_root=args.surveys.resolve() if args.surveys else None,
         ledgers_root=args.ledgers.resolve() if args.ledgers else None,
+        workspace_root=args.workspace.resolve(),
+        # 这个壳不起任务，只读台账；对账留给应用进程，否则它会把应用正在跑的
+        # 那一条标成中断。
+        reconcile_jobs=False,
     )
     print(f"状态文件 {server.state_path}")
     print(f"运行目录 {server.runs_dir}")
     print(f"网页目录 {server.web_root}")
     print(f"语料目录 {server.corpus_root}")
+    print(f"项目根 {server.workspace_root}")
     print(f"全景目录 {server.surveys_root}")
     print(f"http://127.0.0.1:{port}/")
     server.serve_forever()

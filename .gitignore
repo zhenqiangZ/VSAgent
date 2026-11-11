@@ -65,3 +65,10 @@ egfr_vs/
 # 误入的第三方缓存目录
 Microsoft/
 pip/
+
+# 论文实验的运行产物：每次实验一个目录，里面有日志、trace 与界面快照，
+# 单个 screen.log 就有几兆。产物索引与 claim 映射也一起留在这里，不进版本库。
+result/
+# `tools/report_session.py` 生成的会话分析页。默认写进 `.probe/`，
+# 拷到仓根看的时候不该把状态弄脏。
+/*.html

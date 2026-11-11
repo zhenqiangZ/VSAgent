@@ -78,6 +78,8 @@ CI 只有一个 `.github/workflows/ci.yml`：Linux 上两个 job，判据脚本�
 （fastembed + onnxruntime + tokenizers，约 78MB），再
 `python -m vsagent.core.embed download` 拉模型（255MB，**显式下载，不自动**）。
 不装时 `search_corpus` 只跑词法两路，其余功能一概不受影响。
+要 GPU 时先 `pip uninstall onnxruntime`，再 `pip install -r requirements-embed-gpu.txt`：
+`core/onnx_gpu.py` 在建会话之前把 `nvidia-*` 轮子里的库挂进进程，缺任何一个自动退回 CPU。
 模型缓存 `~/.vsagent/models/`，**不进仓、不进 exe**——单模型就 255MB，
 超过方案稿 §8.4 的 +80MB 预算，所以打包走「用户另装」这条路（与 DTA 同一种处理）。
 
@@ -189,11 +191,16 @@ python tests/verify_modal_transparency.py  # 模态居中/半透明，聊天透�
 | 变量 | 说明 |
 | --- | --- |
 | `VSA_MAX_STEPS` | 一轮步数上限，写错时按 24 处理 |
+| `VSA_CONTEXT_BUDGET` | 上下文可用额度的上限（token）。设了之后取「窗口算出的额度」与它的较小值；没设、写错或非正数时不封顶 |
 | `VSA_WEB_PORT` | 本地网页端口，默认 8860，不合法时同样按默认值处理 |
 | `VSA_CORPUS_INDEX_WEB` | `0/1`，`search_web` 的摘要是否自动入库（默认开）。关掉后它退回纯查询，不给引用号 |
 | `VSA_CORPUS_EMBED` | `0/1`，语义通道总开关（默认开）。关掉只跑词法两路 |
 | `VSA_EMBED_MODEL` | 嵌入模型名，默认 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`（384 维）。**换模型要整表重建**：`python -m vsagent.core.embed index` |
 | `VSA_EMBED_MIN_SCORE` | 余弦下限，默认 `0.30`。低于它不算命中——余弦没有「不相关」这个值，不设下限的话「本地没有」会变成「命中 29 组」 |
+| `VSA_RERANK` | `0/1`，晚交互精排。代码默认关；GPU 上开着的代价是每次检索约 0.44 秒（p95），换来标注源命中 0.836 → 0.873、答案在片段里 0.741 → 0.833。CPU 上每次约 12 秒，那种机器上不要开 |
+| `VSA_RERANK_MODEL` | 精排模型，默认 `lightonai/mLateOn`（1.25GB）。先显式下载：`python -m vsagent.core.knowledge.providers download` |
+| `VSA_MEMORY_EXTRACT` | `0/1`，封存主题之后用本地模型抽取记忆（默认关）。端点见下三行 |
+| `VSA_LOCAL_LLM_URL` / `VSA_LOCAL_LLM_MODEL` / `VSA_LOCAL_LLM_TIMEOUT` | 本地 OpenAI 兼容端点，默认 `http://127.0.0.1:8001` / `local` / 20 秒 |
 | `HF_ENDPOINT` | 模型下载端点，**排第一**。不设时先试 `huggingface.co`，失败**自动退到 `hf-mirror.com`**（会打印实际用的端点，不悄悄换源）；镜像的 Xet 后端会回 401，所以下载子进程里固定 `HF_HUB_DISABLE_XET=1` |
 | `VSA_VINA_BIN` | 外部 AutoDock Vina 可执行文件；不设时从 PATH 找 `vina`，缺失时 `dock` 返回安装指引。引擎**不随 exe 打包** |
 | `VSA_AUTOGRID_BIN` | 外部 `autogrid4`；只有 `dock(scoring="ad4")` 用它（AD4 要先用它算亲和力图）。不设时从 PATH 找，缺失时只影响 ad4，vina / vinardo 不受影响 |
@@ -237,8 +244,9 @@ graph TD
   它**不维护第二份历史**：每一步从 `Session` 现场重建模型消息。上限
   `MAX_STEPS=24` / `MAX_STOP_RETRIES=2` / `MAX_RETRIES=2` / `MAX_TOOL_RETRIES=1` /
   `MAX_FAILED_STREAK=3`。剩 `CLOSING_STEPS=3` 步时进入收束阶段：只放行
-  `write_run` / `close_topic` / `task` / `read_turn` / `recall_event`，其余工具直接返回
-  「本轮步数快用完了」，这一阶段整步失败不计进 `MAX_FAILED_STREAK`。
+  `write_run` / `close_topic` / `task` / `read_turn` / `recall_event` / `search_history`，
+  其余工具直接返回「本轮步数快用完了」，这一阶段整步失败不计进 `MAX_FAILED_STREAK`。
+  每轮开头按最后一条用户消息产出一次来源提示（`_intent_text`），并记一条 `intent.hint` 事件。
   当前主题走到 `TOPIC_STEP_LIMIT=20` 步且最近 4 步没有新产物时，内核自己封一次并
   以 `EXIT_TOPIC_FULL` 结束这一轮。**`RetryableToolError` 只在工具层重试 1 次**（模型请求那层是 2）：
   一次调用的超时就有几十秒，重试两次会把一次抖动拖成三倍等待。重试只包 `execute`，
@@ -255,8 +263,10 @@ graph TD
   `Tool.execute` 在 `on_arguments` 记下模型原始参数之后注入它们；声明了却收到 `None`
   直接返回「内核装配问题」，不抛出。
 - `context.py` — `ContextAssembler.build` 按
-  `PREFIX → MEMORY → TASK → EVENT → RECENT → EVIDENCE → HISTORY` 分层装配。
-  `PREFIX` 与 `TASK` 是 `pinned`，压缩时永不驱逐（用户的约束必须活过压缩）；
+  `PREFIX → PROFILE_MEMORY → PROJECT_MEMORY → TASK → EVENT → RECENT → EVIDENCE → HISTORY`
+  分层装配。`PREFIX`、`PROFILE_MEMORY` 与 `TASK` 是 `pinned`，压缩时永不驱逐
+  （用户的约束与长期要求必须活过压缩）。习惯与项目情况分开两层：习惯只在记忆台账变化时变，
+  单独一条 user 消息紧跟 `system`；项目情况随最后一条用户消息变，进 user 头。
   `TASK` 里除了任务状态还有**工作区索引**（`SessionLedger.digest()`，当前受体 +
   最近 5 个产物，≤10 行）与**运行环境**（`environment_block()`：日期、工作目录、
   状态目录）：handle 只在工具返回那一刻出现过，之后要么进证据层、
@@ -270,6 +280,7 @@ graph TD
   `read_turn` 取回。降级顺序
   `evidence_detail → history_summary → recent_tool_clear → event_step_detail →
   event_layer → memory → recent_turns → recent_reasoning → recent_output`。
+  可用额度由窗口按 0.8 算出、扣掉预留与工具定义；`VSA_CONTEXT_BUDGET` 再封一道顶。
   装不下就抛出 `ContextAssemblyError` 明说，**不静默截断**。
 - `event_log.py` — 事件层按 **Topic → Step 流水**记录：
   Task（一条用户消息）→ Topic（任务里的一个独立题目）→ Step（一次模型往返加它的
@@ -305,8 +316,19 @@ graph TD
   既不在事件里也不在 RECENT 里，不说就是无声消失。
   **摘要已退休**：它的三段分别由 TASK、Step 流水、主题结论覆盖；
   `_summarize` 只剩「首轮就溢出、连一段都封不出来」的兜底。
-- `toolset.py` — 按族加载领域工具。75 个工具里领域那 56 个的完整定义约 23K token，
-  每一步都要发；核心 19 个（文件、登记表、任务、假设、事件、记忆、`load_tools`、
+- `history.py` — 按内容查已封存的主题（`search_history`）。事件层只能按编号翻，
+  用户说「上次那个」时模型手上没有编号；这个工具查标题、结论、产物、未决与每步的过程记录，
+  返回主题号与原文位置，原文仍由 `recall_event` 取。默认只查当前会话；`scope="all"`
+  查这台机器上的全部根会话（子 agent 的会话不查），每个会话最多 3 条。跨会话的命中行带
+  `ses_0019 · evt_0007`，取回时 `recall_event` 要带同一个 `session_id`——`evt_0007`
+  在每个会话里都有，单给编号会在当前会话里取错主题。会话表读 `SessionManager.sessions`，
+  不另建索引；规模上限与升级顺序见 `docs/design.md` §4.3。
+- `intent.py` — 来源提示（`detect` / `render`），纯字符串匹配、零请求。
+  读最后一条用户消息，按关键词判断它在问任务进度、记忆、语料还是历史，
+  在最后一条用户消息前面加一行「可能相关的来源」；没有命中就一个字都不加，
+  系统提示逐字节不变。只点名来源、不点名工具。
+- `toolset.py` — 按族加载领域工具。76 个工具里领域那 56 个的完整定义约 23K token，
+  每一步都要发；核心 20 个（文件、登记表、任务、假设、事件、记忆、历史检索、`load_tools`、
   开工前的盘点、结构全景、`write_run` / `open_viewer`）常驻，56 个领域工具分成 18 族由
   `load_tools` 现装现用，
   装过之后每步只发 3.5K。**族记在
@@ -357,11 +379,18 @@ graph TD
 - `ledger.py` — 会话登记表，`receptor#1` / `ligandset#3` 这类 handle 的真相所在。
   `digest()` 是给模型看的那一小段索引（当前受体 + 最近几个产物），
   **不调 `reconcile()`**：那一步会把每个登记路径读一遍算指纹，而索引每一步都要算。
-- `memory.py` — 跨会话项目记忆 `.vsmemory/`。记忆里写**文件路径不写 handle**（handle 只在本次会话有效）。
-  写入做三件事：精确去重、同 refs + 更新词时把旧条目标 `superseded_by`（不直接删除）、
-  agent 的引用必须存在（用户写入可不存在，标 `unverified` 排在后面）。
-  常驻注入是「核心 / 相关 / 最近」三段，1200 token，其余用 `recall` 取；`recall` 按
-  字段权重 × 90 天衰减打分。详见 `docs/design.md` §4.6 与 `docs/history.md` §2.2。
+- `memory.py` — 工具层（`remember` / `recall`）与兼容导出；实现搬到 `core/memory/`
+  （`models` / `store` / `lifecycle` / `retriever` / `extractor` / `vectors`）。
+  记忆里写**文件路径不写 handle**（handle 只在本次会话有效）。
+  三类：`FACT`、`PREFERENCE`（用户习惯，恒常驻 200 token、不进相关度）、`EXPERIENCE`（180 天衰减、分数乘 0.8）。
+  写入做五件事：按「正文 + 类型」精确去重、**只有 `FACT`** 能被隐式取代
+  （同类型且 refs 相交时按字符二元组重合度只取代最相近的一条，下限 0.20）、
+  `remember(conflicts=[…])` 把矛盾写成双向标记（两条都保留，渲染带「冲突，未解决」）、
+  agent 的引用必须存在（用户写入可不存在，标 `unverified`）、习惯最多 8 条。
+  常驻注入是「习惯一段 + 项目情况一段」，合计 1200 token；`recall` 把字面与语义两张
+  名次表按 `Σ 1/(60 + 名次)` 合并（`.vsmemory/vectors.db`，按内容指纹对账），
+  只靠语义命中的条目要过「不低于最高分 0.8」这一关；条目引用贴着当前受体或当前产物时乘 1.2。
+  详见 `docs/design.md` §4.6 与 `docs/history.md` §2.2。
 - `hypothesis.py` — **产出单位**：这个 agent 交出的是一组可检验的判断。
   `Hypothesis` 对象存在 `TaskState.hypotheses` 里（数据在 `models.py`，工具在 `core/agent/`，
   分层理由与 `task.py` 相同），未结的按粒度分组渲染（策略 2 条、机制 3 条）进 `TASK` 层。
@@ -372,6 +401,8 @@ graph TD
 - `provider.py` — 只实现了一种协议：`OpenAICompatProvider`，OpenAI 兼容的 SSE。
   模型**名字**决定 context window / 价格 / 是否支持 reasoning；`switch_model` 会连带重算上下文窗口。
 - `trace.py` — 订阅 EventBus 的 `"*"`，把事件写成 `~/.vsagent/logs/<session>.jsonl`。
+- `report.py` — 把状态文件与 trace 汇成一份会话分析（轮、步、token、工具、主题、异常）。
+  `tools/report_session.py` 与网页的 `/api/sessions/<id>/analysis` 都从这里取，两处不会得出两套数。
 
 一轮的流程：清证据表 → `stable_prefix` → 装配 context → 问模型 → 消费流
 （TEXT/REASONING/TOOL_CALL/REASONING_DELTA 分流到不同 `PartType`）→ 无工具调用则跑 STOP 钩子 →
@@ -495,6 +526,11 @@ graph TD
   E --> F
   F --> G["RRF(k=60) → 邻块 → 按「源 + 章节」聚组"]
 ```
+
+融合、聚组与检索入口在 `core/knowledge/`（`fusion.py` / `search.py` / `models.py`），
+`domain/corpus.py` 只留工具与渲染，并保留 `fuse` / `_group` 两个模块级别名给
+`tools/check_retrieval.py`；证据收集器在 `knowledge/evidence.py`，`context.py` 转出同名符号。
+`knowledge/providers.py` 是晚交互精排，默认关闭（见配置表）。
 
 **`corpus/` 与 `runs/` 的根由 `core/paths.py:project_root()` 定**：源码运行时是仓根，
 打包后是**启动目录**（与 `logs/` 一样）。这两个都**不能按 `__file__` 算**——冻结之后它
@@ -624,10 +660,16 @@ graph TD
 根目录由 `--surveys` 注入，判据因此不必往家目录里写东西。
 路径逃逸用 `resolve_within` 拒绝（403）。
 
-会话在网页上有四个视图，**正文不再随详情整份发**：`/events` 给主题清单与任务状态
+会话在网页上有五个视图，**正文不再随详情整份发**：`/events` 给主题清单与任务状态
 （几十 KB）、`/segment?event=<id|all>` 按事件切点取一段原文、`/artifacts` 给登记表里的
-产物与这个会话产出的运行、`/live` 给当前主题的实时快照。切点用的是
-`Event.cut_message` / `cut_part`，与装配器同一组数，所以页面上的分段不会跟模型看到的对不上。
+产物与这个会话产出的运行、`/live` 给当前主题的实时快照、`/analysis` 给轮次与 token 的
+统计。切点用的是 `Event.cut_message` / `cut_part`，与装配器同一组数，所以页面上的分段
+不会跟模型看到的对不上。
+
+`/analysis` 与 `tools/report_session.py` 共用 `core/agent/report.py`：轮按用户消息切，
+token 与费用取助手消息自带的数，缓存命中、逐步耗时与分层占用取 trace 的
+`context.metrics`，工具失败与主题未决项汇总成异常清单。trace 在状态文件旁边的 `logs/`，
+没有它时照常给轮与主题的统计，`hasTrace` 为 false。原话与正文各截到 600 字。
 
 **`/live` 不读状态文件**：页面两秒拉一次，而 `state.toml` 有几 MB。快照是
 `core/live.py` 写的 `live/<sid>.json`（与状态文件同目录），只装当前主题的序号与标题、
@@ -651,12 +693,14 @@ graph TD
 `GET /api/search?q=` 按标题、主题的标题与结论、产物摘要搜三类，**不搜工具正文**
 （状态文件里几 MB，逐字匹配既慢又吵），正文检索归语料那条链。
 
-**S2 起网页端多了一组语料入口**（`GET /api/library`、`GET /api/library/<kind>:<id>/chunks`、
-`POST /api/library/upload`、`POST /api/library/ingest`、
-`POST /api/library/<kind>:<id>/{rename,delete}`）。章程因此从「只读」改成「查看只读 +
-语料投递与管理」：网页端自己只往 `corpus/inbox/` 写入文件、只写 `labels.json` 的显示名、
-只把目录挪进 `corpus/.trash/`，**从不直接写索引**。索引只以 `mode=ro` 打开，取块数、
-向量覆盖与切块正文。
+**网页端从 S2 起能投递与管理语料，知识中心把这组入口补全**：`GET /api/library` 带
+`q` / `kind` / `status` / `sort` / `offset` / `limit`，`GET /api/library/<kind>:<id>` 给
+元数据、标签与目录文件，`.../chunks?q=` 分页给索引里的切块，`GET /api/corpus/stats` 给
+整库读数。写入口是 `upload` / `ingest` / `rename` / `delete` / `labels` / `batch/delete`
+与 `GET|POST /api/library/folders`：`rename` 与 `labels` 只写 `labels.json`（显示名、标签、
+收藏、文件夹），`delete` 只把目录挪进 `.trash/`，`batch/delete` 一次最多 50 份且只认
+`web:` 源（文献由用户显式导入，删掉之后恢复要重新导入，代价不对等）。网页端**从不直接写
+索引**，索引只以 `mode=ro` 打开，取块数、向量覆盖与切块正文。
 
 **切块面板给的是索引里那一份**：用户要看的就是「检索实际看到的东西」，
 按原件重切出来的那份解释不了「为什么命中了别的小节」。一份长文献几百块，所以
@@ -665,11 +709,26 @@ graph TD
 
 **「入库」是转交**：应用里网页服务就是 TUI 进程里的一个线程，
 `/api/library/ingest` 把 inbox 里的文件交给装配时注入的 `ingest` 回调（应用传
-`ingest_files`，与模型调 `import_documents` 同一个入口），回 202 之后在后台线程跑，
-页面轮询 `GET /api/library` 的 `ingest` 字段收进度。独立运行的服务
+`ingest_files`，与模型调 `import_documents` 同一个入口），回 202 带 `jobId`，
+任务在后台线程里跑，阶段按解析 → 切块 → 写索引 → 向量报进 `JobStore`，
+页面轮询 `GET /api/ingestion/jobs/<id>`。`POST .../retry` 只接 `failed` / `interrupted`
+的任务，并从 inbox 里重新取那几个文件名；原件已经不在时回 400。独立运行的服务
 （`serve_web.py`、`python -m vsagent.core.web`）没有这个回调，明确回 503——
 否则就有两个进程同时改 `sources` / `chunks`。同进程内两处写由 `index.WRITE_LOCK`
 串行化，索引库开 WAL，读列表不会被入库挡住。
+**只有能起任务的进程对账**：独立服务用 `WebServer(reconcile_jobs=False)`，
+否则它会把应用进程正在跑的那一条标成 `interrupted`。
+
+**记忆与检索评测各有一组入口**：`GET /api/memory` 与 `/api/memory/<id>` 只读，归档与恢复
+`POST /api/memory/<id>/{archive,restore}` 走 `memory_action` 回调（与 `submit` / `ingest`
+同一种形状），独立服务回 503。`POST /api/knowledge/evaluation/runs` 起子进程跑
+`tools/check_retrieval.py --json`，报告原样进任务结果；**门禁没过不算任务失败**，
+只有子进程没吐出 JSON 才记 `failed`。`POST /api/knowledge/usage` 追加一行到
+`corpus/.usage/search.jsonl`（超过 5 MB 改名 `search.jsonl.1`），
+`GET /api/knowledge/analytics` 读回次数、p95、通道分布与空结果率。
+`GET /api/knowledge/<type>/<id>/relations` 给文档与记忆之间的引用，路径换算在
+`core/knowledge_refs.py`（记忆存文件路径，索引认 `doc:<哈希>`），找不到的引用标
+`missing` 而不报错。
 
 本地服务不做鉴权，所以写入口都要求 `X-VSA-Request: 1`（逼出 CORS 预检）并校验
 `Origin`——`multipart` 是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 投文件。
@@ -687,7 +746,10 @@ graph TD
 否则服务起来的第一秒就可能收到一个没法调度的提交。
 
 `web/` 无构建步骤，`app.js` 是 hash router（`#/home`、`#/history`、`#/structure/<run_id>`、
-`#/library`），vendored 大包（3MB Mol\*）按页懒加载。挂载是**串行**的（`mountQueue`），
+`#/survey/<id>`、`#/knowledge`），vendored 大包（3MB Mol\*）按页懒加载。
+旧地址 `#/library` 由 `PAGE_ALIAS` 换成 `#/knowledge`：语料页已经并进知识中心，
+留着不换会落到会话历史。
+挂载是**串行**的（`mountQueue`），
 同一地址再次触发 hashchange 不重挂：页面模块把状态放在自己的闭包里，两个挂载同时跑会
 互相清掉 `loadToken`，中间栏停在「正在读取会话…」。挂载结束时给 `#app-view` 打
 `data-ready`，判据靠它区分「这一页画完了」与「上一页的元素还在」。
@@ -729,6 +791,11 @@ graph TD
 整栏重建之前先记下 `scrollTop` 与「是不是贴着底部」，画完再放回去——不加这一步，
 点开一个主题、点一次刷新都会跳回顶部。
 
+详情区顶上还有「对话 / 分析」两个标签。分析按会话算：概览卡片、逐轮总览（点一行展开
+该轮的步与工具、上下文六层的分段条）、主题、异常与口径；数据来自
+`/api/sessions/<id>/analysis`。左栏每一行的元信息右侧有「分析」，切到分析之后点别的
+会话，看到的也是分析。分析按会话缓存，跑完一轮之后刷新按钮会清掉重取。
+
 **主题尾部列出本主题的产物**：从 `event.artifacts` 里的 handle 去登记表对，对上的给
 下载链接，对不上的只写名字与「目录」。这是「这一段做出了什么」的就地回答，
 右栏那份是全任务的总表。
@@ -736,6 +803,15 @@ graph TD
 页面每两秒拉一次 `/live`（标签页不可见时停），运行中的主题画成同一套章节卡的实时版：
 已完成的步、当前工具、等待确认的提示。这一轮结束时重取 `/events` 与列表，新封的那一段
 直接接上去。
+
+知识中心在 `#/knowledge`，一页三标签。语料标签是筛选栏加表格，多选之后批量删除；点一行
+开右侧抽屉，里面是元数据、标签、目录文件与分页的切块，底部的「改显示名」只写
+`labels.json`。批量动作在工具栏，单条改名在抽屉里，两处入口各自对着一类操作。检索标签给
+每一路的名次、诊断行与使用记录汇总，下面挂着评测区（起子进程、看历次报告）。记忆标签按
+类型分组，抽屉里显示引用、版本与冲突。两个共用组件在 `web/components/`（抽屉
+`detail-panel.js`、状态标签 `status-badge.js`），请求封装在 `web/services/api.js`：
+自定义头、错误文本与超时只在那里定义一次。切标签时才拉数据，三个标签各自按请求序号
+丢弃过期响应。
 
 右侧产物名点进结构页之前，先看 `runs/<id>/meta.json` 的 `provenance.session_id`——
 `write_run` 写这一项，历史页靠它把运行目录挂回会话。

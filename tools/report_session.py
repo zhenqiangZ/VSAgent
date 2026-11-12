@@ -49,16 +49,18 @@ TEMPLATE = """<!doctype html>
   --bg:#f6f7f9; --card:#ffffff; --text:#1d2430; --muted:#66707e; --line:#e2e6ed;
   --accent:#2f6feb; --warn:#c9821a; --error:#c0392b; --ok:#2e7d4f;
   --cached:#a9b8ca; --uncached:#2f6feb; --output:#e08a3c;
-  --l-prefix:#4a6fa5; --l-memory:#7a9e7e; --l-task:#c9a227; --l-event:#8a6fb0;
-  --l-recent:#2f6feb; --l-evidence:#d0715e;
+  --l-prefix:#4a6fa5; --l-profile-memory:#2f8f6b; --l-project-memory:#7a9e7e;
+  --l-task:#c9a227; --l-event:#8a6fb0; --l-recent:#2f6feb; --l-evidence:#d0715e;
+  --l-history:#64748b; --l-memory:#9aa4b2;
 }
 @media (prefers-color-scheme: dark){
   :root{
     --bg:#14171c; --card:#1c2028; --text:#e6e9ef; --muted:#98a2b1; --line:#2b313b;
     --accent:#5b8def; --warn:#e0a03a; --error:#e0705f; --ok:#5cb37f;
     --cached:#4b5768; --uncached:#5b8def; --output:#e0a06a;
-    --l-prefix:#6d8fc4; --l-memory:#8fb894; --l-task:#d4b34a; --l-event:#a88bc9;
-    --l-recent:#5b8def; --l-evidence:#e08a7a;
+    --l-prefix:#6d8fc4; --l-profile-memory:#5cb37f; --l-project-memory:#8fb894;
+    --l-task:#d4b34a; --l-event:#a88bc9; --l-recent:#5b8def; --l-evidence:#e08a7a;
+    --l-history:#8b98a8; --l-memory:#aab4c2;
   }
 }
 *{box-sizing:border-box}
@@ -171,7 +173,7 @@ tbody tr.active{background:rgba(47,111,235,.12)}
       token 与费用取状态文件里助手消息自带的 tokens / cost；逐步的输入、缓存、输出取 trace 的 context.metrics。<br>
       步按助手消息里的 STEP_START 数；装配记录与步按顺序一一对应，条数不同时只取两边都有的那一段。<br>
       缓存命中 = cached / input，逐步取该步的读数，整轮取各步算术平均。<br>
-      分层占用取 context.metrics 的 usage，history 为负值时按 0 画。<br>
+      分层占用取 context.metrics 的 usage，按八层装配顺序堆叠；旧 trace 把三类记忆合成一层 memory，单独标成「记忆（旧口径）」，缺失的层显示 0，负值时按 0 画。<br>
       事件层 degraded 的判据是「层里的主题数少于已封存数」，长会话里它每一步都为真，与这一步是否真的裁掉东西无关。
     </div>
   </section>
@@ -187,6 +189,22 @@ const pct = (x) => (x || 0).toFixed(3);
 const secs = (s) => s >= 120 ? (s / 60).toFixed(1) + ' 分' : s.toFixed(1) + ' 秒';
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const money = (x) => x ? '$' + x.toFixed(4) : '—';
+
+// 上下文八层：与 core/agent/context.py 的 LAYER_ORDER、网页分析页的
+// ANALYSIS_LAYERS 同一份口径。旧 trace 的聚合 memory 只作为兼容层出现。
+const LAYER_ORDER = ['prefix', 'profile_memory', 'project_memory', 'task',
+                     'event', 'recent', 'evidence', 'history'];
+const LAYER_COLORS = {
+  prefix: '--l-prefix', profile_memory: '--l-profile-memory',
+  project_memory: '--l-project-memory', task: '--l-task', event: '--l-event',
+  recent: '--l-recent', evidence: '--l-evidence', history: '--l-history',
+  memory: '--l-memory'
+};
+const LAYER_NAMES = {
+  prefix: '前缀', profile_memory: '习惯', project_memory: '项目事实', task: '任务',
+  event: '事件', recent: '最近', evidence: '证据', history: '历史摘要',
+  memory: '记忆（旧口径）'
+};
 
 function statusTag(status) {
   const map = {done: ['ok', '完成'], running: ['warn', '进行中'], failed: ['error', '失败'],
@@ -426,13 +444,13 @@ function selectTurn(index) {
     chartStack(document.getElementById('c-tokens'), metrics, ['cached', 'uncached'],
       {cached: '--cached', uncached: '--uncached'}, {cached: '缓存命中', uncached: '新增输入'});
     chartLine(document.getElementById('c-cache'), metrics, 'hit', '命中', '--accent');
-    // 分层占用嵌在 usage 里，摊平之后再画
+    // 分层占用嵌在 usage 里，摊平之后再画；旧 trace 的聚合 memory 只在
+    // 确实有值时才多画一段，避免凭空多出一层。
     const layerRows = metrics.map((m) => ({...m, ...m.usage}));
-    chartStack(document.getElementById('c-layers'), layerRows,
-      ['prefix', 'memory', 'task', 'event', 'recent', 'evidence'],
-      {prefix: '--l-prefix', memory: '--l-memory', task: '--l-task', event: '--l-event',
-       recent: '--l-recent', evidence: '--l-evidence'},
-      {prefix: '前缀', memory: '记忆', task: '任务', event: '事件', recent: '最近', evidence: '证据'});
+    const layerKeys = layerRows.some((m) => (m.memory || 0) > 0)
+      ? LAYER_ORDER.concat(['memory']) : LAYER_ORDER.slice();
+    chartStack(document.getElementById('c-layers'), layerRows, layerKeys,
+      LAYER_COLORS, LAYER_NAMES);
     // 耗时不在 metrics 里，用步表补上
     const withTime = metrics.map((m, i) => ({...m, seconds: turn.steps[i] ? turn.steps[i].seconds : 0}));
     chartBars(document.getElementById('c-time'), withTime, 'seconds', '耗时', '--l-evidence');

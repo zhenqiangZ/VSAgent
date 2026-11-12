@@ -513,7 +513,7 @@ def run_event_checks(base, state_path, session_id):
     )
 
 
-def write_synthetic_trace(path, session_id, messages):
+def write_synthetic_trace(path, session_id, messages, legacy=False):
     """造一份最小的 trace。
 
     只写分析要用的四类事件：消息写入、轮末、装配读数与状态。时间戳按消息顺序
@@ -556,14 +556,28 @@ def write_synthetic_trace(path, session_id, messages):
                     "degraded": [],
                     "events": 1,
                     "evidence_entries": 0,
-                    "usage": {
-                        "prefix": 100,
-                        "memory": 0,
-                        "task": 0,
-                        "event": 50,
-                        "recent": 200,
-                        "evidence": 0,
-                    },
+                    "usage": (
+                        {
+                            "prefix": 100,
+                            "memory": 80,
+                            "task": 0,
+                            "event": 50,
+                            "recent": 200,
+                            "evidence": 0,
+                            "history": -5,
+                        }
+                        if legacy
+                        else {
+                            "prefix": 100,
+                            "profile_memory": 20,
+                            "project_memory": 30,
+                            "task": 0,
+                            "event": 50,
+                            "recent": 200,
+                            "evidence": 0,
+                            "history": 10,
+                        }
+                    ),
                 },
             }
         )
@@ -644,11 +658,54 @@ def run_analysis_checks(base, state_path, session_id):
         f"命中 {first['cache_hit'] if first else '—'}",
     )
     check(
-        "每一步都带出上下文六层的占用",
+        "每一步都带出上下文八层的占用",
         bool(first and first["metrics"])
         and set(first["metrics"][0]["usage"])
-        == {"prefix", "memory", "task", "event", "recent", "evidence"},
+        == {
+            "prefix",
+            "profile_memory",
+            "project_memory",
+            "task",
+            "event",
+            "recent",
+            "evidence",
+            "history",
+        },
         f"{sorted(first['metrics'][0]['usage']) if first and first['metrics'] else '—'}",
+    )
+
+    # 旧 trace 的聚合 memory 单独保留成兼容层，负值截成 0；
+    # 不能把旧数据里不存在的习惯 / 项目事实拆分凭空造出来。
+    write_synthetic_trace(trace_path, session_id, session.messages, legacy=True)
+    status, payload = request(f"{base}/api/sessions/{session_id}/analysis")
+    legacy_first = next(
+        (turn for turn in payload.get("turns") or [] if turn["has_reply"]), None
+    )
+    legacy_usage = (
+        legacy_first["metrics"][0]["usage"]
+        if legacy_first and legacy_first["metrics"]
+        else {}
+    )
+    check(
+        "旧口径的聚合记忆保留为兼容层，负值截成 0",
+        status == 200
+        and set(legacy_usage)
+        == {
+            "prefix",
+            "profile_memory",
+            "project_memory",
+            "task",
+            "event",
+            "recent",
+            "evidence",
+            "history",
+            "memory",
+        }
+        and legacy_usage.get("memory") == 80
+        and legacy_usage.get("history") == 0
+        and legacy_usage.get("profile_memory") == 0
+        and legacy_usage.get("project_memory") == 0,
+        f"{legacy_usage}",
     )
 
     status, _ = request(f"{base}/api/sessions/ses_9999/analysis")

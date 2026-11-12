@@ -595,7 +595,8 @@ class AssessCampaignTool(Tool):
         ]
         if pdb_count:
             lines.append(
-                f"- 实验结构 {pdb_count} 套"
+                f"- 实验结构 {pdb_count} 套（UniProt 登记；"
+                "RCSB 当前数量以 survey_structures 为准）"
                 + (
                     f"，最佳分辨率 {best_resolution:.2f} Å（{best_pdb}）"
                     if best_resolution is not None

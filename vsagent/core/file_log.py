@@ -13,6 +13,9 @@ PROJECT_LOG_DIRECTORY = "logs"
 
 # 单行 detail 的上限。读取失败时异常信息可能很长，整段写进去会把日志读成一团。
 MAX_DETAIL = 300
+# 单个日志文件的大小上限。跨会话累积，一份跑久了的工程很容易到几十 MB；
+# 超过之后改名为 `.1` 再从头写，保留最近一份，旧的那份覆盖掉。
+MAX_BYTES = 32 * 1024 * 1024
 
 # 应用启动时把项目根交进来（测试里是临时目录）；`None` 表示还没配置，
 # 就落到进程当前目录下的 `logs/`，这样脚本与领域工具的单独调用也能记上。
@@ -69,7 +72,14 @@ def record(
     try:
         directory = log_directory()
         directory.mkdir(parents=True, exist_ok=True)
-        with (directory / LOG_FILE).open("a", encoding="utf-8") as handle:
+        target = directory / LOG_FILE
+        # 轮转放在 try 里：它只是旁路维护，磁盘满、权限不足都不能让一次
+        # 正常读取失败。超过上限先改名，旧的那一份 `.1` 被覆盖。
+        if target.exists() and target.stat().st_size >= MAX_BYTES:
+            backup = target.with_name(target.name + ".1")
+            backup.unlink(missing_ok=True)
+            target.rename(backup)
+        with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError:
         return

@@ -22,10 +22,12 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Iterable
 
 from ..models import Session
 from .domain.all_tools import catalog, families
+from .prompt import estimate_tokens
 from .tools import Tool, ToolResult, ToolSpec
 
 
@@ -52,6 +54,9 @@ def family_of(name: str) -> str:
 
 def prune_families(session: Session, used: Iterable[str], topic_index: int) -> list[str]:
     """轮末封存时收敛工具族：这一轮没用过的族卸掉，返回卸了哪些。
+
+    **生产路径已经改用 `release_families`**：主题结束一律释放，不再看
+    「这一轮用过没有」。本函数保留给旧调用与对照测试。
 
     只有「装」没有「卸」的话，一次会话装到八族之后每一步都发 12K token 的
     工具定义，而典型的一轮只用得上两三个族（准备受体的那一轮不需要
@@ -91,6 +96,46 @@ def prune_families(session: Session, used: Iterable[str], topic_index: int) -> l
     return dropped
 
 
+def release_families(session: Session, keep: Iterable[str] = ()) -> list[str]:
+    """主题结束时释放领域族，只保留 `keep` 里的（下一主题要预装的）。
+
+    与 `prune_families` 的区别是**不再看「这一族用过没有」**：主题就是一次
+    工作的边界，过了边界就应当从核心工具重新开始。实测一次装 10 族之后
+    每一步的工具定义是 25,870 token，比正文还大；按主题释放能把第二个主题
+    压回「核心 8,409 + 1–3 族」。
+
+    `keep` 里的族会被**预装**（即使之前没装过）：下一主题的第一步就能用，
+    不必再花一步 `load_tools`。未知族名忽略，不因为一个笔误把整批丢掉。
+    """
+    table = catalog()
+    wanted: list[str] = []
+    for value in keep:
+        name = str(value or "").strip()
+        if name in table and name not in wanted:
+            wanted.append(name)
+    dropped = [name for name in session.tool_families if name not in wanted]
+    previous = list(session.tool_families)
+    previous_topics = dict(session.family_topic)
+    session.tool_families = wanted
+    session.family_topic = {
+        name: session.next_topic_index for name in session.tool_families
+    }
+    if session.tool_families != previous or session.family_topic != previous_topics:
+        session.touch()
+    return dropped
+
+
+def family_tokens(registry: Any, names: Iterable[str]) -> int:
+    """估一族的工具定义占多少 token。`load_tools` 用它在返回里报价格。"""
+    wanted = set(names)
+    specs = [
+        spec
+        for spec in registry.specs()
+        if spec.get("function", {}).get("name") in wanted
+    ]
+    return estimate_tokens(json.dumps(specs, ensure_ascii=False))
+
+
 def catalog_text() -> str:
     """一族一行「族名：这一族里有哪些工具」。
 
@@ -115,9 +160,12 @@ class LoadToolsTool(Tool):
             f"{len(families())} 族，要先用这里装进来，**下一步起**才出现在工具清单里。\n"
             "族与工具：\n"
             + catalog_text()
-            + "\n装一次对整个会话有效；已经装过的再装一次只会把清单再列一遍。\n"
-            "**建议一次把这一轮要用的族都装上**：每装一次都会改动工具清单，"
-            "而工具清单是请求前缀的一部分，下一步的 prompt cache（前缀缓存）会整段失效。"
+            + "\n装一次对**这一主题**有效；主题结束会自动卸载，只保留"
+            " `close_topic(next_tools=...)` 里点名的族。已经装过的再装一次只会把清单再列一遍。\n"
+            "**建议一次把这一主题要用的族都装上，通常一到三族**：每装一次都会改动工具清单，"
+            "而工具清单是请求前缀的一部分，下一步的 prompt cache（前缀缓存）会整段失效；"
+            "但装得太多会一直占着每一步的额度——实测十族约 2.6 万 token。"
+            "装多族用 `families`（数组），与 `family` 二选一。"
         ),
         parameters={
             "type": "object",
@@ -125,10 +173,18 @@ class LoadToolsTool(Tool):
                 "family": {
                     "type": "string",
                     "enum": [family for family, _modules in families()],
-                    "description": "要装入的族",
+                    "description": "要装入的族（单族）；多族用 families",
+                },
+                "families": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [family for family, _modules in families()],
+                    },
+                    "minItems": 1,
+                    "description": "要一次装入的族（数组）；与 family 二选一",
                 },
             },
-            "required": ["family"],
             "additionalProperties": False,
         },
     )
@@ -139,60 +195,124 @@ class LoadToolsTool(Tool):
     registry_argument = "registry"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        """装一族，返回这一族里**真的装得进来**的工具。"""
+        """装入一族或几族，返回**真的装得进来**的工具。
+
+        多族一次装完：每装一次都会改工具清单，而清单是请求前缀的一部分。
+        先校验全部族能不能装，再一起写进会话，避免前几族已经生效、后一族失败。
+        """
         session = arguments.get("session")
         registry = arguments.get("registry")
         disabled = getattr(registry, "disabled", frozenset())
-        family = str(arguments.get("family") or "").strip()
-        names = catalog().get(family)
-        if names is None:
+
+        single = str(arguments.get("family") or "").strip()
+        many = arguments.get("families")
+        if single and many is not None:
+            return ToolResult(output="family 与 families 只能给一个。", failed=True)
+        if many is None:
+            raw = [single] if single else []
+        elif isinstance(many, list):
+            raw = many
+        else:
+            return ToolResult(output="families 要写成数组，例如 [\"structure\", \"chembl\"]。", failed=True)
+
+        wanted: list[str] = []
+        for value in raw:
+            name = str(value or "").strip()
+            if name and name not in wanted:
+                wanted.append(name)
+        if not wanted:
+            return ToolResult(output="要给 family 或 families：说明要装哪一族。", failed=True)
+
+        known = catalog()
+        unknown = [name for name in wanted if name not in known]
+        if unknown:
             return ToolResult(
-                output=f"没有这一族：{family}。可用：{'、'.join(catalog())}",
+                output=f"没有这些族：{'、'.join(unknown)}。可用：{'、'.join(known)}",
                 failed=True,
             )
-        # 被关掉的工具在装配时根本没进注册表，报「已装入」就是说了句做不到的话。
-        available = tuple(name for name in names if name not in disabled)
-        skipped = tuple(name for name in names if name in disabled)
-        if not available:
-            return ToolResult(
-                output=(
-                    f"{family} 族里的工具都被项目配置关掉了（{ '、'.join(skipped) }），"
-                    "装进来也用不了。\n"
-                    "这是 `.vsagent/tools.toml` 里的开关，不是网络或参数问题；"
-                    "不要用 bash 自己实现它，也不要换数据源绕过——"
-                    "要么请用户在 /tools 面板里打开，要么按用户的指示换方案。"
-                ),
-                failed=True,
-                meta={"family": family, "tools": [], "disabled": list(skipped)},
+
+        plans: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+        for family in wanted:
+            names = known[family]
+            available = tuple(name for name in names if name not in disabled)
+            skipped = tuple(name for name in names if name in disabled)
+            if not available:
+                # 被关掉的工具在装配时根本没进注册表，报「已装入」就是说了句做不到的话。
+                return ToolResult(
+                    output=(
+                        f"{family} 族里的工具都被项目配置关掉了（{ '、'.join(skipped) }），"
+                        "装进来也用不了。\n"
+                        "这是 `.vsagent/tools.toml` 里的开关，不是网络或参数问题；"
+                        "不要用 bash 自己实现它，也不要换数据源绕过——"
+                        "要么请用户在 /tools 面板里打开，要么按用户的指示换方案。"
+                    ),
+                    failed=True,
+                    meta={"family": family, "tools": [], "disabled": list(skipped)},
+                )
+            plans.append((family, available, skipped))
+
+        lines: list[str] = []
+        tools: list[str] = []
+        skipped_all: list[str] = []
+        already_map: dict[str, bool] = {}
+        any_new = False
+        for family, available, skipped in plans:
+            already = family in session.tool_families
+            already_map[family] = already
+            if not already:
+                session.tool_families.append(family)
+                any_new = True
+            # 记下它是第几个主题装进来的：收敛时不卸「刚装、还没轮到用」的族，
+            # 否则模型刚装完就被拿走，下一步还得再装一次（那一次缓存又白费）。
+            session.family_topic[family] = session.next_topic_index
+            prefix = "已经装过" if already else "已装入"
+            listed = "、".join(available) + (
+                f"（{'、'.join(skipped)} 被项目配置关掉了，没有列进来）"
+                if skipped
+                else ""
             )
-        already = family in session.tool_families
-        if not already:
-            session.tool_families.append(family)
-        # 记下它是第几个主题装进来的：收敛时不卸「刚装、还没轮到用」的族，
-        # 否则模型刚装完就被拿走，下一步还得再装一次（那一次缓存又白费）。
-        session.family_topic[family] = session.next_topic_index
-        prefix = "已经装过" if already else "已装入"
-        listed = "、".join(available) + (
-            f"（{'、'.join(skipped)} 被项目配置关掉了，没有列进来）" if skipped else ""
-        )
+            cost = family_tokens(registry, available)
+            lines.append(f"{prefix} {family}（约 {cost} token）：{listed}。")
+            tools.extend(available)
+            skipped_all.extend(skipped)
+
+        # 装得太多时把价格说出来：这一句是模型决定「还要不要再装一族」的依据。
+        loaded_names = [
+            name
+            for family in session.tool_families
+            for name in known.get(family, ())
+        ]
+        loaded_cost = family_tokens(registry, loaded_names) if loaded_names else 0
+        warning = ""
+        if len(session.tool_families) > 3:
+            warning = (
+                f"\n**本主题已装 {len(session.tool_families)} 族，工具定义约 "
+                f"{loaded_cost} token**；主题结束会自动卸载没有写进 "
+                "`close_topic(next_tools=...)` 的族。"
+            )
+
         # 第一次装才提醒：装过的族再提一次「一次装完」只会变成噪音。
         hint = (
-            ""
-            if already
-            else (
-                "\n**这一段还要用别的族的话，现在就一起装**："
-                "每装一次都会改动工具清单，下一步的 prompt cache（前缀缓存）会整段失效。"
-            )
+            "\n**这一段还要用别的族的话，现在就一起装**："
+            "每装一次都会改动工具清单，下一步的 prompt cache（前缀缓存）会整段失效。"
+            if any_new
+            else ""
         )
+        meta: dict[str, Any] = {
+            "families": wanted,
+            "tools": tools,
+            "disabled": skipped_all,
+            "already": already_map,
+        }
+        if len(wanted) == 1:
+            meta["family"] = wanted[0]
+            meta["already"] = already_map[wanted[0]]
         return ToolResult(
             output=(
-                f"{prefix} {family}：{listed}。"
-                "下一步起这些工具出现在清单里，参数按各工具的说明给。" + hint
+                "\n".join(lines)
+                + "下一步起这些工具出现在清单里，参数按各工具的说明给。"
+                + hint
+                + warning
             ),
-            meta={
-                "family": family,
-                "tools": list(available),
-                "disabled": list(skipped),
-                "already": already,
-            },
+            meta=meta,
         )

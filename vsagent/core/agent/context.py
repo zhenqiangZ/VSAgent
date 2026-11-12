@@ -42,6 +42,7 @@ from .prompt import (
     OMITTED_NOTICE,
     PROFILE_NOTICE,
     REASONING_PLACEHOLDER,
+    REPLY_NOTICE,
     SUMMARY_NOTICE,
     compress_tool_output,
     estimate_tokens,
@@ -682,6 +683,35 @@ def profile_block(profile_text: str) -> str:
     return f"{PROFILE_NOTICE}\n{profile_text}"
 
 
+def _last_user_position(session: Session) -> tuple[int, int]:
+    """最后一条用户消息里第一个文本部件的位置；没有用户消息时返回 (-1, -1)。"""
+    for message_index in range(len(session.messages) - 1, -1, -1):
+        message = session.messages[message_index]
+        if message.role != "user":
+            continue
+        for part_index, part in enumerate(message.parts):
+            if part.type is PartType.TEXT and part.text.strip():
+                return (message_index, part_index)
+        return (message_index, 0)
+    return (-1, -1)
+
+
+def reply_carry(session: Session) -> str:
+    """上一段已经答复过的正文，只在本段还没有新用户消息时返回。
+
+    封存会把原文从 RECENT 里拿走。不给这一段，模型看到「用户没再说话」，
+    就会把同一件事重写一遍（`ses_0028` 第 17 步）。位置判断是必须的：
+    `stream_reply` 开头补封上一轮中断的主题时，新用户消息已经写进会话，
+    只靠「用户消息清空字段」会被那次封存重新写回。
+    """
+    text = session.topic_reply.strip()
+    if not text:
+        return ""
+    if session.topic_reply_at <= _last_user_position(session):
+        return ""
+    return text
+
+
 def memory_entry_count(block: str) -> int:
     """常驻记忆里有几条。
 
@@ -887,6 +917,8 @@ class ContextAssembler:
         raw_evidence = list(evidence or [])
         # 复述只从任务状态来；状态空着就没有这一段，不凭空造一句。
         focus_text = self._focus_block(session)
+        # 上一段刚封存的答复：只在本段还没有新用户消息时带回来（见 `reply_carry`）。
+        reply_text = reply_carry(session)
         budget = self.budget(tools)
         available = budget.available
         if available < MIN_AVAILABLE:
@@ -931,6 +963,7 @@ class ContextAssembler:
             + estimate_tokens(env_text)
             + estimate_tokens(focus_text)
             + estimate_tokens(event_block)
+            + (estimate_tokens(f"{REPLY_NOTICE}\n{reply_text}") if reply_text else 0)
         )
         remaining = max(0, available - fixed)
         # 摘要与证据先按**实际需要**占额度、各自封顶，剩下的全给 RECENT。
@@ -982,6 +1015,7 @@ class ContextAssembler:
                 evidence,
                 bool(session.events),
                 progress_text=progress,
+                reply_text=reply_text,
             )
 
         messages, usage = compose()
@@ -1305,9 +1339,10 @@ class ContextAssembler:
         evidence: list[Evidence],
         has_events: bool = False,
         progress_text: str = "",
+        reply_text: str = "",
     ) -> tuple[list[dict[str, Any]], dict[Layer, int]]:
         """按固定布局把各层拼成消息，并给出每层的估算用量。"""
-        header = self._task_header(
+        header, header_usage = self._task_header(
             env_text, memory, task_text, digest_text, moved, summary, has_events
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": stable_prefix}]
@@ -1317,6 +1352,13 @@ class ContextAssembler:
             messages.append({"role": "user", "content": profile})
         if header:
             messages.append({"role": "user", "content": header})
+        # 上一个主题刚写完的答复接在 header 之后：封存会把原文从 RECENT 里拿走，
+        # 不给这一段，模型就不知道自己已经答过，下一段会把同一件事重写一遍。
+        # 它只在本段还没有新用户消息时出现（位置判断在装配入口做），
+        # 放在事件块之前，内容在段内不变，不会打乱后面的缓存。
+        reply_block = f"{REPLY_NOTICE}\n{reply_text.strip()}" if reply_text.strip() else ""
+        if reply_block:
+            messages.append({"role": "user", "content": reply_block})
         # 事件单独一条消息，不并进 header：header 每一步都可能变，事件块一旦
         # 定下来就只在新事件出现时变，分开才有机会命中前缀缓存。
         if event_block:
@@ -1351,32 +1393,29 @@ class ContextAssembler:
         if progress_text:
             messages.append({"role": "user", "content": progress_text})
 
+        # 计量按**实际拼进去的块**累加，不再用 header 相减。相减的前提是
+        # 「减掉的项都恰好在 header 里」，而 focus/hint/progress 是单独追加的
+        # 消息、progress 又在 header 里，前提一破就会出现负数，而 total 正是
+        # 降级链与「装不下」判据的输入，负数会让真实占用被少算。
+        # 工作区索引与进度提示算进 TASK 层：它们与任务状态同为「这一步的工作
+        # 前提」，同样 pinned、同样每步重算；单开一层要改 `Layer` 与降级链，
+        # 而它们的额度只有百来个 token，不值那一圈。
+        task_tokens = (
+            header_usage.get(Layer.TASK, 0)
+            + estimate_tokens(focus_text)
+            + estimate_tokens(hint_text)
+            + estimate_tokens(progress_text)
+            + estimate_tokens(reply_block)
+        )
         usage = {
             Layer.PREFIX: estimate_tokens(stable_prefix),
             Layer.PROFILE_MEMORY: estimate_tokens(profile),
-            Layer.PROJECT_MEMORY: estimate_tokens(memory),
-            # 工作区索引算进 TASK 层：它与任务状态同为「这一步的工作前提」，
-            # 同样 pinned、同样每步重算。单开一层要改 `Layer` 与降级链，
-            # 而它的额度只有百来个 token，不值那一圈。进度提示同理。
-            Layer.TASK: (
-                estimate_tokens(task_text)
-                + estimate_tokens(digest_text)
-                + estimate_tokens(env_text)
-                + estimate_tokens(focus_text)
-                + estimate_tokens(hint_text)
-                + estimate_tokens(progress_text)
-            ),
+            Layer.PROJECT_MEMORY: header_usage.get(Layer.PROJECT_MEMORY, 0),
+            Layer.TASK: task_tokens,
             Layer.EVENT: estimate_tokens(event_block),
             Layer.RECENT: turns_tokens(recent),
             Layer.EVIDENCE: estimate_tokens(evidence_block),
-            Layer.HISTORY: (
-                estimate_tokens(header)
-                - estimate_tokens(memory)
-                - estimate_tokens(task_text)
-                - estimate_tokens(digest_text)
-                - estimate_tokens(env_text)
-                - estimate_tokens(focus_text)
-            ),
+            Layer.HISTORY: header_usage.get(Layer.HISTORY, 0),
         }
         return messages, usage
 
@@ -1389,35 +1428,41 @@ class ContextAssembler:
         moved: list[Turn],
         summary: str,
         has_events: bool = False,
-    ) -> str:
+    ) -> tuple[str, dict[Layer, int]]:
         """运行环境 + 常驻记忆 + 任务状态 + 工作区索引 + 摘要 + 引用清单，合成一条 user 头。
 
-        放在 `system` 之后单独一条，是因为 `system` 要保持字节稳定（缓存友好），
+        放在 `system` 之后单独一条，是因为 `system` 要字节稳定（缓存友好），
         而这一头的内容每一步都可能变。
+
+        返回值第二项是**每个块自己的用量**，装配器直接累加。早先的做法是拿
+        拼好的整头去减别的层，减掉的项一旦不在这条头里就会算出负数。
         """
         blocks: list[str] = []
+        usage: dict[Layer, int] = {}
+
+        def add(layer: Layer, block: str) -> None:
+            blocks.append(block)
+            usage[layer] = usage.get(layer, 0) + estimate_tokens(block)
+
         # 环境排最前：它是这一头里唯一的「机器事实」，读的时候先知道自己在哪台机器、
         # 哪个目录下，后面那些「任务 / 索引 / 摘要」才落得到实处。
         if env_text.strip():
-            blocks.append(env_text.strip())
+            add(Layer.TASK, env_text.strip())
         if memory:
-            blocks.append(memory)
+            add(Layer.PROJECT_MEMORY, memory)
         if task_text.strip():
-            blocks.append(task_text.strip())
+            add(Layer.TASK, task_text.strip())
         # 索引排在任务状态之后、摘要之前：它和任务状态一样是「这一步的工作前提」，
         # 而摘要与引用清单是「前面发生过什么」，两类的读法不同，不该夹在一起。
         if digest_text.strip():
-            blocks.append(digest_text.strip())
+            add(Layer.TASK, digest_text.strip())
         # 有事件时也要给摘要：事件只覆盖到某个位置，摘要覆盖它之前的那一段。
         # 只判断 `moved` 的话，事件把 RECENT 之前的内容全接走时摘要会凭空消失。
         if moved or (summary and has_events):
-            if summary:
-                blocks.append(f"{SUMMARY_NOTICE}\n{summary}")
-            else:
-                blocks.append(OMITTED_NOTICE)
+            add(Layer.HISTORY, f"{SUMMARY_NOTICE}\n{summary}" if summary else OMITTED_NOTICE)
             if moved:
-                blocks.append(self._refs_block(moved))
-        return "\n\n".join(blocks)
+                add(Layer.HISTORY, self._refs_block(moved))
+        return "\n\n".join(blocks), usage
 
     def _refs_block(self, moved: list[Turn]) -> str:
         """被移出的步各占一行，之后能按步号取回原文。

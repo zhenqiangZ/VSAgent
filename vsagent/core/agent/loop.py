@@ -17,7 +17,7 @@ from .context import (
 from .event_log import (TOPIC_SOFT_LIMIT, EventRuntime, event_boundary,
                         open_tokens, record_step, seal_range, seal_topic)
 from . import intent
-from .toolset import family_of, hidden_names, prune_families
+from .toolset import family_of, hidden_names, release_families
 from .hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from .permission import PermissionDecision, PermissionPolicy, Verdict
 from .prompt import (
@@ -172,7 +172,10 @@ def missing_tool_reason(
 # 而过程本来就在工具卡里，用户重读一遍得不到新东西。
 WRAPUP_INSTRUCTION = (
     "这一轮任务还没有完成就停下了，停下来是因为：{reason}。\n"
-    "现在写一份简报交给用户，只写四段，每段一行短标题加正文：\n"
+    "现在写一份简报交给用户。第一段必须是「给你的答复」：直接回答用户这一轮问的事，"
+    "能做多少答多少；没做完就把目前能确定的结论、还缺什么写清楚，"
+    "不要让这一段变成纯粹的过程说明。\n"
+    "然后写四段状态，每段一行短标题加正文：\n"
     "停在哪里：一句话，写清是步数用满、请求出错、工具连续失败还是被中断。\n"
     "已经产出：handle、文件路径、关键数字，最多 6 条；没有就写「没有新产物」。\n"
     "还没做完：对照任务状态里的待办，写 1–4 条。\n"
@@ -290,7 +293,7 @@ class AgentLoop:
         if verdict is Verdict.ALLOW:
             if remember:
                 self.policy.allow_all()
-                decision = PermissionDecision(Verdict.ALLOW, rule="本会话已放行所有工具")
+                decision = PermissionDecision(Verdict.ALLOW)
             else:
                 decision = PermissionDecision(Verdict.ALLOW, reason="用户允许")
         else:
@@ -897,7 +900,7 @@ class AgentLoop:
         event = seal_topic(
             session, cut=self._step_cut(session, message, calls), kind="manual"
         )
-        self._announce_seal(session, event)
+        self._after_seal(session, event)
         return event
 
     def _announce_seal(self, session: Session, event: Event | None) -> None:
@@ -920,22 +923,25 @@ class AgentLoop:
         )
 
     def _after_seal(self, session: Session, event: Event | None) -> Event | None:
-        """封存之后的收尾：先说一声，再收敛没卸掉的工具族。
+        """封存之后的收尾：先说一声，再按主题释放工具族。
 
-        收敛工具族只在轮末做：一轮里换三个主题不该把工具清单来回装卸，
-        每次装卸都改动请求体，缓存整段失效。
+        主题就是一次工作的边界：过了边界只保留 `close_topic(next_tools=...)`
+        点名的族（预装给下一个主题），其余领域族全部释放。实测一次装 10 族
+        之后每一步的工具定义是 25,870 token，比正文还大；按主题释放能把下一段
+        压回「核心 8,409 + 1–3 族」。
+
+        封存本身已经改了事件块与摘要，请求前缀本来就要失效；在同一个边界上
+        换工具清单，不会额外多一次缓存未命中。
         """
         if event is None:
             return None
         self._announce_seal(session, event)
         if not event.steps:
             return event
-        dropped = prune_families(
-            session,
-            {name for step in event.steps for name in step.tools},
-            event.topic_index,
-        )
-        if dropped:
+        keep = list(session.next_tools)
+        session.next_tools = []
+        dropped = release_families(session, keep)
+        if dropped or keep:
             self.bus.publish("status.update", {"session_id": session.id})
         # 抽取排在封存之后：五条封存路径都在这里汇合，不必各接一次。
         # 开关默认关闭，没打开时这一行立即返回。
@@ -1584,6 +1590,33 @@ class AgentLoop:
         """补上收尾的 Part、记账，并发出这一轮结束的信号。"""
         if not any(part.type in (PartType.TEXT, PartType.TOOL) for part in message.parts):
             self._publish(message, Part(type=PartType.TEXT, text="（模型没有返回内容）"))
+        # 写过文件但答复没提路径时补一行：模型经常只把路径留在工具卡里，
+        # 用户翻不到。只补缺失的，已经提到的不重复。
+        written = []
+        for part in message.parts:
+            if part.type is not PartType.TOOL or part.tool_name != "write":
+                continue
+            if part.tool_status is not ToolStatus.COMPLETED:
+                continue
+            raw = (part.tool_input or {}).get("path")
+            if isinstance(raw, str) and raw.strip():
+                value = raw.strip()
+                if value not in written:
+                    written.append(value)
+        if written:
+            answer = "".join(
+                part.text for part in message.parts if part.type is PartType.TEXT
+            )
+            missing = [
+                path
+                for path in written
+                if path not in answer and Path(path).name not in answer
+            ]
+            if missing:
+                self._publish(
+                    message,
+                    Part(type=PartType.TEXT, text="本轮写入：" + "、".join(missing)),
+                )
         tokens = message.total_tokens()
         self._publish(
             message,

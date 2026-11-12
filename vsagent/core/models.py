@@ -378,6 +378,10 @@ class Hypothesis:
     # 与哪几条假设在竞争。**两条假设给出不同预期时才填**：没有竞争关系的假设
     # 各自检验，填进来只会让「谁被实验排除」这件事读不清。
     rivals: list[str] = field(default_factory=list)
+    # 一对手假设靠什么结果区分：什么结果支持本条、什么结果支持对手。
+    # 单独成字段，是为了让工具检查这句话真的写了，而不是在 test 里
+    # 找对手编号的字面；也让用户答复不必出现内部编号。
+    discriminator: str = ""
 
     def is_open(self) -> bool:
         return self.status == "open"
@@ -420,6 +424,7 @@ class Hypothesis:
             "status": self.status,
             "result_ref": self.result_ref,
             "rivals": list(self.rivals),
+            "discriminator": self.discriminator,
         }
 
     @classmethod
@@ -444,6 +449,8 @@ class Hypothesis:
                 for item in (data.get("rivals") or [])
                 if str(item).strip()
             ],
+            # 旧会话没有这个键：空串就是「没有写区分判据」，不需要迁移。
+            discriminator=str(data.get("discriminator") or ""),
         )
 
 
@@ -965,6 +972,11 @@ class Session:
     topic_title: str = ""
     topic_summary: str = ""
     topic_handoff: str = ""
+    # 上一条主题封存时留下的最后一段助手正文与它的位置。只在内存里，与
+    # `topic_title` 同一种生命周期。轮次内封存主题后原文不再随请求发出，
+    # 模型会忘记自己已经答过；装配器按位置把它带回下一段，用户消息一到就清空。
+    topic_reply: str = ""
+    topic_reply_at: tuple[int, int] = (0, 0)
     # 模型顺手给整个会话起的名字（`close_topic` 的 session_title）。
     # 与主题名分开：主题是这一段，会话名是整件事。只在内存里，封存时取用。
     pending_session_title: str = ""
@@ -975,6 +987,10 @@ class Session:
     # 装在会话上而不是注册表上：注册表按「根 / 子 agent」共享两份，
     # 记在那里会让一个会话装过的工具漏到另一个会话。
     tool_families: list[str] = field(default_factory=list)
+    # 下一个主题要预装的族（`close_topic(next_tools=...)` 写入）。
+    # 封存时消费一次：只留这些，其余领域族全部释放。只在内存里，
+    # 因为它的作用就是把「下一段」接上，不需要跨进程保留。
+    next_tools: list[str] = field(default_factory=list)
     # 每一族是第几个主题装进来的。收敛（`toolset.prune_families`）用它判断
     # 「刚装、还没轮到用」的族，别刚装完就卸掉。
     family_topic: dict[str, int] = field(default_factory=dict)
@@ -1025,6 +1041,12 @@ class Session:
     def add_message(self, message: Message) -> Message:
         """追加消息并刷新更新时间。"""
         message.session_id = self.id
+        # 新的一轮问话到了，上一轮的答复承接块就没有意义了。清空之后，
+        # 装配器不会再把它带回这一段；位置判断是第二道保险（见
+        # `ContextAssembler._compose`）。
+        if message.role == "user":
+            self.topic_reply = ""
+            self.topic_reply_at = (0, 0)
         self.messages.append(message)
         self.touch()
         return message

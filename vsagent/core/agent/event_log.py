@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,6 +39,10 @@ from .tools import Tool, ToolResult, ToolSpec
 EVENT_TITLE_MAX = 40
 EVENT_SUMMARY_MAX = 1000
 EVENT_HANDOFF_MAX = 200
+# 答复承接块的长度上限（字符）。封存后下一段只能看到这一段，
+# 太长会把每一步的 TASK 层撑大；太短则开头结论或结尾待决事项会被截掉，
+# 所以超限时保留头尾、丢掉中段。
+REPLY_CARRY_MAX = 1200
 # 会话标题比主题标题短：它要挤进左栏与状态栏，写成长句两边都会被截。
 SESSION_TITLE_MAX = 20
 # 本地标题里最多拼几段用户诉求。两段够看出「从哪做到哪」，再多就把标题
@@ -367,12 +372,60 @@ def _usable_ask(text: str) -> bool:
     return len(value.split()) >= 2
 
 
+# 本地标题里给工具用的中文名。表里没有的保留原名：宁可露出一个陌生英文名，
+# 也不要把「调用了什么」写成一句猜出来的中文。
+_TOOL_LABELS = {
+    "open_viewer": "查看结构",
+    "survey_structures": "结构全景",
+    "fetch_structure": "取回结构",
+    "fetch_target": "查靶点",
+    "assess_campaign": "开工盘点",
+    "detect_pockets": "找口袋",
+    "define_pocket": "定口袋",
+    "prepare_receptor": "准备受体",
+    "prepare_ligands": "准备配体",
+    "dock": "对接",
+    "score_affinity": "亲和力打分",
+    "rank_candidates": "候选排名",
+    "hypothesis": "记录假设",
+    "task": "更新任务",
+    "write_run": "写运行目录",
+    "write": "写文件",
+    "read": "读文件",
+    "bash": "运行命令",
+    "search_literature": "检索文献",
+    "search_web": "检索网页",
+    "search_corpus": "检索语料",
+}
+
+# 产物名尾部的随机编号，例如 `P03452-survey-565a0ec1` 的 `-565a0ec1`。
+_HANDLE_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
+# 这些是内部 handle，不是给人看的名字。
+_HANDLE_PREFIXES = ("artifact#", "receptor#", "ligandset#", "pocket#", "run#")
+
+
+def _artifact_label(name: str) -> str:
+    """产物名能不能当标题：去掉尾部编号，handle 一律不要。"""
+    value = name.strip()
+    if not value or value.startswith(_HANDLE_PREFIXES):
+        return ""
+    value = _HANDLE_SUFFIX.sub("", value)
+    if not value or re.fullmatch(r"[0-9a-f]{8}", value):
+        return ""
+    return value
+
+
 def _local_title(session: Session, start: tuple[int, int], end: tuple[int, int], steps: list[Step]) -> str:
-    """本地拼标题：有可用的用户原话就用原话，否则用产物与工具，再否则报位置。
+    """本地拼标题：有可用的用户原话就用原话，否则用工具的中文名，再否则报步数。
 
     「用户要什么」比「用了什么工具」更能说明这一段在干什么，但只在这一句
     真的有内容时成立。实测单字回复会把三条主题都起成「A」，所以先过
     `_usable_ask`。
+
+    没有原话时**不再优先用产物名**：`ses_0028` 的主题被起成
+    「P03452-survey-565a0ec1、open_viewer」，把内部编号与英文工具名端给了用户。
+    工具名有一张中文标签表；产物只在去掉尾部编号、且不是 `artifact#` 这类
+    handle 时才用。
     """
     asks = [text for text in _user_texts(session, start, end) if _usable_ask(text)]
     if asks:
@@ -385,18 +438,19 @@ def _local_title(session: Session, start: tuple[int, int], end: tuple[int, int],
         for name in step.tools:
             if name not in actions:
                 actions.append(name)
+    if actions:
+        labels = [_TOOL_LABELS.get(name, name) for name in actions]
+        suffix = "" if len(labels) <= 2 else f" 等 {len(labels)} 个"
+        return _fit_title("、".join(labels[:2]), suffix)
     artifacts: list[str] = []
     for step in steps:
         for item in step.artifacts:
             if item not in artifacts:
                 artifacts.append(item)
-    if artifacts:
-        suffix = "、" + "、".join(actions[:2]) if actions else ""
-        return _fit_title(artifacts[0] + suffix, "")
-    if actions:
-        suffix = "" if len(actions) <= 3 else f" 等 {len(actions)} 个"
-        return _fit_title("工具：" + "、".join(actions[:3]), suffix)
-    return f"第 {start[0] + 1}–{end[0]} 条"
+    readable = [label for label in (_artifact_label(item) for item in artifacts) if label]
+    if readable:
+        return _fit_title(readable[0], "")
+    return f"过程记录（{len(steps)} 步）"
 
 
 def _local_summary(steps: list[Step], start: tuple[int, int], end: tuple[int, int]) -> str:
@@ -424,6 +478,40 @@ def _local_summary(steps: list[Step], start: tuple[int, int], end: tuple[int, in
     if not artifacts and not issues and steps[-1].result:
         pieces.append(steps[-1].result[:STEP_RESULT_MAX])
     return "；".join(pieces)[:EVENT_SUMMARY_MAX]
+
+
+def _carry_text(text: str) -> str:
+    """把答复压到承接块上限：保留开头结论与结尾待决事项，丢掉中段。"""
+    text = text.strip()
+    if len(text) <= REPLY_CARRY_MAX:
+        return text
+    half = REPLY_CARRY_MAX // 2
+    return text[:half].rstrip() + "\n……\n" + text[-half:].lstrip()
+
+
+def _last_reply_text(
+    session: Session, start: tuple[int, int], end: tuple[int, int]
+) -> tuple[str, tuple[int, int]]:
+    """封存区间 `[start, end)` 里最后一条非空助手正文与它的位置。
+
+    从后往前找：一段里可能有多条正文（叙述、结论、追加说明），
+    最后一条才是用户刚看到的那一句。找不到时返回空串与 `(0, 0)`。
+    """
+    first = max(0, start[0])
+    last = min(end[0], len(session.messages) - 1)
+    for message_index in range(last, first - 1, -1):
+        message = session.messages[message_index]
+        # 只要助手正文：这一段里也会有用户消息，它的文本不是「已答复」。
+        if message.role != "assistant":
+            continue
+        limit = len(message.parts)
+        if message_index == end[0]:
+            limit = min(limit, end[1])
+        for part_index in range(limit - 1, -1, -1):
+            part = message.parts[part_index]
+            if part.type is PartType.TEXT and part.text.strip():
+                return part.text.strip(), (message_index, part_index)
+    return "", (0, 0)
 
 
 def seal_topic(
@@ -493,6 +581,13 @@ def seal_topic(
         title = _local_title(session, start, end, steps)
     if not summary.strip():
         summary = _local_summary(steps, start, end)
+    # 封存会把这一段的原文从 RECENT 里拿走。把最后一条正文记在会话上，
+    # 装配器在本段还没有新用户消息时把它带回去，模型就不会把同一件事重写。
+    # 位置按 (消息, 部件) 记：只靠「新用户消息清空字段」不够，
+    # `stream_reply` 开头补封上一轮时新消息已经写进会话，会被这次封存重新写回。
+    reply_text, reply_at = _last_reply_text(session, start, end)
+    session.topic_reply = _carry_text(reply_text)
+    session.topic_reply_at = reply_at if reply_text else (0, 0)
     # 步号在会话内连号：主题内那一个（`Step.seq`）封存时重排，跨主题的编号
     # 另存在事件上，供召回时指路。
     step_start = session.step_seq + 1
@@ -701,6 +796,15 @@ class CloseTopicTool(Tool):
                         "不是这一段做了什么。会话已经有名字时不传。"
                     ),
                 },
+                "next_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "下一个主题还要用哪些工具族（1–3 个，如 pocket、ligand）。"
+                        "封存时只预装这些，其余领域族全部卸载；不写就只留核心工具，"
+                        "下一主题需要什么再 load_tools。"
+                    ),
+                },
             },
             "required": ["title"],
             "additionalProperties": False,
@@ -738,9 +842,31 @@ class CloseTopicTool(Tool):
                 ),
                 failed=True,
             )
+        next_tools = [
+            str(item or "").strip()
+            for item in (arguments.get("next_tools") or [])
+            if str(item or "").strip()
+        ]
+        # 预装的族名写错时当场拒绝：否则封存会成功，下一个主题却什么都没预装，
+        # 模型要到下一步才发现，白花一步。**校验放在写会话字段之前**：
+        # 失败不能留下 topic_title，否则下一步会被这个失败的标题触发封存。
+        if next_tools:
+            from .domain.all_tools import catalog
+
+            known = catalog()
+            unknown = [name for name in next_tools if name not in known]
+            if unknown:
+                return ToolResult(
+                    output=(
+                        f"next_tools 里没有这些族：{'、'.join(unknown)}。"
+                        f"可用：{'、'.join(known)}"
+                    ),
+                    failed=True,
+                )
         session.topic_title = title
         session.topic_summary = str(arguments.get("summary") or "").strip()[:EVENT_SUMMARY_MAX]
         session.topic_handoff = str(arguments.get("handoff") or "").strip()[:EVENT_HANDOFF_MAX]
+        session.next_tools = next_tools
         session.pending_session_title = (
             str(arguments.get("session_title") or "").strip()[:SESSION_TITLE_MAX]
         )
@@ -751,11 +877,16 @@ class CloseTopicTool(Tool):
                 if value not in artifacts:
                     artifacts.append(value)
         produced = "、".join(artifacts[:5]) if artifacts else "（还没有产物）"
+        next_note = (
+            f"下一主题预装：{'、'.join(session.next_tools)}。"
+            if session.next_tools
+            else "下一主题从核心工具开始。"
+        )
         return ToolResult(
             output=(
                 f"已记下主题「{title}」（{len(session.pending_steps)} 步）。"
                 f"这一步结束时封存，之后这一段原文不再随请求发出，摘要里能看到。"
-                f"已产出的对象：{produced}。"
+                f"已产出的对象：{produced}。{next_note}"
             ),
             meta={"title": title, "steps": len(session.pending_steps)},
         )

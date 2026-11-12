@@ -44,6 +44,18 @@ class TraceWriter:
         self._handle: TextIO | None = None
         self._handle_path: Path | None = None
         self._unsubscribe: Callable[[], None] | None = None
+        # 写入缓冲。一次模型往返里有上百条 `part.update`（每个文本增量一条），
+        # 每条都刷盘等于把一次对话写成几万次系统调用。留 200 毫秒的缓冲：
+        # 进程真崩了，丢的也只是最后 200 毫秒，而崩溃前那一段仍然在文件里。
+        self._buffer: list[str] = []
+        self._buffer_chars = 0
+        self._last_flush = time.monotonic()
+        self.flush_interval = 0.2
+        self.max_buffer = 64 * 1024
+        # `part.update` 按部件采样：同一个部件每 250 毫秒最多一行。
+        # 它的负载只有三个编号，正文在状态文件里，中间帧对回放没有信息。
+        self.update_interval = 0.25
+        self._last_update: dict[str, float] = {}
 
     def start(self) -> None:
         """建出日志目录并开始记录。"""
@@ -58,24 +70,56 @@ class TraceWriter:
         self._close()
 
     def current_path(self) -> Path:
-        """当前会话的日志文件路径。"""
+        """当前会话的日志文件路径。取路径的人通常马上要读，先刷一次缓冲。"""
+        self._flush()
         return self.directory / f"{self.session_id()}.jsonl"
 
     def _write(self, payload: dict[str, Any]) -> None:
-        """把一条事件写成一行。
+        """把一条事件放进缓冲，按时间或大小刷出去。
 
-        每条写完就刷出去：这个文件要看的正是应用出错之前的那一段，
-        留在缓冲区里的内容在进程结束时就没了。
+        `part.update` 单独采样：同一个部件 250 毫秒内只留第一行。它不带正文，
+        只说明「这一步还在动」；正文与工具结果都在状态文件里，少几帧不影响
+        回放与成本分析，而一次 18 步的往返能因此从一万多行降到几百行。
         """
         event = str(payload.get("type", ""))
+        if event == "part.update":
+            key = str(payload.get("part_id", ""))
+            now = time.monotonic()
+            last = self._last_update.get(key, 0.0)
+            if key and now - last < self.update_interval:
+                return
+            self._last_update[key] = now
         body = {key: value for key, value in payload.items() if key != "type"}
         line = json.dumps(
             {"at": time.time(), "event": event, "payload": body},
             ensure_ascii=False,
         )
-        handle = self._open()
-        handle.write(f"{line}\n")
-        handle.flush()
+        # 会话换了就先把旧缓冲写完再换句柄，避免把上一条会话的行写进新文件。
+        path = self.directory / f"{self.session_id()}.jsonl"
+        if self._handle_path is not None and self._handle_path != path:
+            self._flush()
+        self._open()
+        self._buffer.append(f"{line}\n")
+        self._buffer_chars += len(line) + 1
+        if (
+            self._buffer_chars >= self.max_buffer
+            or time.monotonic() - self._last_flush >= self.flush_interval
+        ):
+            self._flush()
+
+    def _flush(self) -> None:
+        """把缓冲里的行写进当前文件并刷盘。
+
+        只写已有句柄，不在这里切换文件：切换由 `_open` 负责，切换前会先调
+        本函数把旧会话的尾部写完。没有句柄时保留缓冲，等 `_open` 建好再写。
+        """
+        if not self._buffer or self._handle is None:
+            return
+        self._handle.write("".join(self._buffer))
+        self._handle.flush()
+        self._buffer.clear()
+        self._buffer_chars = 0
+        self._last_flush = time.monotonic()
 
     def _open(self) -> TextIO:
         """取当前会话的文件句柄，会话换了就换一个。"""
@@ -87,7 +131,8 @@ class TraceWriter:
         return self._handle
 
     def _close(self) -> None:
-        """关掉当前的文件句柄。"""
+        """把缓冲写完再关掉当前的文件句柄。"""
+        self._flush()
         if self._handle is not None:
             self._handle.close()
             self._handle = None

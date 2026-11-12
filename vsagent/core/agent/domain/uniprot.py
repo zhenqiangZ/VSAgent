@@ -491,7 +491,10 @@ def _render_entry(record: dict[str, Any]) -> str:
 
     structures = _pdb_structures(record)
     if structures:
-        lines.append(f"  结构：{len(structures)} 个实验结构，分辨率最好的几个（这决定对接能不能做）：")
+        lines.append(
+            f"  结构：{len(structures)} 个实验结构（UniProt 登记；"
+            "RCSB 当前数量以 survey_structures 为准），分辨率最好的几个（这决定对接能不能做）："
+        )
         for row in structures[:MAX_PDB_IN_DIGEST]:
             resolution = f"{row['resolution']:.2f} Å" if row["resolution"] else "无分辨率"
             chains = f" · 链 {row['chains']}" if row["chains"] else ""
@@ -550,7 +553,7 @@ def _entry_summary(record: dict[str, Any]) -> str:
     if structures:
         first = structures[0]
         best = f"，最佳 {first['resolution']:.2f} Å" if first["resolution"] else ""
-        parts.append(f"实验结构 {len(structures)} 个{best}")
+        parts.append(f"实验结构 {len(structures)} 个（UniProt 登记）{best}")
     else:
         # 「无实验结构」是这一行里最要紧的信息，不能因为数字是 0 就省掉
         parts.append("无实验结构")

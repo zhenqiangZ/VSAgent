@@ -246,6 +246,7 @@ from vsagent.core.agent.toolset import (  # noqa: E402
     family_of,
     hidden_names,
     prune_families,
+    release_families,
 )
 from vsagent.core.agent.trace import TraceWriter, log_directory_for  # noqa: E402
 from vsagent.core.event_bus import EventBus  # noqa: E402
@@ -965,6 +966,34 @@ def check_trace() -> None:
         "停止之后没有新的行",
     )
 
+    # 一次往返里有上百条 part.update（每个文本增量一条）。它们逐条落盘会把
+    # 一轮对话写成上万行；这里按部件采样，同一个部件 250 毫秒内只留一条。
+    burst_dir = ROOT / ".probe" / "trace_burst"
+    shutil.rmtree(burst_dir, ignore_errors=True)
+    burst = EventBus()
+    burst_writer = TraceWriter(burst, lambda: "ses_burst", burst_dir)
+    burst_writer.start()
+    for _ in range(200):
+        burst.publish(
+            "part.update",
+            {"message_id": "msg_b", "part_id": "prt_same", "session_id": "ses_burst"},
+        )
+    burst.publish("turn.done", {"message_id": "msg_b", "session_id": "ses_burst"})
+    path = burst_writer.current_path()
+    burst_rows = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    updates = [row for row in burst_rows if row["event"] == "part.update"]
+    check(
+        len(updates) <= 3,
+        f"同一个部件的连续更新按时间采样，实际 {len(updates)} 行",
+    )
+    check(
+        any(row["event"] == "turn.done" for row in burst_rows),
+        "采样不会丢掉非更新事件",
+    )
+    burst_writer.stop()
+
 
 def check_rules() -> None:
     """项目规则文件的读取与每轮重读。"""
@@ -1198,8 +1227,8 @@ def check_permission() -> None:
     ):
         decision = judge(session_policy, name, arguments)
         check(
-            decision.verdict is Verdict.ALLOW and "所有工具" in decision.rule,
-            f"全放行之后 {name} 不再问：{decision.rule}",
+            decision.verdict is Verdict.ALLOW and not decision.note(),
+            f"全放行之后 {name} 不再问，卡片上也不再写放行说明：{decision.note()!r}",
         )
     # a 排在 Plan 方式与配置规则之前，这两级也不再拦。
     check(
@@ -3406,6 +3435,46 @@ async def check_loop(server: FakeModelServer) -> None:
     )
     check("… 省略 4000 字符" in fed_back, "裁掉的那一段写明省略了多少字符")
 
+    # 写过文件但答复没提路径时，收尾补一行。模型经常只把路径留在工具卡里，
+    # 用户翻不到；这里验的是补的那一行，以及「已经提到就不重复」。
+    delivery = Message(role="assistant", session_id=session.id)
+    delivery.add_part(
+        Part(
+            type=PartType.TOOL,
+            tool_name="write",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"path": "runs/plan.md"},
+            tool_output="已新建 …/runs/plan.md，现在有 10 行",
+        )
+    )
+    delivery.add_part(Part(type=PartType.TEXT, text="计划已经写好。"))
+    loop._finish(session, delivery, 1, 1)
+    texts = [part.text for part in delivery.parts if part.type is PartType.TEXT]
+    check(
+        any("本轮写入：runs/plan.md" in text for text in texts),
+        f"答复没提路径时补一行：{texts}",
+    )
+
+    mentioned = Message(role="assistant", session_id=session.id)
+    mentioned.add_part(
+        Part(
+            type=PartType.TOOL,
+            tool_name="write",
+            tool_status=ToolStatus.COMPLETED,
+            tool_input={"path": "runs/plan.md"},
+            tool_output="已新建 …/runs/plan.md",
+        )
+    )
+    mentioned.add_part(Part(type=PartType.TEXT, text="计划写在 runs/plan.md。"))
+    loop._finish(session, mentioned, 1, 1)
+    mentioned_texts = [
+        part.text for part in mentioned.parts if part.type is PartType.TEXT
+    ]
+    check(
+        len(mentioned_texts) == 1,
+        f"答复已经提到路径时不重复追加：{mentioned_texts}",
+    )
+
     await check_effort(server, loop, recorder)
     await check_identity(server, loop, recorder)
     await check_step_limit(server)
@@ -3806,6 +3875,10 @@ async def check_step_limit(server: FakeModelServer) -> None:
         "停下来是因为" in wrap_up_request["messages"][-1]["content"],
         f"收尾请求把停下来的原因写进指令：{wrap_up_request['messages'][-1]['content'][:80]}",
     )
+    check(
+        "给你的答复" in wrap_up_request["messages"][-1]["content"],
+        "收尾指令先要求回答用户，再写状态简报",
+    )
     check(bool(watcher.names("turn.done")), "走满步数上限之后照常发 turn.done")
     check(
         bool([part for part in message.parts if part.type is PartType.STEP_FINISH]),
@@ -4091,7 +4164,10 @@ async def check_permission_in_loop(server: FakeModelServer) -> None:
         tools[0].tool_status is ToolStatus.COMPLETED and "asked_then_ran" in tools[0].tool_output,
         f"允许之后命令真的执行了：{tools[0].tool_output}",
     )
-    check("本会话" in tools[0].permission, f"放行的依据记在 Part 上：{tools[0].permission}")
+    check(
+        tools[0].permission == "",
+        f"全放行的调用不再往卡片上写依据：{tools[0].permission!r}",
+    )
 
     # 按 a 之后整个工具都放行：换一条**内容完全不同**的命令也不该再问。
     # 按命令原文记的时候这一条会失败，正是用户体感的来源。
@@ -5164,6 +5240,23 @@ def check_focus() -> None:
     check(
         filled.usage[Layer.TASK] > empty.usage[Layer.TASK],
         "复述算进 TASK 层的用量",
+    )
+
+    # 复述很长、摘要很短时，HISTORY 不能是负数：早先用「整头减各层」，
+    # 减掉的 focus 根本不在头里，于是算出一个负的层用量；而 total 正是降级链
+    # 与「装不下」判据的输入，负数会让真实占用被少算。
+    long_focus = Session(title="长复述")
+    long_focus.task_state.apply(goal="目标" * 400)
+    user = long_focus.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="继续"))
+    long_built = build(long_focus)
+    check(
+        all(value >= 0 for value in long_built.usage.values()),
+        f"各层用量都不为负：{long_built.usage}",
+    )
+    check(
+        long_built.usage[Layer.HISTORY] >= 0,
+        f"长复述短摘要时 HISTORY 不为负：{long_built.usage[Layer.HISTORY]}",
     )
 
 
@@ -12353,6 +12446,122 @@ async def check_hypothesis() -> None:
     check(
         "session_id" not in meta["provenance"],
         "没有会话编号时不写这个键（演示数据与旧调用保持原形状）",
+    )
+
+    # ---- 五、一次创建一组互指的假设：组内写 key，不猜编号 ----
+    before_group = len(state.hypotheses)
+    grouped = await call(
+        {
+            "action": "group",
+            "items": [
+                {
+                    "key": "expand",
+                    "kind": "strategy",
+                    "mode": "expand",
+                    "claim": "组外形状筛能带回新骨架",
+                    "mechanism": "沟槽允许不同骨架填充",
+                    "evidence": "artifact#1",
+                    "test": "统计前 100 名里的新化学型",
+                    "expected": "前 100 名里至少 3 个新化学型",
+                    "rivals": ["packed"],
+                    "discriminator": "新化学型 ≥3 支持 expand；≤1 支持 packed",
+                },
+                {
+                    "key": "packed",
+                    "kind": "strategy",
+                    "mode": "expand",
+                    "claim": "该位点只会回收同系列类似物",
+                    "mechanism": "已知系列占满疏水通道",
+                    "evidence": "artifact#1",
+                    "test": "统计前 100 名里的新化学型",
+                    "expected": "前 100 名里新化学型 ≤1",
+                    "rivals": ["expand"],
+                    "discriminator": "新化学型 ≥3 支持 expand；≤1 支持 packed",
+                },
+                {
+                    "key": "stem",
+                    "kind": "mechanism",
+                    "claim": "命中物占据 stem 沟槽而不是唾液酸位点",
+                    "mechanism": "沟槽闭合锁定融合前构象",
+                    "test": "同一批命中物分别对接 stem 与 RBS",
+                    "expected": "≥70% 命中物 stem 分数优于 RBS 1 kcal/mol",
+                },
+            ],
+        }
+    )
+    check(not grouped.failed, f"一组三条一次写入：{grouped.output}")
+    check(
+        len(state.hypotheses) == before_group + 3,
+        f"组内三条都写进去了：{len(state.hypotheses) - before_group}",
+    )
+    group_ids = grouped.meta["ids"]
+    check(
+        state.find_hypothesis(group_ids[0]).rivals == [group_ids[1]]
+        and state.find_hypothesis(group_ids[1]).rivals == [group_ids[0]],
+        "组内 key 解析成正式编号并互指",
+    )
+    check(
+        state.find_hypothesis(group_ids[2]).rivals == [],
+        "没有对手的那条不凭空产生竞争关系",
+    )
+    check(
+        "新化学型" in state.find_hypothesis(group_ids[0]).discriminator,
+        "区分判据跟着假设存下来",
+    )
+
+    before_bad = len(state.hypotheses)
+    bad_group = await call(
+        {
+            "action": "group",
+            "items": [
+                {
+                    "key": "ok",
+                    "kind": "mechanism",
+                    "claim": "组内合法的一条",
+                    "test": "做一次突变",
+                    "expected": "活性下降 10 倍",
+                },
+                {
+                    "key": "bad",
+                    "kind": "mechanism",
+                    "claim": "预期含糊的一条",
+                    "test": "做一次突变",
+                    "expected": "会变好",
+                },
+            ],
+        }
+    )
+    check(
+        bad_group.failed and len(state.hypotheses) == before_bad,
+        f"整组校验不过时一条都不写：{bad_group.output}",
+    )
+
+    unknown_rival = await call(
+        {
+            "action": "group",
+            "items": [
+                {
+                    "key": "one",
+                    "kind": "mechanism",
+                    "claim": "指向组外对手的一组",
+                    "test": "做一次突变",
+                    "expected": "活性下降 10 倍",
+                    "rivals": ["missing"],
+                    "discriminator": "missing 是组外编号",
+                },
+                {
+                    "key": "two",
+                    "kind": "mechanism",
+                    "claim": "同组的第二条",
+                    "test": "做一次突变",
+                    "expected": "活性下降 10 倍",
+                },
+            ],
+        }
+    )
+    check(
+        unknown_rival.failed and "不在本组" in unknown_rival.output,
+        f"组内对手只能写本组 key：{unknown_rival.output}",
     )
 
     # 状态要能落盘再读回来：不然重开会话假设就没了。
@@ -19996,14 +20205,15 @@ async def check_tool_family_loop(server: FakeModelServer) -> None:
     check("dock" not in sent[0], "没装的族不在请求体里")
     check("dock" in sent[1], "装过之后下一步就出现在请求体里")
     check("search_pdb" not in sent[1], "装一族只开一族")
-    check(session.tool_families == ["scoring"], f"族记在会话上：{session.tool_families}")
+    check(session.tool_families == [], f"轮末释放领域族：{session.tool_families}")
 
-    # 下一轮重新问一次，装过的族仍然在：它是会话状态，不是一轮状态。
+    # 下一轮从核心工具开始：族是**主题**状态，不是永久状态。需要时再装，
+    # 这样上一轮装的十族不会一直占着下一轮每一步的额度。
     ask(session, "接着说")
     server.script(Reply(chunks=[*text_chunks("好"), usage_chunk(130, 10)]))
     await loop.stream_reply(session, "")
     latest = {item["function"]["name"] for item in server.requests[-1].get("tools") or []}
-    check("dock" in latest, "跨轮仍然在（族是会话状态，不是一轮状态）")
+    check("dock" not in latest, "下一轮不再默认带着上一轮的族")
     check(
         loop.context_history[-1]["tools"] < loop.context_history[-1]["available"],
         "工具定义记进了度量（否则 /context 看不出清单变大了）",
@@ -20556,7 +20766,7 @@ async def check_tool_family() -> None:
     )
     check(f"{len(groups)} 族" in description, "说明里的族数就是目录里的族数")
     check(
-        "一次把这一轮要用的族都装上" in description,
+        "一次把这一主题要用的族都装上" in description,
         "load_tools 的说明里也写了「一次装完」（模型先读说明，再读返回）",
     )
     # 光比对内容抓不到「写死一个恰好正确的数」。原先这条拿 "13 族" 当哨兵，
@@ -20620,11 +20830,51 @@ async def check_tool_family() -> None:
     )
     check("缓存" not in again.output, "装过的族不再重复这句提醒（否则每步都是噪音）")
 
+    # 一次装多族：说明早就要求「这一轮要用的族一起装」，参数原先只收一个，
+    # 模型只能连发几次，每次都改工具清单。
+    multi = await LoadToolsTool().execute(
+        {"families": ["structure", "chembl"]}, session=session, registry=registry
+    )
+    check(not multi.failed, f"families 数组能一次装多族：{multi.output}")
+    check(
+        session.tool_families == ["scoring", "structure", "chembl"],
+        f"两族都记在会话上：{session.tool_families}",
+    )
+    check(
+        multi.meta["families"] == ["structure", "chembl"],
+        f"meta 里记下这一批族：{multi.meta}",
+    )
+    after_multi = {
+        spec["function"]["name"]
+        for spec in registry.specs(exclude=hidden_names(session))
+    }
+    check(
+        groups["structure"][0] in after_multi and groups["chembl"][0] in after_multi,
+        "两族的工具都出现在清单里",
+    )
+
+    conflicting = await LoadToolsTool().execute(
+        {"family": "structure", "families": ["chembl"]},
+        session=session,
+        registry=registry,
+    )
+    check(
+        conflicting.failed and "只能给一个" in conflicting.output,
+        f"family 与 families 同时给要明确拒绝：{conflicting.output}",
+    )
+    check(
+        session.tool_families == ["scoring", "structure", "chembl"],
+        "被拒的多族调用不改会话状态",
+    )
+
     unknown = await LoadToolsTool().execute(
         {"family": "nope"}, session=session, registry=registry
     )
     check(unknown.failed and "scoring" in unknown.output, f"未知族列出可选项：{unknown.output}")
-    check(session.tool_families == ["scoring"], "未知族不改会话状态")
+    check(
+        session.tool_families == ["scoring", "structure", "chembl"],
+        "未知族不改会话状态",
+    )
 
     # 轮末封存时收敛（P2-1）：族只装不卸的话，装到八族之后每步都发 12K token
     # 的工具定义，而典型的一轮只用得上两三个族。
@@ -20648,6 +20898,29 @@ async def check_tool_family() -> None:
     check(
         prune_families(prune_session, set(), 3) == [],
         "一个工具都没用过时不卸（纯聊天的一轮没有依据）",
+    )
+
+    # 主题租约：过了主题边界，领域族全部释放；只预装 close_topic 点名的族。
+    lease = Session(id="ses_family_lease")
+    lease.tool_families = ["scoring", "structure"]
+    lease.family_topic = {"scoring": 1, "structure": 1}
+    dropped_lease = release_families(lease, ["pocket"])
+    check(
+        dropped_lease == ["scoring", "structure"]
+        and lease.tool_families == ["pocket"],
+        f"主题结束只保留 next_tools：dropped={dropped_lease}，留下={lease.tool_families}",
+    )
+    check(
+        lease.family_topic == {"pocket": lease.next_topic_index},
+        f"预装的族拿到新主题的租约：{lease.family_topic}",
+    )
+    check(
+        release_families(lease, []) == ["pocket"] and lease.tool_families == [],
+        "没有 next_tools 时下一主题从核心工具开始",
+    )
+    check(
+        release_families(lease, ["nope"]) == [] and lease.tool_families == [],
+        "未知族名被忽略，不会把整批预装丢掉",
     )
 
     # 被关掉的工具不许报「已装入」：那句话说出去，模型下一步就会去调它，
@@ -20690,7 +20963,7 @@ async def check_tool_family() -> None:
     # dock 还在，否则模型会以为自己没装过、又去 load 一次。
     restored_session = Session.from_dict(session.to_dict())
     check(
-        restored_session.tool_families == ["scoring"],
+        restored_session.tool_families == ["scoring", "structure", "chembl"],
         f"族跟着会话存盘走：{restored_session.tool_families}",
     )
     check("dock" in hidden_names(Session.from_dict({"id": "ses_x"})), "没存过族时按全藏处理")
@@ -21192,10 +21465,15 @@ async def check_event_log() -> None:
             "title": "跑完两轮对接",
             "summary": "两轮都产出了 docking",
             "handoff": "下一段用 docking#0 做排序",
+            "next_tools": ["pocket", "ligand"],
         },
         event_runtime=runtime,
     )
     check(not recorded.failed and "已记下" in recorded.output, f"记下标题：{recorded.output}")
+    check(
+        manual_session.next_tools == ["pocket", "ligand"],
+        f"下一主题要预装的族挂在会话上：{manual_session.next_tools}",
+    )
     check(manual_session.events == [], "记名字不当场封存，封存在步末")
     check(
         (
@@ -21210,6 +21488,21 @@ async def check_event_log() -> None:
     check(
         "已记下" in again.output and manual_session.topic_title == "再来一次",
         f"再调一次是覆盖，不是报错：{again.output}",
+    )
+    check(
+        manual_session.next_tools == [],
+        "再调一次没写 next_tools 时清空上一次的预装",
+    )
+    bad_next = await CloseTopicTool().execute(
+        {"title": "写错族名", "next_tools": ["nope"]}, event_runtime=runtime
+    )
+    check(
+        bad_next.failed and "没有这些族" in bad_next.output,
+        f"未知的预装族当场拒绝：{bad_next.output}",
+    )
+    check(
+        manual_session.topic_title == "再来一次",
+        "预装族写错时不留下半个标题，下一步不会被它触发封存",
     )
     await CloseTopicTool().execute(
         {
@@ -21635,6 +21928,10 @@ async def check_topic(server: FakeModelServer) -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
     registry.register(CloseTopicTool())
+    # 预装的族要在注册表里真的存在，请求体里才看得到它的工具；生产环境
+    # 的注册表本来就装了全部领域工具，这里补齐同一个形状。
+    for tool in all_domain_tools():
+        registry.register(tool)
     loop = build_loop(server, bus, registry)
     live = Session(id="ses_topic_loop", title="多主题")
     ask(live, "查一条记录")
@@ -21672,6 +21969,7 @@ async def check_topic(server: FakeModelServer) -> None:
                                     "title": "查口袋",
                                     "summary": "口袋在残基 45",
                                     "handoff": "下一步用它做盒子",
+                                    "next_tools": ["pocket"],
                                 }
                             ),
                         )
@@ -21684,6 +21982,18 @@ async def check_topic(server: FakeModelServer) -> None:
     )
     await loop.stream_reply(live, "")
     check(len(server.requests) == 3, f"三步各一次请求：{len(server.requests)}")
+    final_tools = {
+        item["function"]["name"]
+        for item in server.requests[-1].get("tools") or []
+    }
+    check(
+        "detect_pockets" in final_tools,
+        "下一主题预装的族在下一步请求里",
+    )
+    check(
+        "search_pdb" not in final_tools,
+        "预装只带点名的族，不会把别的族一起打开",
+    )
     sealed = next((event for event in live.events if event.title == "查口袋"), None)
     check(sealed is not None and sealed.kind == "manual", "模型给的名字封成一条主题")
     check(sealed.actions == ["echo"], f"流水里是那一步的工具：{sealed.actions if sealed else None}")
@@ -21696,6 +22006,87 @@ async def check_topic(server: FakeModelServer) -> None:
     )
     check(marker in recalled.output, "原文一条没删，按步召得回来")
     check(seen and seen[0]["title"] == "查口袋", f"封存时给界面发一条总线事件：{seen}")
+
+    # 封存会把这一段的答复原文从 RECENT 里拿走。下一段必须还能看到它，
+    # 否则模型会以为「用户没再说话」，把同一件事重写一遍。
+    carry = Session(id="ses_carry", title="承接答复")
+    carry.add_message(
+        Message(role="user", parts=[Part(type=PartType.TEXT, text="给我一个计划")])
+    )
+    reply = carry.add_message(Message(role="assistant"))
+    reply.add_part(Part(type=PartType.STEP_START))
+    reply.add_part(
+        Part(type=PartType.TEXT, text="上一段的答复：先做召回检验，再正式筛。")
+    )
+    record_step(
+        carry,
+        step_no=1,
+        parts=[],
+        message_index=1,
+        part_start=0,
+        part_end=2,
+    )
+    sealed_carry = seal_topic(carry, cut=(1, 2), kind="manual", title="给了计划")
+    check(sealed_carry is not None, "带答复的主题正常封存")
+    check(
+        carry.topic_reply.startswith("上一段的答复"),
+        f"封存时记下最后一段答复：{carry.topic_reply[:30]}",
+    )
+    carry_built = ContextAssembler(128_000).build(carry, "系统提示。")
+    carry_body = "\n".join(
+        str(item.get("content") or "") for item in carry_built.messages
+    )
+    check("上一段的答复" in carry_body, "封存后的下一段带回答复原文")
+    check("不要重复" in carry_body, "承接块写明这是已经答复过的内容")
+    check(
+        carry_built.usage[Layer.TASK] > 0,
+        "承接块算进 TASK 层的用量",
+    )
+
+    # 新用户消息一到，承接块就结束：否则下一轮会看见上一轮的答复。
+    carry.add_message(
+        Message(role="user", parts=[Part(type=PartType.TEXT, text="继续")])
+    )
+    carry_after = ContextAssembler(128_000).build(carry, "系统提示。")
+    after_body = "\n".join(
+        str(item.get("content") or "") for item in carry_after.messages
+    )
+    check("上一段的答复" not in after_body, "新用户消息之后不再承接上一段答复")
+
+    # 兜底标题不能把内部编号与英文工具名端给用户：用户没给可用原话时，
+    # 工具中文名优先，产物名去掉尾部编号才用。
+    from vsagent.core.agent.event_log import _local_title
+
+    title_session = Session(id="ses_title")
+    title_session.add_message(
+        Message(role="user", parts=[Part(type=PartType.TEXT, text="继续")])
+    )
+    title_step = Step(
+        seq=1,
+        tools=["open_viewer"],
+        artifacts=["P03452-survey-565a0ec1"],
+        message_index=1,
+        part_start=0,
+        part_end=1,
+    )
+    local = _local_title(title_session, (0, 0), (2, 0), [title_step])
+    check("查看结构" in local, f"兜底标题用工具中文名：{local}")
+    check(
+        "565a0ec1" not in local and "open_viewer" not in local,
+        f"兜底标题不带内部编号与英文工具名：{local}",
+    )
+
+    # 用户消息不是「已答复」：封存一段只有问话、没有助手正文时，承接块必须是空。
+    from vsagent.core.agent.event_log import _last_reply_text
+
+    user_only = Session(id="ses_user_only")
+    user_only.add_message(
+        Message(role="user", parts=[Part(type=PartType.TEXT, text="只有问话")])
+    )
+    check(
+        _last_reply_text(user_only, (0, 0), (1, 0)) == ("", (0, 0)),
+        "用户消息不会被当成上一段的答复",
+    )
 
 
 async def check_event_capture(server: FakeModelServer) -> None:

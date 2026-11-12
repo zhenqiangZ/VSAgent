@@ -5,9 +5,15 @@ import time
 from pathlib import Path
 
 from ..models import PartType, ToolStatus
+from .context import LAYER_ORDER
 
-LAYERS = ("prefix", "memory", "task", "event", "recent", "evidence")
-"""上下文六层的名字。与 `context.metrics` 的 `usage` 键一致。"""
+LAYERS = tuple(layer.value for layer in LAYER_ORDER)
+"""上下文分层的名字，顺序与装配顺序一致。直接取枚举，避免这里另抄一份名单。"""
+
+COMPAT_LAYERS = ("memory",)
+"""旧 trace 把三类记忆合成一层 `memory`。不拆、不映射到新层——旧数据里
+没有那次拆分，凭空造出来等于编造。只在确实有值时作为兼容层留下，由页面
+标注「旧口径」。"""
 
 STEP_LIMIT = 20
 """一个主题最多走多少步。超过这个数就是走到了主题步数上限。"""
@@ -160,6 +166,14 @@ def step_rows(reply, metrics: list[dict], end_at: float) -> list[dict]:
 
 def metric_row(payload: dict) -> dict:
     usage = payload.get("usage") or {}
+    layers = {
+        name: max(int(usage.get(name, 0) or 0), 0) for name in LAYERS
+    }
+    # 旧聚合层只在确实有值时保留；新 8 层数据里它是 0，不该凭空多出第 9 层。
+    for name in COMPAT_LAYERS:
+        value = max(int(usage.get(name, 0) or 0), 0)
+        if value:
+            layers[name] = value
     return {
         "at": payload.get("_at", 0.0),
         "step": payload.get("step", 0),
@@ -173,7 +187,7 @@ def metric_row(payload: dict) -> dict:
         "degraded": payload.get("degraded") or [],
         "events": payload.get("events", 0),
         "evidence": payload.get("evidence_entries", 0),
-        "usage": {name: max(int(usage.get(name, 0)), 0) for name in LAYERS},
+        "usage": layers,
     }
 
 

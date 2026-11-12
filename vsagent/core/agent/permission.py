@@ -302,7 +302,7 @@ class PermissionPolicy:
         # 本会话全部放行排在其余各级之前：用户在弹窗上按了 a，就是要求之后
         # 不再被权限层打断。中断仍然排在最前面，用户随时可以停下这一轮。
         if self._allow_all:
-            return PermissionDecision(Verdict.ALLOW, rule="本会话已放行所有工具")
+            return PermissionDecision(Verdict.ALLOW)
         name = tool.spec.name
         if agent_name == "Plan" and name in PLAN_DENY:
             return PermissionDecision(

@@ -32,14 +32,15 @@ class Splitter(Static):
     Splitter {
         width: 1;
         height: 100%;
-        background: $vsa-layer;
+        /* 默认是一条很淡的灰线：界线要看得见，但不该比正文更抢眼。 */
+        background: $vsa-line-soft;
     }
-    /* 悬停时抬一档灰，按下或键盘调宽度时转强调色：这一列能拖动，不点亮看不出来。 */
+    /* 悬停与聚焦都只抬一档灰，不用强调色：这一条能拖动，点亮到看得见就够。 */
     Splitter:hover {
         background: $vsa-line;
     }
     Splitter:focus {
-        background: $vsa-accent;
+        background: $vsa-line;
     }
     """)
 
@@ -98,6 +99,6 @@ class Splitter(Static):
         self.post_message(self.ResizeFinished(self))
 
     def action_resize(self, delta: int) -> None:
-        """方向键调一格：改完立刻写进状态文件，不需要等松手。"""
+        """左右键调一格：改完立刻写进状态文件，不需要等松手。"""
         self.post_message(self.ResizeRequested(self, delta * self._sign))
         self.post_message(self.ResizeFinished(self))

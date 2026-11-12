@@ -3,11 +3,12 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Label, ListItem, ListView, Static
 
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
-class ThemeSelectorScreen(ModalScreen[str | None]):
+
+class ThemeSelectorScreen(ClickDismissModal[str | None]):
     """主题选择器，列出 Textual 可用主题。"""
 
     BINDINGS = [
@@ -20,10 +21,10 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         self.themes = list(themes or [])
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="theme-selector"):
+        with Vertical(id="theme-selector", classes=BODY_CLASS):
             yield Static("主题", id="theme-title")
             yield ListView(id="theme-list")
-            yield Static("enter 应用   esc 关闭   ▸ 当前主题", id="theme-hint")
+            yield Static("enter 应用   点击空白处关闭（esc）   ▸ 当前主题", id="theme-hint")
 
     def on_mount(self) -> None:
         """填充主题列表并聚焦。

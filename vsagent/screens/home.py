@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 
-from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
@@ -22,7 +21,7 @@ from ..widgets.command_autocomplete import CommandAutocomplete
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import COMMAND_TOKEN, FILE_TOKEN, ComposerInput, search_files
 from ..widgets.file_autocomplete import AutocompletePopup, FileAutocomplete
-from ..widgets.session_list import NewTaskRow, SessionRow, fit
+from ..widgets.session_list import NewTaskRow, SessionRow
 from ..widgets.top_bar import TopBar, TopLink
 
 # 字标逐行写、最后补齐到同一宽度再拼起来。**不能省掉补齐**：`#home-logo` 是
@@ -107,8 +106,8 @@ class HomeInput(ComposerInput):
 class HomeAction(Static):
     """输入框底部的一格操作提示。
 
-    只是一行字，点一下才做事：附件插入 `@`，模型与工具打开各自的面板，发送等于回车。
-    做成组件而不是给整行挂点击，是为了每一格有自己的动作，也能各自响应悬停。
+    现在只剩「发送」这一格：点一下等于按下回车。做成组件而不是给整行挂点击，
+    是为了这一格能单独响应点击与悬停。
     """
 
     class Pressed(TextualMessage):
@@ -195,13 +194,10 @@ class HomeScreen(Screen):
                                     id="home-input",
                                     highlight_cursor_line=False,
                                 )
-                            yield Static(self._info_text(), id="home-info")
-                            # 输入框底部的操作提示：附件、模型、工具与发送。
-                            # 前三个只把入口摆出来，点一下才动作；发送那一格是回车的替身。
+                            # 输入框底部这一行：左边是当前的 Agent 与模型，右边是发送提示。
+                            # 模型与工具的入口收回到顶栏与斜杠命令，这一行只留状态与发送。
                             with Horizontal(id="home-actions"):
-                                yield HomeAction("file", "@ 文件", id="home-action-file")
-                                yield HomeAction("model", "/model 模型", id="home-action-model")
-                                yield HomeAction("tools", "/tools 工具", id="home-action-tools")
+                                yield Static(self._info_text(), id="home-status")
                                 yield HomeAction("send", "Enter 发送", id="home-send-hint")
                     # 快捷键提示紧跟输入框：它讲的是输入框里的操作，
                     # 放到最近任务下面就成了页脚，用户不会有耐心看到那里。
@@ -256,13 +252,22 @@ class HomeScreen(Screen):
         self.refresh_tasks()
 
     def apply_quick_visibility(self) -> None:
-        """矮终端里收起快捷入口。
+        """矮终端里收起快捷入口，并收紧最近任务的高度。
 
-        这一行加上它上面的间距占 2 行；24 行终端里除输入区以外已经占掉 20 行，
-        多这两行会把字标顶出屏幕。
+        快捷入口连同它上面的间距占 2 行；最近任务改成两行卡片之后又多占约 5 行。
+        24 行终端里除输入区以外已经占掉 20 行，不收起会把字标顶出屏幕。
+        最近任务在矮终端里封到更小的高度，超出这一段的部分自己滚动，
+        四条任务一条不少。
         """
-        self.query_one("#home-quick").styles.display = (
-            "block" if self.app.size.height >= 26 else "none"
+        height = self.app.size.height
+        show_quick = height >= 26
+        self.query_one("#home-quick").styles.display = "block" if show_quick else "none"
+        # 顶栏与页脚共 3 行；其余固定部分在快捷入口显示时占 18 行、收起时占 16 行，
+        # 其中最近任务上面那 2 行是它与快捷入口之间的空格。
+        # 剩下的高度全给最近任务，封顶 12 行，至少留 2 行。
+        fixed = 21 if show_quick else 19
+        self.query_one("#home-recent").styles.max_height = max(
+            1, min(12, height - fixed)
         )
 
     def refresh_tasks(self) -> None:
@@ -288,7 +293,8 @@ class HomeScreen(Screen):
                     item,
                     current=item.id == current,
                     width=width,
-                    meta=self._recent_meta(item, width),
+                    meta=self._recent_meta(item),
+                    two_line=True,
                 )
             )
         if running and listed:
@@ -299,7 +305,8 @@ class HomeScreen(Screen):
                     item,
                     current=item.id == current,
                     width=width,
-                    meta=self._recent_meta(item, width),
+                    meta=self._recent_meta(item),
+                    two_line=True,
                 )
             )
 
@@ -315,23 +322,20 @@ class HomeScreen(Screen):
         return Horizontal(*children, classes=classes)
 
     @staticmethod
-    def _recent_meta(session: Session, width: int) -> str:
-        """最近任务那一行的附加信息：主题数、产物数、时间与最近结果。
+    def _recent_meta(session: Session) -> str:
+        """最近任务卡片第二行：主题数、产物数、时间与最近结果。
 
-        结果按剩余宽度截断。`SessionRow` 的两列内边距、状态词 6 格与它前后各
-        两格的空隙，加上 meta 自己的分隔，一共占掉 13 格；标题留 12 格、
-        meta 前面的分隔留 2 格，所以结果那一段最多 `width - 27 - counts` 格，
-        不够 6 格就不写结果。
+        这一行独占一行，标题与状态词都在第一行，这里只把完整内容拼出来；
+        按栏宽截断交给 `SessionRow` 的两行排版统一处理。
         """
         counts = (
             f"{len(session.events)} 主题 · {_artifact_count(session)} 产物"
             f" · {_clock(session.updated_at)}"
         )
         result = _latest_result(session)
-        room = width - 27 - cell_len(counts)
-        if not result or room < 6:
+        if not result:
             return counts
-        return f"{counts} · {fit(result, room)}"
+        return f"{counts} · {result}"
 
     def on_session_row_picked(self, message: SessionRow.Picked) -> None:
         """点左栏或最近任务里的一行：切到那个会话并进入聊天界面。"""
@@ -353,18 +357,9 @@ class HomeScreen(Screen):
         self.app.execute_command(message.command)
 
     def on_home_action_pressed(self, message: HomeAction.Pressed) -> None:
-        """输入框底部那几格：附件插入引用前缀，模型与工具开面板，发送等于回车。"""
+        """输入框底部这一格：发送等于回车。"""
         message.stop()
-        if message.action == "file":
-            # 提交时由 `resolve_file_refs` 把 @路径 读成文件引用；这里只负责起个头。
-            self.input.insert("@")
-            self.input.focus()
-            return
-        if message.action == "send":
-            self.action_submit_input()
-            return
-        # 模型与工具各自有面板，直接走命令；输入框里的草稿留着不动。
-        self.app.execute_command(message.action)
+        self.action_submit_input()
 
     def on_quick_task_picked(self, message: QuickTask.Picked) -> None:
         """点快捷入口：把模板填进输入框，光标放到末尾，任务不提交。"""
@@ -444,7 +439,7 @@ class HomeScreen(Screen):
         popup.set_commands(registry.complete(query))
 
     def on_screen_resume(self) -> None:
-        """弹窗关闭后按最新的模型与 Agent 重画状态行，并把任务列表重取一次。"""
+        """弹窗关闭后按最新的模型与 Agent 重画底部状态，并把任务列表重取一次。"""
         self._refresh_info()
         self.refresh_tasks()
 
@@ -576,8 +571,8 @@ class HomeScreen(Screen):
         return text
 
     def _refresh_info(self) -> None:
-        """重画状态行。"""
-        self.query_one("#home-info", Static).update(self._info_text())
+        """重画输入框底部那一行里的 Agent 与模型。"""
+        self.query_one("#home-status", Static).update(self._info_text())
 
     def _on_palette_result(self, command_name: str | None) -> None:
         """执行命令面板选中的命令。"""

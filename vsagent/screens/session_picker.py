@@ -5,10 +5,10 @@ import time
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Input, ListItem, ListView, Static
 
 from ..core.models import Session
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
 # 会话列表每行两段：标题一行、元信息一行。标题前面留一个标记位，
 # 当前会话画 ▸，其余留空格——不这样对齐，标题列会随标记有无左右错开。
@@ -37,8 +37,11 @@ def relative_time(stamp: float, now: float | None = None) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(stamp))
 
 
-class ConfirmDialog(ModalScreen[bool]):
+class ConfirmDialog(ClickDismissModal[bool]):
     """确认对话框，返回用户是否确认。"""
+
+    # 点击弹窗之外的空白处等同于取消，与按 n 或 esc 的结果一致。
+    CANCEL_RESULT = False
 
     BINDINGS = [
         Binding("y", "confirm", "Yes", priority=True),
@@ -52,9 +55,9 @@ class ConfirmDialog(ModalScreen[bool]):
         self._question = question
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="confirm-dialog"):
+        with Vertical(id="confirm-dialog", classes=BODY_CLASS):
             yield Static(self._question, id="confirm-text", markup=False)
-            yield Static("y 确认    n 取消", id="confirm-hint")
+            yield Static("y 确认    n 取消    点空白处取消", id="confirm-hint")
 
     def action_confirm(self) -> None:
         """确认。"""
@@ -65,7 +68,7 @@ class ConfirmDialog(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class RenameDialog(ModalScreen[str | None]):
+class RenameDialog(ClickDismissModal[str | None]):
     """重命名对话框，返回新的标题。"""
 
     BINDINGS = [
@@ -78,10 +81,10 @@ class RenameDialog(ModalScreen[str | None]):
         self._title = title
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="rename-dialog"):
+        with Vertical(id="rename-dialog", classes=BODY_CLASS):
             yield Static("重命名会话", id="rename-title")
             yield Input(value=self._title, id="rename-input")
-            yield Static("enter 确定    esc 取消", id="rename-hint")
+            yield Static("enter 确定    点空白处或 esc 取消", id="rename-hint")
 
     def on_mount(self) -> None:
         """聚焦输入框。"""
@@ -96,7 +99,7 @@ class RenameDialog(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class SessionPickerScreen(ModalScreen[str | None]):
+class SessionPickerScreen(ClickDismissModal[str | None]):
     """会话选择器，支持选择、重命名与删除。"""
 
     BINDINGS = [
@@ -112,10 +115,10 @@ class SessionPickerScreen(ModalScreen[str | None]):
         self._ids: list[str] = []
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="session-picker"):
+        with Vertical(id="session-picker", classes=BODY_CLASS):
             yield Static("会话", id="picker-title")
             yield ListView(id="session-list")
-            yield Static("enter 打开   r 重命名   d 删除   esc 关闭   ▸ 当前会话", id="picker-hint")
+            yield Static("enter 打开 r 重命名 d 删除  点空白处关闭  ▸ 当前会话", id="picker-hint")
 
     def on_mount(self) -> None:
         """填充会话列表并聚焦。"""

@@ -6,8 +6,9 @@ from typing import Callable
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import ModalScreen
 from textual.widgets import ListItem, ListView, Static
+
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
 # 开关状态用一个字符表示。开/关两态用同一对「实心/空心圆」而不是
 # 「on/off」这种词：一列排下来，扫一眼就能数出开了几个。
@@ -41,7 +42,7 @@ class ToolEntry:
     origin: str = ""
 
 
-class ToolsPanelScreen(ModalScreen[None]):
+class ToolsPanelScreen(ClickDismissModal[None]):
     """工具管理面板：逐条开关，改完立刻生效。
 
     开关写进项目侧的 `.vsagent/tools.toml`，与手改那份文件是同一个东西；
@@ -64,12 +65,12 @@ class ToolsPanelScreen(ModalScreen[None]):
         self._on_toggle = on_toggle
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="tools-panel"):
+        with Vertical(id="tools-panel", classes=BODY_CLASS):
             yield Static("工具", id="tools-title")
             yield ListView(id="tools-list")
             # 提示行要能在 80 列的终端里整句放得下（面板宽 70%、最多 90 列）：
             # 挤不下的后半句会被裁掉，而这句话正是在解释「关掉意味着什么」。
-            yield Static("space/enter 开关  esc 关闭  关掉的工具模型看不到", id="tools-hint")
+            yield Static("space/enter 开关 点空白处关闭 关掉的工具模型看不到", id="tools-hint")
 
     def on_mount(self) -> None:
         """填充列表并聚焦。"""

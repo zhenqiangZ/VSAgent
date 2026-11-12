@@ -4,8 +4,9 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.markup import escape
-from textual.screen import ModalScreen
 from textual.widgets import Static
+
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
 SAMPLE_DIFF = """\
 --- a/vsagent/app.py
@@ -23,7 +24,7 @@ SAMPLE_DIFF = """\
 """
 
 
-class DiffOverlayScreen(ModalScreen[None]):
+class DiffOverlayScreen(ClickDismissModal[None]):
     """全屏 Diff 查看器，支持滚动与简易语法着色。"""
 
     BINDINGS = [
@@ -38,10 +39,10 @@ class DiffOverlayScreen(ModalScreen[None]):
         self._diff_text = diff_text or SAMPLE_DIFF
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="diff-overlay"):
+        with VerticalScroll(id="diff-overlay", classes=BODY_CLASS):
             yield Static("Diff", id="diff-title")
             yield Static(self._colorize(), id="diff-body")
-            yield Static("up/down 滚动   q 或 esc 关闭", id="diff-hint")
+            yield Static("up/down 滚动   点击空白处关闭（q 或 esc）", id="diff-hint")
 
     def on_mount(self) -> None:
         """聚焦滚动区域以便直接响应上下键。"""

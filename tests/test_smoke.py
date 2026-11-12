@@ -561,12 +561,12 @@ async def run_rail_checks() -> None:
         check(pane.x == rail.region.right + 1, "消息区隔着一条分栏界线紧挨左栏")
 
         sessions = list(chat.query_one("#chat-sessions").query(SessionRow))
-        check(len(sessions) == len(manager.root_sessions()), "聊天左栏同样列出全部会话")
+        check(len(sessions) == len(manager.root_sessions()), "聊天左栏列出最近的会话")
         check(len(chat.query(NewTaskRow)) == 0, "聊天左栏没有新建任务行")
         chat_headers = [str(item.content) for item in chat.query(".rail-section")]
         check(
-            any(text.startswith("全部任务 ") for text in chat_headers),
-            f"聊天左栏第二段仍叫全部任务：{chat_headers}",
+            any(text.startswith("最近任务 ") for text in chat_headers),
+            f"聊天左栏第二段叫最近任务：{chat_headers}",
         )
         topics = list(chat.query_one("#chat-topics").query(TopicRow))
         check(topics == [], "还没有主题时主题列表是空的")
@@ -590,7 +590,7 @@ async def run_rail_checks() -> None:
         # 分节标题带条数：栏拖窄之后标题只剩几个字，数字是这一段唯一还读得出来的信息。
         headers = [str(item.content) for item in chat.query(".rail-section")]
         check(
-            any(text.startswith("全部任务 ") for text in headers)
+            any(text.startswith("最近任务 ") for text in headers)
             and any(text.startswith("主题 ") for text in headers),
             f"会话与主题的分节标题都带条数：{headers}",
         )
@@ -651,7 +651,7 @@ async def run_narrow_checks() -> None:
         manager.current.title = "主任务"
         for index in range(4):
             manager.create_session(f"窄屏测试任务 {index}")
-        # 一条长标题：窄屏里只能压成一行，折行会把列表撑乱。
+        # 一条长标题：两行卡片里第一行也只截断不折行，折行会把列表撑乱。
         manager.create_session("很长的一条任务标题" * 8)
 
         home = app.screen
@@ -672,8 +672,8 @@ async def run_narrow_checks() -> None:
         )
         rows = list(home.query_one("#home-recent").query(SessionRow))
         check(
-            bool(rows) and all(row.region.height == 1 for row in rows),
-            "最近任务在窄屏里仍然一行一条",
+            bool(rows) and all(row.region.height == 2 for row in rows),
+            "最近任务在窄屏里仍然是两行一条卡片",
         )
 
         await pilot.resize_terminal(80, 24)
@@ -833,7 +833,7 @@ async def run_splitter_checks() -> None:
 
 
 async def run_home_action_checks(server: FakeModelServer) -> None:
-    """输入框底部的操作提示：四格字、附件前缀、模型与工具面板、发送。"""
+    """输入框底部一行：Agent 与模型状态、发送；键入 @ 的补全；顶栏入口与点空白处关弹窗。"""
     path = ROOT / ".probe" / "home_action_state.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.unlink(missing_ok=True)
@@ -844,29 +844,41 @@ async def run_home_action_checks(server: FakeModelServer) -> None:
         await pilot.pause(0.4)
         home = app.screen
         actions = home.query_one("#home-actions")
+        status = home.query_one("#home-status")
+        send = home.query_one("#home-send-hint")
         labels = [str(item.content) for item in actions.query(HomeAction)]
         check(
-            labels == ["@ 文件", "/model 模型", "/tools 工具", "Enter 发送"],
-            f"输入框底部四格提示按顺序排列：{labels}",
+            labels == ["Enter 发送"],
+            f"输入框底部只剩发送这一格：{labels}",
+        )
+        check(
+            "Build" in str(status.content)
+            and app.current_model_label in str(status.content),
+            f"左端显示当前 Agent 与模型：{str(status.content)!r}",
         )
         box = home.query_one("#home-box")
         check(
             actions.region.y > home.input.region.y
             and actions.region.bottom < box.region.bottom,
-            f"提示行在输入框内部的最下面：{actions.region}，输入框 {box.region}",
+            f"底部这一行在输入框内部的最下面：{actions.region}，输入框 {box.region}",
         )
-        send = home.query_one("#home-send-hint")
         check(
             send.region.right == home.query_one("#home-box-main").content_region.right,
             f"发送提示贴在输入框右端：{send.region.right}",
         )
 
-        # 附件：插入引用前缀，光标留在输入框里接着打字；候选列表同时打开。
-        await pilot.click(home.query_one("#home-action-file"))
+        # 切 Agent 之后底部状态跟着更新。
+        await pilot.press("tab")
         await pilot.pause()
-        check(home.input.text == "@", f"点附件插入引用前缀：{home.input.text!r}")
-        check(home.input.has_focus, "插入之后焦点仍在输入框")
-        check(home.file_popup.is_open, "插入 @ 之后文件补全弹窗打开")
+        check(
+            "Plan" in str(status.content),
+            f"切 Agent 后底部状态跟着更新：{str(status.content)!r}",
+        )
+
+        # 键入 @ 触发文件补全：入口从底部行收回了，手打 @ 照样能引用文件。
+        home.input.text = "@"
+        await pilot.pause()
+        check(home.file_popup.is_open, "键入 @ 打开文件补全弹窗")
         candidates = home.file_popup.visible_items
         check(bool(candidates), f"文件补全给出候选：{candidates}")
         check(
@@ -903,22 +915,24 @@ async def run_home_action_checks(server: FakeModelServer) -> None:
         check(not home.file_popup.is_open, "esc 收起文件补全")
         check(home.input.text == "@", f"收起候选不动输入内容：{home.input.text!r}")
 
-        # 模型与工具：各自打开面板，输入框里的草稿留着。
+        # 模型与工具的入口仍在顶栏；打开之后点空白处关闭。
         home.input.text = "草稿"
-        await pilot.click(home.query_one("#home-action-model"))
+        model_link = next(link for link in home.query(TopLink) if link.command == "model")
+        await pilot.click(model_link)
         await pilot.pause()
-        check(isinstance(app.screen, ConnectionFormScreen), "点模型打开接口表单")
-        await pilot.press("escape")
+        check(isinstance(app.screen, ConnectionFormScreen), "顶栏模型入口打开接口表单")
+        await pilot.click(offset=(1, 1))
         await pilot.pause()
-        check(isinstance(app.screen, HomeScreen), "esc 关掉表单回到主界面")
+        check(isinstance(app.screen, HomeScreen), "点空白处关掉表单回到主界面")
         check(home.input.text == "草稿", f"开面板不动输入框里的草稿：{home.input.text!r}")
 
-        await pilot.click(home.query_one("#home-action-tools"))
+        tools_link = next(link for link in home.query(TopLink) if link.command == "tools")
+        await pilot.click(tools_link)
         await pilot.pause()
-        check(isinstance(app.screen, ToolsPanelScreen), "点工具打开工具面板")
-        await pilot.press("escape")
+        check(isinstance(app.screen, ToolsPanelScreen), "顶栏工具入口打开工具面板")
+        await pilot.click(offset=(1, 1))
         await pilot.pause()
-        check(isinstance(app.screen, HomeScreen), "esc 关掉面板回到主界面")
+        check(isinstance(app.screen, HomeScreen), "点空白处关掉面板回到主界面")
 
         # 发送：与回车同一条路，建任务并进入聊天界面。
         home.input.text = "从发送提示进来"
@@ -1007,16 +1021,19 @@ async def run_home_recent_checks() -> None:
         )
 
         text = str(rows[done.id].render())
-        check("1 主题 · 2 产物" in text, f"完成的任务写出主题数与产物数：{text!r}")
-        check("4HJO" in text, f"最近结果取最后一条主题的结论：{text!r}")
-        head = text.split("  ")[0]
+        lines = text.split("\n")
+        check(len(lines) == 2, f"最近任务改成两行卡片：{text!r}")
+        check("1 主题 · 2 产物" in lines[1], f"第二行写出主题数与产物数：{lines[1]!r}")
+        check("4HJO" in lines[1], f"最近结果取最后一条主题的结论：{lines[1]!r}")
+        head = lines[0].split("  ")[0]
         check(
             head.startswith("靶点") and cell_len(head) >= 8,
             f"标题保留开头，没有被结果挤成空串：{head!r}",
         )
         check(
-            cell_len(text) <= rows[done.id].content_size.width,
-            f"一行不超出内容宽度：{cell_len(text)} / {rows[done.id].content_size.width}",
+            all(cell_len(line) <= rows[done.id].content_size.width for line in lines),
+            f"两行都不超出内容宽度："
+            f"{[cell_len(line) for line in lines]} / {rows[done.id].content_size.width}",
         )
 
         text = str(rows[failed.id].render())
@@ -1030,24 +1047,28 @@ async def run_home_recent_checks() -> None:
         text = str(rows[empty.id].render())
         check("0 主题 · 0 产物" in text, f"没跑过的任务写 0：{text!r}")
         check(
-            home._recent_meta(empty, 63).count("·") == 2,
-            f"没有结果时只有主题、产物、时间两处分隔：{home._recent_meta(empty, 63)!r}",
+            home._recent_meta(empty).count("·") == 2,
+            f"没有结果时只有主题、产物、时间两处分隔：{home._recent_meta(empty)!r}",
         )
 
         text = str(rows[running.id].render())
         check("0 主题 · 0 产物" in text, f"正在跑的任务也写计数：{text!r}")
         check("正在准备受体" in text, f"没有结论与失败原因时取状态说明：{text!r}")
 
-        # 窄一些的行宽：标题至少留 12 格，结果按剩余宽度截断。
-        narrow = home._recent_meta(done, 57)
-        check("…" in narrow, f"宽度不够时结果截断：{narrow!r}")
-        check(
-            "4HJO" in narrow,
-            f"截断保留结果的开头：{narrow!r}",
+        # 窄栏宽：两行各自按可用宽度截断，标题与计数都还在。
+        narrow = SessionRow(
+            done, width=40, meta=home._recent_meta(done), two_line=True
         )
+        narrow_lines = str(narrow.render()).split("\n")
+        check(len(narrow_lines) == 2, f"窄栏宽仍是两行：{narrow_lines!r}")
         check(
-            home._recent_meta(done, 50).count("·") == 2,
-            f"宽度再窄就不写结果：{home._recent_meta(done, 50)!r}",
+            all(cell_len(line) <= 40 for line in narrow_lines),
+            f"窄栏宽下两行都不溢出：{[cell_len(line) for line in narrow_lines]}",
+        )
+        check("…" in narrow_lines[1], f"宽度不够时第二行截断：{narrow_lines[1]!r}")
+        check(
+            narrow_lines[0].startswith("靶点"),
+            f"第一行仍是标题，没有被第二行挤掉：{narrow_lines[0]!r}",
         )
 
     path.unlink(missing_ok=True)
@@ -1168,6 +1189,113 @@ async def run_home_top_bar_checks() -> None:
     path.unlink(missing_ok=True)
 
 
+async def run_modal_click_checks() -> None:
+    """弹窗点空白处关闭：只读弹窗、表单、权限询问与确认框的返回值，键盘 esc 仍可用。"""
+    path = ROOT / ".probe" / "modal_click_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    app = build_app(path)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause(0.4)
+
+        # 只读弹窗：点内部不关，点遮罩关闭。
+        app.push_screen(MessageScreen("只读弹窗", ["第一行", "第二行"]))
+        await pilot.pause()
+        body = app.screen.query_one(".modal-body")
+        region = body.region
+        await pilot.click(offset=(region.x + 2, region.y + 2))
+        await pilot.pause()
+        check(isinstance(app.screen, MessageScreen), "点弹窗内部不关闭")
+        await pilot.click(offset=(1, 1))
+        await pilot.pause()
+        check(isinstance(app.screen, HomeScreen), "点遮罩关闭只读弹窗")
+
+        # 键盘 esc 仍然是关闭弹窗的一条路。
+        app.push_screen(MessageScreen("只读弹窗二", ["内容"]))
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        check(isinstance(app.screen, HomeScreen), "esc 仍能关闭弹窗")
+
+        # 接口表单：点遮罩返回空值，不把半成品写进配置。
+        app.push_screen(ConnectionFormScreen(), lambda value: None)
+        await pilot.pause()
+        check(isinstance(app.screen, ConnectionFormScreen), "接口表单已经打开")
+        await pilot.click(offset=(1, 1))
+        await pilot.pause()
+        check(isinstance(app.screen, HomeScreen), "点遮罩关闭接口表单")
+
+        # 权限询问：点遮罩必须等价于拒绝，不能误放行工具调用。
+        answers = []
+        app.push_screen(
+            PermissionDialog("bash", "echo hi", "Build", ""), answers.append
+        )
+        await pilot.pause()
+        await pilot.click(offset=(1, 1))
+        await pilot.pause()
+        check(isinstance(app.screen, HomeScreen), "点遮罩关闭权限询问")
+        check(
+            len(answers) == 1
+            and answers[0].verdict == Verdict.DENY
+            and not answers[0].remember,
+            f"点遮罩等价于拒绝，不放行工具：{answers}",
+        )
+
+        # 确认框：点遮罩等价于取消，不会当成确认。
+        confirmed = []
+        app.push_screen(ConfirmDialog("要删除吗？"), confirmed.append)
+        await pilot.pause()
+        await pilot.click(offset=(1, 1))
+        await pilot.pause()
+        check(
+            confirmed == [False],
+            f"确认框点遮罩等价于取消：{confirmed}",
+        )
+
+    path.unlink(missing_ok=True)
+
+
+async def run_chat_rail_checks() -> None:
+    """聊天左栏：只列最近八条会话，每条两行卡片，会话区与主题区之间不再有分隔条。"""
+    path = ROOT / ".probe" / "chat_rail_state.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
+    app = build_app(path)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause(0.4)
+        manager = app.session_manager
+        for index in range(12):
+            manager.create_session(f"会话 {index + 1}")
+        app.open_session(manager.current.id)
+        await pilot.pause(0.4)
+        chat = app.screen
+        sessions = chat.query_one("#chat-sessions")
+        topics = chat.query_one("#chat-topics")
+        rows = list(sessions.query(SessionRow))
+        check(len(rows) == 8, f"聊天左栏只列最近八条会话：{len(rows)}")
+        check(
+            all(row.region.height == 2 for row in rows),
+            f"每条会话是两行卡片：{[row.region.height for row in rows]}",
+        )
+        check(
+            not chat.query("#rail-vsplit"),
+            "会话区与主题区之间不再有横向分隔条",
+        )
+        check(
+            sessions.region.height == 12,
+            f"会话区固定十二条高：{sessions.region.height}",
+        )
+        check(
+            topics.region.height
+            == chat.query_one("#chat-rail").content_size.height - sessions.region.height,
+            f"主题区拿走剩下的高度：{topics.region.height}",
+        )
+
+    path.unlink(missing_ok=True)
+
+
 async def run() -> None:
     server = FakeModelServer()
     server.start()
@@ -1190,6 +1318,8 @@ async def run() -> None:
         await run_rail_checks()
         await run_narrow_checks()
         await run_splitter_checks()
+        await run_chat_rail_checks()
+        await run_modal_click_checks()
         await run_home_recent_checks()
         await run_home_quick_checks()
         await run_home_top_bar_checks()
@@ -2221,8 +2351,8 @@ async def run_permission_round(server: FakeModelServer, key: str) -> tuple[ToolS
             assert tool is not None
             decision = app.agent.policy.check(tool, {"command": TOOL_MARK}, "Build")
             check(
-                decision.verdict is Verdict.ALLOW and "本会话" in decision.rule,
-                f"按 a 之后同样的调用不再问：{decision.note()}",
+                decision.verdict is Verdict.ALLOW and not decision.note(),
+                f"按 a 之后同样的调用不再问，卡片上也不写放行说明：{decision.note()!r}",
             )
             # 换一条**内容完全不同**的命令也放行：这是「本会话全放行」的关键，
             # 按命令原文记的时候这一条会失败。
@@ -2326,8 +2456,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
 
         field = home.query_one("#home-input", HomeInput)
         row = home.query_one("#home-prompt-row")
-        info = home.query_one("#home-info")
-        check(info.region.y - row.region.bottom == 1, "输入行与状态行之间留出间距")
+        info = home.query_one("#home-actions")
+        check(info.region.y - row.region.bottom == 1, "输入行与底部状态行之间留出间距")
         check(field.region.height == 1, "空输入时文本框只有一行")
         field.text = "a" * 300
         await pilot.pause()
@@ -2358,7 +2488,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         await pilot.press("tab")
         await pilot.pause()
         check(app.session_manager.last_agent == "Plan", "tab 在启动界面切换 Agent")
-        check("Plan" in str(home.query_one("#home-info").content), "状态行跟着切换 Agent")
+        check("Plan" in str(home.query_one("#home-status").content), "底部状态跟着切换 Agent")
         await pilot.press("tab")
         await pilot.pause()
         check(app.session_manager.last_agent == "Build", "再按 tab 切回原来的 Agent")
@@ -2478,15 +2608,20 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             cursor_style.color.name == "#0a0a0a",
             f"光标下的字用深色，白底上才看得清：{cursor_style.color.name}",
         )
-        # 消息区右侧的滚动条取三级文字那一档：在纯黑底上看得见，又不会比正文更抢眼。
-        # 这里读的是 `styles` 上的 textual 颜色对象，取 `.hex`（大写、带 #），不是 rich 的 `.name`。
+        # 消息区右侧的滚动条收成一列、取灰阶里最暗的几档：只回答「还能往哪滚」，
+        # 不该比正文更抢眼。这里读的是 `styles` 上的 textual 颜色对象，
+        # 取 `.hex`（大写、带 #），不是 rich 的 `.name`。
         check(
-            pane.styles.scrollbar_color.hex.lower() == "#5a5a5a",
-            f"消息区滚动条取三级文字那一档：{pane.styles.scrollbar_color.hex}",
+            str(pane.styles.scrollbar_size_vertical) == "1",
+            f"消息区滚动条收成一列：{pane.styles.scrollbar_size_vertical}",
         )
         check(
-            pane.styles.scrollbar_color_hover.hex.lower() == "#8b949e"
-            and pane.styles.scrollbar_color_active.hex.lower() == "#e0e0e0",
+            pane.styles.scrollbar_color.hex.lower() == "#3a3a3a",
+            f"消息区滚动条取最暗的灰：{pane.styles.scrollbar_color.hex}",
+        )
+        check(
+            pane.styles.scrollbar_color_hover.hex.lower() == "#4a4a4a"
+            and pane.styles.scrollbar_color_active.hex.lower() == "#5a5a5a",
             f"滚动条悬停与拖动各提一档：{pane.styles.scrollbar_color_hover.hex}"
             f" / {pane.styles.scrollbar_color_active.hex}",
         )
@@ -4766,7 +4901,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             restored.current_model_label == restored.agent.config.model,
             f"状态行上的模型取自连接配置：{restored.current_model_label}",
         )
-        info_line = str(restored.screen.query_one("#home-info").content)
+        info_line = str(restored.screen.query_one("#home-status").content)
         check(
             restored.agent.config.model in info_line and last_agent in info_line,
             f"启动界面的状态行显示模型与读回来的 Agent：{info_line}",
@@ -5004,6 +5139,29 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(
             pane.query("MessageView").last().message.id == session.messages[-1].id,
             "最下面一条就是最新那条消息",
+        )
+
+        # 提示条挂着时整段重建窗口：左栏点到窗口之外的主题，`focus_topic` 就把
+        # `topic.start[0]` 交给 `_jump_window`。这里直接调后者固定跳转位置，把
+        # 「提示条已挂 + 重建到窗口上沿之前」这个组合逼出来。Textual 的摘除是
+        # 异步的，若重建时又建一个同名 id 的提示条，注册那一刻会撞上还没摘掉的
+        # 旧节点，抛出 DuplicateIds；连跳两次让这个时序必现。
+        hint = pane._history_hint
+        check(hint is not None, "跳之前提示条已经建出来了")
+        for index in (5, 9):
+            pane._jump_window(index, pane._topics[0].key)
+            await settle()
+            check(
+                pane._history_hint is hint,
+                f"跳到第 {index} 条之后提示条还是原来那个组件",
+            )
+        check(
+            len(pane.query("#history-hint")) == 1,
+            f"树上只有一条提示：{len(pane.query('#history-hint'))} 条",
+        )
+        check(
+            bool(hint.display) and str(hint.render()).startswith("↑ 上方还有"),
+            f"跳完窗口上沿还有更早的消息，提示条仍写着条数：{str(hint.render())!r}",
         )
 
         STATE_PATH.unlink(missing_ok=True)

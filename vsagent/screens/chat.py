@@ -37,6 +37,8 @@ from .context_usage import ContextUsageScreen
 MIN_MAIN_WIDTH = 40
 # 右栏最多列这么多条产物。再多就要滚动，而它是一份索引，不是正文。
 ARTIFACT_ROWS = 6
+# 聊天左栏只列最近这几条会话；更早的会话走 /sessions 选择器查看。
+CHAT_SESSION_LIMIT = 8
 
 
 def _short(text: str, width: int) -> str:
@@ -511,12 +513,19 @@ class ChatScreen(Screen):
         self.refresh_status()
 
     def refresh_rail(self) -> None:
-        """重画左栏：会话树与这一轮的主题。
+        """重画左栏：最近几条会话与这一轮的主题。
 
+        会话只列最近 `CHAT_SESSION_LIMIT` 条，更早的走 `/sessions` 选择器；
         主题清单读消息区算出来的那一份，不在这里另算一遍边界；换会话、新主题、
         封存与轮末都走这一个入口。
         """
-        self.query_one("#chat-sessions", SessionList).refresh_sessions(with_children=True)
+        self.query_one("#chat-sessions", SessionList).refresh_sessions(
+            with_children=True,
+            limit=CHAT_SESSION_LIMIT,
+            list_title="最近任务",
+            two_line=True,
+            indent=2,
+        )
         self.query_one("#chat-topics", TopicList).refresh_topics(self.messages.topics)
 
     def on_session_row_picked(self, message: SessionRow.Picked) -> None:

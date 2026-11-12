@@ -265,10 +265,21 @@ class TopicHeader(Container):
         return detail_text(self.topic, open_now)
 
     def on_click(self, event: events.Click) -> None:
-        """点标题或说明行切换整段折叠，点开关那一行切换本主题全部工具。"""
+        """点标题或说明行切换整段折叠，点开关那一行切换本主题全部工具。
+
+        折叠时下面那一行写的是工具名，用户点它想看的就是工具输出：直接把主题
+        和工具一起展开，不必先展开主题再点一次开关。
+        """
         event.stop()
         if event.widget is self._tools:
             self.pane.toggle_topic_tools(self.topic.key)
+            return
+        if (
+            event.widget is self._detail
+            and self.topic.steps
+            and not self.pane._is_open(self.topic.key)
+        ):
+            self.pane.open_topic_with_tools(self.topic.key)
             return
         self.pane.toggle_topic(self.topic.key)
 

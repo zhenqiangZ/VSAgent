@@ -7,11 +7,11 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from .. import palette
 from ..widgets.status_bar import LAYER_LABELS, format_tokens
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
 # 条的最大格数。面板宽 72 列时，条 24 + 间隔 2 + 类别 10 + 数字 7 还余下十几列，
 # 窄终端上也不会把类别或数字挤掉。
@@ -63,7 +63,7 @@ def bar_line(label: str, value: int, maximum: int) -> Text:
     return line
 
 
-class ContextUsageScreen(ModalScreen[None]):
+class ContextUsageScreen(ClickDismissModal[None]):
     """点开占比数字之后从下方升起的柱状图。
 
     贴底显示，底边紧挨状态栏；水平中心对准状态栏里那个百分比数字，
@@ -99,7 +99,7 @@ class ContextUsageScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         window = int(self._metrics.get("window") or 0)
         items = usage_items(self._metrics)
-        with Vertical(id="context-usage-dialog"):
+        with Vertical(id="context-usage-dialog", classes=BODY_CLASS):
             yield Static("上下文占比", id="context-usage-title", markup=False)
             yield Static(
                 f"窗口 {format_tokens(window)}",
@@ -112,7 +112,7 @@ class ContextUsageScreen(ModalScreen[None]):
                     yield Static(bar_line(label, value, maximum), classes="context-usage-line")
             else:
                 yield Static("还没有装配度量", classes="context-usage-line", markup=False)
-            yield Static("esc 关闭", id="context-usage-hint", markup=False)
+            yield Static("点击空白处关闭（esc）", id="context-usage-hint", markup=False)
 
     def action_dismiss(self) -> None:
         """关闭柱状图。"""

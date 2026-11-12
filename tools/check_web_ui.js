@@ -133,9 +133,10 @@ function buildRun(targetDir, sessionId) {
   execFileSync(PYTHON, args, { stdio: "ignore" });
 }
 
-// 给分析视图造一份最小的 trace：每条助手消息一次装配记录，上下文六层都有数。
-// 判据要核的是「页面有没有把 usage 画出来」，不是 trace 写得好不好。
-function writeTrace(sessionId, messages) {
+// 给分析视图造一份最小的 trace：每条助手消息一次装配记录，上下文八层都有数；
+// legacy 参数写旧会话的六层聚合形状，用来核兼容层。判据要核的是「页面有没有
+// 把 usage 画出来」，不是 trace 写得好不好。
+function writeTrace(sessionId, messages, legacy = false) {
   const base = 1700000000;
   const lines = [];
   messages.forEach((message, index) => {
@@ -166,7 +167,18 @@ function writeTrace(sessionId, messages) {
         degraded: [],
         events: 1,
         evidence_entries: 0,
-        usage: { prefix: 300, memory: 100, task: 50, event: 200, recent: 250, evidence: 100 },
+        usage: legacy
+          ? { prefix: 300, memory: 100, task: 50, event: 200, recent: 250, evidence: 100 }
+          : {
+              prefix: 300,
+              profile_memory: 40,
+              project_memory: 60,
+              task: 50,
+              event: 200,
+              recent: 250,
+              evidence: 100,
+              history: 30,
+            },
       },
     });
   });
@@ -1024,33 +1036,63 @@ async function checkHistoryPage(page, listing, biggestId) {
   const turnDetail = await page.locator("#an-turn-detail").evaluate((node) => ({
     question: node.querySelector(".analysis-question")?.textContent || "",
     tables: node.querySelectorAll(".analysis-table").length,
+    titles: [...node.querySelectorAll(".analysis-subtitle")].map((item) =>
+      item.textContent.trim()
+    ),
   }));
   check(
-    "点一轮展开它的步与工具",
-    Boolean(turnDetail.question) && turnDetail.tables === 2,
-    `问题 ${turnDetail.question.length} 字，表格 ${turnDetail.tables} 张`
+    "点一轮展开步、工具与本轮主题三个小节",
+    Boolean(turnDetail.question) &&
+      turnDetail.tables >= 2 &&
+      ["逐步明细", "工具调用", "本轮主题"].every((title) =>
+        turnDetail.titles.includes(title)
+      ),
+    `问题 ${turnDetail.question.length} 字，表格 ${turnDetail.tables} 张，小节 ${turnDetail.titles.join("、")}`
   );
 
-  // 补一份 trace 再看上下文分层：六层各占一段，每一步一条。
+  // 补一份 trace 再看上下文分层：八层各占一段，每一步一根堆叠柱。
   writeTrace(biggestId, detail.messages);
   await page.locator("#session-refresh").click();
   await page.waitForFunction(
-    () => document.querySelectorAll("#an-turn-detail .analysis-layer-row").length > 0,
+    () => document.querySelectorAll("#an-chart-layers svg rect").length > 0,
     undefined,
     { timeout: 60000 }
   );
-  const layers = await page.locator("#an-turn-detail").evaluate((node) => ({
-    legend: node.querySelectorAll(".analysis-layer-legend i").length,
-    rows: node.querySelectorAll(".analysis-layer-row").length,
-    segments: node.querySelectorAll(".analysis-layer-bar i").length,
+  const layers = await page.locator("#an-chart-layers").evaluate((node) => ({
+    legend: node.querySelectorAll(".analysis-chart-legend i").length,
+    segments: node.querySelectorAll("svg rect").length,
+    svgs: node.querySelectorAll("svg").length,
   }));
   check(
     "分析带出每轮的上下文分层",
-    layers.legend === 6 && layers.rows > 0 && layers.segments === layers.rows * 6,
-    `图例 ${layers.legend} 层，${layers.rows} 步，${layers.segments} 段`
+    layers.svgs === 1 && layers.legend === 8 && layers.segments > 0,
+    `图例 ${layers.legend} 层，${layers.segments} 段`
   );
 
-  await page.locator('.detail-tab[data-view="conversation"]').click();
+  // 旧 trace 把三类记忆合成一层 memory：页面要单列「记忆（旧口径）」，
+  // 缺失的层按 0 显示，不能把旧数据拆成新层。
+  writeTrace(biggestId, detail.messages, true);
+  await page.locator("#session-refresh").click();
+  await page.waitForFunction(
+    () =>
+      document.querySelectorAll("#an-chart-layers .analysis-chart-legend i").length === 9,
+    undefined,
+    { timeout: 60000 }
+  );
+  const legacyLayers = await page.locator("#an-chart-layers").evaluate((node) => ({
+    legend: node.querySelectorAll(".analysis-chart-legend i").length,
+    names: [...node.querySelectorAll(".analysis-chart-legend span")].map((item) =>
+      item.textContent.trim()
+    ),
+  }));
+  check(
+    "旧口径的聚合记忆单独标出，不拆成新层",
+    legacyLayers.legend === 9 &&
+      legacyLayers.names.some((name) => name.includes("记忆（旧口径）")),
+    `图例 ${legacyLayers.legend} 项：${legacyLayers.names.join("、")}`
+  );
+
+  await page.locator("#analysis-toggle").click();
   const workbenchBack = await page
     .locator(".workbench")
     .evaluate((node) => getComputedStyle(node).display !== "none");

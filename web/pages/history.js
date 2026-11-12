@@ -25,10 +25,6 @@
       </aside>
       <section class="history-detail">
         <header id="session-head" class="is-hidden"></header>
-        <nav id="detail-tabs" class="detail-tabs is-hidden" role="tablist" aria-label="会话视图">
-          <button class="detail-tab is-active" type="button" data-view="conversation" role="tab" aria-selected="true">对话</button>
-          <button class="detail-tab" type="button" data-view="analysis" role="tab" aria-selected="false">分析</button>
-        </nav>
         <div class="workbench">
           <nav id="topic-rail" aria-label="主题导航"></nav>
           <div class="conversation-column">
@@ -285,8 +281,10 @@
       toggle.textContent = artifactWidth ? `产物 ${artifactWidth}` : "产物";
       toggle.setAttribute("aria-expanded", artifactWidth ? "true" : "false");
     }
-    for (const button of root.querySelectorAll(".pane-toggle, #artifact-toggle")) {
-      // 专注模式下两个抽屉按钮都不能用：打开抽屉就等于退出专注，
+    for (const button of root.querySelectorAll(
+      ".pane-toggle, #artifact-toggle, #analysis-toggle"
+    )) {
+      // 专注模式下这几个按钮都不能用：打开抽屉或统计页就等于退出专注，
       // 而退出专注有专门的按钮与 Esc。
       button.disabled = focusMode;
     }
@@ -295,6 +293,7 @@
       focus.textContent = focusMode ? "退出专注" : "专注";
       focus.setAttribute("aria-pressed", focusMode ? "true" : "false");
     }
+    syncAnalysisToggle();
   }
 
   function cycleArtifacts() {
@@ -541,6 +540,14 @@
     artifactToggle.id = "artifact-toggle";
     artifactToggle.addEventListener("click", cycleArtifacts);
     actions.appendChild(artifactToggle);
+
+    // 「分析」与产物、专注并列：打开会话后三个开关在同一行，
+    // 点一下在对话与统计之间来回切换。
+    const analysisToggle = el("button", "head-toggle", "分析");
+    analysisToggle.type = "button";
+    analysisToggle.id = "analysis-toggle";
+    analysisToggle.addEventListener("click", toggleAnalysisView);
+    actions.appendChild(analysisToggle);
 
     const topicToggle = el("button", "pane-toggle", "主题");
     topicToggle.type = "button";
@@ -1099,6 +1106,17 @@
   // 文件路径与补丁文字，那几类按原样显示，不给链接。
   const ARTIFACT_HANDLE = /^(receptor|ligandset|artifact)#\d+$/;
 
+  // 结构全景在登记表里是一个目录（survey.json 放在目录里），没有可下载的文件，
+  // 所以 download 字段是空的。登记表另行给出 kind=survey 与 survey_id，
+  // 这里换成指向结构全景页的页内地址，主题清单与右侧产物栏共用一份。
+  function surveyView(entry) {
+    const meta = entry.meta || {};
+    const surveyId = String(meta.survey_id || "").trim();
+    return meta.kind === "survey" && surveyId
+      ? `#/survey/${encodeURIComponent(surveyId)}`
+      : "";
+  }
+
   function topicArtifactEntries(event) {
     const items = (artifacts && artifacts.items) || [];
     const byHandle = new Map(items.map((item) => [item.handle, item]));
@@ -1117,10 +1135,13 @@
     for (const entry of entries) {
       const row = el("div", "topic-artifact");
       const label = entry.summary || entry.name || entry.handle;
-      if (entry.download) {
+      const view = surveyView(entry);
+      if (entry.download || view) {
         const link = el("a", "topic-artifact-name", label);
-        link.href = entry.download;
+        link.href = entry.download || view;
         link.title = entry.path || entry.handle;
+        // 打开页面的链接与下载文件的链接在样式上区分开：一个带 ↗，一个带 ↓。
+        if (view && !entry.download) link.classList.add("is-view");
         row.appendChild(link);
       } else {
         const name = el("span", "topic-artifact-name", label);
@@ -1716,6 +1737,12 @@
           link.setAttribute("download", "");
           box.appendChild(link);
         }
+        const view = surveyView(item);
+        if (view) {
+          const link = el("a", "artifact-download", "结构全景");
+          link.href = view;
+          box.appendChild(link);
+        }
         pane.appendChild(box);
       }
     }
@@ -1745,16 +1772,51 @@
     info: ["提示", "is-info"],
   };
 
-  // 上下文六层。名字与 `core/agent/context.py` 的 `usage` 键一致，
+  // 上下文八层。名字与 `core/agent/context.py` 的 `LAYER_ORDER` 一致，
   // 颜色由 `--layer-*` 给出；顺序就是装配顺序。
   const ANALYSIS_LAYERS = [
     ["prefix", "前缀"],
-    ["memory", "记忆"],
+    ["profile_memory", "习惯"],
+    ["project_memory", "项目事实"],
     ["task", "任务"],
     ["event", "事件"],
     ["recent", "最近"],
     ["evidence", "证据"],
+    ["history", "历史摘要"],
   ];
+
+  // 旧 trace 把三类记忆合成 `memory`。只在某一步确实有值时才追加到图例，
+  // 不与上面八层合并，避免把旧数据里不存在的拆分当成事实。
+  const COMPAT_LAYER = ["memory", "记忆（旧口径）"];
+
+  function syncAnalysisToggle() {
+    if (!root) return;
+    const button = root.querySelector("#analysis-toggle");
+    if (!button) return;
+    const active = detailView === "analysis";
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = focusMode;
+  }
+
+  // 地址栏跟着视图走，用 replaceState 而不是改 location.hash：
+  // 改 hash 会触发 hashchange，整页重挂，刚点开的那一轮就丢了。
+  function syncAnalysisUrl(view) {
+    const hash = window.location.hash || "";
+    const [path, queryText = ""] = hash.replace(/^#\/?/, "").split("?");
+    const params = new URLSearchParams(queryText);
+    if (view === "analysis") params.set("tab", "analysis");
+    else params.delete("tab");
+    const query = params.toString();
+    const next = `#/${path}${query ? `?${query}` : ""}`;
+    if (next !== hash) window.history.replaceState(null, "", next);
+  }
+
+  function toggleAnalysisView() {
+    const next = detailView === "analysis" ? "conversation" : "analysis";
+    setDetailView(next);
+    syncAnalysisUrl(next);
+  }
 
   function setDetailView(view) {
     detailView = view;
@@ -1763,11 +1825,7 @@
     if (detail) detail.classList.toggle("is-analysis", view === "analysis");
     const pane = root.querySelector("#analysis-pane");
     if (pane) pane.classList.toggle("is-hidden", view !== "analysis");
-    for (const tab of root.querySelectorAll(".detail-tab")) {
-      const active = tab.dataset.view === view;
-      tab.classList.toggle("is-active", active);
-      tab.setAttribute("aria-selected", String(active));
-    }
+    syncAnalysisToggle();
     if (view === "analysis") loadAnalysis();
   }
 
@@ -1845,6 +1903,10 @@
           <td class="is-num">${metric ? formatNumber(metric.uncached) : "—"}</td>
           <td class="is-num">${metric ? formatNumber(metric.output) : "—"}</td>
           <td class="is-num">${metric ? formatPct(metric.hit) : "—"}</td>
+          <td class="is-num">${metric ? formatNumber(metric.total) : "—"}</td>
+          <td class="is-num">${metric ? formatPct(metric.window) : "—"}</td>
+          <td class="is-num">${metric ? formatNumber(metric.events) : "—"}</td>
+          <td class="is-num">${metric ? formatNumber(metric.evidence) : "—"}</td>
           <td>${metric && metric.degraded.length ? escapeHtml(metric.degraded.join("、")) : ""}</td>
         </tr>`;
       })
@@ -1852,7 +1914,9 @@
     return analysisTable(
       `<th class="is-num">步</th><th class="is-num">耗时</th><th>工具</th>
        <th class="is-num">推理字</th><th class="is-num">输入</th><th class="is-num">缓存</th>
-       <th class="is-num">新增</th><th class="is-num">输出</th><th class="is-num">命中</th><th>降级</th>`,
+       <th class="is-num">新增</th><th class="is-num">输出</th><th class="is-num">命中</th>
+       <th class="is-num">总 token</th><th class="is-num">预算占用</th>
+       <th class="is-num">主题</th><th class="is-num">证据</th><th>降级</th>`,
       rows
     );
   }
@@ -1880,42 +1944,273 @@
     );
   }
 
-  function layerPanel(turn) {
-    const rows = turn.steps
-      .map((step) => {
-        const usage = (step.metric && step.metric.usage) || {};
-        const total = ANALYSIS_LAYERS.reduce((sum, [key]) => sum + (usage[key] || 0), 0);
-        return { step, usage, total };
-      })
-      .filter((item) => item.total > 0);
-    if (!rows.length) {
-      return el("p", "analysis-empty", "这一轮没有装配记录，读不到上下文分层。");
+  // ------------------------------------------------------------------
+  // 轮详情里的四张图，口径与 `tools/report_session.py` 的静态报告一致：
+  // 每步 token 堆叠条、缓存命中折线、上下文分层堆叠条、每步耗时柱。
+  // SVG 只能用 createElementNS 建；文本一律走 textContent，不拼 innerHTML。
+  // ------------------------------------------------------------------
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const CHART_W = 720;
+  const CHART_H = 220;
+  const CHART_PAD = { l: 54, r: 12, t: 12, b: 26 };
+
+  function svgEl(tag, attrs) {
+    const node = document.createElementNS(SVG_NS, tag);
+    for (const [name, value] of Object.entries(attrs || {})) {
+      node.setAttribute(name, String(value));
     }
-    const box = el("div", "analysis-layers");
-    const legend = el("div", "analysis-layer-legend");
-    for (const [key, name] of ANALYSIS_LAYERS) {
+    return node;
+  }
+
+  function chartColor(name) {
+    return (
+      getComputedStyle(document.documentElement).getPropertyValue(name).trim() ||
+      "#94a3b8"
+    );
+  }
+
+  function chartAxis(svg, max, formatValue) {
+    for (let i = 0; i <= 4; i++) {
+      const y = CHART_PAD.t + (CHART_H - CHART_PAD.t - CHART_PAD.b) * i / 4;
+      svg.appendChild(
+        svgEl("line", {
+          x1: CHART_PAD.l,
+          y1: y,
+          x2: CHART_W - CHART_PAD.r,
+          y2: y,
+          stroke: chartColor("--line"),
+        })
+      );
+      const label = svgEl("text", {
+        x: CHART_PAD.l - 6,
+        y: y + 4,
+        "text-anchor": "end",
+        class: "ax",
+      });
+      label.textContent = formatValue(max * (1 - i / 4));
+      svg.appendChild(label);
+    }
+  }
+
+  function chartStepLabel(svg, x, step, index, count) {
+    if (count > 18 && index % Math.ceil(count / 18) !== 0) return;
+    const label = svgEl("text", {
+      x,
+      y: CHART_H - 8,
+      "text-anchor": "middle",
+      class: "ax",
+    });
+    label.textContent = String(step === undefined ? index + 1 : step);
+    svg.appendChild(label);
+  }
+
+  function chartFrame() {
+    return svgEl("svg", {
+      viewBox: `0 0 ${CHART_W} ${CHART_H}`,
+      class: "analysis-chart",
+    });
+  }
+
+  // series 是 [key, 名称, CSS 变量名] 的列表；每行按这些键叠成一根柱。
+  function chartStack(container, rows, series) {
+    const n = Math.max(rows.length, 1);
+    const max = Math.max(
+      1,
+      ...rows.map((row) =>
+        series.reduce((sum, [key]) => sum + (Number(row[key]) || 0), 0)
+      )
+    );
+    const bw = (CHART_W - CHART_PAD.l - CHART_PAD.r) / n;
+    const svg = chartFrame();
+    chartAxis(svg, max, (value) => formatNumber(Math.round(value)));
+    rows.forEach((row, index) => {
+      const x = CHART_PAD.l + index * bw + bw * 0.16;
+      const w = Math.max(bw * 0.68, 1);
+      let y = CHART_H - CHART_PAD.b;
+      for (const [key, name, cssVar] of series) {
+        const value = Number(row[key]) || 0;
+        if (value <= 0) continue;
+        const height = (CHART_H - CHART_PAD.t - CHART_PAD.b) * value / max;
+        y -= height;
+        const rect = svgEl("rect", {
+          x,
+          y,
+          width: w,
+          height,
+          fill: chartColor(cssVar),
+        });
+        const title = svgEl("title");
+        title.textContent = `第 ${row.step} 步 ${name} ${formatNumber(value)}`;
+        rect.appendChild(title);
+        svg.appendChild(rect);
+      }
+      chartStepLabel(svg, x + w / 2, row.step, index, rows.length);
+    });
+    container.appendChild(svg);
+
+    const legend = el("div", "analysis-chart-legend");
+    for (const [key, name] of series) {
       const item = el("span", "", name);
       item.insertBefore(el("i", `is-${key}`), item.firstChild);
       legend.appendChild(item);
     }
-    box.appendChild(legend);
-    for (const { step, usage, total } of rows) {
-      const row = el("div", "analysis-layer-row");
-      row.appendChild(el("span", "analysis-layer-step", `第 ${step.no} 步`));
-      const bar = el("span", "analysis-layer-bar");
-      for (const [key, name] of ANALYSIS_LAYERS) {
-        const value = usage[key] || 0;
-        if (!value) continue;
-        const piece = el("i", `is-${key}`);
-        piece.style.width = `${(value / total) * 100}%`;
-        piece.title = `${name} ${formatNumber(value)}`;
-        bar.appendChild(piece);
+    container.appendChild(legend);
+  }
+
+  function chartLine(container, rows, key, label, cssVar) {
+    const n = Math.max(rows.length, 1);
+    const bw = (CHART_W - CHART_PAD.l - CHART_PAD.r) / n;
+    const svg = chartFrame();
+    chartAxis(svg, 1, (value) => value.toFixed(2));
+    const points = rows.map((row, index) => {
+      const x = CHART_PAD.l + index * bw + bw / 2;
+      const value = Math.min(Math.max(Number(row[key]) || 0, 0), 1);
+      return {
+        x,
+        y: CHART_PAD.t + (CHART_H - CHART_PAD.t - CHART_PAD.b) * (1 - value),
+        row,
+        index,
+      };
+    });
+    if (points.length) {
+      svg.appendChild(
+        svgEl("polyline", {
+          points: points.map((point) => `${point.x},${point.y}`).join(" "),
+          fill: "none",
+          stroke: chartColor(cssVar),
+          "stroke-width": 2,
+        })
+      );
+      for (const point of points) {
+        const dot = svgEl("circle", {
+          cx: point.x,
+          cy: point.y,
+          r: 3,
+          fill: chartColor(cssVar),
+        });
+        const title = svgEl("title");
+        title.textContent = `第 ${point.row.step} 步 ${label} ${formatPct(point.row[key])}`;
+        dot.appendChild(title);
+        svg.appendChild(dot);
+        chartStepLabel(svg, point.x, point.row.step, point.index, rows.length);
       }
-      row.appendChild(bar);
-      row.appendChild(el("span", "analysis-layer-total", formatNumber(total)));
-      box.appendChild(row);
     }
+    container.appendChild(svg);
+  }
+
+  function chartBars(container, rows, key, label, cssVar) {
+    const n = Math.max(rows.length, 1);
+    const max = Math.max(1, ...rows.map((row) => Number(row[key]) || 0));
+    const bw = (CHART_W - CHART_PAD.l - CHART_PAD.r) / n;
+    const svg = chartFrame();
+    chartAxis(svg, max, (value) => value.toFixed(0));
+    rows.forEach((row, index) => {
+      const value = Number(row[key]) || 0;
+      const x = CHART_PAD.l + index * bw + bw * 0.18;
+      const w = Math.max(bw * 0.64, 1);
+      const height = (CHART_H - CHART_PAD.t - CHART_PAD.b) * value / max;
+      const rect = svgEl("rect", {
+        x,
+        y: CHART_H - CHART_PAD.b - height,
+        width: w,
+        height,
+        fill: chartColor(cssVar),
+        rx: 2,
+      });
+      const title = svgEl("title");
+      title.textContent = `第 ${row.step} 步 ${label} ${value.toFixed(1)} 秒`;
+      rect.appendChild(title);
+      svg.appendChild(rect);
+      chartStepLabel(svg, x + w / 2, row.step, index, rows.length);
+    });
+    container.appendChild(svg);
+  }
+
+  function analysisCharts(data, turn) {
+    const box = el("div", "analysis-charts");
+    const holders = new Map();
+    for (const [id, title] of [
+      ["an-chart-tokens", "每步 token"],
+      ["an-chart-cache", "缓存命中"],
+      ["an-chart-layers", "上下文分层"],
+      ["an-chart-time", "每步耗时（秒）"],
+    ]) {
+      const card = el("div", "analysis-card");
+      card.appendChild(el("div", "analysis-card-label", title));
+      const holder = el("div", "analysis-chart-holder");
+      holder.id = id;
+      card.appendChild(holder);
+      box.appendChild(card);
+      holders.set(id, holder);
+    }
+
+    const metrics = turn.metrics || [];
+    if (!data.hasTrace || !metrics.length) {
+      for (const holder of holders.values()) {
+        holder.appendChild(
+          el("p", "analysis-empty", "这一轮没有装配记录，画不出图表。")
+        );
+      }
+      return box;
+    }
+
+    // 分层占用嵌在 usage 里，摊平之后再画；耗时不在 metrics 里，用步表补上。
+    const rows = metrics.map((metric, index) => ({
+      ...metric,
+      ...(metric.usage || {}),
+      seconds: turn.steps[index] ? turn.steps[index].seconds || 0 : 0,
+    }));
+
+    chartStack(holders.get("an-chart-tokens"), rows, [
+      ["cached", "缓存命中", "--cached"],
+      ["uncached", "新增输入", "--uncached"],
+    ]);
+    chartLine(holders.get("an-chart-cache"), rows, "hit", "命中", "--accent");
+
+    const layers = [...ANALYSIS_LAYERS];
+    // 旧 trace 的聚合层只在确实有值时画，避免凭空多出一段。
+    if (rows.some((row) => (Number(row.memory) || 0) > 0)) layers.push(COMPAT_LAYER);
+    chartStack(
+      holders.get("an-chart-layers"),
+      rows,
+      layers.map(([key, name]) => [key, name, `--layer-${key.replace(/_/g, "-")}`])
+    );
+    chartBars(
+      holders.get("an-chart-time"),
+      rows,
+      "seconds",
+      "耗时",
+      "--layer-evidence"
+    );
     return box;
+  }
+
+  // 本轮封存的主题：按封存时间落在本轮起止之间筛选，与静态报告同一口径。
+  function turnTopics(data, turn) {
+    const items = (data.events || []).filter(
+      (event) =>
+        event.created_at >= turn.started_at - 0.5 &&
+        event.created_at <= turn.ended_at + 0.5
+    );
+    if (!items.length) {
+      return el("p", "analysis-empty", "这一轮没有封存主题。");
+    }
+    const rows = items
+      .map(
+        (event) => `<tr>
+          <td class="is-mono">${escapeHtml(event.id)}</td>
+          <td>${escapeHtml(event.title)}</td>
+          <td class="is-num">${event.steps}</td>
+          <td>${escapeHtml(TOPIC_STATUS[event.status] || event.status || "—")}</td>
+          <td class="is-mono">${escapeHtml((event.artifacts || []).slice(0, 6).join("、"))}</td>
+        </tr>`
+      )
+      .join("");
+    return analysisTable(
+      `<th>编号</th><th>标题</th><th class="is-num">步</th><th>状态</th><th>产物</th>`,
+      rows
+    );
   }
 
   function turnDetail(data, index) {
@@ -1955,12 +2250,13 @@
       box.appendChild(answer);
     }
 
-    box.appendChild(el("h4", "analysis-subtitle", "上下文分层"));
-    box.appendChild(layerPanel(turn));
+    box.appendChild(analysisCharts(data, turn));
     box.appendChild(el("h4", "analysis-subtitle", "逐步明细"));
     box.appendChild(stepTable(turn));
     box.appendChild(el("h4", "analysis-subtitle", "工具调用"));
     box.appendChild(toolTable(turn));
+    box.appendChild(el("h4", "analysis-subtitle", "本轮主题"));
+    box.appendChild(turnTopics(data, turn));
     return box;
   }
 
@@ -2023,9 +2319,9 @@
     const note = el("p", "analysis-note");
     note.innerHTML = [
       "耗时取 trace 时间戳之差（用户消息写入到 turn.done），不含两次输入之间的空闲。",
-      "token 与费用取助手消息自带的 tokens / cost；逐步的输入、缓存、输出取 trace 的 context.metrics。",
-      "缓存命中 = cached / input，逐步取该步的读数，整轮取各步算术平均。",
-      "上下文分层取每一步装配的 usage，分段宽度按该步六层之和折算。",
+      "逐步的输入、缓存、输出与费用是模型返回的真实 token；总 token 与上下文分层是装配时按字符估算的，两种口径不同，不要相加。",
+      "缓存命中 = cached / input，逐步取该步的读数，整轮取各步算术平均；预算占用 = 该步输入 / 上下文窗口额度。",
+      "上下文分层取每一步装配的 usage，按八层顺序堆叠；旧会话若把三类记忆合成一层 memory，会单独标成「记忆（旧口径）」，缺失的层显示 0。",
       "没有 trace 时逐步读数留空，轮数、token 与主题统计仍来自状态文件。",
     ]
       .map(escapeHtml)
@@ -2141,8 +2437,6 @@
     artifacts = shelf;
     const session = sessions.find((item) => item.id === sessionId);
     renderHead({ ...(session || {}), title: list.title || (session && session.title) || "" });
-    const tabs = root.querySelector("#detail-tabs");
-    if (tabs) tabs.classList.remove("is-hidden");
     renderTopicRail();
     renderArtifactPane();
     renderConversation();
@@ -2175,7 +2469,6 @@
     root.querySelector("#chat-composer").classList.remove("is-hidden");
 
     root.querySelector("#session-head").classList.add("is-hidden");
-    root.querySelector("#detail-tabs").classList.add("is-hidden");
     root.querySelector("#analysis-pane").classList.add("is-hidden");
     const box = root.querySelector("#conversation");
     box.innerHTML = "";
@@ -2274,10 +2567,6 @@
       await loadSessions();
       if (activeId) await refreshSession();
     });
-    for (const tab of container.querySelectorAll(".detail-tab")) {
-      tab.addEventListener("click", () => setDetailView(tab.dataset.view));
-    }
-
     const onVisible = () => {
       if (document.visibilityState === "visible") pollLive();
     };

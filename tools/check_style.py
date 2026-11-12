@@ -1,7 +1,7 @@
 """判据：配色与排版只从一处取值。
 
 两端的样式各有一份唯一的取值处：终端在 `vsagent/palette.py`，网页在
-`web/app.css` 的 `:root`。判据管的是「有没有出现第二个来源」，样式好坏不在这里。
+`web/` 下样式文件的 `:root`。判据管的是「有没有出现第二个来源」，样式好坏不在这里。
 四条都能机械判：
 
 1. **终端色值只出现在 `palette.py`**：`app.tcss` 与 widget 里的样式文本只写
@@ -32,7 +32,7 @@ sys.path.insert(0, str(ROOT))
 
 from vsagent.palette import CSS_VARIABLES  # noqa: E402
 
-WEB_CSS = ROOT / "web" / "app.css"
+WEB_DIR = ROOT / "web"
 TUI_DIR = ROOT / "vsagent"
 PALETTE = TUI_DIR / "palette.py"
 
@@ -81,58 +81,79 @@ def line_of(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
-def check_web(failures: list[str]) -> tuple[int, int]:
-    """网页端：字号六档、间距八档。返回（字号声明数、间距声明数）。"""
-    label = WEB_CSS.relative_to(ROOT).as_posix()
-    text = blank_comments(WEB_CSS.read_text(encoding="utf-8"))
-    declared = set(WEB_DECLARED.findall(text))
-    used = set(WEB_USED.findall(text))
+def web_sheets() -> list[Path]:
+    """网页侧要查的样式文件。
+
+    `web/vendor/` 是第三方库，它不按这六档八档写，也不该由我们改。
+    """
+    return sorted(
+        path
+        for path in WEB_DIR.rglob("*.css")
+        if "vendor" not in path.relative_to(WEB_DIR).parts
+    )
+
+
+def check_web(failures: list[str]) -> tuple[int, int, int]:
+    """网页端：字号六档、间距八档。返回（样式文件数、字号声明数、间距声明数）。
+
+    声明与引用按全体样式文件合起来算：档位在 `:root` 里声明一处，
+    用到它的规则可以在别的文件里。
+    """
+    sheets = web_sheets()
+    declared: set[str] = set()
+    used: set[str] = set()
     font_values = {f"var({name})" for name in FONT_TOKENS}
     steps = {f"--space-{step}" for step in range(1, SPACE_STEPS + 1)}
 
     fonts = 0
-    for match in FONT_SIZE.finditer(text):
-        fonts += 1
-        value = match.group(1).strip()
-        if value not in font_values:
-            failures.append(
-                f"{label}:{line_of(text, match.start())} 字号写成 {value}，"
-                "只能用那六档 --fs-*"
-            )
-
     spaces = 0
-    for match in SPACING.finditer(text):
-        spaces += 1
-        for size in PX.finditer(match.group(2)):
-            if abs(float(size.group(1))) > SPACING_MAX:
+    for path in sheets:
+        label = path.relative_to(ROOT).as_posix()
+        text = blank_comments(path.read_text(encoding="utf-8"))
+        declared |= set(WEB_DECLARED.findall(text))
+        used |= set(WEB_USED.findall(text))
+
+        for match in FONT_SIZE.finditer(text):
+            fonts += 1
+            value = match.group(1).strip()
+            if value not in font_values:
                 failures.append(
-                    f"{label}:{line_of(text, match.start())} "
-                    f"{match.group(1)} 用了 {size.group(0)}，"
-                    "大于 3px 的间距要用 --space-*"
+                    f"{label}:{line_of(text, match.start())} 字号写成 {value}，"
+                    "只能用那六档 --fs-*"
                 )
+
+        for match in SPACING.finditer(text):
+            spaces += 1
+            for size in PX.finditer(match.group(2)):
+                if abs(float(size.group(1))) > SPACING_MAX:
+                    failures.append(
+                        f"{label}:{line_of(text, match.start())} "
+                        f"{match.group(1)} 用了 {size.group(0)}，"
+                        "大于 3px 的间距要用 --space-*"
+                    )
 
     # 档位之外的名字归「多出档位」那一条，不再重复报「声明了没有引用」。
     for name in sorted(declared - used):
         if name in FONT_TOKENS | steps:
-            failures.append(f"{label} 声明了 {name} 却没有一处引用")
+            failures.append(f"网页样式：声明了 {name} 却没有一处引用")
     for name in sorted(used - declared):
         if name.startswith(("--fs-", "--space-")):
-            failures.append(f"{label} 引用了未声明的 {name}")
+            failures.append(f"网页样式：引用了未声明的 {name}")
 
     extra_fonts = sorted(
         name for name in declared
         if name.startswith("--fs-") and name not in FONT_TOKENS
     )
     if extra_fonts:
-        failures.append(f"{label} 多出字号档位：{extra_fonts}")
+        failures.append(f"网页样式：多出字号档位：{extra_fonts}")
     extra_spaces = sorted(
         name for name in declared
         if name.startswith("--space-") and name not in steps
     )
     if extra_spaces:
-        failures.append(f"{label} 多出间距档位：{extra_spaces}")
+        failures.append(f"网页样式：多出间距档位：{extra_spaces}")
 
-    return fonts, spaces
+    return len(sheets), fonts, spaces
 
 
 def scan_python(path: Path) -> tuple[list[tuple[int, str]], set[str]]:
@@ -221,9 +242,12 @@ def check_tui(failures: list[str]) -> int:
 
 def main() -> int:
     failures: list[str] = []
-    fonts, spaces = check_web(failures)
+    sheets, fonts, spaces = check_web(failures)
     hexes = check_tui(failures)
-    print(f"网页：字号 {fonts} 处、间距 {spaces} 处，档位 {len(FONT_TOKENS)} + {SPACE_STEPS}")
+    print(
+        f"网页：{sheets} 份样式，字号 {fonts} 处、间距 {spaces} 处，"
+        f"档位 {len(FONT_TOKENS)} + {SPACE_STEPS}"
+    )
     print(f"终端：色值 {hexes} 处（palette.py 之外应为 0），变量 {len(CSS_VARIABLES)} 个")
 
     if failures:

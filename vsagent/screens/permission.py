@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from ..core.agent.permission import Verdict
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
 # 参数预览的上限。比旧版的 200 放宽很多：询问弹窗的价值就在于让用户看清
 # 将要执行什么，截得太早会把危险的后半段藏起来。再长就交给预览框自己滚动。
@@ -48,7 +48,7 @@ class PermissionAnswer:
     remember: bool
 
 
-class PermissionDialog(ModalScreen[PermissionAnswer]):
+class PermissionDialog(ClickDismissModal[PermissionAnswer]):
     """工具调用前的询问弹窗。
 
     版式照 macOS 的授权面板：一行小标题说明这是什么窗口，一行问题说明
@@ -74,6 +74,9 @@ class PermissionDialog(ModalScreen[PermissionAnswer]):
         Binding("escape", "deny", "拒绝", priority=True),
     ]
 
+    # 点击弹窗之外的空白处等同于拒绝，不能把工具调用误放行。
+    CANCEL_RESULT = PermissionAnswer(Verdict.DENY, False)
+
     def __init__(
         self,
         tool_name: str,
@@ -89,7 +92,7 @@ class PermissionDialog(ModalScreen[PermissionAnswer]):
         self._argument_label = argument_label_for(tool_name)
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="permission-dialog"):
+        with Vertical(id="permission-dialog", classes=BODY_CLASS):
             yield Static("VSAgent　请求执行权限", id="permission-eyebrow", markup=False)
             yield Static(self.title_text(), id="permission-title", markup=False)
             yield Static(
@@ -122,7 +125,7 @@ class PermissionDialog(ModalScreen[PermissionAnswer]):
 
     def hint_text(self) -> str:
         """底部一行小字，写清 a 的授权范围与恢复方式。"""
-        return "回车允许一次　·　A 之后本会话不再询问（含越界与计费），切换会话恢复。"
+        return "回车允许一次　·　A 之后本会话不再询问（含越界与计费），切换会话恢复。　·　点空白处拒绝"
 
     def argument_text(self) -> str:
         """参数预览正文，过长时截断并写明去哪里看全文。"""

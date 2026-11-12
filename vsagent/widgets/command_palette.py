@@ -3,13 +3,13 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
 from ..core.command_registry import Command, CommandRegistry
+from ..screens.click_dismiss import BODY_CLASS, ClickDismissModal
 
 
-class CommandPalette(ModalScreen[str | None]):
+class CommandPalette(ClickDismissModal[str | None]):
     """命令面板，支持模糊搜索命令。"""
 
     BINDINGS = [
@@ -25,11 +25,11 @@ class CommandPalette(ModalScreen[str | None]):
         self._results: list[Command] = []
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="command-palette"):
+        with Vertical(id="command-palette", classes=BODY_CLASS):
             yield Static("命令面板", id="palette-title")
             yield Input(placeholder="输入命令名或描述…", id="palette-input")
             yield ListView(id="palette-list")
-            yield Static("enter 执行   up/down 选择   esc 关闭", id="palette-hint")
+            yield Static("enter 执行   up/down 选择   点空白处或 esc 关闭", id="palette-hint")
 
     def on_mount(self) -> None:
         """打开时聚焦输入框并列出全部命令。"""

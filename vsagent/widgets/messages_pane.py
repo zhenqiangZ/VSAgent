@@ -925,13 +925,16 @@ class MessagesPane(ScrollableContainer):
         return step_seconds(self._messages, step)
 
     def _header_for(self, topic: TopicView) -> TopicHeader:
-        """主题头一列只有一个：重建与流式追加都从这里取。"""
+        """主题头一列只有一个：重建与流式追加都从这里取。
+
+        新建的头也要按真实的展开状态画一遍：`TopicHeader` 构造时按展开态落笔，
+        折叠着的主题会显示成一个「点开也没有内容」的展开头。
+        """
         header = self._header_views.get(topic.key)
         if header is None:
             header = TopicHeader(topic, self)
             self._header_views[topic.key] = header
-        else:
-            header.sync(topic, self._is_open(topic.key), self._tools_open.get(topic.key, False))
+        header.sync(topic, self._is_open(topic.key), self._tools_open.get(topic.key, False))
         return header
 
     def _artifacts_for(self, topic: TopicView) -> ArtifactRow:
@@ -1082,6 +1085,25 @@ class MessagesPane(ScrollableContainer):
         self._change_height(mutate, self._header_views.get(key))
         return visible
 
+    def open_topic_with_tools(self, key: str) -> None:
+        """展开一个折叠的主题，并把它的工具输出一起展开。
+
+        折叠着的主题头下面只写着工具名，用户点那一行想看的就是工具输出；
+        先展开主题、再点一次「展开全部工具」是多余的一步。
+        """
+        topic = self._topic_by_key.get(key)
+        if topic is None:
+            return
+        if not self._is_open(key):
+            self._open[key] = True
+            self._manual_open.add(key)
+        self._tools_open[key] = True
+        # 工具卡自己的输出层要一起打开：主题展开只管到「卡片露出来」这一层，
+        # 每张卡内部还各自有一段折叠。
+        for card in self._topic_cards(topic):
+            card.set_output_visible(True)
+        self._sync_visibility(self._header_views.get(key))
+
     def _topic_cards(self, topic: TopicView) -> list[ToolCard]:
         """这个主题里已经建出来的工具卡。更早的段没挂上时返回空表。
 
@@ -1123,9 +1145,6 @@ class MessagesPane(ScrollableContainer):
         """把挂载窗口挪到 `index` 这一条消息，画完之后滚到 `key` 那个主题的标题行。"""
         for view in list(self._message_views.values()):
             view.remove()
-        if self._history_hint is not None:
-            self._history_hint.remove()
-            self._history_hint = None
         for header in list(self._header_views.values()):
             if header.is_mounted:
                 header.remove()
@@ -1150,13 +1169,10 @@ class MessagesPane(ScrollableContainer):
         self._mounted_start = max(0, min(index, total - 1))
         self._mounted_end = min(total, self._mounted_start + HISTORY_PAGE * 2)
         self.refresh_topics()
-        widgets: list[Widget] = []
-        if self._mounted_start:
-            self._history_hint = Static(
-                self._history_hint_text(), id="history-hint", markup=False
-            )
-            widgets.append(self._history_hint)
-        widgets.extend(self._build_views(self._mounted_start, self._mounted_end))
+        # 提示条常驻在树上，这里只更新它的文字与显隐。摘除在 Textual 里是异步的，
+        # 删掉再建同名 id 会撞上还没摘掉的旧节点，抛出 DuplicateIds。
+        self._update_history_hint()
+        widgets = self._build_views(self._mounted_start, self._mounted_end)
         if widgets:
             self.mount_all(widgets)
         self._set_follow(False)
@@ -1494,13 +1510,8 @@ class MessagesPane(ScrollableContainer):
         total = len(messages)
         self._mounted_start = max(0, total - HISTORY_PAGE)
         self._mounted_end = total
-        widgets: list[Widget] = []
-        if self._mounted_start:
-            self._history_hint = Static(
-                self._history_hint_text(), id="history-hint", markup=False
-            )
-            widgets.append(self._history_hint)
-        widgets.extend(self._build_views(self._mounted_start, self._mounted_end))
+        self._update_history_hint()
+        widgets = self._build_views(self._mounted_start, self._mounted_end)
         if widgets:
             self.mount_all(widgets)
         self._set_follow(True)
@@ -1511,9 +1522,6 @@ class MessagesPane(ScrollableContainer):
         """清空列表内的全部消息。"""
         for view in list(self._message_views.values()):
             view.remove()
-        if self._history_hint is not None:
-            self._history_hint.remove()
-            self._history_hint = None
         for header in list(self._header_views.values()):
             if header.parent is self:
                 header.remove()
@@ -1539,6 +1547,7 @@ class MessagesPane(ScrollableContainer):
         self._mounted_start = 0
         self._mounted_end = 0
         self._loading = False
+        self._update_history_hint()
 
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         """滚动之后维护跟随状态，并滑动消息窗口（接近边界补挂、离远裁剪）。
@@ -1874,22 +1883,24 @@ class MessagesPane(ScrollableContainer):
             self._grow_up()
 
     def _update_history_hint(self) -> None:
-        """提示条跟着窗口上沿走：上方还有没建出来的就显示，顶到第一条就摘掉。
+        """提示条跟着窗口上沿走：上方还有没建出来的就显示，顶到第一条就藏起来。
 
-        提示条始终是窗口最上面那一条，`_grow_up` 把新内容插在它之后。裁剪上端之后
-        上方重新出现没建出来的消息，这里要把提示条再挂回来。
+        这个组件只建一次，之后一直留在树上，只改文字与显隐。`Widget.remove()`
+        在 Textual 里是异步的，摘除消息只是把 Prune 消息投进队列；若这里先摘再建
+        同名 id，新节点注册时旧的还在 DOM 的 id 表里，会抛出 DuplicateIds。
+        `_grow_up` 用的 `after=self._history_hint` 锚点也因为常驻而一直有效。
         """
         hint = self._history_hint
-        if self._mounted_start == 0:
-            if hint is not None:
-                hint.remove()
-                self._history_hint = None
-            return
+        visible = self._mounted_start > 0
         if hint is None:
+            if not visible:
+                return
             hint = Static(self._history_hint_text(), id="history-hint", markup=False)
             self._history_hint = hint
             self.mount(hint, before=0)
-        else:
+            return
+        hint.display = visible
+        if visible:
             hint.update(self._history_hint_text())
 
     def scroll_to_bottom(self) -> None:

@@ -3,14 +3,14 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from ..core.command_registry import CommandRegistry
 from ..core.keybind_manager import KeybindManager
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
 
-class HelpScreen(ModalScreen[None]):
+class HelpScreen(ClickDismissModal[None]):
     """帮助对话框，展示快捷键与斜杠命令。"""
 
     BINDINGS = [Binding("escape", "dismiss", "Close", priority=True)]
@@ -27,7 +27,7 @@ class HelpScreen(ModalScreen[None]):
         self.origin = origin
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="help-screen"):
+        with VerticalScroll(id="help-screen", classes=BODY_CLASS):
             chat_section = ("快捷键", self.keybinds.describe(), "help-keys")
             home_section = ("启动界面", self.keybinds.describe_home(), "help-home")
             # 当前所在屏幕那一段排在最前：这两段加起来超过一屏，另一段一定要滚才看得到。
@@ -41,7 +41,7 @@ class HelpScreen(ModalScreen[None]):
                 yield Static(self._rows_text(rows), id=element_id, markup=False)
             yield Static("斜杠命令", classes="help-section")
             yield Static(self._commands_text(), id="help-commands", markup=False)
-            yield Static("esc 关闭", id="help-hint")
+            yield Static("点击空白处关闭（esc）", id="help-hint")
 
     @staticmethod
     def _rows_text(rows: list[tuple[str, str]]) -> str:

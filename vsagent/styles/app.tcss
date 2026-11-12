@@ -39,14 +39,16 @@ ModalScreen {
     align: center middle;
 }
 
-/* 最近任务：运行中的排最前，其余按时间排，最多六条。高度封顶，
-   矮终端里不把输入框顶上去。 */
+/* 最近任务：运行中的排最前，其余按时间排四条，每条占两行。高度封顶，
+   放不下时这一段自己滚动，矮终端里不把输入框顶上去。 */
 #home-recent {
     width: 82;
     max-width: 100%;
     height: auto;
-    max-height: 8;
-    margin-top: 1;
+    max-height: 12;
+    margin-top: 2;
+    overflow-y: auto;
+    scrollbar-size-vertical: 0;
 }
 
 /* 分节标题与「+ 新建任务」同一行：标题在左，入口在右。 */
@@ -115,6 +117,11 @@ ModalScreen {
 
 .rail-row.-current {
     background: $vsa-layer;
+}
+
+/* 最近任务的两行卡片：标题与状态词一行，附加信息一行。 */
+.rail-row.-two-line {
+    height: 2;
 }
 
 .rail-empty {
@@ -203,15 +210,15 @@ ModalScreen {
     color: $vsa-text-3;
 }
 
-#home-info {
+/* 输入框底部这一行：左边是 Agent 与模型的状态，右边是发送提示。 */
+#home-actions {
     width: 100%;
     height: 1;
     margin-top: 1;
 }
 
-/* 输入框底部的操作提示：一行小字，点一下才动作。悬停抬一档，告诉用户这一格能点。 */
-#home-actions {
-    width: 100%;
+#home-status {
+    width: 1fr;
     height: 1;
 }
 
@@ -226,11 +233,10 @@ ModalScreen {
     color: $vsa-text-1;
 }
 
-/* 发送那一格靠右：它对应的动作是回车，摆在末位读起来像一句收尾。 */
+/* 发送那一格按内容宽度排，紧贴在整行右端：它的动作是回车，摆在末位读起来像一句收尾。 */
 #home-send-hint {
-    width: 1fr;
+    width: auto;
     margin-right: 0;
-    text-align: right;
     color: $vsa-text-4;
 }
 
@@ -271,8 +277,8 @@ ModalScreen {
     height: 1fr;
 }
 
-/* 左栏：会话树在上、这一轮的主题在下。两段各自滚动，中间用一条横线分开。
-   左边界由 `Splitter` 那一列画，这里不再写 border-right：两条线并排会看出双线。 */
+/* 左栏：会话树在上、这一轮的主题在下。两段各自滚动，中间不画分隔线。
+   左边界由竖向 `Splitter` 那一列画，这里不再写 border-right：两条线并排会看出双线。 */
 #chat-rail {
     width: 30;
     height: 100%;
@@ -280,14 +286,32 @@ ModalScreen {
     background: $vsa-rail;
 }
 
+/* 会话区高度固定十二条，大约放得下四张两行卡片；超出的部分自己滚动。
+   主题区拿走剩下的高度。 */
 #chat-sessions {
-    height: auto;
-    max-height: 40%;
+    height: 12;
+    /* 滚动条收成一列、取灰阶：它只回答「还能往哪滚」，不该比会话标题更显眼。 */
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $vsa-rail;
+    scrollbar-color: $vsa-line-strong;
+    scrollbar-color-hover: $vsa-text-4;
+    scrollbar-color-active: $vsa-text-3;
+}
+
+/* 聊天左栏的会话卡片：两行文字之外再留一行空隙，条与条之间不挤在一起。 */
+#chat-sessions .rail-row.-two-line {
+    margin-bottom: 1;
 }
 
 #chat-topics {
     height: 1fr;
-    border-top: solid $vsa-layer;
+    width: 100%;
+    /* 与上面会话区同一套滚动条：一列宽、灰阶。 */
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $vsa-rail;
+    scrollbar-color: $vsa-line-strong;
+    scrollbar-color-hover: $vsa-text-4;
+    scrollbar-color-active: $vsa-text-3;
 }
 
 /* 中间那一栏：对话与输入框。两者同宽同左边界，输入框不再横贯整屏。 */
@@ -300,12 +324,13 @@ ModalScreen {
     width: 1fr;
     height: 1fr;
     padding: 0 1;
-    /* 轨道与屏幕底色同色所以不显形，条本身取三级文字那一档：在纯黑底上看得见，
-       又不会比正文更抢眼。悬停与拖动各提一档，告诉用户手指点在了什么上面 */
+    /* 滚动条同样收成一列；轨道与屏幕底色同色所以不显形，滑块只取最暗的几档灰，
+       悬停与拖动各提一档，告诉用户手指点在了什么上面。 */
+    scrollbar-size-vertical: 1;
     scrollbar-background: $vsa-screen;
-    scrollbar-color: $vsa-text-3;
-    scrollbar-color-hover: $vsa-text-2;
-    scrollbar-color-active: $vsa-text-1;
+    scrollbar-color: $vsa-line-strong;
+    scrollbar-color-hover: $vsa-text-4;
+    scrollbar-color-active: $vsa-text-3;
 }
 
 /* 上下文侧栏：默认隐藏，/sidebar 打开后占 30 列，中间那一栏让出这块宽度。

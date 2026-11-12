@@ -3,10 +3,10 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Input, Label, Static
 
 from ..core.connection import Connection
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
 # 四个输入框的 id。回车在它们之间往下走，最后一个回车保存。
 FIELDS = (
@@ -17,7 +17,7 @@ FIELDS = (
 )
 
 
-class ConnectionFormScreen(ModalScreen[Connection | None]):
+class ConnectionFormScreen(ClickDismissModal[Connection | None]):
     """模型接口表单：地址、密钥、模型名，外加可选的上下文窗口。
 
     密钥用密码框显示，界面上不会把明文留在屏幕上；但它的值会随配置写进
@@ -38,7 +38,7 @@ class ConnectionFormScreen(ModalScreen[Connection | None]):
 
     def compose(self) -> ComposeResult:
         current = self._current
-        with Vertical(id="connection-form"):
+        with Vertical(id="connection-form", classes=BODY_CLASS):
             yield Static("模型接口", id="connection-title")
             yield Label("接口地址", classes="connection-label")
             yield Input(
@@ -66,7 +66,7 @@ class ConnectionFormScreen(ModalScreen[Connection | None]):
                 id="connection-window",
             )
             yield Static("", id="connection-error")
-            yield Static("tab 切换    enter 下一项    ctrl+s 保存    esc 取消", id="connection-hint")
+            yield Static("tab 切换 enter 下一项 ctrl+s 保存 点空白处/esc 取消", id="connection-hint")
 
     def on_mount(self) -> None:
         """聚焦第一格。"""

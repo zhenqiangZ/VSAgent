@@ -12,8 +12,9 @@ from dataclasses import dataclass
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static, TextArea
+
+from .click_dismiss import BODY_CLASS, ClickDismissModal
 
 from ..core.agent.context import ContextAssembler
 from ..core.agent.prompt import estimate_tokens, translate_message
@@ -48,7 +49,7 @@ def _stamp(message: Message) -> str:
     return time.strftime("%H:%M", time.localtime(message.created_at))
 
 
-class SpawnAgentScreen(ModalScreen[SpawnRequest | None]):
+class SpawnAgentScreen(ClickDismissModal[SpawnRequest | None]):
     """创建子 agent 的模态。"""
 
     BINDINGS = [
@@ -69,7 +70,7 @@ class SpawnAgentScreen(ModalScreen[SpawnRequest | None]):
 
     def compose(self) -> ComposeResult:
         total = len(self.source.messages)
-        with Vertical(id="spawn-dialog"):
+        with Vertical(id="spawn-dialog", classes=BODY_CLASS):
             yield Static("派发子 Agent", id="spawn-title")
             yield Static("名称", classes="spawn-label")
             yield Input(placeholder="靶点调研", id="spawn-name")
@@ -85,7 +86,7 @@ class SpawnAgentScreen(ModalScreen[SpawnRequest | None]):
             yield Static("", id="spawn-error")
             yield Static(
                 "「仅创建」只存任务书，进去按 ctrl+r 再开始。\n"
-                "ctrl+enter 创建并运行　esc 取消",
+                "ctrl+enter 创建并运行　点空白处或 esc 取消",
                 id="spawn-hint",
             )
             with Horizontal(id="spawn-buttons"):

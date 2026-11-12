@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import time
+
 from rich.cells import cell_len
 from rich.text import Text
 from textual.containers import VerticalScroll
@@ -27,6 +29,31 @@ _STATUS_COLOR = {
     "failed": palette.ERROR,
     "cancelled": palette.WARN,
 }
+
+
+def _stamp(seconds: float) -> str:
+    """列表里的时间：当天的只写时分，更早的带上月日。"""
+    if not seconds:
+        return ""
+    if time.time() - seconds < 86400:
+        return time.strftime("%H:%M", time.localtime(seconds))
+    return time.strftime("%m-%d", time.localtime(seconds))
+
+
+def session_meta(session: Session) -> str:
+    """两行卡片第二行的内容：消息数、最后更新时间与模型名。
+
+    这一段是辅助信息，标题与状态词都在第一行。模型名放在最后，栏宽不够时
+    先被截掉的是它，而不是「多少条消息」这种更常用的线索。
+    """
+    parts = [f"{len(session.messages)} 条消息"]
+    stamp = _stamp(session.updated_at)
+    if stamp:
+        parts.append(stamp)
+    model = (session.model_id or "").strip()
+    if model:
+        parts.append(model)
+    return " · ".join(parts)
 
 
 def fit(text: str, width: int) -> str:
@@ -71,33 +98,80 @@ class SessionRow(Static):
         depth: int = 0,
         width: int = 28,
         meta: str = "",
+        two_line: bool = False,
+        indent: int = 0,
     ) -> None:
         super().__init__(classes="rail-row")
+        # 会话对象留一份：列表结构没变、只有第二行内容需要更新时，
+        # `sync_meta` 用它重新算一遍消息数与时间。
+        self.session = session
         self.session_id = session.id
         self._title = session.title or "（没有标题）"
         self._status = session.status or "idle"
         self._depth = depth
         self._width = width
         self._meta = meta
+        self._two_line = two_line
+        self._indent = indent
         if current:
             self.add_class("-current")
         if depth:
             self.add_class("-child")
+        if two_line:
+            self.add_class("-two-line")
+
+    def sync_meta(self, meta: str) -> None:
+        """换一条附加信息并重画。
+
+        列表结构没变、只有第二行的消息数与时间变了时走这里：不重建组件，
+        滚动位置也就不会被推回顶部。
+        """
+        if meta == self._meta:
+            return
+        self._meta = meta
+        self.refresh()
 
     def render(self) -> Text:
-        # 右边留给状态词、附加说明与两层缩进。状态词最长是「运行中」6 格，
+        # 右边留给状态词与两层缩进。状态词最长是「运行中」6 格，
         # 它前后各有一段两格的空隙；这四格与 `6` 一起算进 reserve，
         # 否则「运行中」那一行的末字会比内容区宽出几格被裁掉。
         # 行自己左右各有一列内边距，可用宽度也要先减掉这两列。
         inner = max(1, self._width - 2)
-        reserve = 10 + self._depth * 2 + (cell_len(self._meta) + 3 if self._meta else 0)
         text = Text()
-        if self._depth:
-            text.append("  " * self._depth)
-        text.append(
-            fit(self._title, inner - reserve),
-            style=f"bold {palette.TEXT_1}" if self.has_class("-current") else palette.TEXT_1,
+        title_style = (
+            f"bold {palette.TEXT_1}" if self.has_class("-current") else palette.TEXT_1
         )
+        if self._two_line:
+            # 两行卡片：第一行缩进之后是标题与状态词，第二行再缩进两格放
+            # 消息数、时间与模型名。卡片之间由样式表留出一行空隙。
+            lead = " " * (self._depth * 2 + self._indent)
+            sub_lead = lead + "  "
+            reserve = 10
+            text.append(lead)
+            text.append(
+                fit(self._title, max(1, inner - cell_len(lead) - reserve)),
+                style=title_style,
+            )
+            text.append("  ")
+            text.append(
+                SESSION_STATUS_TEXT.get(self._status, self._status),
+                style=_STATUS_COLOR.get(self._status, palette.TEXT_3),
+            )
+            text.append("\n")
+            text.append(sub_lead)
+            text.append(
+                fit(self._meta, max(1, inner - cell_len(sub_lead))),
+                style=palette.TEXT_4,
+            )
+            return text
+        lead = " " * (self._depth * 2 + self._indent)
+        reserve = (
+            10
+            + cell_len(lead)
+            + (cell_len(self._meta) + 3 if self._meta else 0)
+        )
+        text.append(lead)
+        text.append(fit(self._title, max(1, inner - reserve)), style=title_style)
         text.append("  ")
         text.append(
             SESSION_STATUS_TEXT.get(self._status, self._status),
@@ -148,6 +222,9 @@ class SessionList(VerticalScroll):
         self._with_children = False
         self._new_task = False
         self._list_title: str | None = None
+        self._limit = 40
+        self._two_line = False
+        self._indent = 0
         # 上一次画出来的那份内容。每一步都会刷新左栏，内容没变时重建一次等于
         # 把滚动位置推回顶部：用户正翻着会话，模型每走一步就被弹回去一次。
         self._signature: tuple[object, ...] | None = None
@@ -159,15 +236,23 @@ class SessionList(VerticalScroll):
         limit: int = 40,
         new_task: bool = False,
         list_title: str | None = None,
+        two_line: bool = False,
+        indent: int = 0,
     ) -> None:
         """重画会话树。
 
         `new_task` 在顶部加一行「新建任务」入口（主界面用）；`list_title` 换掉
-        非运行中那一段的标题（主界面叫「最近任务」，聊天左栏叫「全部任务」）。
+        非运行中那一段的标题（主界面与聊天左栏现在都叫「最近任务」）。`limit`
+        限制这一段的条数，聊天左栏只列最近几条，更早的走 `/sessions`。
+        `two_line` 让每条会话占两行（标题与状态一行，消息数与时间一行），
+        `indent` 是第一行的左缩进格数；聊天左栏用这两个参数把列表排得松一些。
         """
         self._with_children = with_children
         self._new_task = new_task
         self._list_title = list_title
+        self._limit = limit
+        self._two_line = two_line
+        self._indent = indent
         manager = self.app.session_manager
         current = manager.current_session_id
         roots = manager.root_sessions()
@@ -183,7 +268,7 @@ class SessionList(VerticalScroll):
             entries.append(("section", f"运行中 {len(running)}", 0))
             entries.extend(("row", item, 0) for item in running)
         listed = [item for item in roots if item.status != "running"][:limit]
-        # 有运行中的任务时，第二段只列其余那些，标题跟着改：写「全部任务 3」而下面
+        # 有运行中的任务时，第二段只列其余那些，标题跟着改：写「最近任务 3」而下面
         # 一行都没有，读的人会以为列表坏了。段标题带条数，栏拖窄之后数字是唯一
         # 还读得出来的信息。
         if listed:
@@ -196,8 +281,17 @@ class SessionList(VerticalScroll):
         if not roots:
             entries.append(("empty", "还没有会话", 0))
 
-        signature = (width, tuple(self._mark(entry, current) for entry in entries))
+        signature = (
+            width,
+            two_line,
+            indent,
+            tuple(self._mark(entry, current) for entry in entries),
+        )
         if signature == self._signature:
+            if two_line:
+                # 结构没变，只把第二行的消息数与时间刷新一遍，不重建组件。
+                for row in self.query(SessionRow):
+                    row.sync_meta(session_meta(row.session))
             return
         self._signature = signature
 
@@ -217,6 +311,9 @@ class SessionList(VerticalScroll):
                         current=payload.id == current,
                         depth=depth,
                         width=width,
+                        meta=session_meta(payload) if two_line else "",
+                        two_line=two_line,
+                        indent=indent,
                     )
                 )
         self.remove_children()
@@ -233,9 +330,16 @@ class SessionList(VerticalScroll):
         return (kind, payload.id, payload.title, payload.status, payload.id == current, depth)
 
     def on_resize(self) -> None:
-        """宽度变了要重截标题：留着旧的那份会溢出或过早省略。"""
+        """宽度变了要重截标题：留着旧的那份会溢出或过早省略。
+
+        条数上限也要带回来：不带的话窗口一变宽，聊天左栏会从「最近八条」
+        跳回默认的四十条。
+        """
         self.refresh_sessions(
             with_children=self._with_children,
+            limit=self._limit,
             new_task=self._new_task,
             list_title=self._list_title,
+            two_line=self._two_line,
+            indent=self._indent,
         )

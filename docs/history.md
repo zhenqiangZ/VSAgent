@@ -257,7 +257,7 @@
   逐条判适用（不互斥），返回全部加一条推荐，每条带成本档与「能区分什么」。
 - **一条硬约束**：配体侧活性要用 `spread=True` 取完整分布。默认只取最强的一段时，P00533 的 325 个
   分子全在 pChEMBL 9.49–11.00，Δ≥2 的匹配对恒为 0。
-- **判据**：`campaign` 组；阈值表在 `screening-playbook.md` §5。
+- **判据**：`campaign` 组；阈值表在 `dist/rules/references/campaign_methods.md`。
 
 ### 4.4 结构全景（2026-11-03）
 

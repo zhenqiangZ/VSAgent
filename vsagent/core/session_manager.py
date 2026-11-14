@@ -24,6 +24,28 @@ RAIL_MIN, RAIL_MAX = 16, 60
 SIDE_MIN, SIDE_MAX = 20, 60
 
 
+LOST_CAMPAIGN_NOTE = "多角色执行随上次退出中断，需要重新派发"
+
+
+def _settle_lost_campaign(session: Session) -> None:
+    """上次退出时还在跑的多角色执行，落成失败并说明原因。
+
+    调度器是内存对象（`host._campaigns`），重启之后没有执行者。留着
+    `delegating` / `research` / `integration`，`agent_status` 就会一直报一个
+    不会动的「研究进行中」，模型据此以为还在跑、不去重新派发（P-83）。
+
+    只处理这三个状态：`planning` 是「排过计划」，可能是只做了预演，留着不算错。
+    """
+    from .agent.campaign_state import DELEGATING, FAILED, INTEGRATION, RESEARCH
+
+    if session.campaign_state not in (DELEGATING, RESEARCH, INTEGRATION):
+        return
+    session.campaign_state = FAILED
+    blockers = list(session.task_state.blockers)
+    if LOST_CAMPAIGN_NOTE not in blockers:
+        session.task_state.apply(blockers=[*blockers, LOST_CAMPAIGN_NOTE])
+
+
 def width_from(state: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
     """读出状态文件里的一栏宽度，写坏或越界时退回默认值与区间。"""
     try:
@@ -241,6 +263,7 @@ class SessionManager:
             if session.status == "running":
                 session.status = "idle"
                 session.status_note = "上次退出时仍在运行"
+            _settle_lost_campaign(session)
             self.sessions[session.id] = session
         self.current_session_id = str(state.get("current_session_id", ""))
         if self.current_session_id not in self.sessions:

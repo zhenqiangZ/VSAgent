@@ -25,19 +25,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from vsagent.core.agent.capabilities import ROLES  # noqa: E402
 from vsagent.core.agent.domain.all_tools import catalog, domain_tools  # noqa: E402
 from vsagent.core.agent.domain.campaign import AssessCampaignTool  # noqa: E402
 from vsagent.core.agent.domain.survey import SurveyStructuresTool  # noqa: E402
 from vsagent.core.agent.domain.export import OpenViewerTool, WriteRunTool  # noqa: E402
 from vsagent.core.agent.permission import PATH_ARGUMENTS, PLAN_DENY  # noqa: E402
 from vsagent.core.agent.prompt import (  # noqa: E402
+    REFERENCE_RULE_DIR,
     RULES_DIR_ENV,
+    agent_rules,
     estimate_tokens,
+    global_rules,
     project_rules,
+    read_rule,
+    reference_files,
+    rule_inventory,
     rules_directory,
+    rules_home,
+    select_rules,
     stable_prefix,
+    stage_rules,
 )
+from vsagent.core.agent.stages import STAGES  # noqa: E402
 from vsagent.core.agent.toolset import hidden_names  # noqa: E402
+from vsagent.core.agent.toolprofiles import ORCHESTRATOR, keeps  # noqa: E402
 from vsagent.core.agent.tools import (  # noqa: E402
     BashTool,
     GrepTool,
@@ -52,6 +64,9 @@ from vsagent.core.models import Session  # noqa: E402
 # 固定那几段的预算：身份、假设契约、路线判断、操作纪律、shell、登记表、记忆、事件。
 # 这几段每步都发，涨了会挤压最近几轮的原文，所以照旧卡住。
 PREFIX_BUDGET = 1900
+# 一份角色规则的预算。角色规则进稳定前缀，每多一份就在每一步重复计费；
+# 400 是实测值的上界（最长的一份 259），留了余量，但不允许它长成第二本手册。
+ROLE_RULE_BUDGET = 400
 # 规则文件（`AGENTS.md`）不设上限：它是许可与判据的来源，少一条就可能让模型做一个
 # 本来被禁止的动作。这里只报它的体量，供改的人心里有数。
 # 这些句式一出现就说明有人又在提示里抄了一份会过期的清单。
@@ -151,14 +166,36 @@ def main() -> int:
     total = estimate_tokens(prefix)
     fixed_tokens = estimate_tokens(fixed)
     rules_tokens = estimate_tokens(rules)
+    main_rules = select_rules(rules, user_facing=True)
+    sub_rules = select_rules(rules, user_facing=False)
     print(f"固定段 {fixed_tokens} token（预算 {PREFIX_BUDGET}）")
-    print(f"项目规则 {rules_tokens} token / {len(rules.splitlines())} 行（不设上限，只报数）")
+    print(
+        f"项目规则 {rules_tokens} token / {len(rules.splitlines())} 行"
+        f"（不设上限，只报数：主 {estimate_tokens(main_rules)}、"
+        f"子 {estimate_tokens(sub_rules)}）"
+    )
     print(f"整段前缀 {total} token")
     print(f"  Plan 身份 {estimate_tokens(plan_prefix) - total:+d} token"
-          f"，子 agent 前缀 {estimate_tokens(child_prefix) - total:+d} token")
+          f"，子 agent 前缀 {estimate_tokens(child_prefix) - total:+d} token（少了面向用户的规则）")
 
     if fixed_tokens > PREFIX_BUDGET:
         failures.append(f"固定段 {fixed_tokens} token，超过预算 {PREFIX_BUDGET}")
+
+    # 规则分两段：主 agent 少一节导航，子 agent 再少掉「怎么与用户交互」的四节。
+    #
+    # 这里**不设上限**：规则是许可与判据的来源，少一条就可能让模型做一个本来
+    # 被禁止的动作；体量只报数，由人决定要不要拆。判据只查两件事——切分真的
+    # 生效了，以及子 agent 手里确实没有那几节。
+    for marker in ("## 1.", "## 2.", "## 6.", "## 7.", "## 8."):
+        if marker not in main_rules:
+            failures.append(f"主 agent 的规则里缺了 {marker}：切分把它切掉了")
+    for marker in ("### 2.2", "## 3.", "## 4.", "## 5.", "## 1."):
+        if marker in sub_rules:
+            failures.append(f"子 agent 的规则里还有 {marker}：它不与用户对话")
+    if "## 9." in main_rules:
+        failures.append("主 agent 仍加载流程索引（第 9 节），那一节是导航")
+    if estimate_tokens(sub_rules) >= estimate_tokens(main_rules):
+        failures.append("子 agent 的规则没有比主 agent 少：切分没生效")
 
     # 前缀同一份输入必须产出同一份字节：差一个字节，整段 prompt cache 就废了。
     if prefix != build():
@@ -166,33 +203,108 @@ def main() -> int:
 
     # 点名的工具：名字出现在前缀里，就得保证模型这一步拿得到，或者知道怎么装。
     #
-    # 可见性由 `hidden_names` 现算，不写死名单：新加一族领域工具时，谁被点名、
-    # 它首步看不看得见，都跟着族表走。
+    # 可见性由 `hidden_names` 与主 agent 档位现算，不写死名单：新加一族领域工具、
+    # 或者把哪个常驻工具从主 agent 档位里移走时，谁被点名、它首步看不看得见，
+    # 都跟着那两处走。2026-11-13 就是后者：`assess_campaign` 移到角色档之后，
+    # 前缀里那句「查完调 assess_campaign」必须跟着改，否则模型会去调一个看不见的工具。
     named = sorted(
         name for name in specs if re.search(rf"\b{re.escape(name)}\b", prefix)
     )
-    invisible = sorted(name for name in named if name in hidden_names(Session(id="ses_check_prefix")))
+    hidden = hidden_names(Session(id="ses_check_prefix"))
+    need_family = sorted(name for name in named if name in hidden)
+    off_profile = sorted(
+        name for name in named if name not in hidden and not keeps(ORCHESTRATOR, name)
+    )
     print(f"  点名的工具 {len(named)} 个：{'、'.join(named) if named else '无'}")
-    if invisible:
-        print(f"  其中首步不可见（要先装族）：{'、'.join(invisible)}")
+    if need_family:
+        print(f"  其中首步不可见（要先装族）：{'、'.join(need_family)}")
         if "load_tools" not in prefix:
             failures.append(
-                f"点名了首步不可见的工具 {invisible}，前缀里却没有 load_tools 的说明"
+                f"点名了首步不可见的工具 {need_family}，前缀里却没有 load_tools 的说明"
             )
+    if off_profile:
+        print(f"  其中不在主 agent 档位里：{'、'.join(off_profile)}")
+        failures.append(
+            f"前缀点名了主 agent 档位里没有的工具 {off_profile}："
+            "它看不见，只会照着这句话去调一次"
+        )
+
+    # 分级规则：全局、角色、阶段三层都会进入模型看到的文字（前两层进稳定前缀，
+    # 阶段层进任务块），所以「不点名首步看不见的工具」对它们同样成立。
+    # 参考材料不默认注入，不在这一条的范围里——它本来就可以点名具体工具。
+    base = rules_directory(ROOT)
+    inventory = rule_inventory(base)
+    extra_roles = sorted(set(inventory["agents"]) - set(ROLES))
+    if extra_roles:
+        failures.append(f"rules/agents 里有不属于任何角色的文件：{extra_roles}")
+    missing_roles = sorted(set(ROLES) - set(inventory["agents"]))
+    if missing_roles:
+        failures.append(f"这些角色没有规则文件：{missing_roles}")
+    extra_stages = sorted(set(inventory["stages"]) - set(STAGES))
+    if extra_stages:
+        failures.append(f"rules/stages 里有不属于任何阶段的文件：{extra_stages}")
+    missing_stages = sorted(set(STAGES) - set(inventory["stages"]))
+    if missing_stages:
+        failures.append(f"这些阶段没有规则文件：{missing_stages}")
+
+    tiers = [global_rules(base)]
+    tiers += [agent_rules(base, role) for role in ROLES]
+    tiers += [stage_rules(stage, ROOT) for stage in STAGES]
+    tier_text = "\n".join(tiers)
+    # 只查**首步看不见的**领域工具：`assess_campaign` 这类常驻工具本来就看得见，
+    # 在角色规则里点名它是正常的，不能和「要先装族」的混成一条。
+    _hidden = hidden_names(Session(id="ses_check_tiers"))
+    tier_named = sorted(
+        name
+        for name in specs
+        if name in _hidden and re.search(rf"\b{re.escape(name)}\b", tier_text)
+    )
+    print(f"  分级规则全部 {estimate_tokens(tier_text)} token（不会同时注入）")
+    per_step = (
+        estimate_tokens(global_rules(base))
+        + max(estimate_tokens(agent_rules(base, role)) for role in ROLES)
+        + max((estimate_tokens(stage_rules(stage, ROOT)) for stage in STAGES), default=0)
+    )
+    print(f"  每一步最多 {per_step} token（全局 + 一份角色 + 一份阶段）")
+    if tier_named:
+        failures.append(
+            f"分级规则里点名了领域工具 {tier_named}：它们首步看不见，点名等于教模型撞墙"
+        )
+
+    # 一份角色规则太长，等于把手册塞进每一步。逐份卡，不卡总和：
+    # 总和会随着角色变多而涨，那时该拆的是内容，不是放宽这一条。
+    for role in ROLES:
+        tokens = estimate_tokens(agent_rules(base, role))
+        if tokens > ROLE_RULE_BUDGET:
+            failures.append(f"{role} 的角色规则 {tokens} token，超过 {ROLE_RULE_BUDGET}")
+
+    # 参考材料只列名字。被注入了就说明装配器读错了目录。
+    reference_home = rules_home(base) / REFERENCE_RULE_DIR
+    for name in reference_files(base):
+        body = read_rule(reference_home / name)
+        if body and body in prefix:
+            failures.append(f"参考材料 {name} 被默认注入了前缀：它应当按需读取")
 
     # 呈现与打分是这一轮新加的两段。缺了它们，模型不会主动取页面地址，也不会
     # 把 DTA 当成对接之外的第二路。
     if "没有地址就不要发这段描述" not in prefix:
         failures.append("呈现纪律不在前缀里：结构描述会退回纯文字")
-    if "scoring 族" not in prefix or "微调" not in prefix:
+    if "`docking` 族" not in prefix or "`affinity` 族" not in prefix or "微调" not in prefix:
         failures.append("打分纪律不在前缀里：DTA 通道不会被想到")
     visible_domain = {name for names in catalog().values() for name in names}
     for name in ("write_run", "open_viewer"):
         if name in visible_domain:
             failures.append(f"{name} 仍在领域族里，首步看不见；它应当是常驻核心工具")
-    scoring = set(catalog().get("scoring", ()))
-    if scoring != {"dock", "fit_affinity", "score_affinity"}:
-        failures.append(f"scoring 族不是三个打分工具：{sorted(scoring)}")
+    # 打分拆成两族：对接单独一族，DTA 单独一族。合起来的话「用户不要对接」这条
+    # 约束在族级加载上就是空的——装了评分族，dock 一定在清单里。
+    docking_family = set(catalog().get("docking", ()))
+    affinity_family = set(catalog().get("affinity", ()))
+    if docking_family != {"dock"}:
+        failures.append(f"docking 族不只放对接：{sorted(docking_family)}")
+    if affinity_family != {"fit_affinity", "score_affinity"}:
+        failures.append(f"affinity 族不是那对 DTA 工具：{sorted(affinity_family)}")
+    if "scoring" in catalog():
+        failures.append("scoring 族还在：它只应作为旧会话的别名保留")
 
     # 越界判定认的那些参数名，必须在工具的参数表里真的存在。
     # 参数改名之后，这张表会**静默失效**：路径不再被检查，而一切看起来正常。

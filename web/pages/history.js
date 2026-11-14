@@ -649,6 +649,15 @@
         details.appendChild(el("div", "reason-body", part.text || ""));
         return details;
       }
+      case "route": {
+        // 第一行是标题（`route_adapter.describe` 的约定），余下是正文。
+        // 默认收起：一轮十几行，摊开会把答复挤下去；要看计划时点一下。
+        const lines = (part.text || "").split("\n");
+        const details = el("details", "part part-route");
+        details.appendChild(el("summary", "", lines[0] || "意图与任务"));
+        details.appendChild(el("div", "route-body", lines.slice(1).join("\n").trim()));
+        return details;
+      }
       case "tool":
         return toolNode(part, messageIndex, partIndex);
       case "patch": {

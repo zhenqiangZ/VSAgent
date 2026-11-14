@@ -235,14 +235,14 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("search_pdb", {"query": "EGFR kinase", "limit": 5}),
     # 已知活性 → 类似物
     ("search_actives", {"accession": "P00533"}),
-    ("find_analogs", {"query": "CHEMBL939"}),
+    ("search_analogs", {"query": "CHEMBL939"}),
     # PubChem：同一件事的另一条路——认任意标识（名称/CID/SMILES/InChIKey/ChEMBL 编号），
     # 回答「这是什么结构、是不是已知药」而不是「有什么活性」。下面两条各走一个方向：
     # 给名称（PubChem → 按 InChIKey 补 ChEMBL 画像），与给编号（ChEMBL → 按 InChIKey
     # 补 PubChem 身份）。再按结构在**全库**里找近亲。三条都是纯查询，不登记任何产物。
-    ("lookup_compound", {"compound": "aspirin", "synonyms": True}),
-    ("lookup_compound", {"compound": "CHEMBL25"}),
-    ("find_similar_compounds", {
+    ("fetch_compound", {"compound": "aspirin", "synonyms": True}),
+    ("fetch_compound", {"compound": "CHEMBL25"}),
+    ("search_similar_compounds", {
         "smiles": "CC(=O)OC1=CC=CC=C1C(=O)O",
         "threshold": 98,
         "limit": 5,

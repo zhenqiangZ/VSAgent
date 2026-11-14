@@ -61,6 +61,19 @@ def _render_part(part: Part) -> list[str]:
             "</details>",
             "",
         ]
+    if part.type is PartType.ROUTE:
+        # 与界面上一样折叠：导出的正文是给人读的答复，这一块是过程记录。
+        lines = (part.text or "").splitlines()
+        title = lines[0].strip() if lines else "意图与任务"
+        return [
+            "<details>",
+            f"<summary>{title}</summary>",
+            "",
+            "\n".join(lines[1:]).strip(),
+            "",
+            "</details>",
+            "",
+        ]
     if part.type is PartType.TOOL:
         status = part.tool_status.value if part.tool_status else "pending"
         lines = [f"**工具 `{part.tool_name}` · {status}**", ""]

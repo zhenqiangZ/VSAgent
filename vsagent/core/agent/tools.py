@@ -308,6 +308,12 @@ class Tool(ABC):
     # 事件挂在会话上，收口位置要问到「这一轮写到第几条了」，所以它拿的是
     # 会话加一个当前位置，而不是整份上下文。与上面几个口子同理，这里也不认它的类型。
     event_argument: ClassVar[str] = ""
+    # 收科研工作区的参数名。只有登记科研对象、加证据、评审假设这几个工具声明。
+    #
+    # 与登记表那个口子分开，因为两者管的东西不同：登记表回答「这一轮算出来的东西
+    # 在哪」，工作区回答「我们在研究什么」。一个结构对象可以引用 `receptor#1`
+    # 这个 handle，反过来不成立。混成一个口子，工具就得自己判断手里是哪一个。
+    workspace_argument: ClassVar[str] = ""
     # 收工具登记表本身的参数名。只有 `load_tools` 声明。
     #
     # 别的工具拿登记表是为了写条目；它拿的是**注册表**，只为读一件事：哪些工具
@@ -330,6 +336,7 @@ class Tool(ABC):
         spawner: Any = None,
         event_runtime: Any = None,
         registry: Any = None,
+        workspace: Any = None,
         on_arguments: Callable[[dict[str, Any]], None] | None = None,
     ) -> ToolResult:
         """内核唯一的调用入口：注入 context、任务状态、证据收集器与结构服务之后再走 `run`。
@@ -358,6 +365,7 @@ class Tool(ABC):
             (self.spawn_argument, spawner, "子 agent 派发器"),
             (self.event_argument, event_runtime, "事件运行时"),
             (self.registry_argument, registry, "工具注册表"),
+            (self.workspace_argument, workspace, "科研工作区"),
         ):
             if not name:
                 continue
@@ -677,10 +685,25 @@ class BashTool(Tool):
 
     spec = ToolSpec(
         name="bash",
-        description="执行一条 shell 命令，返回合并后的标准输出与标准错误。",
+        description=(
+            "当没有专用工具可用时（要查环境、跑项目自带脚本），执行一条 shell 命令，"
+            "返回合并后的标准输出与标准错误。读文件、搜文本、改文件不要用它——"
+            "`read` / `grep` / `write` / `patch` 会留下可核查的记录。"
+            "每调用一次都是一个全新的解释器，换目录要写在同一句里"
+            "（`cd 目录 && 命令`）；默认 600 秒超时，超时会杀掉整棵进程树。命令会改动磁盘，"
+            "执行前先确认；非零退出码不算异常，按输出判断。"
+        ),
         parameters={
             "type": "object",
-            "properties": {"command": {"type": "string", "description": "要执行的命令"}},
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "要执行的命令。换目录写 `cd 目录 && 命令`，不要拆成两次调用；"
+                        "只读命令也走这里。示例：`ls -la runs | head`"
+                    ),
+                }
+            },
             "required": ["command"],
         },
     )
@@ -746,15 +769,22 @@ class ReadTool(Tool):
     spec = ToolSpec(
         name="read",
         description=(
-            "读取一个文本文件的内容，每行前面带文件里的绝对行号。"
-            "用 offset 与 limit 读取其中一段，文件很长时先读开头再决定往下看哪里。"
+            "当你要看一个文件的内容时用它。要看已经移出上下文的会话某一步，用 `read_turn`；"
+            "要读本地语料原文用 `read_source`；要读论文正文用 `read_fulltext`。"
+            "读取时每行带文件里的绝对行号，默认最多 2000 行；用 offset 与 limit 读其中一段。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "文件路径，相对路径按工作目录解释"},
-                "offset": {"type": "integer", "description": "从第几行开始读，从 1 数起"},
-                "limit": {"type": "integer", "description": "最多读多少行"},
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几行开始读，从 1 数起；默认 1",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "最多读多少行，默认 2000",
+                },
             },
             "required": ["path"],
             "additionalProperties": False,
@@ -828,8 +858,8 @@ class WriteTool(Tool):
     spec = ToolSpec(
         name="write",
         description=(
-            "把一个文件的全部内容写成给出的文本，原有的内容会被整份替换掉。"
-            "父目录不存在时会自动建出来。只改其中一处时用 patch 更省事。"
+            "新建文件、或整份重写一个文件时用它：原有的内容会被整份替换掉，覆盖之后"
+            "不可撤销。父目录不存在时会自动建出来。只改其中一处时用 `patch` 更安全。"
         ),
         parameters={
             "type": "object",
@@ -888,8 +918,9 @@ class PatchTool(Tool):
     spec = ToolSpec(
         name="patch",
         description=(
-            "把一个文件里的一段文字换成另一段。old 必须在文件里唯一出现，"
-            "出现零次或多次都会失败；失败时把 old 写长一些，带上前后几行把位置定下来。"
+            "改文件里的一处时用它，不要整份重写（那是 `write`，覆盖后不可撤销）。"
+            "old 必须在文件里唯一出现，出现零次或多次都会失败；"
+            "失败时把 old 写长一些，带上前后几行把位置定下来。"
         ),
         parameters={
             "type": "object",
@@ -965,7 +996,9 @@ class GrepTool(Tool):
     spec = ToolSpec(
         name="grep",
         description=(
-            "按正则表达式在一棵目录里搜索文件内容，输出命中的文件、行号与那一行。"
+            "当你要在一段代码或文本里找某个标识符或模式时用它；"
+            "要看命中处的上下文，再用 `read` 按行号读。"
+            "按正则表达式搜索文件内容，输出命中的文件、行号与那一行。"
             "path 可以是目录也可以是单个文件；glob 用来限定文件名，"
             "不给出时只搜代码与常见文本后缀。"
         ),
@@ -1126,6 +1159,7 @@ class ReadTurnTool(Tool):
             "默认不含思考过程，要当时的推演传 reasoning=true。"
             f"offset / limit 按行分页，默认 {READ_TURN_LIMIT} 行；"
             f"每次最多返回 {READ_TURN_MAX_TOKENS} token。"
+            "要看文件当前内容用 `read`，按主题找历史用 `recall_event`。"
         ),
         parameters={
             "type": "object",

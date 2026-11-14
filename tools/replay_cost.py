@@ -52,7 +52,7 @@ from vsagent.core.agent.event_log import (  # noqa: E402
 from vsagent.core.agent.ledger import SessionLedger, default_snapshot_path  # noqa: E402
 from vsagent.core.agent.memory import MemoryStore, RecallTool, RememberTool  # noqa: E402
 from vsagent.core.agent.prompt import stable_prefix  # noqa: E402
-from vsagent.core.agent.spawn import AgentStatusTool, SpawnAgentTool  # noqa: E402
+from vsagent.core.agent.spawn import AgentStatusTool  # noqa: E402
 from vsagent.core.agent.task import TaskTool  # noqa: E402
 from vsagent.core.agent.toolset import LoadToolsTool, hidden_names, prune_families  # noqa: E402
 from vsagent.core.agent.tools import (  # noqa: E402
@@ -96,7 +96,6 @@ def build_registry() -> ToolRegistry:
     for tool in event_tools():
         registry.register(tool)
     registry.register(LoadToolsTool())
-    registry.register(SpawnAgentTool())
     registry.register(AgentStatusTool())
     for tool in domain_tools():
         registry.register(tool)

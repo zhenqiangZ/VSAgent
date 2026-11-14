@@ -5,7 +5,7 @@ ChEMBL 编号都收，一次调用给出身份、计算性质，以及（在 ChE
 类药性、作用靶点与适应症。
 
 **为什么把 ChEMBL 那半并进来。** 原先两个工具：`describe_molecule` 只认 ChEMBL 编号、
-`lookup_compound` 认任意标识。模型于是要先判断「手里的是 CHEMBL939 还是一段 SMILES」
+`fetch_compound` 认任意标识。模型于是要先判断「手里的是 CHEMBL939 还是一段 SMILES」
 再挑工具，判错就是一次白跑——而对出来的对接产物、枚举出来的类似物，模型手里往往
 **只有 SMILES**，那条路对它根本不成立。合并之后：给编号走 ChEMBL → PubChem，给结构
 走 PubChem → ChEMBL，两个方向在输出里长得一样。
@@ -46,9 +46,9 @@ __all__ = [
     "CID_PATTERN",
     "DEFAULT_LIMIT",
     "DEFAULT_THRESHOLD",
-    "FindSimilarCompoundsTool",
+    "SearchSimilarCompoundsTool",
     "INCHIKEY_PATTERN",
-    "LookupCompoundTool",
+    "FetchCompoundTool",
     "MAX_LIMIT",
     "MAX_SYNONYMS",
     "MIN_THRESHOLD",
@@ -56,7 +56,7 @@ __all__ = [
     "PubChemError",
     "domain_tools",
     "find_similar",
-    "lookup_compound",
+    "fetch_compound",
 ]
 
 BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
@@ -77,7 +77,7 @@ CID_PATTERN = re.compile(r"^(?:CID[:\s#-]*)?(\d{1,9})$", re.I)
 INCHIKEY_PATTERN = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$", re.I)
 SMILES_HINT = re.compile(r"[=#\[\]()@+\\/]")
 """看起来像 SMILES 的字符。**只当线索，不当判据**：`CCO`（乙醇）一个提示字符都没有，
-所以名称查不到时还要再拿它当 SMILES 试一次（见 `lookup_compound` 的候选顺序）。"""
+所以名称查不到时还要再拿它当 SMILES 试一次（见 `fetch_compound` 的候选顺序）。"""
 
 DEFAULT_THRESHOLD = 90
 MIN_THRESHOLD = 50
@@ -247,7 +247,7 @@ def _candidates(compound: str) -> list[tuple[str, str]]:
     return [("name", text), ("smiles", text)]
 
 
-def lookup_compound(
+def fetch_compound(
     compound: str, *, synonyms: bool = False, timeout: float = http.DEFAULT_TIMEOUT
 ) -> list[Compound]:
     """查化合物。返回命中的全部记录（同名多义时会有多条）。"""
@@ -394,7 +394,7 @@ def find_similar(
     """按结构相似度找已知化合物。返回 `(前 limit 条, 阈值内的总命中数)`。"""
     text = (smiles or "").strip()
     if not text:
-        raise PubChemError("smiles 不能为空。先 lookup_compound 拿到 SMILES，或从登记表里取。")
+        raise PubChemError("smiles 不能为空。先 fetch_compound 拿到 SMILES，或从登记表里取。")
     size = max(1, min(limit, MAX_LIMIT))
     cids = _similarity_cids(text, threshold=threshold, timeout=timeout)
     if not cids:
@@ -449,11 +449,11 @@ def _render_one(item: Compound, *, index: int | None = None) -> list[str]:
     return lines
 
 
-class LookupCompoundTool(Tool):
+class FetchCompoundTool(Tool):
     """查一个化合物的身份：PubChem 那半 + ChEMBL 那半。纯查询，不产生产物。"""
 
     spec = ToolSpec(
-        name="lookup_compound",
+        name="fetch_compound",
         description=(
             "查一个化合物的**身份**：PubChem 给结构、计算性质与 CID，ChEMBL 有记录时再补上"
             "「是不是药、类药性如何、作用于哪些靶点、治什么病」。输入可以是名称（aspirin）、"
@@ -467,7 +467,7 @@ class LookupCompoundTool(Tool):
             "**同名多义时不补 ChEMBL**：一个名字对多个 CID 时先确认是哪个，再拿 CID 查一次。"
             "ChEMBL 里没有这个结构时会明说——那不是失败，只说明它没被收录。"
             "每次调用 2–6 秒（两个库各一两次请求，ChEMBL 那边偏慢）。"
-            "要找这个结构的近亲用 find_similar_compounds。"
+            "要找这个结构的近亲用 search_similar_compounds。"
         ),
         parameters={
             "type": "object",
@@ -516,14 +516,14 @@ class LookupCompoundTool(Tool):
                 )
             else:
                 try:
-                    items = lookup_compound(key)
+                    items = fetch_compound(key)
                 except PubChemError as error:
-                    # `lookup_compound` 查不到会抛，不会回空表——所以「空」这一档
+                    # `fetch_compound` 查不到会抛，不会回空表——所以「空」这一档
                     # 只有上面那种「没有键可比」的情况，不必另设一个分支。
                     missing = f"PubChem 那半没取到：{error}"
         else:
             try:
-                items = lookup_compound(compound, synonyms=bool(arguments.get("synonyms")))
+                items = fetch_compound(compound, synonyms=bool(arguments.get("synonyms")))
             except PubChemError as error:
                 return ToolResult(output=str(error), failed=True)
             # 唯一命中才补 ChEMBL：同名多义时不知道该补哪一个。
@@ -561,7 +561,7 @@ class LookupCompoundTool(Tool):
         elif len(items) == 1:
             lines.append("")
             lines.append(
-                "  要按结构找近亲：find_similar_compounds smiles=<上面的 SMILES>；"
+                "  要按结构找近亲：search_similar_compounds smiles=<上面的 SMILES>；"
                 "要这个靶点的已知活性：search_actives。"
             )
 
@@ -576,11 +576,11 @@ class LookupCompoundTool(Tool):
         return ToolResult(output="\n".join(lines), meta=meta)
 
 
-class FindSimilarCompoundsTool(Tool):
+class SearchSimilarCompoundsTool(Tool):
     """按结构相似度在 PubChem 全库找已知化合物。纯查询。"""
 
     spec = ToolSpec(
-        name="find_similar_compounds",
+        name="search_similar_compounds",
         description=(
             "按结构相似度在 **PubChem 全库**里找已知化合物（2D 指纹，阈值 50–100，默认 90）。"
             "用在「这个结构是不是别人早就做过」与「找一批可买的类似物」这两步："
@@ -588,7 +588,7 @@ class FindSimilarCompoundsTool(Tool):
             "返回命中总数与前几条的身份（CID、名称、分子式、MW、XLogP、SMILES）。"
             "**接口不给相似度分数**，所以这里也不编：结果按 PubChem 的相似度从高到低排列，"
             "但它与本地的 Tanimoto 分数不是一套指纹，不能互相比较。\n\n"
-            "**与 find_analogs 的分工**：那条在 ChEMBL 里按 ChEMBL 编号找类似物（带活性）；"
+            "**与 search_analogs 的分工**：那条在 ChEMBL 里按 ChEMBL 编号找类似物（带活性）；"
             "这条只认 SMILES、覆盖全库（带结构但不保证有活性）。阈值调低命中会迅速变多"
             "（90 时阿司匹林已有近七千条），所以默认只列前 10 条。"
         ),
@@ -597,7 +597,7 @@ class FindSimilarCompoundsTool(Tool):
             "properties": {
                 "smiles": {
                     "type": "string",
-                    "description": "查询结构的 SMILES（可从 lookup_compound 或登记表拿到）",
+                    "description": "查询结构的 SMILES（可从 fetch_compound 或登记表拿到）",
                 },
                 "threshold": {
                     "type": "integer",
@@ -617,7 +617,7 @@ class FindSimilarCompoundsTool(Tool):
         smiles = str(arguments.get("smiles") or "").strip()
         if not smiles:
             return ToolResult(
-                output="smiles 不能为空。先用 lookup_compound 查，或从登记表里取结构串。",
+                output="smiles 不能为空。先用 fetch_compound 查，或从登记表里取结构串。",
                 failed=True,
             )
         try:
@@ -676,7 +676,7 @@ class FindSimilarCompoundsTool(Tool):
 
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具。"""
-    return [LookupCompoundTool(), FindSimilarCompoundsTool()]
+    return [FetchCompoundTool(), SearchSimilarCompoundsTool()]
 
 
 if __name__ == "__main__":

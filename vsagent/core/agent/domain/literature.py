@@ -948,7 +948,7 @@ class ReadFulltextTool(Tool):
             "而不是给一段空文本。返回内容按 max_chars 截断，并在末尾写清本节原本多长。\n\n"
             "入口：search_europepmc 的每一行都带着 PMCID（`PMC12545111`），也接受 PMID"
             "与 DOI。想知道「这组实验到底怎么做的、数字是多少」用它；只想知道「有没有这类"
-            "文献」用 search_europepmc 就够。"
+            "文献」用 search_europepmc 就够。本地语料里的原文用 `read_source`，不要在这里读。"
         ),
         parameters={
             "type": "object",

@@ -395,7 +395,7 @@ def load_ligand_file(
         raise LigandError("文件是空的")
     if len(payload) > MAX_IMPORT_BYTES:
         raise LigandError(
-            f"文件 {len(payload) / 1024 / 1024:.1f} MB，超过 64 MB 上限；先拆分或先用 find_analogs 缩小集合"
+            f"文件 {len(payload) / 1024 / 1024:.1f} MB，超过 64 MB 上限；先拆分或先用 search_analogs 缩小集合"
         )
     if b"\x00" in payload:
         raise LigandError("文件里有 NUL 字节，看起来不是文本格式")
@@ -1190,7 +1190,7 @@ class PrepareLigandsTool(Tool):
             "confirm=true 才生成 3D 与 PDBQT，并登记成**准备后的配体集**。"
             "同一组参数按内容指纹复用，不覆盖旧产物。单条失败（3D 或 Meeko）不中断整批，"
             "但整批一个都没成功时不登记。源可以是 import_ligandset 的产物，也可以是 "
-            "search_actives / find_analogs 直接落下的 CSV。"
+            "search_actives / search_analogs 直接落下的 CSV。"
             "\n**大库用 offset 分批**：`limit` 是这一批取多少，`offset` 是从第几条开始。"
             "两批之间不会重叠，也不会漏——`offset` 进缓存键，所以两批是两个产物目录。"
         ),
@@ -1721,16 +1721,16 @@ class CurateLigandsTool(Tool):
                     "type": "string",
                     "description": "原始配体集的 handle（已经 prepare 过的不能筛）",
                 },
-                "min_mw": {"type": "number", "description": "分子量下限"},
+                "min_mw": {"type": "number", "description": "分子量下限，0–2000；不给则不设下限"},
                 "max_mw": {
                     "type": "number",
-                    "description": f"分子量上限，常用 {DEFAULT_MAX_MW:g}",
+                    "description": f"分子量上限，0–2000，常用 {DEFAULT_MAX_MW:g}；不给则不设上限",
                 },
-                "max_logp": {"type": "number", "description": "logP 上限"},
-                "max_tpsa": {"type": "number", "description": "TPSA 上限（Å²）"},
-                "max_hbd": {"type": "integer", "description": "氢键供体数上限"},
-                "max_hba": {"type": "integer", "description": "氢键受体数上限"},
-                "max_rotb": {"type": "integer", "description": "可旋转键数上限"},
+                "max_logp": {"type": "number", "description": "logP 上限，−20–40；不给则不设上限"},
+                "max_tpsa": {"type": "number", "description": "TPSA 上限（Å²），0–1000；不给则不设上限"},
+                "max_hbd": {"type": "integer", "description": "氢键供体数上限，0–50；不给则不设上限"},
+                "max_hba": {"type": "integer", "description": "氢键受体数上限，0–50；不给则不设上限"},
+                "max_rotb": {"type": "integer", "description": "可旋转键数上限，0–100；不给则不设上限"},
                 "pains": {
                     "type": "boolean",
                     "description": "是否查 PAINS_A/B/C，默认 true",

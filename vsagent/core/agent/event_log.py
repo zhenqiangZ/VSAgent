@@ -186,12 +186,33 @@ def _arg_text(value: Any) -> str:
     return _short(text, STEP_RESULT_MAX)
 
 
+def task_tags(session: Session) -> tuple[str, str]:
+    """这一步属于哪次任务：`(计划号, 这个 Agent 的任务号)`。
+
+    计划号取会话上的 `campaign_id`（战役发起时写）；根会话没有战役时退回它的
+    任务规格号——那是"用户这一轮要做的事"的编号，同样是可查的。子 Agent 的任务号
+    写在 `task_id` 上（`dispatcher` 派发时按 `计划号:角色` 生成），根会话为空。
+
+    读不到就返回空串，不猜：宁可在流水里少一列，也不要挂一个错的编号上去。
+    """
+    campaign = str(getattr(session, "campaign_id", "") or "")
+    own = str(getattr(session, "task_id", "") or "")
+    spec = ""
+    raw = getattr(session, "task_spec", None)
+    if isinstance(raw, dict):
+        spec = str(raw.get("task_id") or "")
+    return (campaign or spec, own)
+
+
 def step_from_parts(
     seq: int,
     parts: list[Part],
     message_index: int,
     part_start: int = 0,
     part_end: int = 0,
+    *,
+    task_id: str = "",
+    agent_task_id: str = "",
 ) -> Step | None:
     """把一次模型往返里的工具 Part 折成一条 Step。不调模型、不读 reasoning。
 
@@ -252,6 +273,8 @@ def step_from_parts(
         message_index=message_index,
         part_start=part_start,
         part_end=part_end,
+        task_id=task_id,
+        agent_task_id=agent_task_id,
     )
 
 
@@ -280,6 +303,7 @@ def steps_from_messages(
     from .context import step_segments
 
     steps: list[Step] = []
+    task_id, agent_task_id = task_tags(session)
     first = max(0, start[0])
     last = min(end[0], len(session.messages) - 1)
     for index in range(first, last + 1):
@@ -298,6 +322,8 @@ def steps_from_messages(
                 index,
                 min(positions),
                 max(positions) + 1,
+                task_id=task_id,
+                agent_task_id=agent_task_id,
             )
             if step is not None:
                 steps.append(step)
@@ -318,7 +344,16 @@ def record_step(
     只在内存里累积：每步都重写整份 `state.toml` 不值（一次会话几十步），
     而丢几步可以接受——原文还在 RECENT 里，最坏是这一主题少几行流水。
     """
-    step = step_from_parts(step_no, parts, message_index, part_start, part_end)
+    task_id, agent_task_id = task_tags(session)
+    step = step_from_parts(
+        step_no,
+        parts,
+        message_index,
+        part_start,
+        part_end,
+        task_id=task_id,
+        agent_task_id=agent_task_id,
+    )
     if step is None:
         return None
     session.pending_steps.append(step)
@@ -730,8 +765,14 @@ def render_event_detail(
         f"步号：{event.span or '（没有流水）'}　来源：{event.kind}"
         + ("（本地汇编）" if event.degraded else ""),
         f"原文约 {event.tokens} token",
-        f"结论：{event.summary or '（没有结论）'}",
     ]
+    # 出自哪次任务。只在这一层给：每步都印一遍同一串编号，只会把流水挤长。
+    if event.task_id:
+        tag = f"任务：{event.task_id}"
+        if event.agent_task_id:
+            tag += f"（子任务 {event.agent_task_id}）"
+        lines.append(tag)
+    lines.append(f"结论：{event.summary or '（没有结论）'}")
     if event.handoff:
         lines.append(f"交接：{event.handoff}")
     if event.steps:
@@ -756,14 +797,10 @@ class CloseTopicTool(Tool):
     spec = ToolSpec(
         name="close_topic",
         description=(
-            "一个主题做完时调一次：起名字、写结论、写后续依赖什么。\n"
+            "一个主题做完时调一次。**这一步结束时封存**，这一段的原文不再随请求发出，"
+            "只留标题、结论与流水；要看细节用 recall_event。原文取不回来，依据只能写进结论。\n"
             "时机：当前目标已经达成，或者工作要换到一件不相干的事上。"
             "最后一条消息里出现「本主题已 N 步」时，就是在提醒你看这件事。\n"
-            "调完之后：**这一步结束时封存**，这一段的原文不再随请求发出，"
-            "只留标题、结论与流水；要看细节用 recall_event。所以结论里要点名产物"
-            "（handle、路径、关键数字），并写清**放弃过哪条路、为什么**——"
-            "思考过程不随原文取回，这类依据只能写在结论里。"
-            "下一个主题要用到的东西写进 handoff。\n"
             "它自己不算一步。同一个目标还没做完就别调——切成两半会让两个主题都读不通。"
         ),
         parameters={
@@ -791,9 +828,8 @@ class CloseTopicTool(Tool):
                 "session_title": {
                     "type": "string",
                     "description": (
-                        f"不超过 {SESSION_TITLE_MAX} 字，整个会话的名字。"
-                        "只在第一次封存时用得上：它回答的是「这件事是什么」，"
-                        "不是这一段做了什么。会话已经有名字时不传。"
+                        f"不超过 {SESSION_TITLE_MAX} 字，整个会话的名字；"
+                        "只在第一次封存时传，会话已经有名字就不传。"
                     ),
                 },
                 "next_tools": {
@@ -847,6 +883,11 @@ class CloseTopicTool(Tool):
             for item in (arguments.get("next_tools") or [])
             if str(item or "").strip()
         ]
+        # 旧族名先展开：`scoring` 现在是 `docking` 与 `affinity` 两族。
+        if next_tools:
+            from .toolset import expand_families
+
+            next_tools = expand_families(next_tools)
         # 预装的族名写错时当场拒绝：否则封存会成功，下一个主题却什么都没预装，
         # 模型要到下一步才发现，白花一步。**校验放在写会话字段之前**：
         # 失败不能留下 topic_title，否则下一步会被这个失败的标题触发封存。
@@ -866,7 +907,11 @@ class CloseTopicTool(Tool):
         session.topic_title = title
         session.topic_summary = str(arguments.get("summary") or "").strip()[:EVENT_SUMMARY_MAX]
         session.topic_handoff = str(arguments.get("handoff") or "").strip()[:EVENT_HANDOFF_MAX]
-        session.next_tools = next_tools
+        # 主 agent 这一轮只编排：族由计划按角色发给子会话（`coordinator.run`），
+        # 预装到根会话没有用处——`hidden_names` 本来就不发，提示语还会让人以为
+        # 它下一步能自己用。子会话照旧预装，省一次 `load_tools`（P-83）。
+        principal = bool(getattr(session, "principal_only", False))
+        session.next_tools = [] if principal else next_tools
         session.pending_session_title = (
             str(arguments.get("session_title") or "").strip()[:SESSION_TITLE_MAX]
         )
@@ -877,11 +922,14 @@ class CloseTopicTool(Tool):
                 if value not in artifacts:
                     artifacts.append(value)
         produced = "、".join(artifacts[:5]) if artifacts else "（还没有产物）"
-        next_note = (
-            f"下一主题预装：{'、'.join(session.next_tools)}。"
-            if session.next_tools
-            else "下一主题从核心工具开始。"
-        )
+        if principal:
+            next_note = "下一主题由计划按角色给族，主 agent 不预装。"
+        else:
+            next_note = (
+                f"下一主题预装：{'、'.join(session.next_tools)}。"
+                if session.next_tools
+                else "下一主题从核心工具开始。"
+            )
         return ToolResult(
             output=(
                 f"已记下主题「{title}」（{len(session.pending_steps)} 步）。"
@@ -904,6 +952,7 @@ class RecallEventTool(Tool):
             "默认读当前会话；session_id 指向别的会话，跨会话检索的命中行里带着它。"
             "默认不含思考过程，要当时的推演传 reasoning=true。"
             "原文按 offset / limit 分页，默认 120 行，每次最多 4000 token。"
+            "不知道编号时先用 `search_history` 找主题；文件内容用 `read`。"
         ),
         parameters={
             "type": "object",

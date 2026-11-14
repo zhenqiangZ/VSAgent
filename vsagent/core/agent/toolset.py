@@ -18,6 +18,10 @@
 
 **默认可见**是刻意的：只有登记进 `FAMILIES` 的才算「可以被藏起来」。新加一个工具
 忘了登记族，它仍然每步都在，不会出现「写了却没装、模型看不见」那种查不出来的毛病。
+
+主 agent 那一边还有一条：这一轮有可执行计划时，`hidden_names` 把**全部族**都藏掉
+（`Session.principal_only`）。计划里的族按角色分，装到根会话上只会让它自己把领域
+工作做掉；`load_tools` 在同一个会话上也直接退回「派给角色」。
 """
 
 from __future__ import annotations
@@ -32,12 +36,46 @@ from .tools import Tool, ToolResult, ToolSpec
 
 
 def hidden_names(session: Session) -> frozenset[str]:
-    """这一步**不该发给模型**的工具名：属于还没装入的那几族。"""
-    hidden: set[str] = set()
+    """这一步**不该发给模型**的工具名。
+
+    两种藏法，理由不同：
+
+    - 领域族没装入这一族：按族藏，装一次就能看见；
+    - 这一轮主 agent 只编排（`principal_only`）：**全部领域族都藏**，装过也不发。
+      计划里的族是给派出去的角色用的，主 agent 拿到它们只会自己把活干了。
+    """
+    if getattr(session, "principal_only", False):
+        hidden: set[str] = set()
+        for names in catalog().values():
+            hidden.update(names)
+        return frozenset(hidden)
+    loaded = set(expand_families(session.tool_families))
+    hidden = set()
     for family, names in catalog().items():
-        if family not in session.tool_families:
+        if family not in loaded:
             hidden.update(names)
     return frozenset(hidden)
+
+
+# 旧族名：只出现在旧会话的 `tool_families` 与 `next_tools` 里。
+#
+# 2026-11 把 `scoring` 拆成 `docking` 与 `affinity` 之后，读过旧会话的人会带着
+# 这个名字回来。不认它的话，那次会话里 dock / fit_affinity / score_affinity 会
+# 突然从清单里消失，而模型看不出原因——它会当成「工具没了」，转去用 bash。
+LEGACY_FAMILIES: dict[str, tuple[str, ...]] = {
+    "scoring": ("docking", "affinity"),
+}
+
+
+def expand_families(names: Iterable[str]) -> list[str]:
+    """把旧族名展开成新族名：保留顺序、去重、不认识的照原样留着交给调用方报错。"""
+    out: list[str] = []
+    for name in names:
+        value = str(name or "").strip()
+        for item in LEGACY_FAMILIES.get(value, (value,)):
+            if item and item not in out:
+                out.append(item)
+    return out
 
 
 def family_of(name: str) -> str:
@@ -125,9 +163,13 @@ def release_families(session: Session, keep: Iterable[str] = ()) -> list[str]:
     return dropped
 
 
-def family_tokens(registry: Any, names: Iterable[str]) -> int:
-    """估一族的工具定义占多少 token。`load_tools` 用它在返回里报价格。"""
-    wanted = set(names)
+def family_tokens(registry: Any, tool_names: Iterable[str]) -> int:
+    """估这些**工具**的定义占多少 token。
+
+    参数是工具名，不是族名——名字原先叫 `names`，调用方很容易把族名传进来，
+    结果永远是 1 token（一个都没匹配上）。要用族名，先经 `catalog()` 换成工具名。
+    """
+    wanted = set(tool_names)
     specs = [
         spec
         for spec in registry.specs()
@@ -157,15 +199,12 @@ class LoadToolsTool(Tool):
         description=(
             "按族装入领域工具。文件、登记表、任务、事件、记忆这些核心工具一直在；"
             "其余工具分成 "
-            f"{len(families())} 族，要先用这里装进来，**下一步起**才出现在工具清单里。\n"
-            "族与工具：\n"
-            + catalog_text()
-            + "\n装一次对**这一主题**有效；主题结束会自动卸载，只保留"
-            " `close_topic(next_tools=...)` 里点名的族。已经装过的再装一次只会把清单再列一遍。\n"
-            "**建议一次把这一主题要用的族都装上，通常一到三族**：每装一次都会改动工具清单，"
-            "而工具清单是请求前缀的一部分，下一步的 prompt cache（前缀缓存）会整段失效；"
-            "但装得太多会一直占着每一步的额度——实测十族约 2.6 万 token。"
-            "装多族用 `families`（数组），与 `family` 二选一。"
+            f"{len(families())} 族（见参数 enum），要先用这里装进来，"
+            "**下一步起**才出现在工具清单里。\n"
+            "**不带参数调用一次**列出每族包含哪些工具——先看再装，不要凭族名猜。\n"
+            "装一次只管**这一主题**，主题结束自动卸载，只保留"
+            " `close_topic(next_tools=...)` 点名的族。通常一次装一到三族：装一次会让下一步的"
+            "前缀缓存整段失效，装太多则每一步都占额度——实测十族约 2.6 万 token。"
         ),
         parameters={
             "type": "object",
@@ -204,6 +243,18 @@ class LoadToolsTool(Tool):
         registry = arguments.get("registry")
         disabled = getattr(registry, "disabled", frozenset())
 
+        if getattr(session, "principal_only", False):
+            # 主 agent 这一轮有可执行计划：领域动作已经分给角色。装进来也看不见
+            # （`hidden_names` 会藏掉全部族），与其让模型以为装上了，不如当场说清。
+            return ToolResult(
+                output=(
+                    "主 agent 这一轮只做编排，不装领域工具。"
+                    "需要取数就把这件事派给承担该能力的角色（dispatch_campaign）；"
+                    "角色拿的是能力计划里的族，不需要你预装。"
+                ),
+                failed=True,
+            )
+
         single = str(arguments.get("family") or "").strip()
         many = arguments.get("families")
         if single and many is not None:
@@ -221,7 +272,16 @@ class LoadToolsTool(Tool):
             if name and name not in wanted:
                 wanted.append(name)
         if not wanted:
-            return ToolResult(output="要给 family 或 families：说明要装哪一族。", failed=True)
+            # 不带参数 = 看目录。族 → 工具那张表有 60 行，写进每一步都发的说明里
+            # 要占 500 多 token；改成调用时现给，模型照样查得到，常驻额度省下来。
+            return ToolResult(
+                output=(
+                    "要装哪一族？下面是每一族包含的工具；装的时候把族名传给 family"
+                    "（多族用 families）：\n" + catalog_text()
+                )
+            )
+        # 旧族名先展开：`scoring` 现在是 `docking` 与 `affinity` 两族。
+        wanted = expand_families(wanted)
 
         known = catalog()
         unknown = [name for name in wanted if name not in known]

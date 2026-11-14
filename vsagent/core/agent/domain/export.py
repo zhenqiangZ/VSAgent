@@ -777,19 +777,15 @@ class WriteRunTool(Tool):
         name="write_run",
         description=(
             "把一个受体（可选的对接产物）写成**运行目录**（`meta.json` / `receptor.pdb` / `ligands/`），"
-            "登记成 artifact，网页端据此渲染结构页。\n"
-            "`view=pockets`（默认）算口袋；`view=structure` 只展示结构、不联网。"
-            "两者都先做同一套预处理（选链与构象、去水去溶剂去氢）。\n"
-            "给了 `docking` 就写对接结果（位姿、分数、`provenance.poses`），不要再传 `ligands`。"
-            "给了 `affinity` 会按分子 id 贴 `affinity_pk`；`affinity` 要与 `docking` 一起给。\n"
-            "`interactions` 控制每分子的接触、几何氢键与 PLIP 指纹：`top`（默认）给所有位姿"
-            "算几何接触与几何氢键、前 8 个再算 PLIP；`all` 给全部加 PLIP；`none` 不算。\n"
-            "口袋来源三选一：给了 `pockets` 就直接用那份口袋集（`detect_pockets` 的产物，"
-            "四路叠合的结果都能上网页）；给了 `candidates` 就走先验（核对编号与链序列，"
+            "登记成 artifact，网页端据此渲染结构页；两个 view 都会先做预处理。\n"
+            "口袋来源三选一：给了 `pockets` 直接用那份口袋集（`detect_pockets` 的产物）；"
+            "给了 `candidates` 就走先验（核对编号与链序列，"
             "按 CA 叠合后用共晶配体圈口袋，`source=ligand`）；都没给就搜该蛋白的带配体复合物，"
             "一个都没有才转 p2rank。三路都拿不到就写空口袋并说明原因。\n"
             "`uniprot` 是蛋白编号（如 P00519），**不是** PDB 编号；只给 `pdb_id` 会让主来源"
-            "只剩手上这一份结构。center / score / min_distance 一律现算，不要自己编。"
+            "只剩手上这一份结构。center / score / min_distance 一律现算，不要自己编。\n"
+            "返回运行目录的 artifact handle 与结构页地址，附本次处理摘要；"
+            "失败时说明卡在哪一步，旧 meta.json 不会被改动。"
         ),
         parameters={
             "type": "object",
@@ -1096,7 +1092,15 @@ class WriteRunTool(Tool):
         _mark_reference(bundle.pockets, reference)
 
         # ---- 写盘 ----
-        run_id = _run_id(arguments.get("run_id"), pdb_id, name)
+        run_id = _run_id(
+            arguments.get("run_id"), pdb_id, name, str(ledger.session_id or "")
+        )
+        asked = str(arguments.get("run_id") or "").strip()
+        renamed = (
+            f"运行目录重名：{asked} 已被别的会话写过，这次改存为 {run_id}（旧结果没被覆盖）。\n"
+            if asked and run_id and run_id != asked
+            else ""
+        )
         if run_id is None:
             return ToolResult(
                 output=(
@@ -1245,7 +1249,7 @@ class WriteRunTool(Tool):
                     "接触与作用已写进页面。"
                 )
         return ToolResult(
-            output=report,
+            output=renamed + report,
             meta={
                 "handle": str(artifact.handle),
                 "run_id": run_id,
@@ -1392,21 +1396,49 @@ def _mark_reference(pockets: list[dict[str, Any]], reference: str) -> None:
                 return
 
 
-def _run_id(explicit: Any, pdb_id: str, name: str) -> str | None:
-    """运行目录名：显式给就用显式的，否则按 pdb_id 生成。不合法时返回 None。"""
+def _run_id(explicit: Any, pdb_id: str, name: str, owner: str = "") -> str | None:
+    """运行目录名：显式给就用显式的，否则按 pdb_id 生成。不合法时返回 None。
+
+    **同名分两种。** 同一会话重写同名目录是更新（旧 pose 会被清掉，那是
+    `write_run` 一直支持的做法）；**另一个会话**写同一个名字则要另起一个目录，
+    否则后者会把前者的留档悄悄抹掉（P-04 的遗留）。归属看 `meta.json` 里的
+    `provenance.session_id`，与登记表判会话用的是同一个字段。
+    """
     value = str(explicit or "").strip()
     if value:
-        return value if RUN_ID_PATTERN.match(value) else None
+        if not RUN_ID_PATTERN.match(value):
+            return None
+        return _free_name(value, owner)
     base = _slug(pdb_id or name, fallback="run")
+    return _free_name(base, owner)
+
+
+def _free_name(base: str, owner: str = "") -> str:
+    """从 `base` 开始找一个能用的目录名。
+
+    没被占用就用它；被占用但归属同一个会话，也用它（那是重写）；否则加 `-2/-3`。
+    """
     candidate = base
     index = 2
     root = runs_dir()
     while (root / candidate).exists():
+        if owner and _run_owner(root / candidate) == owner:
+            return candidate
         candidate = f"{base}-{index}"
         index += 1
         if index > 999:
             break
-    return candidate if RUN_ID_PATTERN.match(candidate) else None
+    return candidate
+
+
+def _run_owner(target: Path) -> str:
+    """这个运行目录是哪个会话写的。读不出来就当没有归属（按别人的处理）。"""
+    try:
+        data = json.loads((target / RUN_META).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - 坏 meta 不该让写目录失败
+        return ""
+    provenance = data.get("provenance") or {}
+    return str(provenance.get("session_id") or "") if isinstance(provenance, dict) else ""
 
 
 def _prepare_run_dir(run_id: str) -> Path:
@@ -2055,13 +2087,9 @@ class OpenViewerTool(Tool):
         description=(
             "给一个已写出的产物返回它在**本地网页**上的地址。运行目录形如 "
             "`http://127.0.0.1:<port>/#/structure/<run_id>`；`survey_structures` 写的"
-            "结构全景形如 `#/survey/<survey_id>`。"
-            "给 `pocket` 会打开该口袋的局部视图，`molecule` 会打开该分子的详情与作用线。\n"
+            "结构全景形如 `#/survey/<survey_id>`。\n"
             "消息里出现具体的结构、口袋、位姿或相互作用时，必须用这个工具取地址；"
-            "不要自己拼接。\n"
-            "默认只返回地址、**不擅自打开浏览器**（无头环境会静默失败，"
-            "在 TUI 里 suspend 去拉浏览器会把界面顶掉）——需要时再传 open_browser=true。\n"
-            "服务没起来时返回一条可操作的说明，不抛异常。"
+            "不要自己拼接。默认只返回地址，需要打开浏览器时传 open_browser=true。"
         ),
         parameters={
             "type": "object",

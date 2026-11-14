@@ -58,6 +58,18 @@ def _part_index(message: Message, part: Part) -> int:
     return max(0, len(message.parts) - 1)
 
 
+def split_route(text: str) -> tuple[str, str]:
+    """把 `route_adapter.describe` 写的那段文本拆成折叠块的标题与正文。
+
+    第一行当标题，余下是正文。约定写在这两处（这里与网页端），所以正文不另存字段：
+    它就是那段文本，谁读都一样。
+    """
+    lines = (text or "").splitlines()
+    if not lines:
+        return "意图与任务", ""
+    return lines[0].strip() or "意图与任务", "\n".join(lines[1:]).strip("\n")
+
+
 # 工具输出最多显示这么多行，超出的部分折成一行提示，免得长输出把消息区整个刷过去。
 MAX_OUTPUT_LINES = 6
 
@@ -254,6 +266,50 @@ class ReasoningPartView(FoldBlock):
     def sync(self, part: Part) -> None:
         """刷新思考正文。"""
         self.set_body(part.text)
+
+
+class RoutePartView(FoldBlock):
+    """这一轮的意图解析与任务定义，默认收起，与工具卡同一层缩进。
+
+    与思考块共用一套折叠，但不跟着 `/thinking` 开关走：那条开关管的是模型的
+    草稿，这一块是系统按规则给出的「这一轮按什么理解、要交什么」，它本身就是
+    结论的一部分，藏起来等于让用户看不见计划与实际做法的关系。
+
+    正文是纯文本（`route_adapter.describe` 写的），不做 Markdown 解析：里面是
+    编号与短句，重排一遍只会多一层解析。
+    """
+
+    DEFAULT_CSS = palette.css("""
+    RoutePartView {
+        height: auto;
+        /* 与工具卡同一列：两者都是「这一步的过程」，只是一个是计划、一个是执行。 */
+        margin: 0 0 1 4;
+        border-left: thick $vsa-line;
+    }
+    RoutePartView .fold-header { color: $vsa-text-3; }
+    RoutePartView .fold-body { color: $vsa-text-2; }
+    """)
+
+    def __init__(self, part: Part) -> None:
+        head, body = split_route(part.text)
+        super().__init__(title=head, classes="part part-route")
+        self.part_id = part.id
+        # 记成「已经写出去的那一份」：`CoalescedText` 的窗口按它判有没有新内容，
+        # 不记的话轮末那次 flush 会以为正文还是空的。
+        self._start_window(body)
+        self.write_text(body)
+
+    def sync(self, part: Part) -> None:
+        """整块重写。它不流式：解析完成时才发一次，重建时也只是一段固定文本。"""
+        head, body = split_route(part.text)
+        changed = head != self._title
+        self._title = head
+        self._start_window(body)
+        self.write_text(body)
+        if changed:
+            # 标题行在 `compose` 里建，这里按类名找；还没挂上时循环一次也不走。
+            for header in self.query(".fold-header"):
+                header.update(self._header_text())
 
 
 class ToolCard(Container):
@@ -1933,6 +1989,8 @@ class MessagesPane(ScrollableContainer):
             return PatchPartView(part)
         if part.type is PartType.SUMMARY:
             return SummaryPartView(part)
+        if part.type is PartType.ROUTE:
+            return RoutePartView(part)
         return SimplePartView(part)
 
     def _build_and_register(

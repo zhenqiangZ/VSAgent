@@ -12,11 +12,11 @@ UniProt 回答「这是什么蛋白」，ChEMBL 回答「什么东西能结合�
 `search_actives` 回答「这个靶点有哪些已知配体」，一次调用同时给出上面三样东西：
 一行摘要、一个 `ligandset` 句柄、一份写盘的完整活性表。
 
-另一个工具 `find_analogs` 回答「还有什么东西长得像它」（新颖性检查与骨架跃迁）。
+另一个工具 `search_analogs` 回答「还有什么东西长得像它」（新颖性检查与骨架跃迁）。
 
 **「这个分子是什么来头」不在本模块出工具**：那个问题要同时问两个库——PubChem 给身份
 与计算性质，ChEMBL 给成药状态、类药性与适应症——所以它归 `pubchem.py` 的
-`lookup_compound` 一个入口（见那里的合并说明）。本模块只提供两段库函数供它调用：
+`fetch_compound` 一个入口（见那里的合并说明）。本模块只提供两段库函数供它调用：
 `find_by_inchikey`（InChIKey → 编号，两个库之间唯一可靠的桥）与 `describe_molecule`
 （编号 → 画像文本 + meta）。原先这里是第三个工具 `describe_molecule`，2026-10 合并掉了：
 模型得先判断「手里是编号还是 SMILES」再挑工具，判错就是一次白跑。
@@ -171,7 +171,7 @@ MIN_SIMILARITY = 40
 MAX_SIMILARITY = 100
 
 MAX_ANALOG_ROWS = 1000
-"""`find_analogs` 的取回上限。到这个量级就该收紧阈值，而不是翻更多页。"""
+"""`search_analogs` 的取回上限。到这个量级就该收紧阈值，而不是翻更多页。"""
 
 SIMILARITY_PAGE = 200
 """相似性检索的单页条数。
@@ -470,7 +470,7 @@ def normalize_molecule_id(value: str) -> str:
     if not CHEMBL_ID_PATTERN.fullmatch(code):
         raise http.ToolError(
             f"{value!r} 不是 ChEMBL 分子编号。编号形如 CHEMBL939，"
-            "取自 search_actives / find_analogs 的结果；"
+            "取自 search_actives / search_analogs 的结果；"
             "如果想按结构找，请直接给一段 SMILES"
         )
     return code
@@ -856,7 +856,7 @@ def describe_molecule(code: str, *, timeout: float = TIMEOUT) -> tuple[str, dict
     if not isinstance(record, Mapping) or not record.get("molecule_chembl_id"):
         raise http.ToolError(
             f"ChEMBL 里没有分子编号 {molecule_id}。"
-            "编号取自 search_actives / find_analogs 的输出，不要凭印象写一个"
+            "编号取自 search_actives / search_analogs 的输出，不要凭印象写一个"
         )
     mechanisms, targets = _mechanisms(molecule_id, timeout=timeout)
     indications, indication_total = _indications(molecule_id, timeout=timeout)
@@ -2129,11 +2129,11 @@ class SearchActivesTool(Tool):
         )
 
 
-class FindAnalogsTool(Tool):
+class SearchAnalogsTool(Tool):
     """按结构相似性找 ChEMBL 里的类似化合物，登记成 ligandset。"""
 
     spec = ToolSpec(
-        name="find_analogs",
+        name="search_analogs",
         description=(
             "按结构相似性找出 ChEMBL 里已知的类似化合物，并登记成一个配体集。"
             "用途：新颖性检查（命中的分子是不是早就有人做过）、骨架跃迁（换一副骨架）。"
@@ -2172,7 +2172,7 @@ class FindAnalogsTool(Tool):
         ledger = arguments.get("ledger")
         if not isinstance(ledger, SessionLedger):
             return ToolResult(
-                output="内核装配问题：find_analogs 需要一个会话登记表，但这次调用没有拿到。",
+                output="内核装配问题：search_analogs 需要一个会话登记表，但这次调用没有拿到。",
                 failed=True,
             )
         raw = str(arguments.get("query") or "").strip()
@@ -2332,7 +2332,7 @@ class FindAnalogsTool(Tool):
 
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具，按装配顺序。"""
-    return [SearchActivesTool(), FindAnalogsTool()]
+    return [SearchActivesTool(), SearchAnalogsTool()]
 
 if __name__ == "__main__":
     from debug_tools import main

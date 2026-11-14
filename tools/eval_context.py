@@ -59,7 +59,7 @@ from vsagent.core.agent.prompt import (  # noqa: E402
     is_key_line,
     stable_prefix,
 )
-from vsagent.core.agent.spawn import AgentStatusTool, SpawnAgentTool  # noqa: E402
+from vsagent.core.agent.spawn import AgentStatusTool  # noqa: E402
 from vsagent.core.agent.task import TaskTool  # noqa: E402
 from vsagent.core.agent.toolset import LoadToolsTool, hidden_names  # noqa: E402
 from vsagent.core.agent.tools import (  # noqa: E402
@@ -118,7 +118,6 @@ def tool_specs(
         ReadTurnTool(),
         TaskTool(),
         LoadToolsTool(),
-        SpawnAgentTool(),
         AgentStatusTool(),
         *event_tools(),
     ]

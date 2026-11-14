@@ -14,6 +14,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# 路由（意图解析）默认是 shadow，会在每一轮之前多问一次模型。这里的假服务按固定
+# 脚本应答，多出来的那一次会把整条脚本错开一位，后面的断言全部对不上。
+# 界面与循环的断言与那一次解析无关，整份冒烟测试关掉它。
+os.environ.setdefault("VSA_ROUTE", "off")
+
 import vsagent  # noqa: E402
 import re  # noqa: E402
 from rich.cells import cell_len  # noqa: E402
@@ -94,6 +99,7 @@ from vsagent.widgets.messages_pane import (  # noqa: E402
     MAX_MOUNTED,
     MessagesPane,
     ReasoningPartView,
+    RoutePartView,
     SimplePartView,
     TextPartView,
     ToolCard,
@@ -3546,8 +3552,8 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         total = len(app.command_registry.all())
         check(listed == total, f"打一个 / 列出全部命令：列了 {listed} 条，注册表 {total} 条")
         check(
-            bool(popup.visible_items) and popup.visible_items[0].startswith("/agent"),
-            f"候选按命令名排序，头一条是 /agent：{popup.visible_items[:2]}",
+            bool(popup.visible_items) and popup.visible_items[0].startswith("/agents"),
+            f"候选按命令名排序，头一条是 /agents：{popup.visible_items[:2]}",
         )
         await type_text(pilot, "hel")
         await pilot.pause()
@@ -3931,6 +3937,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             PartType.PATCH,
             PartType.ERROR,
             PartType.SUMMARY,
+            PartType.ROUTE,
         }
         unrouted = sorted(item.value for item in set(PartType) - routed)
         check(not unrouted, f"每种 Part 都归入了渲染路径，未归入的：{unrouted}")
@@ -3957,6 +3964,33 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(
             (restored.patch_added, restored.patch_removed) == (7, 2),
             "补丁统计随会话一起存取",
+        )
+
+        # 意图与任务那一块：ROUTE 必须走折叠块，第一次出现就是收起的，
+        # 标题取文本第一行（`route_adapter.describe` 的约定），余下才是正文。
+        route_text = (
+            "意图与任务 · 新任务 · 1 个角色 · shadow\n\n"
+            "[意图]\n  类型：structure_discovery\n\n"
+            "[任务]\n  task_0123abcd · rev 0 · ready"
+        )
+        route_view = MessagesPane()._build_part(Part(type=PartType.ROUTE, text=route_text))
+        check(
+            isinstance(route_view, RoutePartView),
+            f"ROUTE 走折叠块：{type(route_view).__name__}",
+        )
+        check(
+            route_view._title == "意图与任务 · 新任务 · 1 个角色 · shadow",
+            f"标题取第一行：{route_view._title!r}",
+        )
+        check(not route_view._expanded, "过程记录默认收起")
+        route_body = str(route_view._body.render())
+        check(
+            "[任务]" in route_body and "task_0123abcd" in route_body,
+            f"正文是余下的那几段：{route_body!r}",
+        )
+        check(
+            "意图与任务" not in route_body,
+            "标题那一行不重复进正文",
         )
 
         # 文件补全要跳过生成目录。造一棵自己的小目录树，免得这条检查随仓库里有什么而变。

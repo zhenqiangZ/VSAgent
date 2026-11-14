@@ -112,17 +112,17 @@ python tests/verify_exe.py         # ConPTY 截图验证，需要 Windows
 
 ## 文档
 
-四份，按读法分工：
+五份，按读法分工：
 
 | 文件 | 内容 |
 | --- | --- |
 | `docs/design.md` | 系统现在是什么样：分层、内核、上下文、事件层、工具族、界面、网页、状态 |
-| `docs/screening-playbook.md` | 筛选流程的细则：四个确认点、口袋、对接、打分、开工盘点 |
+| `dist/rules/` | 四档规则：不变式（`global/`）、每个角色交什么（`agents/`）、每一步做到什么算完成（`stages/`）、方法与阈值（`references/`，按需读取） |
 | `docs/history.md` | 每个决定当时的约束、做法与依据 |
 | `docs/review.md` | 实测读数与失败模式 |
 | `docs/reference.md` | 判据来源、外部服务与本机路径、环境变量 |
 
-`AGENTS.md` 是给模型看的项目规则与判据，每个确认点末尾指向细则的一节。
+`dist/AGENTS.md` 是给模型看的项目规则与判据，每个确认点末尾指向 `dist/rules/` 里的一节。
 
 ## 边界
 

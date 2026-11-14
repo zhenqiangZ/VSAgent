@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..file_log import record as log_read
-from .context import page_lines, render_turn_text, split_turns, step_at
+from vsagent.core.agent.planning.context import page_lines, render_turn_text, split_turns, step_at
 
 # bash 一次调用的等待上限。
 #

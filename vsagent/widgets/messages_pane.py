@@ -12,8 +12,8 @@ from textual.widget import Widget
 from textual.widgets import Markdown, Static
 
 from .. import palette
-from ..core.agent.event_log import artifact_refs
-from ..core.agent.topics import (
+from vsagent.core.agent.state.event_log import artifact_refs
+from vsagent.core.agent.state.topics import (
     TopicView,
     position_key,
     step_seconds,

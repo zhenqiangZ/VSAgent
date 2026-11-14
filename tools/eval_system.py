@@ -38,10 +38,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from vsagent.core.agent.capability_router import DENIAL_RULES, CapabilityRouter  # noqa: E402
-from vsagent.core.agent.contracts import TaskSpec  # noqa: E402
-from vsagent.core.agent.coordinator import build_tasks  # noqa: E402
-from vsagent.core.agent.profiles import profile  # noqa: E402
+from vsagent.core.agent.planning.capability_router import DENIAL_RULES, CapabilityRouter
+from vsagent.core.agent.roles.contracts import TaskSpec
+from vsagent.core.agent.execution.coordinator import build_tasks
+from vsagent.core.agent.roles.profiles import profile
 
 
 @dataclass(frozen=True)

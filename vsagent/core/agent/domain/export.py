@@ -37,7 +37,7 @@ from urllib.parse import quote
 
 from ...paths import project_root
 from ...models import Hypothesis
-from ..ledger import (
+from vsagent.core.agent.state.ledger import (
     ArtifactHandle,
     LigandSetHandle,
     ReceptorHandle,

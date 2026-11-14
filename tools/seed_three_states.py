@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from vsagent.core import live
-from vsagent.core.agent.event_log import seal_range
+from vsagent.core.agent.state.event_log import seal_range
 from vsagent.core.models import Message, Part, PartType, Session, ToolStatus
 from vsagent.core.session_manager import SessionManager
 

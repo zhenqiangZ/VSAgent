@@ -23,7 +23,7 @@ import io
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..ledger import LigandSetHandle, SessionLedger, expect_handle, fingerprint_path
+from vsagent.core.agent.state.ledger import LigandSetHandle, SessionLedger, expect_handle, fingerprint_path
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
 from . import ligand, products
 from .chemistry import CHEM_TOOL_DESCRIPTION_NOTE, require_chem

@@ -25,13 +25,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from vsagent.core.agent.capabilities import ROLES  # noqa: E402
+from vsagent.core.agent.roles.capabilities import ROLES
 from vsagent.core.agent.domain.all_tools import catalog, domain_tools  # noqa: E402
 from vsagent.core.agent.domain.campaign import AssessCampaignTool  # noqa: E402
 from vsagent.core.agent.domain.survey import SurveyStructuresTool  # noqa: E402
 from vsagent.core.agent.domain.export import OpenViewerTool, WriteRunTool  # noqa: E402
 from vsagent.core.agent.permission import PATH_ARGUMENTS, PLAN_DENY  # noqa: E402
-from vsagent.core.agent.prompt import (  # noqa: E402
+from vsagent.core.agent.roles.prompt import (  # noqa: E402
     REFERENCE_RULE_DIR,
     RULES_DIR_ENV,
     agent_rules,
@@ -47,9 +47,9 @@ from vsagent.core.agent.prompt import (  # noqa: E402
     stable_prefix,
     stage_rules,
 )
-from vsagent.core.agent.stages import STAGES  # noqa: E402
+from vsagent.core.agent.planning.stages import STAGES
 from vsagent.core.agent.toolset import hidden_names  # noqa: E402
-from vsagent.core.agent.toolprofiles import ORCHESTRATOR, keeps  # noqa: E402
+from vsagent.core.agent.roles.toolprofiles import ORCHESTRATOR, keeps
 from vsagent.core.agent.tools import (  # noqa: E402
     BashTool,
     GrepTool,
@@ -58,7 +58,7 @@ from vsagent.core.agent.tools import (  # noqa: E402
     ToolRegistry,
     WriteTool,
 )
-from vsagent.core.agent.workspace import Workspace  # noqa: E402
+from vsagent.core.agent.research.workspace import Workspace
 from vsagent.core.models import Session  # noqa: E402
 
 # 固定那几段的预算：身份、假设契约、路线判断、操作纪律、shell、登记表、记忆、事件。

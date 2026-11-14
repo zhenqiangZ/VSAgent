@@ -97,15 +97,15 @@ P-80 的硬闸门只有在「计划本身能补齐」时才成立。2026-11-13 �
 
 ## 出处
 
-- 角色 / 能力 / 族 / 权限：`vsagent/core/agent/capabilities.py`
-- 前置关系 / 缺前置判据：`vsagent/core/agent/capability_router.py`
-- 报告必填：`vsagent/core/agent/profiles.py`（`REPORT_REQUIREMENTS`）
-- 任务翻译 / 权限字段 / 角色子集：`vsagent/core/agent/coordinator.py`
-- 派发、幂等与缺前置拦截：`vsagent/core/agent/dispatcher.py`、`spawn.py`
-- 并行 / 失败传播：`vsagent/core/agent/scheduler.py`
-- 深度 / 上下文复制：`vsagent/core/agent/host.py`
+- 角色 / 能力 / 族 / 权限：`vsagent/core/agent/roles/capabilities.py`
+- 前置关系 / 缺前置判据：`vsagent/core/agent/planning/capability_router.py`
+- 报告必填：`vsagent/core/agent/roles/profiles.py`（`REPORT_REQUIREMENTS`）
+- 任务翻译 / 权限字段 / 角色子集：`vsagent/core/agent/execution/coordinator.py`
+- 派发、幂等与缺前置拦截：`vsagent/core/agent/execution/dispatcher.py`、`execution/spawn.py`
+- 并行 / 失败传播：`vsagent/core/agent/execution/scheduler.py`
+- 深度 / 上下文复制：`vsagent/core/agent/execution/host.py`
 - 权限（准备类 ASK、Plan 禁令）：`vsagent/core/agent/permission.py`
-- 两档工具与角色例外：`vsagent/core/agent/toolprofiles.py`
+- 两档工具与角色例外：`vsagent/core/agent/roles/toolprofiles.py`
 
 核对命令：`python tools/check_capabilities.py`、`python tools/check_toolset.py`、
 `python tests/test_agent.py --only profiles`、`--only capabilities`、`--only scheduler`。

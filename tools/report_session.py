@@ -9,8 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from vsagent.core.agent.report import build, read_trace
-from vsagent.core.agent.trace import log_directory_for
+from vsagent.core.agent.execution.report import build, read_trace
+from vsagent.core.agent.state.trace import log_directory_for
 from vsagent.core.session_manager import SessionManager, default_state_path
 
 
@@ -190,7 +190,7 @@ const secs = (s) => s >= 120 ? (s / 60).toFixed(1) + ' 分' : s.toFixed(1) + ' �
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const money = (x) => x ? '$' + x.toFixed(4) : '—';
 
-// 上下文八层：与 core/agent/context.py 的 LAYER_ORDER、网页分析页的
+// 上下文八层：与 core/agent/planning/context.py 的 LAYER_ORDER、网页分析页的
 // ANALYSIS_LAYERS 同一份口径。旧 trace 的聚合 memory 只作为兼容层出现。
 const LAYER_ORDER = ['prefix', 'profile_memory', 'project_memory', 'task',
                      'event', 'recent', 'evidence', 'history'];

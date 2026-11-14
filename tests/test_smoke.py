@@ -31,9 +31,9 @@ from textual.widget import Widget  # noqa: E402
 from textual.widgets import Input, ListView  # noqa: E402
 
 from vsagent.app import VSAgentApp  # noqa: E402
-from vsagent.core.agent.memory import MemoryStore  # noqa: E402
+from vsagent.core.agent.state.memory import MemoryStore
 from vsagent.core.agent.permission import PermissionPolicy, Verdict  # noqa: E402
-from vsagent.core.agent.prompt import KEEP_MESSAGES  # noqa: E402
+from vsagent.core.agent.roles.prompt import KEEP_MESSAGES
 from vsagent.core.command_registry import CommandRegistry  # noqa: E402
 from vsagent.core.connection import (  # noqa: E402
     Connection,
@@ -1515,7 +1515,7 @@ async def run_topic_card_checks() -> None:
     单独开一个小应用，不经过模型服务：这里验的是「位置」与「可见性」，
     与一轮怎么跑无关。
     """
-    from vsagent.core.agent.event_log import record_step, seal_topic
+    from vsagent.core.agent.state.event_log import record_step, seal_topic
     from vsagent.core.models import Session
     from vsagent.widgets.topic_card import StepRow, TopicHeader
 
@@ -1774,8 +1774,8 @@ def run_topic_state_checks() -> None:
     失败与中断全靠轮末封存才显示的话，用户按停那一刻与真出错那一刻看到的
     都是同一副「进行中」的样子，事后也分不出谁是谁。
     """
-    from vsagent.core.agent.event_log import record_step
-    from vsagent.core.agent.topics import topic_views
+    from vsagent.core.agent.state.event_log import record_step
+    from vsagent.core.agent.state.topics import topic_views
     from vsagent.widgets.topic_card import detail_color, detail_text, topic_state
 
     def build(status: str, tool_status: ToolStatus, output: str) -> Session:
@@ -1855,7 +1855,7 @@ def run_topic_state_checks() -> None:
 
 async def run_artifact_row_checks() -> None:
     """主题下面那一行产物：收起时也在，名字点得动。"""
-    from vsagent.core.agent.event_log import seal_topic
+    from vsagent.core.agent.state.event_log import seal_topic
     from vsagent.widgets.topic_card import ArtifactRow
 
     session = Session(id="ses_artifact_row", title="产物行")
@@ -1919,7 +1919,7 @@ async def run_topic_scroll_checks() -> None:
     按总高度差补偿会把整屏平移：折叠由点击触发，变化发生在被点的那一行下面，
     视口上方一行都不该跟着动。三条路各验一次，外加「贴底时点一下不再被拽回底部」。
     """
-    from vsagent.core.agent.event_log import record_step, seal_topic
+    from vsagent.core.agent.state.event_log import record_step, seal_topic
     from vsagent.widgets.topic_card import StepRow, TopicHeader
 
     session = Session(id="ses_topic_scroll", title="折叠滚动")
@@ -2051,8 +2051,8 @@ async def run_live_step_checks() -> None:
     「正在运行 dock · 已 2 步」，第三步却不在清单上。这一行的状态取工具卡上的
     实时值，记成步前后是同一行。
     """
-    from vsagent.core.agent.event_log import record_step
-    from vsagent.core.agent.topics import step_status, topic_views
+    from vsagent.core.agent.state.event_log import record_step
+    from vsagent.core.agent.state.topics import step_status, topic_views
     from vsagent.widgets.topic_card import StepRow
 
     session = Session(id="ses_live_step", title="运行中的步")
@@ -2219,7 +2219,7 @@ def run_viewer_address_checks() -> None:
     所以两条分支各验一次。
     """
     from vsagent.core.agent.domain.export import viewer_address
-    from vsagent.core.agent.ledger import LedgerError, SessionLedger
+    from vsagent.core.agent.state.ledger import LedgerError, SessionLedger
 
     ledger = SessionLedger(snapshot_path=ROOT / ".probe" / "ledger_viewer.json")
     ledger.reset()

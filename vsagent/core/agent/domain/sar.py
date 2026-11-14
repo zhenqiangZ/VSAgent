@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..ledger import (
+from vsagent.core.agent.state.ledger import (
     ArtifactHandle,
     LigandSetHandle,
     SessionLedger,

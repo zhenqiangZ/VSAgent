@@ -15,12 +15,12 @@ from typing import Any
 from .domain.campaign import AssessCampaignTool
 from .domain.export import OpenViewerTool, WriteRunTool
 from .domain.survey import SurveyStructuresTool
-from .event_log import domain_tools as event_tools
-from .history import SearchHistoryTool
-from .hypothesis import HypothesisTool
-from .memory import RecallTool, RememberTool
-from .spawn import AgentStatusTool, DispatchCampaignTool
-from .task import TaskTool
+from vsagent.core.agent.state.event_log import domain_tools as event_tools
+from vsagent.core.agent.state.history import SearchHistoryTool
+from vsagent.core.agent.state.hypothesis import HypothesisTool
+from vsagent.core.agent.state.memory import RecallTool, RememberTool
+from vsagent.core.agent.execution.spawn import AgentStatusTool, DispatchCampaignTool
+from vsagent.core.agent.state.task import TaskTool
 from .tools import BashTool, GrepTool, PatchTool, ReadTool, ReadTurnTool, Tool, WriteTool
 from .toolset import LoadToolsTool
 

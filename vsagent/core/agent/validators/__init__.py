@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..contracts import CapabilityPlan, TaskSpec
+from vsagent.core.agent.roles.contracts import CapabilityPlan, TaskSpec
 from . import capability_guard, delivery, output_contract, task_precondition
 from .base import DEFAULT_MODE, ENV, MODES, Finding, Verdict, mode_from_env
 

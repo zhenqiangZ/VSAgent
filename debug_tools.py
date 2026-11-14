@@ -62,8 +62,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from vsagent.core.agent.context import EvidenceStore
-from vsagent.core.agent.ledger import SessionLedger
+from vsagent.core.agent.planning.context import EvidenceStore
+from vsagent.core.agent.state.ledger import SessionLedger
 from vsagent.core.agent.tools import Tool, ToolError, argument_error
 from vsagent.core.models import TaskState
 from vsagent.env import load_env

@@ -6,7 +6,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from vsagent.core.agent import intent  # noqa: E402
+from vsagent.core.agent.planning import intent
 
 DEFAULT_CASES = PROJECT_ROOT / ".probe/intent-cases.jsonl"
 

@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from vsagent.core.agent.capabilities import (  # noqa: E402
+from vsagent.core.agent.roles.capabilities import (  # noqa: E402
     CAPABILITIES,
     families_for,
     roles_with_capabilities,

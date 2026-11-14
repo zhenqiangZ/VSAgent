@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from vsagent.core.agent.intent_parser import IntentParseError, IntentParser  # noqa: E402
+from vsagent.core.agent.planning.intent_parser import IntentParseError, IntentParser
 from vsagent.core.agent.provider import OpenAICompatProvider, ProviderConfig  # noqa: E402
 
 

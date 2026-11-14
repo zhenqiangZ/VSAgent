@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..ledger import fingerprint_parts
+from vsagent.core.agent.state.ledger import fingerprint_parts
 
 PARAMS_FILE = "params.json"
 MAX_PRODUCT_TRIES = 1000

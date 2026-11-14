@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from ..contracts import TaskSpec
+from vsagent.core.agent.roles.contracts import TaskSpec
 from .base import Finding
 
 NAME = "task_precondition"

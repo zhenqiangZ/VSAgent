@@ -36,7 +36,7 @@ def _settle_lost_campaign(session: Session) -> None:
 
     只处理这三个状态：`planning` 是「排过计划」，可能是只做了预演，留着不算错。
     """
-    from .agent.campaign_state import DELEGATING, FAILED, INTEGRATION, RESEARCH
+    from vsagent.core.agent.execution.campaign_state import DELEGATING, FAILED, INTEGRATION, RESEARCH
 
     if session.campaign_state not in (DELEGATING, RESEARCH, INTEGRATION):
         return

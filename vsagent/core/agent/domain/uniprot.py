@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..ledger import SessionLedger, fingerprint_text
+from vsagent.core.agent.state.ledger import SessionLedger, fingerprint_text
 from ..tools import Tool, ToolResult, ToolSpec
 from . import http
 

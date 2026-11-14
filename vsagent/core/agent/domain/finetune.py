@@ -39,7 +39,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..ledger import (
+from vsagent.core.agent.state.ledger import (
     LigandSetHandle,
     ReceptorHandle,
     SessionLedger,

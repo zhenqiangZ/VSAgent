@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..contracts import TaskSpec
+from vsagent.core.agent.roles.contracts import TaskSpec
 from .base import Finding
 from .output_contract import NAME, unverifiable, verify
 

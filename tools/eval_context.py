@@ -41,7 +41,7 @@ from types import SimpleNamespace
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from vsagent.core.agent.context import (  # noqa: E402
+from vsagent.core.agent.planning.context import (  # noqa: E402
     EVIDENCE_REF_LIMIT,
     TOOL_ARCHIVE_MARK,
     ContextAssembler,
@@ -51,16 +51,16 @@ from vsagent.core.agent.context import (  # noqa: E402
     evidence_ref_of,
 )
 from vsagent.core.agent.domain.all_tools import domain_tools  # noqa: E402
-from vsagent.core.agent.event_log import domain_tools as event_tools  # noqa: E402
-from vsagent.core.agent.ledger import SessionLedger  # noqa: E402
-from vsagent.core.agent.memory import MemoryStore, RecallTool, RememberTool  # noqa: E402
-from vsagent.core.agent.prompt import (  # noqa: E402
+from vsagent.core.agent.state.event_log import domain_tools as event_tools
+from vsagent.core.agent.state.ledger import SessionLedger
+from vsagent.core.agent.state.memory import MemoryStore, RecallTool, RememberTool
+from vsagent.core.agent.roles.prompt import (  # noqa: E402
     estimate_tokens,
     is_key_line,
     stable_prefix,
 )
-from vsagent.core.agent.spawn import AgentStatusTool  # noqa: E402
-from vsagent.core.agent.task import TaskTool  # noqa: E402
+from vsagent.core.agent.execution.spawn import AgentStatusTool
+from vsagent.core.agent.state.task import TaskTool
 from vsagent.core.agent.toolset import LoadToolsTool, hidden_names  # noqa: E402
 from vsagent.core.agent.tools import (  # noqa: E402
     BashTool,
@@ -72,7 +72,7 @@ from vsagent.core.agent.tools import (  # noqa: E402
     ToolRegistry,
     WriteTool,
 )
-from vsagent.core.agent.workspace import Workspace  # noqa: E402
+from vsagent.core.agent.research.workspace import Workspace
 from vsagent.core.models import Message, Part, PartType, Session, ToolStatus  # noqa: E402
 from vsagent.core.session_manager import SessionManager, default_state_path  # noqa: E402
 

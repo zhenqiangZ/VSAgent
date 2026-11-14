@@ -8,21 +8,21 @@ from pathlib import Path
 from textual.app import App
 from textual.screen import Screen
 
-from .core.agent import toolprofiles
-from .core.agent.context import event_line
+from vsagent.core.agent.roles import toolprofiles
+from vsagent.core.agent.planning.context import event_line
 from .core.agent.coretools import build_core_tools
-from .core.agent.coordinator import Coordinator
-from .core.agent.dispatcher import AgentDispatcher
+from vsagent.core.agent.execution.coordinator import Coordinator
+from vsagent.core.agent.execution.dispatcher import AgentDispatcher
 from .core.agent.domain.all_tools import domain_tools
 from .core.agent.domain.corpus import ingest_files
 from .core.agent.domain.export import runs_dir, viewer_address
 from .core.web.service import WebService, web_root
-from .core.agent.event_log import render_event_detail
-from .core.agent.hooks import HookRunner, default_hooks_paths, load_hooks
-from .core.agent.host import AgentHost
-from .core.agent.ledger import LedgerError, SessionLedger
-from .core.agent.loop import AgentLoop, max_steps_from_env
-from .core.agent.memory import MemoryKind, MemoryStore
+from vsagent.core.agent.state.event_log import render_event_detail
+from vsagent.core.agent.execution.hooks import HookRunner, default_hooks_paths, load_hooks
+from vsagent.core.agent.execution.host import AgentHost
+from vsagent.core.agent.state.ledger import LedgerError, SessionLedger
+from vsagent.core.agent.execution.loop import AgentLoop, max_steps_from_env
+from vsagent.core.agent.state.memory import MemoryKind, MemoryStore
 from .core.memory import MemoryError as MemoryStoreError
 from .core.agent.permission import (
     PermissionPolicy,
@@ -35,16 +35,16 @@ from .core.agent.permission import (
     save_disabled,
     tools_config_path,
 )
-from .core.agent.prompt import KEEP_MESSAGES
+from vsagent.core.agent.roles.prompt import KEEP_MESSAGES
 from .core.agent.provider import (
     OpenAICompatProvider,
     ProviderConfig,
 )
-from .core.agent.route_adapter import RouteAdapter, mode_from_env
-from .core.agent.scheduler import AgentScheduler
+from vsagent.core.agent.planning.route_adapter import RouteAdapter, mode_from_env
+from vsagent.core.agent.execution.scheduler import AgentScheduler
 from .core.agent.validators import mode_from_env as validators_mode_from_env
 from .core.agent.tools import BASH_TIMEOUT, ToolRegistry
-from .core.agent.trace import TraceWriter, log_directory_for
+from vsagent.core.agent.state.trace import TraceWriter, log_directory_for
 from .core.command_registry import CommandRegistry
 from .core.connection import Connection, connection_path_for, load_connection, save_connection
 from .core.event_bus import EventBus
@@ -98,7 +98,7 @@ def subagent_label(session: object) -> str:
     title = str(getattr(session, "title", "") or "")
     if not role:
         return title
-    from .core.agent.profiles import profile as _profile
+    from vsagent.core.agent.roles.profiles import profile as _profile
 
     try:
         name = _profile(role).title.split("：")[0]

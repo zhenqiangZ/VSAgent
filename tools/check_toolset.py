@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from vsagent.core.agent.coretools import build_core_tools  # noqa: E402
-from vsagent.core.agent.prompt import estimate_tokens  # noqa: E402
-from vsagent.core.agent.toolprofiles import (  # noqa: E402
+from vsagent.core.agent.roles.prompt import estimate_tokens
+from vsagent.core.agent.roles.toolprofiles import (  # noqa: E402
     ORCHESTRATOR,
     WORKER,
     WORKER_CORE,

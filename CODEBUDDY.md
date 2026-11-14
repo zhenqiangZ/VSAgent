@@ -59,9 +59,11 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 依赖手工装，测试是**直接跑的脚本**。模块地图见 `docs/design.md` 第十节（不给逐文件行数，
 那类数字随改动漂移；也不含 `web/` `viz/`）。
 
-CI 只有一个 `.github/workflows/ci.yml`：Linux 上两个 job，判据脚本四个——内核 job 跑
-`test_agent.py`、`check_prefix.py` 与 `check_style.py`，界面 job 跑 `test_smoke.py`；
-**两份依赖都装**（叠合与先验口袋那几条断言需要 gemmi，缺了会直接抛出 ToolError）。
+CI 只有一个 `.github/workflows/ci.yml`：Linux 上两个 job——内核 job 依次跑
+`check_repo.py`（凭据扫描，不装依赖也能跑）、`test_agent.py`、`check_capabilities.py`、
+`check_toolset.py`、`check_prefix.py`、`check_style.py`，界面 job 跑 `test_smoke.py`
+（它是超集，末尾会重跑 `test_agent.py` 的全部断言）。**两份依赖都装**（叠合与先验口袋
+那几条断言需要 gemmi，缺了会直接抛出 ToolError）。本地想一次跑完用 `tools/check_all.py`。
 没有 Windows job——`verify_exe` 需要 pywinpty，那条路还没有人验证过。
 
 代码注释与 docstring 一律用中文写，解释「为什么这么写」。新增代码跟随这一惯例。
@@ -123,6 +125,7 @@ python -m vsagent.core.web     # 包内实现的独立进程壳，--port 优先�
 python tools/serve_web.py           # 同一个 WebServer 的 CLI 壳（--state/--runs/--web/--corpus/--port）
 
 # 判据脚本
+python tools/check_all.py           # 一条命令按顺序跑完下面全部判据；--list 列出，--only 过滤
 python tools/check_web_api.py       # 在副本上起服务，验 API 形状 / 并发 / 写撕裂读 / 语料读写
 python tools/check_retrieval.py     # 检索评测：词法单路 / 双词法 / 三路 + 组级指标，三条必须满足的条件
 python tools/check_retrieval.py --list          # 只看评测集概况
@@ -239,6 +242,12 @@ graph TD
    翻译层。「把界面换成网页端」因此不需要动内核。
 
 ### 内核（`core/agent/`）
+
+这一层按用途分五组，下文提到文件名时省略了组名：`planning/`（意图、任务编译、能力路由、
+上下文装配）、`roles/`（能力与族、角色说明书、系统提示、`contracts/` 协议）、
+`execution/`（驱动、调度、派发、宿主、报告）、`state/`（事件流水、登记表、记忆、假设、主题）、
+`research/`（科研对象与证据）。根上只留 `tools.py` / `toolset.py` / `coretools.py` /
+`permission.py` / `provider.py` 与 `domain/`、`validators/` 两个包。
 
 - `loop.py` — `AgentLoop` 是唯一的驱动，界面只认它的 `stream_reply / run_bash / cancel`。
   它**不维护第二份历史**：每一步从 `Session` 现场重建模型消息。上限
@@ -599,7 +608,7 @@ graph TD
   主题就排几行标题，点开一个才展开它的过程。三层：主题头（标题、状态、步数与工具数、
   一句结论）→ 步行（序号、做了什么、耗时、成败）→ 工具卡，缩进依次加深。思考过程属于
   某一步，缩进与步行一致：左边那条竖线与步行的「▸」同列，正文与步行的文字同列。
-  主题头与步行由 `core/agent/topics.py` 从 `session.messages` 与 `session.events` 算出来，
+  主题头与步行由 `core/agent/state/topics.py` 从 `session.messages` 与 `session.events` 算出来，
   边界是 `Event.cut` 的 (消息, Part) 位置，与装配器读的是同一组数。主题可以从一条
   助手消息中间开始（`close_topic` 的切点就在同一条消息里），所以位置 0 的头挂在消息
   外面，消息中间的头插在 `parts_box` 里；`-pane-row` 让两种挂法从同一列开始。
@@ -667,7 +676,7 @@ graph TD
 统计。切点用的是 `Event.cut_message` / `cut_part`，与装配器同一组数，所以页面上的分段
 不会跟模型看到的对不上。
 
-`/analysis` 与 `tools/report_session.py` 共用 `core/agent/report.py`：轮按用户消息切，
+`/analysis` 与 `tools/report_session.py` 共用 `core/agent/execution/report.py`：轮按用户消息切，
 token 与费用取助手消息自带的数，缓存命中、逐步耗时与分层占用取 trace 的
 `context.metrics`，工具失败与主题未决项汇总成异常清单。trace 在状态文件旁边的 `logs/`，
 没有它时照常给轮与主题的统计，`hasTrace` 为 false。原话与正文各截到 600 字。

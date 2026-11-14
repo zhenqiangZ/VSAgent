@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..ledger import SessionLedger, fingerprint_parts, fingerprint_path
+from vsagent.core.agent.state.ledger import SessionLedger, fingerprint_parts, fingerprint_path
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
 from ...file_log import record as log_read
 from . import pdbtext
@@ -1097,7 +1097,7 @@ class PrepareReceptorTool(Tool):
 
         # 类型对不上交给登记表那层判：它给的是「这个参数要的是 receptor，但收到
         # artifact#1」这样的中文，比在这里再写一遍判断准。
-        from ..ledger import ReceptorHandle, expect_handle
+        from vsagent.core.agent.state.ledger import ReceptorHandle, expect_handle
 
         try:
             expect_handle(entry, ReceptorHandle, "structure")
@@ -1151,7 +1151,7 @@ class PrepareReceptorTool(Tool):
                     failed=True,
                 )
             try:
-                from ..ledger import ArtifactHandle, expect_handle
+                from vsagent.core.agent.state.ledger import ArtifactHandle, expect_handle
 
                 pocket_entry = ledger.get(raw_pocket)
                 expect_handle(pocket_entry, ArtifactHandle, "pocket")

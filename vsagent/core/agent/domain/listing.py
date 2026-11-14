@@ -23,7 +23,7 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..ledger import (
+from vsagent.core.agent.state.ledger import (
     _FILE_STATE_NOTES,
     Entry,
     Kind,

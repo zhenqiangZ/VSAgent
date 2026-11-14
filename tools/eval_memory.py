@@ -36,12 +36,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from vsagent.core.agent.memory import (  # noqa: E402
+from vsagent.core.agent.state.memory import (  # noqa: E402
     MAX_ENTRIES,
     RESIDENT_LIMIT,
     MemoryStore,
 )
-from vsagent.core.agent.prompt import estimate_tokens  # noqa: E402
+from vsagent.core.agent.roles.prompt import estimate_tokens
 
 
 def normalize(text: str) -> str:

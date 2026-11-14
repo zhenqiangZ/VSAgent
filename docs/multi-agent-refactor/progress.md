@@ -1311,3 +1311,39 @@
   总览表同步。
 - **没做**：`dist/VSAgent` 仍未重建；`AgentProfile.retries` 有意不加——重试会把
   「失败」变成「慢失败」，先让时限把卡住的情形暴露出来再说。
+
+### P-84 代码结构：`core/agent/` 分五组，判据一条命令
+
+- **起因**：`core/agent/` 根目录三十来个文件平铺，「谁能改计划」「谁在跑」「谁只是数据」
+  全靠记文件名；改一个模块要在一屏目录列表里找。这是纯结构整理，**不改任何调用顺序**。
+- **做法**：按「一个模块被谁用、什么时候被调」分五组——
+  `planning/`（intent / intent_parser / task_context / task_compiler / capability_router /
+  route_adapter / stages / context）、`roles/`（capabilities / profiles / toolprofiles /
+  prompt / contracts/）、`execution/`（coordinator / scheduler / dispatcher / dependency /
+  campaign_state / spawn / host / reports / report / loop / hooks）、
+  `state/`（event_log / ledger / memory / hypothesis / hypothesis_review / history / task /
+  topics / trace）、`research/`（research_objects / research_workspace / workspace /
+  evidence_registry）。根上只留 `tools.py` / `toolset.py` / `coretools.py` /
+  `permission.py` / `provider.py` 与 `domain/`、`validators/` 两个包。
+- **import**：搬过的文件、以及指向它们的 import 一律改成绝对路径（其余相对 import 原地
+  不动，免得整仓 diff 都是 `..` 换全路径）。89 个文件、329 行。
+- **踩到的坑**：`roles/prompt.py` 里 `rules_directory()` 用
+  `Path(__file__).resolve().parents[3]` 算仓根，搬深一层之后它指到 `vsagent/` 的上一层，
+  规则文件读不到、`read_rule` 返回空串，**程序照常启动**——只有 `rules` 那一组判据红。
+  改走 `core/paths.py:project_root()`，与层数无关。这是本次唯一一处非机械改动。
+  另有两处不在扫描范围里的引用：仓根的 `debug_tools.py`（`context` / `ledger`），
+  以及 `tools/report_session.py` 里一段网页注释的路径。
+- **新增 `tools/check_all.py`**：按固定顺序跑 agent → smoke → capabilities → toolset →
+  prefix → style → repo，任一条非零就停并打印末尾 40 行。`--list` / `--only <子串>`。
+  理由：这些判据过去是「想起来才跑一个」，最常见的失败形态是根本没跑。
+- **归档**：`docs/runtime-fixes-plan.md`、`-2.md`、`knowledge-center-plan.md` 移到
+  `docs/archive/`（做完的计划，不随代码更新）；`review.md` 是活文档，留在 `docs/`。
+- **判据**：`tests/test_agent.py` 4,752 项 `EXIT=0`（项数与整理前一致，`--only` 语义未变）；
+  `tests/test_smoke.py` 5,663 项 `EXIT=0`；`check_capabilities` / `check_toolset` /
+  `check_prefix` / `check_style` / `check_repo` 全 `EXIT=0`；`import vsagent.app` 通过。
+- **没做**：`tests/test_agent.py` 拆成 `tests/checks/*.py`、`tools/` 再分目录——
+  这两项只动组织不动行为，而前者要拆的是项目唯一的主判据（27k 行、共享夹具与
+  `GROUPS` 注册表），拆坏的代价是**把安全网本身弄坏**。留作单独一轮。
+  exe 挪出 `dist/` 同样没做：`rules_directory()` 的冻结分支按 `sys.executable` 的
+  同级目录找规则，挪到 `dist/bin/` 就得再加一层回退，而验证它必须完整打一次包；
+  当前 `dist/VSAgent` + `dist/AGENTS.md` + `dist/rules/` 已经满足「规则可读」。

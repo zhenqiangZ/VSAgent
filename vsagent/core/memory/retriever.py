@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 
-from ..agent.prompt import estimate_tokens
+from vsagent.core.agent.roles.prompt import estimate_tokens
 from ..rrf import RRF_K
 from ..text import terms
 from .models import (

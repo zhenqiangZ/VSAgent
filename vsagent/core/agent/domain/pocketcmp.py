@@ -15,7 +15,7 @@ import asyncio
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from ..ledger import ArtifactHandle, LedgerError, ReceptorHandle, SessionLedger, expect_handle
+from vsagent.core.agent.state.ledger import ArtifactHandle, LedgerError, ReceptorHandle, SessionLedger, expect_handle
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
 from . import chembl, export, pdbtext, pockets, products, uniprot
 

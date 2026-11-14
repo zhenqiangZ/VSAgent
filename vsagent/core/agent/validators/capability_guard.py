@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from ..contracts import CapabilityPlan
+from vsagent.core.agent.roles.contracts import CapabilityPlan
 from ..toolset import family_of
 from .base import Finding
 

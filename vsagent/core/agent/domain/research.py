@@ -22,12 +22,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..evidence_registry import CLASSES, EXPERIMENTAL, LABELS
-from ..evidence_registry import add as add_evidence
-from ..hypothesis_review import VERDICT_LABELS
-from ..hypothesis_review import apply as apply_review
-from ..hypothesis_review import review
-from ..research_objects import KINDS, KIND_LABELS, ObjectError, make_id
+from vsagent.core.agent.research.evidence_registry import CLASSES, EXPERIMENTAL, LABELS
+from vsagent.core.agent.research.evidence_registry import add as add_evidence
+from vsagent.core.agent.state.hypothesis_review import VERDICT_LABELS
+from vsagent.core.agent.state.hypothesis_review import apply as apply_review
+from vsagent.core.agent.state.hypothesis_review import review
+from vsagent.core.agent.research.research_objects import KINDS, KIND_LABELS, ObjectError, make_id
 from ..tools import Tool, ToolResult, ToolSpec
 
 __all__ = [

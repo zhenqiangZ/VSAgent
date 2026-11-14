@@ -712,7 +712,7 @@ inbox 里已有的文件名。
 折叠之后的滚动位置按锚点补偿：补偿量取被点的主题头、被点的步行或视口最上面那一块的屏幕行差，
 改完放回原来的行。补偿之后不再贴底就把跟随关掉，下一次流式输出不会把视口拽回底部。
 
-主题头与步行由 `core/agent/topics.py` 从 `session.messages`、`session.events`、
+主题头与步行由 `core/agent/state/topics.py` 从 `session.messages`、`session.events`、
 `session.pending_steps`、`live.snapshot` 算出，边界是 `Event.cut` 的（消息, Part）位置，
 与装配器读的是同一组数。
 
@@ -803,7 +803,7 @@ inbox 里已有的文件名。
 异常清单。trace 按会话分文件写在状态文件旁边的 `logs/` 下，没有这一份时仍然给轮与主题的
 统计，响应里的 `hasTrace` 为 false，页面据此说明逐步读数缺失。原话与正文各截到 600 字，
 整份正文不随分析发出去。这一份统计与 `tools/report_session.py` 共用
-`core/agent/report.py`，命令行与网页不会得出两套数。
+`core/agent/execution/report.py`，命令行与网页不会得出两套数。
 
 `/live` 不读状态文件：页面两秒拉一次，而 `state.toml` 有几 MB。快照是 `core/live.py` 写的
 `live/<sid>.json`，只装当前主题的序号与标题、已完成的步、当前工具与状态、首行结果、是否在等
@@ -932,36 +932,37 @@ multipart 是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 
 | `core/paths.py` | 项目根、语料根、运行目录根 |
 | `core/parse.py`、`chunker.py`、`index.py`、`embed.py`、`corpus.py` | 语料解析、切块、索引、向量、检索 |
 | `core/web/{routes,service}.py` | 网页服务与路由表 |
-| `core/agent/loop.py` | 唯一驱动，`stream_reply` / `run_bash` / `cancel` |
-| `core/agent/context.py` | 八层装配、预算、降级、证据收集 |
-| `core/agent/event_log.py` | 主题与步的流水、封存、召回 |
-| `core/agent/prompt.py` | 稳定前缀、规则注入、平台说明、压缩原语 |
 | `core/agent/tools.py` | `Tool` / `ToolRegistry` / 内核文件工具 / 参数校验 |
 | `core/agent/toolset.py` | 按族装载、轮末卸载、看不见工具时的解释 |
-| `core/agent/permission.py`、`hooks.py` | 权限判定与外部钩子 |
-| `core/agent/ledger.py`、`memory.py` | handle 登记表、跨会话记忆 |
-| `core/agent/hypothesis.py`、`task.py` | 假设对象与任务状态工具 |
-| `core/agent/topics.py` | 主题视图、步状态、运行中的那一步 |
-| `core/agent/host.py`、`spawn.py` | 会话宿主与子 agent 派发 |
-| `core/agent/contracts/` | 五类协议：`IntentSpec` / `TaskSpec` / `CapabilityPlan` / `AgentTask` / `AgentReport`；不 import 运行期模块 |
-| `core/agent/intent_parser.py`、`task_context.py` | 把一句话解析成 `IntentSpec`；判定轮次类型与新旧约束怎么合并 |
-| `core/agent/task_compiler.py` | `IntentSpec` → `TaskSpec`，纯规则，不调模型 |
-| `core/agent/capabilities.py`、`capability_router.py` | 十个能力到工具族的映射；模板打能力标签、依赖与并行 |
-| `core/agent/route_adapter.py` | `off / shadow / enforce` 三档开关，失败时不改会话状态 |
+| `core/agent/permission.py` | 权限判定（外部钩子在 `execution/hooks.py`） |
+| `core/agent/coretools.py` | 常驻核心工具的装配清单 |
+| `core/agent/provider.py` | 模型协议（OpenAI 兼容 SSE） |
 | `core/agent/validators/` | 四层运行时校验：能力守卫、任务前置、输出合同、交付验收 |
-| `core/agent/profiles.py`、`reports.py` | 十个角色的说明书与派发前授权核对；从子会话机械抽取报告 |
-| `core/agent/dispatcher.py`、`scheduler.py`、`coordinator.py`、`dependency.py` | 建会话与判重、按依赖分层调度、能力计划翻任务、依赖图 |
-| `core/agent/research_objects.py`、`research_workspace.py`、`evidence_registry.py`、`hypothesis_review.py` | 科研对象与工作区、证据分级、假设评审 |
-| `core/agent/campaign_state.py`、`stages.py` | 战役状态机与计划戳记；从子目标推导当前阶段 |
-| `core/agent/toolprofiles.py`、`coretools.py` | 两档工具档位；常驻工具清单 |
-| `core/agent/trace.py`、`provider.py` | 事件日志与模型协议（OpenAI 兼容 SSE） |
-| `core/agent/report.py` | 会话分析：轮、步、token、工具、主题、异常 |
 | `core/agent/domain/` | 60 个领域工具、20 族，外加 `http.py`（唯一网络出口）与库层模块 |
+| `core/agent/{planning,roles,execution,state,research}/` | 其余模块按用途分五组，见下一张表 |
 | `dist/rules/` | 四档规则：`global/` 3、`agents/` 10、`stages/` 5、`references/` 5 |
 | `screens/`、`widgets/`、`styles/app.tcss`、`palette.py` | 屏幕、部件与样式；终端色值只在 `palette.py` |
 | `web/`、`viz/` | 网页前端与三维查看器的构建产物 |
 | `tests/test_agent.py`、`tests/test_smoke.py` | 内核判据与界面判据（直接跑的脚本） |
 | `tools/` | 判据脚本与探针 |
+
+`core/agent/` 原来三十来个文件平铺在一个目录里，「谁能改计划」「谁在跑」「谁只是数据」
+全靠记文件名。现在按**一个模块被谁用、什么时候被调**分五组，根上只留跨组的基础设施
+（`tools.py` / `toolset.py` / `coretools.py` / `permission.py` / `provider.py`）和两个
+本来就成包的目录（`domain/` 领域工具、`validators/` 运行时校验）。
+
+| 组 | 模块 | 管什么 |
+| --- | --- | --- |
+| `planning/` | `intent.py`、`intent_parser.py`、`task_context.py`、`task_compiler.py`、`capability_router.py`、`route_adapter.py`、`stages.py`、`context.py` | 一句话怎么变成计划：意图规则、解析成 `IntentSpec`、编译成 `TaskSpec`、能力闭包与路由开关；`context.py` 是装配用的八层模型 |
+| `roles/` | `capabilities.py`、`profiles.py`、`toolprofiles.py`、`prompt.py`、`contracts/` | 角色本身：能力与族、说明书与报告必填、两档工具、系统提示与规则注入、五类协议 |
+| `execution/` | `coordinator.py`、`scheduler.py`、`dispatcher.py`、`dependency.py`、`spawn.py`、`host.py`、`campaign_state.py`、`reports.py`、`report.py`、`loop.py`、`hooks.py` | 跑起来的那一层：计划翻任务、建会话与判重、分层调度、子 agent 派发、会话宿主、状态机、报告抽取、唯一驱动与外部钩子 |
+| `state/` | `event_log.py`、`ledger.py`、`memory.py`、`hypothesis.py`、`hypothesis_review.py`、`history.py`、`task.py`、`topics.py`、`trace.py` | 落在磁盘上的东西：主题与步的流水、handle 登记表、跨会话记忆、假设与假设评审、任务状态、主题视图、追踪 |
+| `research/` | `research_objects.py`、`research_workspace.py`、`workspace.py`、`evidence_registry.py` | 科研对象与工作区、证据分级 |
+
+分组只影响 import 路径，不改变任何调用顺序。移动时把**搬过的文件和指向它们的 import**
+改成绝对形式（其余相对 import 原地不动，免得整仓 diff 都是 `..` 换全路径）。顺带修了
+`roles/prompt.py` 里算仓根的 `parents[3]`：搬一层目录它就静默指到别处，规则文件读不到而
+程序照常启动——现在改走 `core/paths.py:project_root()`，与层数无关。
 
 内核文件工具五个：`bash` / `read` / `write` / `patch` / `grep`，外加 `read_turn`
 （按 `step N` 取回一步原文，默认不含思考过程，一次最多 4,000 token）。

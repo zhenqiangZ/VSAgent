@@ -13,7 +13,7 @@ from textual.message import Message as TextualMessage
 from textual.widgets import Static
 
 from .. import palette
-from ..core.agent.topics import TopicView
+from vsagent.core.agent.state.topics import TopicView
 from .session_list import fit
 from .topic_card import STATUS_COLOR, STATUS_MARK, topic_state
 

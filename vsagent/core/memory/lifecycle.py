@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..agent.ledger import LedgerError, fingerprint_path, parse_handle
+from vsagent.core.agent.state.ledger import LedgerError, fingerprint_path, parse_handle
 from .models import (
     SUPERSEDE_MARKERS,
     SUPERSEDE_OVERLAP,

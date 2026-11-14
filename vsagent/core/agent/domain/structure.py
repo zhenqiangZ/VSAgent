@@ -66,7 +66,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..ledger import SessionLedger, fingerprint_bytes, fingerprint_text
+from vsagent.core.agent.state.ledger import SessionLedger, fingerprint_bytes, fingerprint_text
 from ..tools import Tool, ToolResult, ToolSpec
 from ...file_log import record as log_read
 from . import http, uniprot
@@ -1737,7 +1737,7 @@ class AssessStructureTool(Tool):
             )
         try:
             entry = ledger.get(raw)
-            from ..ledger import ReceptorHandle, expect_handle
+            from vsagent.core.agent.state.ledger import ReceptorHandle, expect_handle
 
             expect_handle(entry, ReceptorHandle, "structure")
         except Exception as error:

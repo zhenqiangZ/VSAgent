@@ -40,9 +40,9 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit, urlparse
 
 from .. import corpus, knowledge_refs, live
-from ..agent.report import build as build_report
-from ..agent.report import read_trace
-from ..agent.trace import log_directory_for
+from vsagent.core.agent.execution.report import build as build_report
+from vsagent.core.agent.execution.report import read_trace
+from vsagent.core.agent.state.trace import log_directory_for
 from ..paths import SURVEY_DIRECTORY, config_home, project_root
 from ..session_manager import SessionManager
 from .jobs import JobStore

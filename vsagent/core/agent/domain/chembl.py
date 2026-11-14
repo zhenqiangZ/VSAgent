@@ -75,7 +75,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from ..ledger import SessionLedger, fingerprint_parts, fingerprint_text
+from vsagent.core.agent.state.ledger import SessionLedger, fingerprint_parts, fingerprint_text
 from ..tools import Tool, ToolResult, ToolSpec
 from . import http
 from .uniprot import normalize_accession

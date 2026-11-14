@@ -32,7 +32,7 @@ os.environ.setdefault("VSA_VALIDATE", "off")
 from textual.widgets import Input, TextArea  # noqa: E402
 
 from vsagent.app import VSAgentApp  # noqa: E402
-from vsagent.core.agent.hooks import (  # noqa: E402
+from vsagent.core.agent.execution.hooks import (  # noqa: E402
     POST_TOOL_USE,
     PRE_TOOL_USE,
     STOP,
@@ -40,8 +40,8 @@ from vsagent.core.agent.hooks import (  # noqa: E402
     HookRunner,
     load_hooks,
 )
-from vsagent.core.agent.host import AgentHost  # noqa: E402
-from vsagent.core.agent.loop import (  # noqa: E402
+from vsagent.core.agent.execution.host import AgentHost
+from vsagent.core.agent.execution.loop import (  # noqa: E402
     EXIT_TOPIC_FULL,
     MAX_RETRIES,
     MAX_STOP_RETRIES,
@@ -65,7 +65,7 @@ from vsagent.core.agent.permission import (  # noqa: E402
     project_config_directory,
     save_disabled,
 )
-from vsagent.core.agent.memory import (  # noqa: E402
+from vsagent.core.agent.state.memory import (  # noqa: E402
     MAX_ENTRIES,
     MAX_PREFERENCES,
     MEMORY_DIR_NAME,
@@ -80,10 +80,10 @@ from vsagent.core.agent.memory import (  # noqa: E402
     memory_root,
     overlap,
 )
-from vsagent.core.agent.history import SearchHistoryTool  # noqa: E402
-from vsagent.core.agent import intent as intent_rules  # noqa: E402
-from vsagent.core.agent.intent import HINT_LIMIT, IntentHint  # noqa: E402
-from vsagent.core.agent.context import (  # noqa: E402
+from vsagent.core.agent.state.history import SearchHistoryTool
+from vsagent.core.agent.planning import intent as intent_rules
+from vsagent.core.agent.planning.intent import HINT_LIMIT, IntentHint
+from vsagent.core.agent.planning.context import (  # noqa: E402
     CONTEXT_RATIO,
     DEGRADE_ORDER,
     EVIDENCE_LIMIT,
@@ -109,7 +109,7 @@ from vsagent.core.agent.context import (  # noqa: E402
     render_range,
     split_turns,
 )
-from vsagent.core.agent.event_log import (  # noqa: E402
+from vsagent.core.agent.state.event_log import (  # noqa: E402
     TOPIC_SOFT_LIMIT,
     CloseTopicTool,
     EventRuntime,
@@ -122,10 +122,10 @@ from vsagent.core.agent.event_log import (  # noqa: E402
     seal_topic,
     topic_start,
 )
-from vsagent.core.agent.task import TaskTool  # noqa: E402
-from vsagent.core.agent.topics import step_seconds, topic_views  # noqa: E402
-from vsagent.core.agent.hypothesis import HypothesisTool  # noqa: E402
-from vsagent.core.agent.spawn import (  # noqa: E402
+from vsagent.core.agent.state.task import TaskTool
+from vsagent.core.agent.state.topics import step_seconds, topic_views
+from vsagent.core.agent.state.hypothesis import HypothesisTool
+from vsagent.core.agent.execution.spawn import (  # noqa: E402
     REPORT_TOKENS,
     AgentStatusTool,
     _cap_report,
@@ -139,7 +139,7 @@ from vsagent.core.connection import (  # noqa: E402
     save_connection,
 )
 from vsagent.core.session_manager import SessionManager  # noqa: E402
-from vsagent.core.agent.prompt import (  # noqa: E402
+from vsagent.core.agent.roles.prompt import (  # noqa: E402
     DEEP_MARK,
     EMPTY_REASONING,
     KEEP_MESSAGES,
@@ -204,8 +204,8 @@ from vsagent.core.agent.tools import (  # noqa: E402
     number_lines,
     resolve_path,
 )
-from vsagent.core.agent.workspace import Workspace  # noqa: E402
-from vsagent.core.agent.ledger import (  # noqa: E402
+from vsagent.core.agent.research.workspace import Workspace
+from vsagent.core.agent.state.ledger import (  # noqa: E402
     DIGEST_LINE_CHARS,
     DIGEST_MAX_LINES,
     ArtifactHandle,
@@ -243,7 +243,7 @@ from vsagent.core.agent.domain import screen as screen_module  # noqa: E402
 from vsagent.core.agent.domain import admet as admet_module  # noqa: E402
 from vsagent.core.agent.domain import sar as sar_module  # noqa: E402
 from vsagent.core.agent.domain import pharmacophore as pharmacophore_module  # noqa: E402
-from vsagent.core.agent.contracts import (  # noqa: E402
+from vsagent.core.agent.roles.contracts import (  # noqa: E402
     ACCEPTANCE_KINDS,
     AgentReport,
     AgentTask,
@@ -254,16 +254,16 @@ from vsagent.core.agent.contracts import (  # noqa: E402
     TaskSpec,
 )
 from vsagent.core.agent.coretools import build_core_tools  # noqa: E402
-from vsagent.core.agent.intent_parser import IntentParseError, IntentParser  # noqa: E402
-from vsagent.core.agent.task_compiler import CompileError, TaskCompiler  # noqa: E402
-from vsagent.core.agent.capability_router import (  # noqa: E402
+from vsagent.core.agent.planning.intent_parser import IntentParseError, IntentParser
+from vsagent.core.agent.planning.task_compiler import CompileError, TaskCompiler
+from vsagent.core.agent.planning.capability_router import (  # noqa: E402
     CapabilityRouter,
     RouterError,
     missing_prerequisites,
 )
 from vsagent.core.agent.domain.all_tools import catalog, families, tool_family  # noqa: E402
 from vsagent.core.agent.domain.all_tools import domain_tools as all_domain_tools  # noqa: E402
-from vsagent.core.agent.toolprofiles import (  # noqa: E402
+from vsagent.core.agent.roles.toolprofiles import (  # noqa: E402
     ENV as TOOLSET_ENV,
     FULL,
     ORCHESTRATOR,
@@ -284,7 +284,7 @@ from vsagent.core.agent.toolset import (  # noqa: E402
     prune_families,
     release_families,
 )
-from vsagent.core.agent.trace import TraceWriter, log_directory_for  # noqa: E402
+from vsagent.core.agent.state.trace import TraceWriter, log_directory_for
 from vsagent.core.event_bus import EventBus  # noqa: E402
 from vsagent.core.models import (  # noqa: E402
     Event,
@@ -1147,10 +1147,10 @@ def check_rules_tier() -> None:
     阶段规则进了前缀会让缓存每推进一步就失效，参考材料默认注入等于把
     整本手册塞进前缀。
     """
-    from vsagent.core.agent import prompt as prompt_module
-    from vsagent.core.agent.capabilities import CAPABILITIES, ROLES
-    from vsagent.core.agent.profiles import TITLES
-    from vsagent.core.agent.stages import (
+    from vsagent.core.agent.roles import prompt as prompt_module
+    from vsagent.core.agent.roles.capabilities import CAPABILITIES, ROLES
+    from vsagent.core.agent.roles.profiles import TITLES
+    from vsagent.core.agent.planning.stages import (
         CAPABILITY_STAGE,
         STAGES,
         stage_for,
@@ -1300,7 +1300,7 @@ def check_packaging() -> None:
     真正的逐字节比对在 `tests/verify_exe.py::check_rules_bundle()`——它打开打包产物
     自己的包尾目录，只能在打包环境里跑。这里守的是「接线接对了没有」。
     """
-    from vsagent.core.agent import prompt as prompt_module
+    from vsagent.core.agent.roles import prompt as prompt_module
 
     def datas_paths(expr: ast.expr) -> list[str]:
         """收集 `root / "x" / "y"` 拼出来的相对路径。`datas` 的每一项都长这个样子。
@@ -1448,7 +1448,7 @@ def check_docs() -> None:
     只查**名字**，不查句子：名字是最稳定的那一部分，改了名字而文档没跟上，是
     读者一定会踩到的坑；句子怎么写，交给写文档的人。
     """
-    from vsagent.core.agent.capabilities import CAPABILITIES, ROLES
+    from vsagent.core.agent.roles.capabilities import CAPABILITIES, ROLES
 
     text = (ROOT / "docs" / "design.md").read_text(encoding="utf-8")
 
@@ -13456,7 +13456,7 @@ async def check_write_run() -> None:
     import tempfile
     from pathlib import Path as _Path
 
-    from vsagent.core.agent.ledger import SessionLedger
+    from vsagent.core.agent.state.ledger import SessionLedger
 
     real_1iep = IEP_FIXTURE
     text = real_1iep.read_text(encoding="utf-8")
@@ -13482,7 +13482,7 @@ async def check_write_run_docking() -> None:
     import tempfile
     from pathlib import Path as _Path
 
-    from vsagent.core.agent.ledger import SessionLedger
+    from vsagent.core.agent.state.ledger import SessionLedger
 
     runs_root = _Path(tempfile.mkdtemp(prefix="vsa-run-dock-"))
     original_runs_dir = export_module.runs_dir
@@ -13915,7 +13915,7 @@ async def _check_write_run_body(export_module, pockets_module, prankweb_module,
         )
         # 再走一遍证据层：干净行要真能落进证据的正文里，光「is_key_line 为真」
         # 还不够——`add_from_part` 还要选它。
-        from vsagent.core.agent.context import EvidenceStore as _Store
+        from vsagent.core.agent.planning.context import EvidenceStore as _Store
 
         probe_part = Part(
             type=PartType.TOOL,
@@ -14376,7 +14376,7 @@ async def check_survey() -> None:
     from vsagent.core.agent.domain import http as http_module
     from vsagent.core.agent.domain import rsearch as rsearch_module
     from vsagent.core.agent.domain import survey as survey_module
-    from vsagent.core.agent.ledger import SessionLedger
+    from vsagent.core.agent.state.ledger import SessionLedger
 
     tmp = _Path(tempfile.mkdtemp(prefix="vsa-survey-"))
     original_dir = rsearch_module.search_dir
@@ -20772,7 +20772,7 @@ def check_reasoning() -> None:
       · 上一轮的推理换成占位符，本轮的是原文（同一轮内要能看见自己上一步的推理）；
       · 总量下降，而 `stable_prefix` 逐字节不变（前缀缓存不能被打断）。
     """
-    from vsagent.core.agent import context as context_module
+    from vsagent.core.agent.planning import context as context_module
 
     prefix = "系统提示。" * 20
     session = Session(id="ses_reason", title="推理")
@@ -21639,7 +21639,7 @@ async def check_contracts() -> None:
 
 async def check_capabilities() -> None:
     """能力注册表：族名与常驻工具都真实存在，角色能反查，坏表会被拦住。"""
-    from vsagent.core.agent.capabilities import (
+    from vsagent.core.agent.roles.capabilities import (
         CAPABILITIES,
         Capability,
         capability,
@@ -21764,8 +21764,8 @@ async def check_capabilities() -> None:
 
 async def check_router() -> None:
     """路由：按子目标取族、依赖成环会被拒、缺前置进未决、结果稳定。"""
-    from vsagent.core.agent.capabilities import capability as lookup_capability
-    from vsagent.core.agent.task_compiler import TEMPLATES
+    from vsagent.core.agent.roles.capabilities import capability as lookup_capability
+    from vsagent.core.agent.planning.task_compiler import TEMPLATES
 
     compiler, router = TaskCompiler(), CapabilityRouter()
 
@@ -21918,7 +21918,7 @@ async def check_router() -> None:
 
 async def check_task_compiler() -> None:
     """规则编译：同一意图两次一致、每条交付物有验收条件、禁止项能删掉冲突模板。"""
-    from vsagent.core.agent.task_compiler import GENERIC_TEMPLATE, TEMPLATES
+    from vsagent.core.agent.planning.task_compiler import GENERIC_TEMPLATE, TEMPLATES
 
     compiler = TaskCompiler()
     intent = IntentSpec(
@@ -22009,7 +22009,7 @@ async def check_task_compiler() -> None:
 
 async def check_task_context() -> None:
     """轮次类型接线：继续、改目标、看结果、恢复，以及没有任务时的降级。"""
-    from vsagent.core.agent.task_context import TaskContextResolver, context_line
+    from vsagent.core.agent.planning.task_context import TaskContextResolver, context_line
 
     def intent(mode: str, **kwargs) -> IntentSpec:
         base = {"primary_goal": "获取 EGFR 的结构", "intent_types": ("structure_discovery",)}
@@ -22099,8 +22099,8 @@ class _StubParser:
 
 async def check_profiles() -> None:
     """角色说明书：能力从注册表来、报告要求能判、坏说明书会被拦住。"""
-    from vsagent.core.agent.capabilities import CAPABILITIES
-    from vsagent.core.agent.profiles import (
+    from vsagent.core.agent.roles.capabilities import CAPABILITIES
+    from vsagent.core.agent.roles.profiles import (
         PROFILES,
         REPORT_FIELDS,
         AgentProfile,
@@ -22225,7 +22225,7 @@ async def check_profiles() -> None:
 
 async def check_delivery() -> None:
     """输出合同与交付验收：能验的验，验不了的标 manual，不假装通过。"""
-    from vsagent.core.agent.task_compiler import GENERIC_TEMPLATE, TEMPLATES
+    from vsagent.core.agent.planning.task_compiler import GENERIC_TEMPLATE, TEMPLATES
     from vsagent.core.agent.validators import check_delivery
     from vsagent.core.agent.validators.output_contract import (
         CONTRACTS,
@@ -22378,8 +22378,8 @@ def _report_session(answer: str, *, exit_reason: str = "") -> Session:
 
 async def check_reports() -> None:
     """报告生成：结论、产物、证据、局限全部机械抽取，不合格就不收。"""
-    from vsagent.core.agent.profiles import profile
-    from vsagent.core.agent.reports import MAX_CONCLUSIONS, MAX_REFS, build, digest
+    from vsagent.core.agent.roles.profiles import profile
+    from vsagent.core.agent.execution.reports import MAX_CONCLUSIONS, MAX_REFS, build, digest
 
     answer = "- 找到 3 个候选口袋\n2. 最大口袋体积 812 Å³\n\n* 建议先看第 2 个"
     built = build(_report_session(answer), profile("structure_pocket"), task_id="t1")
@@ -22459,9 +22459,9 @@ async def check_reports() -> None:
 
 async def check_validators() -> None:
     """校验器：计划外的族被拦、任务状态与缺输入、shadow 只记录不阻止。"""
-    from vsagent.core.agent.capabilities import capability
-    from vsagent.core.agent.contracts import CapabilityPlan
-    from vsagent.core.agent.task_compiler import TaskCompiler
+    from vsagent.core.agent.roles.capabilities import capability
+    from vsagent.core.agent.roles.contracts import CapabilityPlan
+    from vsagent.core.agent.planning.task_compiler import TaskCompiler
     from vsagent.core.agent.validators import check_tool
     from vsagent.core.agent.validators import capability_guard, task_precondition
 
@@ -22559,7 +22559,7 @@ async def check_validators() -> None:
 
 async def check_route() -> None:
     """路由适配器的三种模式，以及循环层怎么用它的结果。"""
-    from vsagent.core.agent.route_adapter import RouteAdapter, RouteDecision
+    from vsagent.core.agent.planning.route_adapter import RouteAdapter, RouteDecision
 
     # 1. off：解析器一次都不该被调用。
     stub = _StubParser(error=AssertionError("off 模式不该解析"))
@@ -22595,8 +22595,8 @@ async def check_route() -> None:
     check(rejected.error and rejected.task is None, f"未解析完时不编译：{rejected.error}")
 
     # 5. 循环层：enforce 装族、shadow 不装、出错不动。
-    from vsagent.core.agent.contracts import IntentSpec as _Intent
-    from vsagent.core.agent.task_compiler import TaskCompiler
+    from vsagent.core.agent.roles.contracts import IntentSpec as _Intent
+    from vsagent.core.agent.planning.task_compiler import TaskCompiler
 
     built = TaskCompiler().compile(
         _Intent(primary_goal="取 EGFR 的全部实验结构", intent_types=("structure_discovery",))
@@ -22786,8 +22786,8 @@ async def check_route() -> None:
     check("[来源]" not in route_text, "没有命中关键词的那些轮不长出这一行")
 
     # 解析失败也保留它：关键词提示不依赖模型，那句话本身就该被看见。
-    from vsagent.core.agent import intent as intent_mod
-    from vsagent.core.agent.route_adapter import describe as describe_route
+    from vsagent.core.agent.planning import intent as intent_mod
+    from vsagent.core.agent.planning.route_adapter import describe as describe_route
 
     failed_text = describe_route(
         RouteDecision(mode="enforce", error="解析挂了"),
@@ -24264,7 +24264,7 @@ async def check_topic(server: FakeModelServer) -> None:
 
     # 兜底标题不能把内部编号与英文工具名端给用户：用户没给可用原话时，
     # 工具中文名优先，产物名去掉尾部编号才用。
-    from vsagent.core.agent.event_log import _local_title
+    from vsagent.core.agent.state.event_log import _local_title
 
     title_session = Session(id="ses_title")
     title_session.add_message(
@@ -24286,7 +24286,7 @@ async def check_topic(server: FakeModelServer) -> None:
     )
 
     # 用户消息不是「已答复」：封存一段只有问话、没有助手正文时，承接块必须是空。
-    from vsagent.core.agent.event_log import _last_reply_text
+    from vsagent.core.agent.state.event_log import _last_reply_text
 
     user_only = Session(id="ses_user_only")
     user_only.add_message(
@@ -24708,9 +24708,9 @@ def check_plan_deny() -> None:
 
 async def check_dispatch() -> None:
     """结构化派发：一个任务号只派一次、越权的不派、报告按角色判。"""
-    from vsagent.core.agent.contracts import AgentTask
-    from vsagent.core.agent.dispatcher import AgentDispatcher, DispatcherError
-    from vsagent.core.agent.spawn import AgentStatusTool
+    from vsagent.core.agent.roles.contracts import AgentTask
+    from vsagent.core.agent.execution.dispatcher import AgentDispatcher, DispatcherError
+    from vsagent.core.agent.execution.spawn import AgentStatusTool
 
     class _Host:
         """只实现派发器用到的两件事：spawn 与 children_of。"""
@@ -24910,10 +24910,10 @@ async def check_dispatch() -> None:
 
 async def check_scheduler() -> None:
     """依赖与调度：分层、就绪、失败只卡下游、上游引用进下游任务书。"""
-    from vsagent.core.agent.contracts import AgentTask
-    from vsagent.core.agent.dependency import blocked, build, ready
-    from vsagent.core.agent.dispatcher import AgentDispatcher
-    from vsagent.core.agent.scheduler import AgentScheduler, SchedulerError
+    from vsagent.core.agent.roles.contracts import AgentTask
+    from vsagent.core.agent.execution.dependency import blocked, build, ready
+    from vsagent.core.agent.execution.dispatcher import AgentDispatcher
+    from vsagent.core.agent.execution.scheduler import AgentScheduler, SchedulerError
 
     def task(task_id: str, role: str, *deps: str) -> AgentTask:
         return AgentTask(
@@ -25146,7 +25146,7 @@ async def check_scheduler() -> None:
     check(not host.calls, "图不成立时一个都不派")
 
     # --- 与真实 host 接线：派发 → 后台跑 → 等 → 收报告 ---
-    from vsagent.core.agent.host import AgentHost
+    from vsagent.core.agent.execution.host import AgentHost
     from vsagent.core.session_manager import SessionManager
 
     class _QuickLoop:
@@ -25210,11 +25210,11 @@ async def check_scheduler() -> None:
 
 async def check_coordinator() -> None:
     """协调器：计划翻成任务、依赖换号、交付物给汇点、重跑不重复派发。"""
-    from vsagent.core.agent.capability_router import CapabilityRouter
-    from vsagent.core.agent.contracts import AgentTask, CapabilityPlan, TaskSpec
-    from vsagent.core.agent.coordinator import Coordinator, build_tasks, task_id_for
-    from vsagent.core.agent.dispatcher import AgentDispatcher
-    from vsagent.core.agent.scheduler import AgentScheduler
+    from vsagent.core.agent.planning.capability_router import CapabilityRouter
+    from vsagent.core.agent.roles.contracts import AgentTask, CapabilityPlan, TaskSpec
+    from vsagent.core.agent.execution.coordinator import Coordinator, build_tasks, task_id_for
+    from vsagent.core.agent.execution.dispatcher import AgentDispatcher
+    from vsagent.core.agent.execution.scheduler import AgentScheduler
 
     spec = TaskSpec(
         task_id="task_c",
@@ -25269,7 +25269,7 @@ async def check_coordinator() -> None:
         "用户约束传给每个角色",
     )
     # 权限从角色说明书来：以前这个字段没填，`check_task()` 的权限校验是空转。
-    from vsagent.core.agent.profiles import profile as _profile
+    from vsagent.core.agent.roles.profiles import profile as _profile
 
     for item in tasks:
         check(
@@ -25407,10 +25407,10 @@ async def check_coordinator() -> None:
 
 async def check_campaign_dispatch() -> None:
     """多角色执行的入口：预演、启动、结果写回任务状态、取消。"""
-    from vsagent.core.agent.capability_router import CapabilityRouter
-    from vsagent.core.agent.contracts import TaskSpec
-    from vsagent.core.agent.host import AgentHost
-    from vsagent.core.agent.spawn import DispatchCampaignTool
+    from vsagent.core.agent.planning.capability_router import CapabilityRouter
+    from vsagent.core.agent.roles.contracts import TaskSpec
+    from vsagent.core.agent.execution.host import AgentHost
+    from vsagent.core.agent.execution.spawn import DispatchCampaignTool
     from vsagent.core.session_manager import SessionManager
 
     class _Loop:
@@ -25739,8 +25739,8 @@ async def check_campaign_dispatch() -> None:
 
 async def check_campaign_state() -> None:
     """战役状态机：链路、终态、卡住回退、计划作废，以及 host 两头的接线。"""
-    from vsagent.core.agent import campaign_state as cs
-    from vsagent.core.agent.host import AgentHost
+    from vsagent.core.agent.execution import campaign_state as cs
+    from vsagent.core.agent.execution.host import AgentHost
     from vsagent.core.session_manager import SessionManager
 
     # 主链路每一格都走得通。起点是「还没开始」，所以第一格也要过一遍。
@@ -25901,14 +25901,14 @@ async def check_campaign_state() -> None:
 
 async def check_research_workspace() -> None:
     """科研工作区：ID 由身份决定、重复登记是更新、证据分级不能混。"""
-    from vsagent.core.agent import evidence_registry as ev
-    from vsagent.core.agent.research_objects import (
+    from vsagent.core.agent.research import evidence_registry as ev
+    from vsagent.core.agent.research.research_objects import (
         ObjectError,
         ResearchObject,
         make_id,
         split_id,
     )
-    from vsagent.core.agent.research_workspace import ResearchWorkspace, workspace_for
+    from vsagent.core.agent.research.research_workspace import ResearchWorkspace, workspace_for
 
     check(make_id("structure", "4hjo") == "structure:4HJO", "结构编号按大写规整")
     check(make_id("target", "o00141") == "target:O00141", "登录号也按大写规整")
@@ -26044,9 +26044,9 @@ async def check_research_workspace() -> None:
 
 async def check_hypothesis_review() -> None:
     """假设评审：支持与反证摆在一起，只有实验级证据能改假设状态。"""
-    from vsagent.core.agent import evidence_registry as ev
-    from vsagent.core.agent import hypothesis_review as hr
-    from vsagent.core.agent.research_workspace import ResearchWorkspace
+    from vsagent.core.agent.research import evidence_registry as ev
+    from vsagent.core.agent.state import hypothesis_review as hr
+    from vsagent.core.agent.research.research_workspace import ResearchWorkspace
     from vsagent.core.models import Hypothesis, TaskState
 
     with tempfile.TemporaryDirectory() as raw:
@@ -26139,7 +26139,7 @@ async def check_research_tools() -> None:
         RegisterObjectTool,
         ReviewHypothesisTool,
     )
-    from vsagent.core.agent.research_workspace import ResearchWorkspace
+    from vsagent.core.agent.research.research_workspace import ResearchWorkspace
     from vsagent.core.models import Hypothesis, TaskState
 
     register = RegisterObjectTool()

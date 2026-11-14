@@ -31,7 +31,7 @@ from typing import Any, Iterable
 
 from ..models import Session
 from .domain.all_tools import catalog, families
-from .prompt import estimate_tokens
+from vsagent.core.agent.roles.prompt import estimate_tokens
 from .tools import Tool, ToolResult, ToolSpec
 
 

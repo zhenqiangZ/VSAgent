@@ -39,9 +39,9 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from vsagent.core.agent.context import ContextAssembler, estimate_tokens  # noqa: E402
+from vsagent.core.agent.planning.context import ContextAssembler, estimate_tokens
 from vsagent.core.agent.domain.all_tools import domain_tools  # noqa: E402
-from vsagent.core.agent.event_log import (  # noqa: E402
+from vsagent.core.agent.state.event_log import (  # noqa: E402
     TOPIC_SOFT_LIMIT,
     domain_tools as event_tools,
     event_boundary,
@@ -49,11 +49,11 @@ from vsagent.core.agent.event_log import (  # noqa: E402
     record_step,
     seal_range,
 )
-from vsagent.core.agent.ledger import SessionLedger, default_snapshot_path  # noqa: E402
-from vsagent.core.agent.memory import MemoryStore, RecallTool, RememberTool  # noqa: E402
-from vsagent.core.agent.prompt import stable_prefix  # noqa: E402
-from vsagent.core.agent.spawn import AgentStatusTool  # noqa: E402
-from vsagent.core.agent.task import TaskTool  # noqa: E402
+from vsagent.core.agent.state.ledger import SessionLedger, default_snapshot_path
+from vsagent.core.agent.state.memory import MemoryStore, RecallTool, RememberTool
+from vsagent.core.agent.roles.prompt import stable_prefix
+from vsagent.core.agent.execution.spawn import AgentStatusTool
+from vsagent.core.agent.state.task import TaskTool
 from vsagent.core.agent.toolset import LoadToolsTool, hidden_names, prune_families  # noqa: E402
 from vsagent.core.agent.tools import (  # noqa: E402
     BASH_TIMEOUT,
@@ -65,7 +65,7 @@ from vsagent.core.agent.tools import (  # noqa: E402
     ToolRegistry,
     WriteTool,
 )
-from vsagent.core.agent.workspace import Workspace  # noqa: E402
+from vsagent.core.agent.research.workspace import Workspace
 from vsagent.core.models import PartType, Session  # noqa: E402
 from vsagent.core.session_manager import SessionManager, default_state_path  # noqa: E402
 

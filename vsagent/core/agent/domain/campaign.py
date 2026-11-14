@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..ledger import LigandSetHandle, SessionLedger, expect_handle
+from vsagent.core.agent.state.ledger import LigandSetHandle, SessionLedger, expect_handle
 from ..tools import Tool, ToolError, ToolResult, ToolSpec
 from . import affinity, chembl, docking, export, pdbtext, preprocess, products, structure, uniprot
 

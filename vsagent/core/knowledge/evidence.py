@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..agent.prompt import is_key_line
+from vsagent.core.agent.roles.prompt import is_key_line
 from ..models import Part, PartType, ToolStatus
 
 # 限额按**条数**而不是 token 定：证据的价值在「索引还在」，索引是短的一行行，

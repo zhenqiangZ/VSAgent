@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..ledger import SessionLedger
+from vsagent.core.agent.state.ledger import SessionLedger
 from ..tools import Tool, ToolResult, ToolSpec
 from ...paths import SURVEY_DIRECTORY, config_home
 from . import export, products, rsearch, uniprot

@@ -45,6 +45,7 @@ from . import (
     pockets,
     pubchem,
     receptor,
+    research,
     rsearch,
     sar,
     screen,
@@ -73,7 +74,7 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     # chembl 那条认 ChEMBL 编号、回答「有什么活性」；这条认任意标识（名称 / CID /
     # SMILES / InChIKey / ChEMBL 编号）、回答「这是什么结构、是不是已知药、全库有没有
     # 近亲」。对接产物与枚举出来的类似物只有 SMILES，没有 ChEMBL 编号——那条路对它们
-    # 不成立。**2026-10 起 `lookup_compound` 把 ChEMBL 的分子画像也接进来了**（两半靠
+    # 不成立。**2026-10 起 `fetch_compound` 把 ChEMBL 的分子画像也接进来了**（两半靠
     # InChIKey 对上），原先单立的 `describe_molecule` 因此删掉：模型不必先判断手里是
     # 编号还是结构串再挑工具。
     ("pubchem", (pubchem,)),
@@ -90,10 +91,15 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     # 相似度 / 形状是**不看靶点**的通道：只比分子之间像不像，不需要受体。
     # 放在 docking 之前，是因为它便宜（毫秒级/分子）、可以先缩小待对接的库。
     ("screen", (screen,)),
-    # 结构打分是一个环节，三个工具一起可见：dock 给位姿与结构过滤，
-    # fit_affinity 用实测活性微调，score_affinity 用微调后的模型推理。
-    # 分成三族的话模型常常只装 docking，DTA 从不出现在清单里。
-    ("scoring", (docking, finetune, affinity)),
+    # 打分是两路，**分成两族**：`docking` 只放 dock（位姿与结构过滤），
+    # `affinity` 放 DTA 那一对（fit_affinity 用实测活性微调、score_affinity 推理）。
+    # 原先三件合在 `scoring` 一族里，理由是「分族之后模型常常只装 docking，DTA
+    # 从不出现在清单里」；现在分开是为了另一头：用户说「不要对接」时，族级加载
+    # 拦不住 dock——只要装了评分族，对接工具就在清单里。两头不能同时满足，
+    # 取舍是优先保证「用户禁止的能力不出现」，DTA 的可见性交给前缀里的打分纪律
+    # 与后续的能力路由去提醒。
+    ("docking", (docking,)),
+    ("affinity", (finetune, affinity)),
     # 分析排在打分之后：它吃的是 docking / affinity 的产物，不是原始结构。
     # 单独成族是因为「跑完一次」与「看完所有结果」是两件事——前者要引擎，
     # 后者只读产物，装在一起会让只想排序的会话连 vina 的说明一起背上。
@@ -106,6 +112,10 @@ FAMILIES: tuple[tuple[str, tuple[ModuleType, ...]], ...] = (
     ("admet", (admet,)),
     ("sar", (sar,)),
     ("pharmacophore", (pharmacophore,)),
+    # 科研对象与证据。**不跟着任何一类计算走**：结构、口袋、配体、文献都往同一份
+    # 工作区里登记，最后在假设评审那里汇合。所以它单独成族，排在最末——它是
+    # 「把这一轮算出来的东西整理成可追溯的结论」那一步，通常也是最后一步。
+    ("research", (research,)),
 )
 
 # 族名 -> 该族的工具名。第一次用到时建一次，之后直接查。

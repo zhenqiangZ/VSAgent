@@ -65,13 +65,13 @@ class RememberTool(Tool):
     spec = ToolSpec(
         name="remember",
         description=(
-            "把一条项目事实写进项目记忆，跨会话保留，下次开会话还能取到。"
+            "把一条项目事实写进项目记忆，跨会话保留。"
             "只记打分与筛选之前就存在的东西：受体、结合位点、配体库、参考活性物。"
             "**引用一律写文件路径**（相对路径按工作目录解释），不要写 handle——"
             "handle 只在本次会话有效，换个会话就指向别的东西。"
-            "kind=preference 只用来记用户明确说过的长期做法（例如「回答先给结论」），"
-            "用户没有明确表态时一律用 fact；kind=experience 用来记带条件与结果的教训。"
-            "只在用户明确要求、或一条事实确实值得跨会话复用时才调用，不要随手记。"
+            "kind=preference 只记用户明确说过的长期做法，没有明确表态时用 fact；"
+            "kind=experience 记带条件与结果的教训。"
+            "只在用户明确要求、或一条事实确实值得跨会话复用时才调用。"
         ),
         parameters={
             "type": "object",
@@ -173,7 +173,7 @@ class RecallTool(Tool):
                 "kind": {
                     "type": "string",
                     "enum": ["fact", "preference", "experience"],
-                    "description": "只看某一类；不给则三类都返回",
+                    "description": "只看某一类：fact 项目事实 / preference 用户长期做法 / experience 带条件的负结果；不给则三类都返回",
                 },
             },
             "additionalProperties": False,

@@ -525,6 +525,25 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
 .part-reasoning summary { cursor: pointer; color: var(--muted); font-size: var(--fs-small); }
 .part-reasoning .reason-body { margin-top: var(--space-3); line-height: 1.7; white-space: pre-wrap; }
 
+/* 意图与任务定义：与思考块同一套折叠，正文是预先排好的纯文本（编号与短句）。 */
+.part-route {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--reason-bg);
+  padding: var(--space-2) var(--space-4);
+}
+
+.part-route summary { cursor: pointer; color: var(--muted); font-size: var(--fs-small); }
+.part-route .route-body {
+  margin-top: var(--space-3);
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .part-tool, .part-patch {
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);

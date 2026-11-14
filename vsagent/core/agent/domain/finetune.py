@@ -173,7 +173,7 @@ def read_actives(path: Path) -> list[dict[str, Any]]:
 
     两种布局都收：`search_actives` 写的是单个 CSV，`import_ligandset` 写的是产物
     目录（表在目录里的 `ligands.csv`）。只认有 `pchembl_value` 列的表。
-    `find_analogs` 与 `import_ligandset` 的产物即使带这一列也是空的，训不了——
+    `search_analogs` 与 `import_ligandset` 的产物即使带这一列也是空的，训不了——
     这里如实返回空表，由调用方给出一句能照着做的话。
     """
     if path.is_dir():
@@ -268,7 +268,7 @@ class FitAffinityTool(Tool):
             "有限（100 个→ρ 0.04、300 个→0.18、726 个→0.39）；与「ECFP4 + LightGBM」打平，"
             "不超越；`mode=head` 只修绝对尺度，排序不变好；验证集小，RMSE 波动大，"
             "RMSE 不代表排序力；训练数据来自 ChEMBL，测定条件混杂。\n"
-            "需要 `search_actives` 产出的带 pchembl 的配体集；`find_analogs` / "
+            "需要 `search_actives` 产出的带 pchembl 的配体集；`search_analogs` / "
             "`import_ligandset` 的产物没有实测值，训不了。"
         ),
         parameters={
@@ -363,7 +363,7 @@ class FitAffinityTool(Tool):
                 output=(
                     f"{ligands.handle} 里没有可用的实测活性"
                     "（pchembl_value 列缺失，或整列为空）。"
-                    "用 search_actives 取已知活性；find_analogs 与 import_ligandset "
+                    "用 search_actives 取已知活性；search_analogs 与 import_ligandset "
                     "的产物只有结构、没有活性值，训不了。"
                 ),
                 failed=True,

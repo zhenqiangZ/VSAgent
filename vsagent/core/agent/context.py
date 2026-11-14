@@ -47,9 +47,11 @@ from .prompt import (
     compress_tool_output,
     estimate_tokens,
     item_tokens,
+    stage_rules,
     translate_message,
     translate_parts,
 )
+from .stages import stage_for, stage_label
 
 
 class Layer(Enum):
@@ -374,10 +376,15 @@ def split_turns(messages: list[Message]) -> list[Turn]:
     for message_index, message in enumerate(messages):
         by_id = {part.id: part for part in message.parts}
         for begin, stop in step_segments(message):
+            items = translate_parts(message.role, message.parts[begin:stop])
+            if not items:
+                # 段里没有模型看得见的东西（例如消息开头的 `PartType.ROUTE`）：
+                # 不占步号。占了的话，后面每一步的号都会比界面上那个大一。
+                continue
             step_no += 1
             fresh: list[Turn] = []
             current: Turn | None = None
-            for item in translate_parts(message.role, message.parts[begin:stop]):
+            for item in items:
                 if item.get("role") == "tool" and current is not None:
                     current.messages.append(item)
                     fresh.append(current)
@@ -954,11 +961,15 @@ class ContextAssembler:
         # 不该把「最近发生了什么」挤掉。上限 6000 是量出来的——六七个主题的流水。
         event_limit = min(EVENT_LIMIT_MAX, max(EVENT_LIMIT_MIN, available // 6))
         events, event_block = self._cap_events(archived, event_limit)
+        # 阶段规则进动态上下文，不进稳定前缀：阶段会随子目标推进而变，
+        # 放进前缀每变一次就把整段 prompt cache 打掉。
+        stage_text = self._stage_block(session)
         fixed = (
             estimate_tokens(stable_prefix)
             + estimate_tokens(profile)
             + estimate_tokens(memory)
             + estimate_tokens(task_text)
+            + estimate_tokens(stage_text)
             + estimate_tokens(digest_text)
             + estimate_tokens(env_text)
             + estimate_tokens(focus_text)
@@ -1005,6 +1016,7 @@ class ContextAssembler:
                 memory,
                 hint_text,
                 task_text,
+                stage_text,
                 digest_text,
                 env_text,
                 focus_text,
@@ -1322,6 +1334,21 @@ class ContextAssembler:
             lines.append(f"上一段交接：{session.events[-1].handoff.strip()}")
         return _cap_text("\n".join(lines), FOCUS_LIMIT)
 
+    def _stage_block(self, session: Session) -> str:
+        """当前阶段的规则，与任务状态一起进 TASK 层。
+
+        阶段取自任务规格里的子目标（`stages.stage_for`），不取自模型自述：
+        模型说「我现在在选口袋」不算数。认不出阶段时整段不出现——
+        没有阶段规则比给一份不相干的规则好。
+        """
+        stage = stage_for(session)
+        if not stage:
+            return ""
+        text = stage_rules(stage)
+        if not text:
+            return ""
+        return f"【当前阶段：{stage_label(stage)}】\n{text}"
+
     def _compose(
         self,
         stable_prefix: str,
@@ -1329,6 +1356,7 @@ class ContextAssembler:
         memory: str,
         hint_text: str,
         task_text: str,
+        stage_text: str,
         digest_text: str,
         env_text: str,
         focus_text: str,
@@ -1343,7 +1371,7 @@ class ContextAssembler:
     ) -> tuple[list[dict[str, Any]], dict[Layer, int]]:
         """按固定布局把各层拼成消息，并给出每层的估算用量。"""
         header, header_usage = self._task_header(
-            env_text, memory, task_text, digest_text, moved, summary, has_events
+            env_text, memory, task_text, stage_text, digest_text, moved, summary, has_events
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": stable_prefix}]
         # 用户习惯紧跟在系统提示之后：它只在记忆台账变化时才变，
@@ -1424,6 +1452,7 @@ class ContextAssembler:
         env_text: str,
         memory: str,
         task_text: str,
+        stage_text: str,
         digest_text: str,
         moved: list[Turn],
         summary: str,
@@ -1452,6 +1481,10 @@ class ContextAssembler:
             add(Layer.PROJECT_MEMORY, memory)
         if task_text.strip():
             add(Layer.TASK, task_text.strip())
+        # 阶段规则紧跟任务状态：它回答的是「这一步做到什么算完成」，
+        # 与任务状态是同一件事的两个说法。
+        if stage_text.strip():
+            add(Layer.TASK, stage_text.strip())
         # 索引排在任务状态之后、摘要之前：它和任务状态一样是「这一步的工作前提」，
         # 而摘要与引用清单是「前面发生过什么」，两类的读法不同，不该夹在一起。
         if digest_text.strip():

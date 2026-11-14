@@ -8,30 +8,22 @@ from pathlib import Path
 from textual.app import App
 from textual.screen import Screen
 
+from .core.agent import toolprofiles
 from .core.agent.context import event_line
+from .core.agent.coretools import build_core_tools
+from .core.agent.coordinator import Coordinator
+from .core.agent.dispatcher import AgentDispatcher
 from .core.agent.domain.all_tools import domain_tools
-from .core.agent.domain.campaign import AssessCampaignTool
-from .core.agent.domain.survey import SurveyStructuresTool
-from .core.agent.event_log import domain_tools as event_tools
-from .core.agent.event_log import render_event_detail
-from .core.agent.history import SearchHistoryTool
 from .core.agent.domain.corpus import ingest_files
-from .core.agent.domain.export import (
-    OpenViewerTool,
-    WriteRunTool,
-    runs_dir,
-    viewer_address,
-)
+from .core.agent.domain.export import runs_dir, viewer_address
 from .core.web.service import WebService, web_root
+from .core.agent.event_log import render_event_detail
 from .core.agent.hooks import HookRunner, default_hooks_paths, load_hooks
 from .core.agent.host import AgentHost
-from .core.agent.hypothesis import HypothesisTool
 from .core.agent.ledger import LedgerError, SessionLedger
 from .core.agent.loop import AgentLoop, max_steps_from_env
-from .core.agent.memory import MemoryKind, MemoryStore, RecallTool, RememberTool
+from .core.agent.memory import MemoryKind, MemoryStore
 from .core.memory import MemoryError as MemoryStoreError
-from .core.agent.spawn import AgentStatusTool, SpawnAgentTool
-from .core.agent.task import TaskTool
 from .core.agent.permission import (
     PermissionPolicy,
     Verdict,
@@ -48,17 +40,10 @@ from .core.agent.provider import (
     OpenAICompatProvider,
     ProviderConfig,
 )
-from .core.agent.tools import (
-    BASH_TIMEOUT,
-    BashTool,
-    GrepTool,
-    PatchTool,
-    ReadTool,
-    ReadTurnTool,
-    ToolRegistry,
-    WriteTool,
-)
-from .core.agent.toolset import LoadToolsTool
+from .core.agent.route_adapter import RouteAdapter, mode_from_env
+from .core.agent.scheduler import AgentScheduler
+from .core.agent.validators import mode_from_env as validators_mode_from_env
+from .core.agent.tools import BASH_TIMEOUT, ToolRegistry
 from .core.agent.trace import TraceWriter, log_directory_for
 from .core.command_registry import CommandRegistry
 from .core.connection import Connection, connection_path_for, load_connection, save_connection
@@ -91,7 +76,6 @@ from .screens.home import HomeScreen
 from .screens.message import MessageScreen
 from .screens.permission import PermissionAnswer, PermissionDialog
 from .screens.session_picker import ConfirmDialog, SessionPickerScreen
-from .screens.spawn_agent import SpawnAgentScreen, SpawnRequest
 from .screens.subagent import SubagentChatScreen
 from .screens.theme_selector import ThemeSelectorScreen
 from .screens.tools_panel import ToolEntry, ToolsPanelScreen
@@ -100,8 +84,29 @@ from .widgets.toast import ToastNotification, ToastRack
 
 # 需要参数的命令：命令名之后那一段交给处理函数，其余命令不吃参数。
 ARGUMENT_COMMANDS = frozenset(
-    {"remember", "forget", "task", "model", "agent", "rename", "events", "memory"}
+    {"remember", "forget", "task", "model", "rename", "events", "memory"}
 )
+
+
+def subagent_label(session: object) -> str:
+    """子会话在权限弹窗里的身份：角色名（角色键）+ 会话标题。
+
+    只写标题不够：标题会被 `close_topic` 改成「完成 HA2 两条线配体盘点并定路线」，
+    看的人认不出是谁在问；只写会话号更认不出（P-83）。角色键与派发时用的是同一个。
+    """
+    role = str(getattr(session, "agent_role", "") or "")
+    title = str(getattr(session, "title", "") or "")
+    if not role:
+        return title
+    from .core.agent.profiles import profile as _profile
+
+    try:
+        name = _profile(role).title.split("：")[0]
+    except KeyError:
+        name = role
+    if title and title != name:
+        return f"{name}（{role}）· {title}"
+    return f"{name}（{role}）"
 
 
 class VSAgentApp(App[None]):
@@ -174,8 +179,9 @@ class VSAgentApp(App[None]):
         # 建一次就够——工具清单在进程里是固定的。
         self._catalog: list[tuple[str, str]] | None = None
         self._memory: MemoryStore | None = None
-        # 工具注册表按「根 / 子 agent」缓存两份：两者只差一个 spawn_agent。
-        self._registries: dict[bool, ToolRegistry] = {}
+        # 工具注册表按 (档位, 角色) 缓存：主 agent 一份，子 agent 每个角色一份
+        #（角色只用来放行它自己声明的常驻工具，见 `toolprofiles.keeps`）。
+        self._registries: dict[tuple[str, str], ToolRegistry] = {}
         # 判定规则读一次，每个循环层各拿一份新策略：本会话的「全部允许」
         # 不能顺着共享对象漏到子 agent 头上。
         self._policy_rules: tuple[dict, dict] | None = None
@@ -193,6 +199,12 @@ class VSAgentApp(App[None]):
             self.root,
             save_state=self.save_state,
         )
+        # 结构化派发：按 AgentTask 建子会话、按任务号判重、按角色收报告。
+        # 这是模型唯一的派发入口——它按能力计划派，不再有自由文本那条路。
+        self.dispatcher = AgentDispatcher(self.host)
+        # 一份能力计划跑成一次战役：翻译成任务、按依赖调度、收拢结果。
+        # 入口是 `dispatch_campaign`（`spawn.py`），它从这里取协调器。
+        self.coordinator = Coordinator(AgentScheduler(self.dispatcher))
         self._removed_message: Message | None = None
         self._removed_session_id = ""
         # 权限询问排队。多个后台子 agent 同时要权限时，模态不能叠在一起：
@@ -269,7 +281,7 @@ class VSAgentApp(App[None]):
 
         每个会话一份，不共用：循环层里的 `cancelled` / `evidence` /
         待答复判定都是会话级状态。注册表按「根 / 子 agent」复用两份，
-        子 agent 那份**不注册 spawn_agent**——模型连这个工具存在都不知道。
+        子 agent 那份**不注册编排工具**——模型连它们存在都不知道。
         """
         load_env()
         config = self._provider_config()
@@ -278,11 +290,14 @@ class VSAgentApp(App[None]):
         if session.model_id and session.model_id != config.model:
             config = config.for_model(session.model_id)
         memory = self._build_memory()
-        root = not session.is_subagent
-        registry = self._registries.get(root)
+        # 档位按「是不是子 agent」取；角色只用来放行它自己声明过的常驻工具
+        #（目前只有 hypothesis 角色要 hypothesis）。注册表按 (档位, 角色) 缓存。
+        profile = toolprofiles.profile_for(session.is_subagent)
+        role = session.agent_role if session.is_subagent else ""
+        registry = self._registries.get((profile, role))
         if registry is None:
-            registry = self._build_registry(memory, allow_spawn=root)
-            self._registries[root] = registry
+            registry = self._build_registry(memory, profile=profile, role=role)
+            self._registries[(profile, role)] = registry
         return AgentLoop(
             self.event_bus,
             OpenAICompatProvider(config),
@@ -297,7 +312,16 @@ class VSAgentApp(App[None]):
             memory=memory,
             viewer=self.web_service,
             # 子 agent 拿到 None：就算历史里学过这个名字，工具本身也会拒。
-            spawner=self.host if root else None,
+            spawner=self.host if not session.is_subagent else None,
+            # 科研工作区按根会话共享，父子会话拿到的是同一个实例。
+            workspace=self.host.workspace_for(session),
+            # 根会话才有路由：子 agent 的任务书来自父会话，没有"用户意图"可解析。
+            route_adapter=(
+                None
+                if session.is_subagent
+                else RouteAdapter(OpenAICompatProvider(config), mode=mode_from_env())
+            ),
+            validator_mode=validators_mode_from_env(),
             max_steps=max_steps_from_env(),
         )
 
@@ -379,7 +403,8 @@ class VSAgentApp(App[None]):
         memory: MemoryStore,
         disabled: frozenset[str] | None = None,
         *,
-        allow_spawn: bool = True,
+        profile: str = toolprofiles.FULL,
+        role: str = "",
     ) -> ToolRegistry:
         """装配全部工具。每个工具的工作基准都是项目目录，
         与系统提示里写出来的路径是同一个。
@@ -394,52 +419,26 @@ class VSAgentApp(App[None]):
 
         `disabled` 传空集时装配一份「一个都不关」的注册表，`/tools` 面板靠它
         拿到完整清单：面板要能列出被关掉的那些，否则关掉之后就再也打不开了。
+
+        `profile` 决定常驻核心工具装哪一档（见 `toolprofiles.py`）。**只影响核心
+        工具，不影响领域工具族**：后者由 `load_tools` 按主题装入，两档一样。
+        `role` 只放行角色自己声明的常驻工具（`hypothesis` 角色的 `hypothesis`），
+        不改变别的东西。
         """
         if disabled is None:
             disabled = self._disabled_tools()
         registry = ToolRegistry(disabled=disabled)
-        # 超时显式传进来，而不是靠 BashTool 的默认值：改这一个数字就能看见装配处跟着动，
-        # 不必翻回 tools.py 猜当前生效的是哪一个。
-        registry.register(BashTool(cwd=self.root, timeout=BASH_TIMEOUT))
-        registry.register(ReadTool(cwd=self.root))
-        registry.register(WriteTool(cwd=self.root))
-        registry.register(PatchTool(cwd=self.root))
-        registry.register(GrepTool(cwd=self.root))
-        registry.register(RememberTool(memory))
-        registry.register(RecallTool(memory))
-        # 任务状态不用传东西进来：它挂在会话上，由循环层每次调用现取。
-        registry.register(TaskTool())
-        # 假设也挂在会话上（`task_state.hypotheses`），同样由内核注入。
-        # 它是**产出单位**：没有它，模型交上来的是排名而不是可检验的判断。
-        registry.register(HypothesisTool())
-        # 开工前的盘点。**常驻，不登记族**：它决定这一轮装哪几族，一个「决定装哪族」
-        # 的工具本身要先装族才看得见，顺序就反了。
-        registry.register(AssessCampaignTool())
-        # 全部实验结构的全景。同样**常驻，不登记族**：宽泛问题发生在第一轮，
-        # 那时一族都还没装；现装族会改动工具清单，把前缀缓存整段打掉。
-        registry.register(SurveyStructuresTool())
-        # 取回被归档/被移出的原文。与任务状态同理：会话由内核注入。
-        registry.register(ReadTurnTool())
-        # 按内容查已封存的主题。事件层只能按编号翻，用户说「上次那个」时
-        # 模型手上没有编号；这个工具先给编号，原文仍由 recall_event 取。
-        # 会话管理器只读传入：`scope=all` 要查别的会话，写入仍归应用。
-        registry.register(SearchHistoryTool(self.session_manager))
-        # 事件收口与召回：把做完的一段压成标题 + 摘要，需要细节再按编号取回。
-        for tool in event_tools(self.session_manager):
-            registry.register(tool)
-        # 按族加载领域工具：核心那一批常驻，其余由模型自己装。
-        registry.register(LoadToolsTool())
-        # 呈现是交付通道，与 read / write 同一类。它们不登记族，所以每一步都可见：
-        # 放进 export 族时，口袋阶段装的是 pocket / structure，模型看不见它们，
-        # 规则点名 write_run 也调不到。
-        registry.register(WriteRunTool())
-        registry.register(OpenViewerTool())
-        # 派发子 agent 是**根会话专属**的能力。子 agent 的注册表里没有它，
-        # 请求体的 tools 数组里也就没有它，模型连这个名字都看不到。
-        if allow_spawn:
-            registry.register(SpawnAgentTool())
-            # 查询与等待是同一条能力的另一半：只派不取，派发就没有闭环。
-            registry.register(AgentStatusTool())
+        # 装配顺序就是请求体里的顺序，模型按它挑工具，所以清单只写在一处
+        #（`coretools.build_core_tools`）。这里只按档位过滤，不重排。
+        for tool in build_core_tools(
+            root=self.root,
+            memory=memory,
+            sessions=self.session_manager,
+            bash_timeout=BASH_TIMEOUT,
+            allow_agents=toolprofiles.keeps(profile, "agent_status", role),
+        ):
+            if toolprofiles.keeps(profile, tool.spec.name, role):
+                registry.register(tool)
         for tool in domain_tools():
             registry.register(tool)
         return registry
@@ -512,14 +511,21 @@ class VSAgentApp(App[None]):
             return self.tool_entries()
 
         self._disabled = load_tool_switches(self.root)[0]
-        # 两份缓存都作废，再按每个会话重建：子 agent 那份不能因为重建
-        # 就把 spawn_agent 一起装回去。
+        # 缓存作废后按每个会话重建：子 agent 那份不能因为重建就把派发、
+        # 假设这些装回去，档位要按会话重新取一次。
         self._registries.clear()
         for session_id, loop in self.host.items():
             session = self.session_manager.get_session(session_id)
             loop.registry = self._build_registry(
                 self._build_memory(),
-                allow_spawn=not (session is not None and session.is_subagent),
+                profile=toolprofiles.profile_for(
+                    session is not None and session.is_subagent
+                ),
+                role=(
+                    session.agent_role
+                    if session is not None and session.is_subagent
+                    else ""
+                ),
             )
         actual, sources = load_tool_switches(self.root)
         if enabled and name in actual:
@@ -781,71 +787,6 @@ class VSAgentApp(App[None]):
         self.save_state()
         self.show_toast("已创建新会话", "success")
 
-    def _command_agent(self, arguments: str) -> None:
-        """派发子 agent：不带参数开模态，带一段文字就按整段历史直接派发。
-
-        `/agent <任务>` 是快捷键式的用法：常用的「把刚才这段活分出去」，
-        不必每次都过一遍范围选择。
-        """
-        top = self.screen
-        if isinstance(top, SubagentChatScreen):
-            self.show_toast("子 agent 内不能再派发新的 agent", "warning")
-            return
-        if not self.is_configured:
-            self.show_toast("还没有配置模型接口，先输入 /model 填写地址与密钥", "warning")
-            return
-        parent = self.session_manager.current
-        task = arguments.strip()
-        if task:
-            child = self.host.spawn(
-                parent,
-                title=task.splitlines()[0][:20],
-                task=task,
-                start=0,
-                end=len(parent.messages),
-                origin="user",
-            )
-            self.show_toast(f"已派发子 agent「{child.title}」", "success")
-            return
-        self.push_screen(
-            SpawnAgentScreen(
-                parent,
-                self.agent.context_window,
-                # 子 agent 继承父会话装过的族，所以预览要按父会话的实际清单算：
-                # 拿全量算会把可用额度说小一半，用户填的范围看着「放不下」。
-                self.agent.tool_specs(parent),
-            ),
-            self._on_spawn_requested,
-        )
-
-    def _on_spawn_requested(self, request: "SpawnRequest | None") -> None:
-        """创建模态交回结果：建数据、开后台任务、刷新右栏。"""
-        if request is None:
-            return
-        parent = self.session_manager.get_session(request.parent_id)
-        if parent is None:
-            self.show_toast("父会话已经不在了", "error")
-            return
-        try:
-            child = self.host.spawn(
-                parent,
-                title=request.title,
-                task=request.task,
-                start=request.start,
-                end=request.end,
-                origin="user",
-                run=request.run,
-            )
-        except ValueError as error:
-            self.show_toast(str(error), "warning")
-            return
-        if request.run:
-            self.show_toast(f"已派发子 agent「{child.title}」，在后台运行", "success")
-        else:
-            self.show_toast(
-                f"已创建子 agent「{child.title}」，进去后按 ctrl+r 开始", "success"
-            )
-
     def open_subagent(self, session_id: str) -> None:
         """进入子 agent 界面。当前会话不切换，返回时父会话还在原处。
 
@@ -877,7 +818,7 @@ class VSAgentApp(App[None]):
         session = top.session
         anchor = session.parent_id or session.id
         if not self.host.children_of(anchor):
-            self.show_toast("本会话还没有子 agent，用 /agent 派发一个", "info")
+            self.show_toast("本会话还没有子 agent；需要时让模型按任务规格派发", "info")
             return
         if not top.side_panel.has_class("-visible"):
             top.side_panel.set_class(True, "-visible")
@@ -1258,7 +1199,9 @@ class VSAgentApp(App[None]):
             argument = (
                 argument_value(tool, part.tool_input) if tool is not None else ""
             )
-            label = session.title if session.is_subagent else session.agent_name
+            label = (
+                subagent_label(session) if session.is_subagent else session.agent_name
+            )
             self._permission_active = True
             self.push_screen(
                 PermissionDialog(part.tool_name, argument, label, part.permission),

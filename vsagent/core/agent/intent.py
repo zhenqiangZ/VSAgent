@@ -86,3 +86,16 @@ def render(hint: IntentHint) -> str:
     if estimate_tokens(line) > HINT_LIMIT:
         return ""
     return line
+
+
+def summary(hint: IntentHint) -> str:
+    """折叠块里那一行：来源与命中的词都写出来。
+
+    与 `render` 的分工：那一行要塞进上下文，只点来源、不写命中的词——模型不需要
+    知道我们按哪个词猜的，写了反而像在向它解释自己。这一行给人看，命中词用来判断
+    这次提示准不准，所以两者都留。
+    """
+    if not hint.sources:
+        return ""
+    names = "、".join(SOURCE_NAMES[source] for source in hint.sources)
+    return f"可能相关的来源：{names}（命中：{'、'.join(hint.matched)}）"

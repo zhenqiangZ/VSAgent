@@ -170,7 +170,7 @@ python tools/seed_three_states.py --state .probe/web-ui-state/state.toml
 # 打包（Windows）
 pip install -r requirements-pack.txt
 pyinstaller --clean vsagent.spec      # → dist/VSAgent.exe
-python tests/verify_exe.py                 # ConPTY + pyte 截图验证，需要 pywinpty/pyte
+python tests/verify_exe.py                 # 先比对 AGENTS.md 与 dist/rules/ 的字节，再截图验证
 python tests/verify_exe.py --source
 python tests/verify_modal_transparency.py  # 模态居中/半透明，聊天透出
 ```
@@ -404,8 +404,9 @@ graph TD
 - `report.py` — 把状态文件与 trace 汇成一份会话分析（轮、步、token、工具、主题、异常）。
   `tools/report_session.py` 与网页的 `/api/sessions/<id>/analysis` 都从这里取，两处不会得出两套数。
 
-一轮的流程：清证据表 → `stable_prefix` → 装配 context → 问模型 → 消费流
-（TEXT/REASONING/TOOL_CALL/REASONING_DELTA 分流到不同 `PartType`）→ 无工具调用则跑 STOP 钩子 →
+一轮的流程：`_prepare_route`（根会话，`off/shadow/enforce`）→ 清证据表 → `stable_prefix` →
+装配 context → 问模型 → 消费流（TEXT/REASONING/TOOL_CALL/REASONING_DELTA 分流到不同
+`PartType`）→ 无工具调用则跑 STOP 钩子 →
 逐个（**故意不并发**）执行工具：registry 查找 → 参数校验 → PreToolUse 钩子 → `policy.check`
 → 可选的 UI 询问（发 `permission.ask`，界面弹模态）→ 执行 → PostToolUse 钩子 → 收证据 →
 连续 3 步整步全失败则 `EXIT_TOOL_FAILED`。任何非正常退出都会触发一次**不带工具的收尾总结**
@@ -841,9 +842,12 @@ widget 的 `DEFAULT_CSS` 用 `palette.css("""…""")` 包一层，Rich 标记用
 - **截断口径只能有一份**：像 `domain/listing.py:render_entries` 这种中间层要公开出去共用，
   各写一份的话改了其中一处会在长会话里把上下文吃干，而看上去完全正常。
 - **`.probe/` 是所有测试与脚本的临时产物目录**，已 gitignore，可以放心写。
-- `AGENTS.md` **已纳入版本控制**（`.gitignore` 里它是唯一例外），`prompt.py:rules_directory()`
-  读的就是它，且按**代码位置**定位——源码运行时是仓库根，打包后是 exe 所在目录。
+- `dist/AGENTS.md` **已纳入版本控制**，与 `dist/rules/` 一起（仓根不再保留副本）：
+  `prompt.py:rules_directory()` 按**代码位置**定位——源码运行时是仓库根的 `dist/`，
+  打包后**优先读 exe 旁边**，旁边没有才退回解包目录（`sys._MEIPASS`）。
+  `vsagent.spec` 从 `dist/` 取这两份打进包；换 `--distpath` 时会一并复制到新目录。
+  早先靠人工复制，实测落后八天、`dist/rules/` 整个没复制（P-68）。
+  `tests/verify_exe.py::check_rules_bundle()` 两处都开出来逐字节比对。
   它在每个 step 注入系统提示的「项目规则」段，改完下一个 step 即生效；**不设大小上限**，
-  整份注入（编码坏了才返回空串）。它装着**确认点、许可与判据**，展开的操作细则在
-  `docs/screening-playbook.md`——改流程细节写那一份，`AGENTS.md` 只放「什么算数、
-  什么不许做」。
+  整份注入（编码坏了才返回空串）。它装着**确认点、许可与判据**，操作细则是 `dist/rules/`
+  四档——改流程写那里，`AGENTS.md` 只放「什么算数、什么不许做」。

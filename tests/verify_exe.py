@@ -7,6 +7,10 @@
     python tests/verify_exe.py <exe 路径>   验证指定的可执行文件
     python tests/verify_exe.py --source     验证源码直接运行（用于与打包产物对照）
 
+打包产物在抓帧之前还有一步前置检查：`check_rules_bundle()` 打开 exe 自己的包尾目录，
+并核对 exe 旁边那一份，两边都要与仓库逐字节相同。规则缺失不会让程序出错
+（`read_rule` 读不到返回空串），只能这样查。
+
 最后一步会打 /editor 打开外部编辑器，子进程的 EDITOR 指向
 tests/fixtures/marker_editor.cmd，用它判断挂起、外部进程、恢复这条链路是否走通。
 
@@ -39,6 +43,8 @@ import pyte
 from winpty import PtyProcess
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 规则的唯一一份在 `dist/`（与打包产物同一个目录），与仓库根那份不再并存。
+RULES_ROOT = PROJECT_ROOT / "dist"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_model_server import (  # noqa: E402
@@ -184,28 +190,56 @@ def parse_args() -> tuple[list[str], str]:
     return [str(exe)], "frozen"
 
 
-def check_rules_copy(exe: Path) -> str:
-    """打包产物旁边的 `AGENTS.md` 必须与仓库根逐字节相同。
+def check_rules_bundle(exe: Path) -> str:
+    """规则必须与仓库逐字节相同，包里与 exe 旁边两处都要查。
 
-    `prompt.rules_directory()` 打包后按 **exe 位置**找规则文件，所以
-    `dist/AGENTS.md` 才是真正被读的那一份。它靠人工复制，而实测 `dist/` 里那份
-    落后了八天、少两处 `import_documents` 规则——程序一切正常，只是规则不对（P2-5）。
+    `prompt.rules_directory()` 冻结后**优先读可执行文件旁边**（想改规则不必重新打包），
+    旁边没有才退回包里的 `_MEIPASS`。`vsagent.spec` 在打包结束时把 `AGENTS.md` 与
+    `rules/` 复制到 `DISTPATH`，两份内容相同。
 
-    这条比在 spec 里加 `datas` 可靠：它能抓住「spec 改了但没重打包」。
+    以前只读旁边、靠人工复制，实测 `dist/AGENTS.md` 落后八天、`rules/` 整个没复制，
+    而程序一切正常，只是模型少了三档规则（P-68）。所以两处都开出来比对：
+    旁边那份是真正被读的，包里那份是兜底。
+
     返回空串表示没问题。
     """
-    packaged = exe.parent / "AGENTS.md"
-    source = PROJECT_ROOT / "AGENTS.md"
-    if not source.is_file():
-        return ""
-    if not packaged.is_file():
-        return f"{packaged} 不存在——打包时没有把 AGENTS.md 放进去"
-    if packaged.read_bytes() != source.read_bytes():
-        return (
-            f"{packaged} 与仓库根那份不一致（{packaged.stat().st_size} 对 "
-            f"{source.stat().st_size} 字节）——重新打包，或把根目录那份复制过去"
-        )
-    return ""
+    from PyInstaller.archive.readers import CArchiveReader
+
+    try:
+        archive = CArchiveReader(str(exe))
+    except Exception as exc:  # 不是 PyInstaller 产物、或包尾被截断
+        return f"读不出包尾目录（{exc}）——这不是 PyInstaller 打出来的可执行文件？"
+
+    pairs: list[tuple[Path, str]] = [(RULES_ROOT / "AGENTS.md", "AGENTS.md")]
+    rules_dir = RULES_ROOT / "rules"
+    # 包里与 exe 旁边的相对路径都以规则目录为根：`rules/agents/x.md`、`AGENTS.md`。
+    # 不能拿仓库根算——规则就在 `dist/` 下，算出来会多一层 `dist/`。
+    pairs.extend(
+        (path, path.relative_to(RULES_ROOT).as_posix())
+        for path in sorted(rules_dir.rglob("*.md"))
+    )
+
+    problems: list[str] = []
+    for source, name in pairs:
+        if not source.is_file():
+            problems.append(f"{source} 在仓库里不存在")
+            continue
+        wanted = source.read_bytes()
+
+        if name not in archive.toc:
+            problems.append(f"{name} 不在包里——spec 的 datas 漏了它，或者没重新打包")
+        elif archive.extract(name) != wanted:
+            problems.append(f"{name} 与仓库那份不一致（包里）——重新打包")
+
+        sibling = exe.parent / name
+        if not sibling.is_file():
+            problems.append(f"{sibling} 不存在——spec 没有把它复制到可执行文件旁边")
+        elif sibling.read_bytes() != wanted:
+            problems.append(
+                f"{sibling} 与仓库那份不一致（{sibling.stat().st_size} 对 "
+                f"{len(wanted)} 字节）——重新打包，不要手工改旁边这份"
+            )
+    return "；".join(problems)
 
 
 def main() -> int:
@@ -214,7 +248,7 @@ def main() -> int:
         print(f"找不到 {command[0]}，请先执行 pyinstaller --clean vsagent.spec")
         return 1
     if prefix == "frozen":
-        problem = check_rules_copy(Path(command[0]))
+        problem = check_rules_bundle(Path(command[0]))
         if problem:
             print("失败：", problem)
             return 1

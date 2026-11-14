@@ -121,6 +121,9 @@ class PartType(Enum):
     COMPACTION = "compaction"
     ERROR = "error"
     SUMMARY = "summary"
+    # 这一轮的意图解析与任务定义（`route_adapter.describe` 写的那段文本）。
+    # 它是过程记录，不进模型上下文；两种界面都按可折叠的块画。
+    ROUTE = "route"
 
 
 class ToolStatus(Enum):
@@ -710,6 +713,12 @@ class Step:
     message_index: int = 0
     part_start: int = 0
     part_end: int = 0
+    # 这一步属于哪次任务。两级的理由：一场战役有一个计划号（`task_id`），
+    # 里面每个专业 Agent 各有一个任务号（`agent_task_id`）。只记后者的话，
+    # 「这条结论出自哪次战役」要再去反查任务号的前缀；只记前者的话，
+    # 分不出是哪一路做的。根会话没有战役，两者都可能是空串。
+    task_id: str = ""
+    agent_task_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为可写入 TOML 的字典。"""
@@ -724,6 +733,8 @@ class Step:
             "message_index": self.message_index,
             "part_start": self.part_start,
             "part_end": self.part_end,
+            "task_id": self.task_id,
+            "agent_task_id": self.agent_task_id,
         }
 
     @classmethod
@@ -747,6 +758,8 @@ class Step:
             message_index=int(data.get("message_index") or 0),
             part_start=int(data.get("part_start") or 0),
             part_end=int(data.get("part_end") or 0),
+            task_id=str(data.get("task_id") or ""),
+            agent_task_id=str(data.get("agent_task_id") or ""),
         )
 
 
@@ -846,6 +859,22 @@ class Event:
                 if item not in found:
                     found.append(item)
         return found
+
+    @property
+    def task_id(self) -> str:
+        """本主题属于哪次任务。从流水里取第一个非空值，与 `actions` 同一套派生方式。"""
+        for step in self.steps:
+            if step.task_id:
+                return step.task_id
+        return ""
+
+    @property
+    def agent_task_id(self) -> str:
+        """本主题是哪一个专业 Agent 做的。根会话的事件没有这一项。"""
+        for step in self.steps:
+            if step.agent_task_id:
+                return step.agent_task_id
+        return ""
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为可写入 TOML 的字典。
@@ -994,8 +1023,16 @@ class Session:
     # 每一族是第几个主题装进来的。收敛（`toolset.prune_families`）用它判断
     # 「刚装、还没轮到用」的族，别刚装完就卸掉。
     family_topic: dict[str, int] = field(default_factory=dict)
+    # 这一轮主 agent 只做编排：路由给出了可执行计划，领域动作交给计划里的角色。
+    # **只在一轮内有效**：路由关掉或解析失败时不置位，退回「主 agent 自己干」的旧
+    # 路径——否则路由一挂，谁都做不了领域工作。不落盘，重启后按下一轮重新判。
+    principal_only: bool = False
     # 结构化的任务状态：目标、用户约束、进度、阻塞。整块进上下文的 TASK 层，不参与淘汰
     task_state: TaskState = field(default_factory=TaskState)
+    # 当前任务的规格（`contracts.TaskSpec` 的字典形式）。与 `task_state` 分工：
+    # 这里是**合同**（目标、交付物、验收条件），那里是**进度**。
+    # 存字典而不是对象：模型的持久化层不依赖协议包，读的时候再按需还原。
+    task_spec: dict[str, Any] | None = None
     # ---- 子 agent ----
     # 父会话 id。根会话为空，这一条也是「是不是子 agent」的唯一判据。
     parent_id: str = ""
@@ -1007,6 +1044,19 @@ class Session:
     depth: int = 0
     # user / agent：谁派发的。模型派发的会写进父会话的 AGENT Part。
     origin: str = "user"
+    # 结构化派发时记下的角色与任务号（来自 `contracts.AgentTask`）。
+    # 旧会话里手动建的子会话这三项留空：它没有角色，也没有可复用的任务号，
+    # 硬填一个反而会让「同一个任务只派一次」判错。
+    agent_role: str = ""
+    task_id: str = ""
+    campaign_id: str = ""
+    # 这件事走到哪一步（`agent.campaign_state.STATES`）。空串表示还没开始。
+    # 与 `status` 分工：那里是"这个会话在不在跑"，这里是"这件事走到哪一格"。
+    campaign_state: str = ""
+    # 当前这份能力计划是给哪一版任务规格编的。用户改口之后拿它与当前规格比，
+    # 就知道手上这份计划该不该作废。两个字段都由派发时写入，不随每轮刷新。
+    campaign_task_id: str = ""
+    campaign_revision: int = 0
     # fork 的父会话消息区间 [seed_start, seed_end)，闭开区间，便于直接切片。
     seed_start: int = 0
     seed_end: int = 0
@@ -1152,10 +1202,18 @@ class Session:
             "tool_families": list(self.tool_families),
             "family_topic": dict(self.family_topic),
             "task_state": self.task_state.to_dict(),
+            # 空字典而不是 None：状态文件是 TOML，没有 null。读回来时 {} 还原成 None。
+            "task_spec": dict(self.task_spec) if self.task_spec else {},
             "parent_id": self.parent_id,
             "root_id": self.root_id,
             "depth": self.depth,
             "origin": self.origin,
+            "agent_role": self.agent_role,
+            "task_id": self.task_id,
+            "campaign_id": self.campaign_id,
+            "campaign_state": self.campaign_state,
+            "campaign_task_id": self.campaign_task_id,
+            "campaign_revision": self.campaign_revision,
             "seed_start": self.seed_start,
             "seed_end": self.seed_end,
             "status": self.status,
@@ -1181,10 +1239,20 @@ class Session:
             task_state=TaskState.from_dict(
                 data.get("task_state") if isinstance(data.get("task_state"), dict) else {}
             ),
+            task_spec=(
+                data.get("task_spec") if isinstance(data.get("task_spec"), dict) else None
+            )
+            or None,
             parent_id=str(data.get("parent_id") or ""),
             root_id=str(data.get("root_id") or ""),
             depth=int(data.get("depth") or 0),
             origin=str(data.get("origin") or "user"),
+            agent_role=str(data.get("agent_role") or ""),
+            task_id=str(data.get("task_id") or ""),
+            campaign_id=str(data.get("campaign_id") or ""),
+            campaign_state=str(data.get("campaign_state") or ""),
+            campaign_task_id=str(data.get("campaign_task_id") or ""),
+            campaign_revision=int(data.get("campaign_revision") or 0),
             seed_start=int(data.get("seed_start") or 0),
             seed_end=int(data.get("seed_end") or 0),
             status=str(data.get("status") or "idle"),

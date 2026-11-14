@@ -17,6 +17,9 @@ from .context import (
 from .event_log import (TOPIC_SOFT_LIMIT, EventRuntime, event_boundary,
                         open_tokens, record_step, seal_range, seal_topic)
 from . import intent
+from .contracts import TaskSpec
+from .route_adapter import describe as describe_route
+from .validators import check_tool
 from .toolset import family_of, hidden_names, release_families
 from .hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from .permission import PermissionDecision, PermissionPolicy, Verdict
@@ -218,6 +221,9 @@ class AgentLoop:
         memory: Any = None,
         viewer: Any = None,
         spawner: Any = None,
+        workspace: Any = None,
+        route_adapter: Any = None,
+        validator_mode: str = "off",
         max_steps: int = MAX_STEPS,
     ) -> None:
         self.bus = bus
@@ -238,10 +244,24 @@ class AgentLoop:
         # 本地结构服务的状态。与记忆一样是**应用级**的：整个进程一个，
         # 不随会话切换而变，也不每轮重建。open_viewer 只从中读实际端口。
         self.viewer = viewer
-        # 子 agent 派发器。应用级对象，由 app 装配、按会话注入给 spawn_agent。
-        # 根会话的循环层拿得到它，子 agent 的注册表里没有那个工具，
+        # 子 agent 派发器。应用级对象，由 app 装配、按会话注入给 dispatch_campaign
+        # 与 agent_status。根会话的循环层拿得到它，子 agent 的注册表里没有这两个工具，
         # 所以「子 agent 不能再派发」在装配层就成立，不靠工具自己判断。
         self.spawner = spawner
+        # 科研工作区：与登记表一样是**按根会话共享**的一份，由 host 持有。
+        # 循环层只负责把它转交给声明了 `workspace_argument` 的那几个工具；
+        # 自己既不读也不写，所以这里是 None 也不影响其余工具。
+        self.workspace = workspace
+        # 路由适配器：意图 → 任务 → 能力计划。None 表示不接（子 agent 与测试）。
+        self.route_adapter = route_adapter
+        # 校验器模式：off / shadow / enforce。由应用层按环境变量取值。
+        self.validator_mode = validator_mode
+        # 这一轮的计划与任务，供校验器读；每轮开始时清空。
+        self._turn_plan: Any = None
+        self._turn_task: TaskSpec | None = None
+        # 这一轮的关键词提示（`intent.detect`）。在前置流程里算一次，过程记录与
+        # 上下文里那一行用的是同一份，免得两处各扫一遍、还扫出两种结论。
+        self._turn_hint: Any = None
         # 本轮的按需证据（检索回来的记忆、含关键行的工具结果）。
         #
         # 它是**一轮**的：每次发问之前清空。上一轮 recall 出来的记忆，
@@ -399,6 +419,13 @@ class AgentLoop:
         self.bus.publish("message.add", {"message_id": message.id, "session_id": session.id})
         workspace = Workspace(session.id, self.workspace_root)
         workspace.ensure()
+        self._turn_plan = None
+        self._turn_task = None
+        self._turn_hint = None
+        # 每轮先退回「主 agent 可以自己干」：只有路由真的给出计划才置位。路由关上
+        # 或解析失败时保持 False，否则新加的这一层会把旧路径一起锁死。
+        session.principal_only = False
+        await self._prepare_route(session, message)
         try:
             message, step, elapsed_ms, exit_reason = await self._run_steps(
                 session, message, workspace
@@ -433,6 +460,7 @@ class AgentLoop:
         if self.cancelled:
             return message
         self._finish(session, message, step, elapsed_ms)
+        self._note_delivery(session)
         return message
 
     async def run_bash(self, session: Session, command: str) -> Message:
@@ -476,6 +504,7 @@ class AgentLoop:
             Part(type=PartType.STEP_FINISH, text=f"1 · {message.total_tokens()} tok · {self.last_latency_ms} ms"),
         )
         message.cost = self._cost(message.tokens)
+        self._check_delivery(session)
         self.bus.publish("turn.done", {"message_id": message.id, "session_id": session.id})
         self.bus.publish("status.update", {"session_id": session.id})
         return message
@@ -598,13 +627,176 @@ class AgentLoop:
                 break
         return paths
 
+    async def _prepare_route(self, session: Session, message: Message) -> None:
+        """在模型请求之前做一次意图解析与路由。
+
+        三种模式见 `route_adapter.py`。这里只负责五件事：算一次关键词提示
+        （`intent.detect`，与路由无关）、把结果写进 trace、在消息开头留一块可折叠的
+        过程记录（`PartType.ROUTE`）、把任务规格记到会话上（shadow 也记，否则下一轮
+        没有上下文）、把这一轮标记成「主 agent 只编排」。
+
+        **族不装进本会话**：计划里的 `tool_families` 按角色分，派发时由
+        `coordinator` 交给子会话。装到根会话上等于让主 agent 自己去做领域动作，
+        那正是这一层要避免的。
+
+        过程记录先于模型请求写：用户看到「这一轮按什么理解」与「这一轮要交什么」
+        不用等答复出来；解析失败也留一块，写明这一轮退回原路径的原因。
+
+        任何异常都不往外抛：路由是新加的一层，不能成为新的故障点。
+        """
+        text = self._last_user_text(session)
+        if text.strip():
+            # 关键词提示与路由无关：路由关掉、或者是子会话，上下文里那一行照样要给。
+            self._turn_hint = intent.detect(text)
+        if self.route_adapter is None or session.depth > 0:
+            return
+        if not text.strip():
+            return
+        current = None
+        if session.task_spec:
+            try:
+                current = TaskSpec.from_dict(session.task_spec)
+            except Exception as error:  # 旧数据或手工改坏的状态：当作没有当前任务
+                self.bus.publish(
+                    "route.error",
+                    {"session_id": session.id, "error": f"读不出当前任务规格：{error}"},
+                )
+        try:
+            decision = await self.route_adapter.prepare(text, current=current)
+        except Exception as error:
+            self.bus.publish("route.error", {"session_id": session.id, "error": str(error)})
+            return
+        if decision.mode == "off":
+            # 关掉时不写 trace：免得每一轮多一条什么也没发生的记录，把日志冲淡。
+            return
+        # 这一块是给人看的过程记录：两种界面都按折叠块画，模型上下文里没有它。
+        hint_line = intent.summary(self._turn_hint) if self._turn_hint is not None else ""
+        self._publish(
+            message,
+            Part(type=PartType.ROUTE, text=describe_route(decision, hint=hint_line)),
+        )
+        if decision.error:
+            self.bus.publish("route.error", {"session_id": session.id, "error": decision.error})
+        plan = decision.plan
+        self.bus.publish(
+            "route.plan",
+            {
+                "session_id": session.id,
+                "mode": decision.mode,
+                "task_id": decision.task.task_id if decision.task else "",
+                "revision": decision.task.revision if decision.task else 0,
+                "capabilities": list(plan.selected_capabilities) if plan else [],
+                "agents": list(plan.selected_agents) if plan else [],
+                "families": list(decision.families),
+                "warnings": list(decision.warnings),
+            },
+        )
+        if decision.error:
+            # 出错就什么都不改：宁可这一轮退回原来的路径，也不要把一份半成品
+            # 计划写进会话状态，下一轮再按它继续。
+            return
+        if decision.task is not None:
+            previous = session.task_spec or {}
+            session.task_spec = decision.task.to_dict()
+            self._note_task_change(session, previous, decision.task)
+        self._turn_plan = decision.plan
+        self._turn_task = decision.task
+        # 有可执行计划 = 这一轮主 agent 只编排。族不再装进本会话：计划里的族是
+        # 派发时按角色给子会话的（`coordinator.run(families=plan.tool_families)`），
+        # 装到根会话上只会让主 agent 自己把领域工作做掉。计划里一个角色都没有时
+        # 不置位——那份计划没有接手的人，锁死工具只会让这一轮什么也做不了。
+        session.principal_only = bool(
+            decision.plan is not None and decision.plan.selected_agents
+        )
+
+    def _note_task_change(self, session: Session, previous: dict, task: Any) -> None:
+        """任务规格变了，把战役状态推到「定规格」。
+
+        两种情况分开：
+
+        - 任务号变了 = 另一件事，前面那一轮的进度不再适用，直接重置；
+        - 同一个任务改了要求 = 原来那一轮被打断。能前进就前进；正在研究中
+          退不回去，这时不硬改——那份计划该不该作废由计划戳记判（`PlanStamp`），
+          状态机只回答「现在在哪一格」。
+        """
+        from . import campaign_state
+
+        if previous == task.to_dict():
+            return
+        old_id = str(previous.get("task_id") or "")
+        if old_id and old_id != task.task_id:
+            session.campaign_state = campaign_state.SPECIFICATION
+            return
+        state, _reason = campaign_state.soft_advance(
+            session.campaign_state, campaign_state.SPECIFICATION
+        )
+        session.campaign_state = state
+
+    def _note_delivery(self, session: Session) -> None:
+        """这一轮回答已经发出去了：收齐的结果就此交付。
+
+        只在「汇总结果」那一格之后推进，普通追问不动状态机。复核与交付连着走：
+        回答发出之前已经没有别的动作可做，两格记的是同一件事的两面。
+        复核本身不是这段代码在做——它是主 Agent 在正文里做的判断，这里只记账。
+        """
+        from . import campaign_state
+
+        state = session.campaign_state
+        if state != campaign_state.INTEGRATION:
+            return
+        for target in (campaign_state.CRITICAL_REVIEW, campaign_state.DELIVERY):
+            next_state, _reason = campaign_state.soft_advance(session.campaign_state, target)
+            session.campaign_state = next_state
+
+    def _check_delivery(self, session: Session) -> None:
+        """轮末的交付验收：只记录，不阻断。
+
+        回答已经发出去了，这里能做的只有把"少交了哪一件"写进 trace。真要阻断，
+        得再来一轮补交，那是另一件事（见 `validators/delivery.py` 的说明）。
+        """
+        if self.validator_mode == "off" or self._turn_task is None:
+            return
+        from .validators import check_delivery
+        from .validators.output_contract import unverifiable
+
+        findings = check_delivery(
+            self._turn_task, ledger=self.ledger, workspace=self.workspace_root
+        )
+        names = [row["name"] for row in self._turn_task.required_outputs]
+        self.bus.publish(
+            "validator.delivery",
+            {
+                "session_id": session.id,
+                "mode": self.validator_mode,
+                "task_id": self._turn_task.task_id,
+                "outputs": names,
+                "manual": unverifiable(names),
+                "findings": [item.as_dict() for item in findings],
+            },
+        )
+
+    def _validate_tool(self, session: Session, name: str) -> Any:
+        """按当轮计划与任务判一次。`off` 时不做任何事，连对象都不构造。"""
+        if self.validator_mode == "off":
+            return check_tool(name)  # 空计划、空任务：必然没有发现
+        task = self._turn_task
+        if task is None and session.task_spec:
+            try:
+                task = TaskSpec.from_dict(session.task_spec)
+            except Exception:
+                task = None
+        return check_tool(name, plan=self._turn_plan, task=task)
+
     def _intent_text(self, session: Session) -> str:
         """按最后一条用户消息给一行「可能在问哪几类来源」。
 
         只在有命中时返回，且只点名来源、不点名工具：工具名写进提示等于在
         提示里存一份工具清单，工具改名或调整分组之后就过期了。
+
+        提示在前置流程里已经算过（过程记录那一块用的就是它），这里直接用；
+        没算过（没装配路由、或者是子会话以前的调用）就现扫一遍。
         """
-        hint = intent.detect(self._last_user_text(session))
+        hint = self._turn_hint or intent.detect(self._last_user_text(session))
         text = intent.render(hint)
         if text:
             self.bus.publish(
@@ -1399,12 +1591,29 @@ class AgentLoop:
         if report.blocked:
             self._fail_tool(message, part, f"钩子拦下了这次调用：{report.reason}")
             return
+        verdict = self._validate_tool(session, tool.spec.name)
+        if verdict.findings:
+            self.bus.publish(
+                "validator.finding",
+                {
+                    "session_id": session.id,
+                    "tool": tool.spec.name,
+                    "mode": self.validator_mode,
+                    "findings": verdict.as_dicts(),
+                },
+            )
+        if verdict.blocked and self.validator_mode == "enforce":
+            reason = "；".join(item.message for item in verdict.findings if item.blocking)
+            self._fail_tool(message, part, f"校验器拦下了这次调用：{reason}")
+            return
         decision = self.policy.check(
             tool,
             part.tool_input,
             session.agent_name,
             explicit=explicit,
             cancelled=self.cancelled,
+            # 子 agent 的标记：它改不了共享的当前受体，也准备不了受体与配体。
+            worker=session.depth > 0,
         )
         if decision.verdict is Verdict.ASK:
             decision = await self._ask_permission(session, message, part, tool, decision)
@@ -1448,6 +1657,7 @@ class AgentLoop:
                     spawner=self.spawner,
                     event_runtime=self._event_runtime(session),
                     registry=self.registry,
+                    workspace=self.workspace,
                     on_arguments=record_arguments,
                 )
                 break

@@ -21,9 +21,11 @@ from ..file_refs import resolve_file_refs
 from ..models import Message, Part, PartType, Session
 from ..session_manager import SessionManager
 from .. import live
+from . import campaign_state
 from .context import ContextAssembler
 from .ledger import SessionLedger
 from .loop import EXIT_CANCELLED, EXIT_ERROR, EXIT_LABELS, EXIT_TOOL_FAILED, AgentLoop
+from .research_workspace import ResearchWorkspace
 from .spawn import SEED_RATIO, fork_messages, task_preamble
 
 # 子 agent 最多能再往下派几层。0 表示根会话，1 表示子 agent。
@@ -58,6 +60,10 @@ class AgentHost:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         # 按根会话共享：子 agent 的 handle 与父会话是同一份。
         self._ledgers: dict[str, SessionLedger] = {}
+        # 科研工作区同样按根会话共享，理由与登记表一样：结构 Agent 登记的口袋，
+        # 机制 Agent 要按同一个 ID 找到；各建一个实例会各存一份，后写的那份
+        # 把先写的整份覆盖掉（快照是整份写的）。
+        self._workspaces: dict[str, ResearchWorkspace] = {}
         # 实时快照的节流时刻。一次模型往返里有几百个 `part.update`（每个文本增量
         # 都发一次），每个都写一遍文件没有意义；半秒一次足够页面显示「正在做什么」。
         self._live_at: dict[str, float] = {}
@@ -65,9 +71,12 @@ class AgentHost:
         # 只在跑的时候挂：不跑的时候总线上多两个处理函数，界面那几条「订阅数」的
         # 判据会跟着变，而它们在空闲时验的正是「没有多余的东西挂着」。
         self._live_subs: dict[str, list[Callable[[], None]]] = {}
+        # 正在跑的多角色执行，按发起它的会话记。与 `_tasks` 分开：一场战役
+        # 包含多个子会话，塞进 `_tasks` 会让"这个会话在跑吗"多算一次。
+        self._campaigns: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
-    # 循环层与登记表
+    # 循环层、登记表与工作区
     # ------------------------------------------------------------------
     def ledger_for(self, session: Session) -> SessionLedger:
         """同一个根会话下的所有会话共用一份登记表。
@@ -82,6 +91,24 @@ class AgentHost:
             ledger.load()
             self._ledgers[family] = ledger
         return ledger
+
+    def workspace_for(self, session: Session) -> ResearchWorkspace:
+        """同一个根会话下的所有会话共用一份科研工作区。
+
+        与 `ledger_for` 同一条理由，但后果更重：登记表丢一条只是少一个 handle，
+        工作区丢一条会让"这个结论的依据是哪条证据"断掉。所以这里必须**返回同一个
+        实例**，让子 Agent 的登记直接落在父会话正在看的那份表里；各建一个指向同一
+        文件的实例，会在各自保存时用整份快照覆盖对方。
+
+        按 `family_id` 取，不按会话 id：子 Agent 与父会话是同一件事的两个执行者。
+        """
+        family = session.family_id
+        workspace = self._workspaces.get(family)
+        if workspace is None:
+            workspace = ResearchWorkspace(session_id=family)
+            workspace.load()
+            self._workspaces[family] = workspace
+        return workspace
 
     def loop_for(self, session_id: str) -> AgentLoop:
         """取会话对应的循环层，没有就现建一个。
@@ -123,9 +150,10 @@ class AgentHost:
             task.cancel()
 
     def drop_family(self, family_id: str) -> None:
-        """根会话没了，它那一份共享登记表也就不该继续留在内存里。"""
+        """根会话没了，它那一份共享登记表与工作区也就不该继续留在内存里。"""
         if family_id:
             self._ledgers.pop(family_id, None)
+            self._workspaces.pop(family_id, None)
 
     async def wait(self, session_ids: list[str], timeout: float = 20.0) -> list[str]:
         """等这些会话跑完，返回超时前结束的那些 id。
@@ -159,11 +187,18 @@ class AgentHost:
         origin: str = "user",
         prompt: bool = True,
         run: bool = True,
+        agent_role: str = "",
+        task_id: str = "",
+        campaign_id: str = "",
     ) -> Session:
         """从父会话 fork 一个子 agent，可选立刻开跑。
 
         `prompt=False` 连任务书都不写（工具层校验失败之类的场景用）；
         `run=False` 写任务书但不立刻跑，留给用户在子 agent 界面里手动开始。
+
+        `agent_role` / `task_id` / `campaign_id` 只有结构化派发（`dispatcher.py`）
+        才给：它们写在**创建时**而不是创建之后补，因为 `run=True` 时子会话可能
+        在下一轮事件循环就开始跑，补写会与第一轮抢同一个会话。
 
         深度上限在这里兜底。工具层与界面层都各自拦过一次，但真正决定
         「能不能创建」的是这一处：前两层只是让模型与用户早点看到原因。
@@ -188,6 +223,9 @@ class AgentHost:
         child.agent_name = parent.agent_name
         child.model_id = parent.model_id
         child.effort = parent.effort
+        child.agent_role = agent_role
+        child.task_id = task_id
+        child.campaign_id = campaign_id
         # 装过的工具族一起继承：子 agent 接着干同一件事，父会话为了这件事
         # 装过哪几族，它就得有哪几族。不继承的话它得自己再 load 一遍，
         # 而它看到的任务说明里并没有「先装工具」这一步。
@@ -211,10 +249,12 @@ class AgentHost:
                 "parent_id": parent.id,
                 "title": child.title,
                 "origin": origin,
+                "agent_role": agent_role,
+                "task_id": task_id,
             },
         )
-        # 用户派发要在父会话里留一条记录：模型派发至少有工具卡，
-        # 用户打 /agent 的话，不记下来事后翻聊天记录完全看不出这里分出去过。
+        # 手动建的子会话（旧版本 /agent 留下的）在父会话里留一条记录：
+        # 模型派发至少有工具卡，手动建的不记下来，事后翻聊天记录看不出这里分出去过。
         # 记在 fork 之后，所以这条标记不会跟着被复制进子会话。
         if origin == "user":
             self._record_dispatch(parent, child)
@@ -461,8 +501,127 @@ class AgentHost:
         """直接子 agent，按创建时间升序。"""
         return self.manager.children_of(session_id)
 
+    # ------------------------------------------------------------------
+    # 战役（一次多角色执行）
+    # ------------------------------------------------------------------
+    def start_campaign(
+        self,
+        session: Session,
+        coroutine: Any,
+        *,
+        on_done: Callable[[Any], None] | None = None,
+    ) -> bool:
+        """在后台跑一次多角色执行。同一个会话同时只允许一次。
+
+        与 `_start` 分开是因为生命周期不同：一轮回答以"最后一个 token"结束，
+        一次战役以"所有子会话跑完"结束，中间可能隔着几分钟。放进 `_tasks`
+        会让"这个会话在跑吗"的判定把整场战役算成一轮回答。
+        """
+        if session.id in self._campaigns:
+            return False
+        task = asyncio.create_task(self._campaign(session, coroutine, on_done))
+        self._campaigns[session.id] = task
+        self._set_campaign_state(session, campaign_state.RESEARCH)
+        return True
+
+    def _set_campaign_state(self, session: Session, target: str) -> None:
+        """推进战役状态。
+
+        跳不过去只记一条，不让后台任务挂掉：状态机是记账，不是闸门。
+        真出现跳不过去，说明调用点写错了，事件里带着两头的名字。
+        """
+        next_state, reason = campaign_state.soft_advance(session.campaign_state, target)
+        if reason:
+            self.bus.publish(
+                "campaign.state_error",
+                {"session_id": session.id, "target": target, "error": reason},
+            )
+            return
+        session.campaign_state = next_state
+        self.bus.publish(
+            "campaign.state",
+            {
+                "session_id": session.id,
+                "state": session.campaign_state,
+                "label": campaign_state.label(session.campaign_state),
+            },
+        )
+
+    def campaign_running(self, session_id: str) -> bool:
+        task = self._campaigns.get(session_id)
+        return task is not None and not task.done()
+
+    async def _campaign(
+        self,
+        session: Session,
+        coroutine: Any,
+        on_done: Callable[[Any], None] | None,
+    ) -> None:
+        try:
+            campaign = await coroutine
+        except asyncio.CancelledError:
+            self._set_campaign_state(session, campaign_state.CANCELLED)
+            self.bus.publish("campaign.cancelled", {"session_id": session.id})
+            raise
+        except Exception as error:  # noqa: BLE001 - 后台任务不能把异常吞进事件循环
+            self._set_campaign_state(session, campaign_state.FAILED)
+            self.bus.publish(
+                "campaign.error",
+                {"session_id": session.id, "error": f"{type(error).__name__}: {error}"},
+            )
+            return
+        finally:
+            self._campaigns.pop(session.id, None)
+        # 子会话都跑完了，结果回到父会话手上：下一步是汇总与复核，不是交付。
+        self._set_campaign_state(session, campaign_state.INTEGRATION)
+        if on_done is not None:
+            on_done(campaign)
+        self.bus.publish(
+            "campaign.done",
+            {
+                "session_id": session.id,
+                "task_id": getattr(getattr(campaign, "plan", None), "task_id", ""),
+                "done": list(campaign.done()) if hasattr(campaign, "done") else [],
+                "unfinished": (
+                    list(campaign.unfinished()) if hasattr(campaign, "unfinished") else []
+                ),
+                # 这次按子集派发、计划里还剩谁。事件订阅方据此知道事情没完。
+                "pending": list(getattr(campaign, "pending", ()) or ()),
+            },
+        )
+        if self.save_state is not None:
+            self.save_state()
+
+    def cancel_campaign(self, session_id: str) -> int:
+        """取消一次战役：它自己、它派出的子会话，返回停掉的会话数。
+
+        只取消带任务号的子会话：那是这次战役派出去的。旧版本用 `/agent`
+        建的子 agent 没有任务号，不该被连坐。
+        """
+        stopped = 0
+        task = self._campaigns.pop(session_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            stopped += 1
+        # 任务还没跑到第一个 await 就被取消时，`_campaign` 里那段不会执行，
+        # 所以这里补一次。同一状态写两次是允许的（状态是「当前是什么」）。
+        owner = self.manager.get_session(session_id)
+        if task is not None and owner is not None:
+            self._set_campaign_state(owner, campaign_state.CANCELLED)
+        for child in self.children_of(session_id):
+            if not child.task_id:
+                continue
+            if self.is_running(child.id):
+                self.cancel(child.id)
+                stopped += 1
+        return stopped
+
     def shutdown(self) -> None:
         """退出时取消全部后台任务。"""
+        for task in list(self._campaigns.values()):
+            if not task.done():
+                task.cancel()
+        self._campaigns.clear()
         for task in list(self._tasks.values()):
             if not task.done():
                 task.cancel()

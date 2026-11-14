@@ -99,22 +99,14 @@ class HypothesisTool(Tool):
     spec = ToolSpec(
         name="hypothesis",
         description=(
-            "**你的产出单位是假设，不是排名。** 用这个工具提出一条可检验的判断，"
-            "或在拿到证据后修订、关闭它。\n"
-            "一条假设写六件事：主张（claim）、机制（mechanism）、已有证据（evidence）、"
-            "怎么检验（test）、预期结果（expected）、什么算被否掉。"
-            "`test` 与 `expected` 是硬门槛：没有它们就不是假设，是印象。"
-            "`expected` 里要有数、阈值或对照（例如「IC50 < 100 nM」「对照组无活性」）。\n"
-            "两种粒度：`kind=strategy` 是这一轮该怎么筛（聚焦库还是多样性库），"
-            "必须给 `mode`（expand 组外找新骨架 / narrow 组内做同系物优化）；"
-            "`kind=mechanism` 是这批分子为什么活。两类都要提——只谈机制会在错的库上"
-            "做精细分析，只谈策略则永远不知道为什么要这么筛。\n"
-            "两条假设给出**不同预期**时，用 `rivals` 写下对方编号，并用 `discriminator`"
-            "写清哪个结果支持哪一条。没有竞争关系的假设各自检验，不要互填。\n"
-            "**同一批里互相竞争的假设用 action=group 一次提出**：组内 `rivals` 写 key，"
-            "不写 hyp#N；2–4 条一起校验，任何一条不合法就整组不写。\n"
-            "`action=close` 要说明依据；拿到实验数据后用 `record_assay(hypothesis=...)` "
-            "回填，状态会按预期与实际自动改，不必手工关。"
+            "**你的产出单位是假设，不是排名。** 一条假设必须能判真假：主张、机制、证据、"
+            "检验方法、可量化的预期、否证条件。\n"
+            "`test` 与 `expected` 是硬门槛，缺了就是印象；`expected` 要有数、阈值或对照"
+            "（例如「IC50 < 100 nM」）。\n"
+            "两类都要提：`kind=strategy` 是这一轮该怎么筛，`kind=mechanism` 是这批分子为什么活。"
+            "只谈机制会在错的库上做精细分析，只谈策略则永远不知道为什么要这么筛。\n"
+            "两条假设给出**不同预期**时写 `rivals` 与 `discriminator`；同一批竞争假设用 "
+            "`action=group` 一次提出，组内用 key 互指，任何一条不合法就整组不写。"
         ),
         parameters={
             "type": "object",
@@ -166,15 +158,14 @@ class HypothesisTool(Tool):
                     "minItems": 2,
                     "maxItems": 4,
                     "description": (
-                        "action=group 时的一组假设，2–4 条，一次写入。组内用 key 互指，"
-                        "不会出现「引用尚未创建的编号」这种失败"
+                        "action=group 时的一组假设，2–4 条，一次写入；组内用 key 互指"
                     ),
                     "items": {
                         "type": "object",
                         "properties": {
                             "key": {
                                 "type": "string",
-                                "description": "组内临时名，1–12 位小写字母、数字、下划线或连字符",
+                                "description": "组内临时名",
                             },
                             "kind": {
                                 "type": "string",
@@ -184,21 +175,21 @@ class HypothesisTool(Tool):
                             "mode": {
                                 "type": "string",
                                 "enum": list(HYPOTHESIS_MODES),
-                                "description": "策略假设必填：expand / narrow",
+                                "description": "expand / narrow",
                             },
-                            "claim": {"type": "string", "description": "主张，一句话"},
+                            "claim": {"type": "string", "description": "主张"},
                             "mechanism": {"type": "string", "description": "机制"},
-                            "evidence": {"type": "string", "description": "已有证据与出处"},
+                            "evidence": {"type": "string", "description": "证据与出处"},
                             "test": {"type": "string", "description": "怎么检验"},
-                            "expected": {"type": "string", "description": "预期结果，要含数值或对照"},
+                            "expected": {"type": "string", "description": "要含数值或对照"},
                             "rivals": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "本组内的 key，不是 hyp#N",
+                                "description": "组内 key",
                             },
                             "discriminator": {
                                 "type": "string",
-                                "description": "有 rivals 时必填：什么结果支持本条、什么结果支持对手",
+                                "description": "什么结果支持本条、什么支持对手",
                             },
                         },
                         "required": ["key", "kind", "claim", "test", "expected"],

@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 from PyInstaller.utils.hooks import (
     collect_data_files,
@@ -29,6 +30,16 @@ datas.append(
         "vsagent/core/agent/domain",
     )
 )
+
+# 规则文件也要进包：`AGENTS.md` 是许可与四个确认点，`rules/` 下是全局不变式、
+# 角色规则、阶段规则与参考材料四档。规则的唯一一份在 `dist/`（与打包产物同一个目录，
+# 仓根不保留副本），这里从 `dist/` 取，冻结后由 `datas` 放进 `_MEIPASS` 兜底。
+# 漏了不会报错：`read_rule` 读不到返回空串，程序照常运行，只是模型少读几档规则。
+# `tests/verify_exe.py` 会逐个条目与这份规则比对字节，打包后跑一次就能发现。
+datas += [
+    (str(root / "dist" / "AGENTS.md"), "."),
+    (str(root / "dist" / "rules"), "rules"),
+]
 
 # 第三方包**自己带的**数据文件不会自动进包：`_pyinstaller_hooks_contrib` 里没有 meeko 钩子，
 # 而 meeko 是按 `Path(__file__).parents[0] / "data" / "params"` 与 `files("meeko") / "data"`
@@ -104,3 +115,15 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+# 规则在 `dist/`，与默认输出目录是同一个地方，所以默认打包不需要复制。
+# 换一个 `--distpath` 时才把这两份带过去——否则 exe 旁边没有规则，冻结版会退回
+# `_MEIPASS` 里那一份，虽然照样能跑，但「旁边优先」这条路径就没被覆盖到。
+# `EXE(...)` 在上面已经同步完成打包，所以这里执行时 exe 已经写好，DISTPATH 也已存在。
+_rules_source = root / "dist"
+_rules_target = Path(DISTPATH)
+if _rules_source.resolve() != _rules_target.resolve():
+    shutil.copy2(_rules_source / "AGENTS.md", _rules_target / "AGENTS.md")
+    shutil.copytree(
+        _rules_source / "rules", _rules_target / "rules", dirs_exist_ok=True
+    )

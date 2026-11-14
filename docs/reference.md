@@ -6,7 +6,8 @@
 
 本文件不定义 Agent 的执行权限，也不替代 `AGENTS.md` 中的确认机制。
 
-具体工具调用和流程操作由 `docs/screening-playbook.md` 规定。
+具体工具调用和流程操作由 `dist/rules/` 规定：操作要点在 `global/`、`agents/`、`stages/`，
+方法与阈值在 `references/`（按需读取）。
 
 本文件的主要作用是：
 

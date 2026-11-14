@@ -23,7 +23,27 @@ PERMISSIONS_FILE = "permissions.toml"
 # 开关管「装配时装不装进来」——后者决定工具在不在请求体的 tools 数组里。
 TOOLS_FILE = "tools.toml"
 # 默认策略下要问一次的工具：会改动文件或运行命令的那些
-DEFAULT_ASK = frozenset({"write", "patch", "bash", "dock", "score_affinity", "fit_affinity"})
+#
+# `prepare_receptor` / `prepare_ligands` 也在这里：它们写的是需要用户确认的产物
+#（`AGENTS.md` §5.3 的第三个确认点）。2026-11-13 之前这两个动作对子 agent 是
+# 一律 DENY，结果是「主 agent 纯编排之后，没有任何会话能准备受体」；现在改成
+# 交给承担该能力的角色做，但每次仍要用户点一次头——拦的从「谁」换成「有没有确认」。
+DEFAULT_ASK = frozenset(
+    {
+        "write",
+        "patch",
+        "bash",
+        "dock",
+        "score_affinity",
+        "fit_affinity",
+        "prepare_receptor",
+        "prepare_ligands",
+        # 切换当前受体改的是整个会话家族共享的状态，2026-11-12 的事故就是它。
+        # 交给 `structure_pocket` 执行不等于不用问：选哪套结构它说了算，
+        # 但「把当前受体换掉」要用户点头（P-83）。
+        "switch_receptor",
+    }
+)
 # Plan 方式下一律拒绝的工具。一条命令会不会改动看不出来，所以 bash 也算在里面
 #
 # 领域工具里进这一档的是「会落一份新产物并登记成新条目」的那些：准备受体 / 配体、
@@ -41,6 +61,21 @@ PLAN_DENY = frozenset(
      "matched_pairs", "enumerate_analogs", "record_assay",
      "build_pharmacophore", "screen_pharmacophore", "align_ligands"}
 )
+
+# 子 agent 与主 agent 的权限差别，现在只剩工具档位与 `PLAN_DENY`。
+#
+# 2026-11-12 曾经在这里禁掉 `switch_receptor` / `prepare_receptor` /
+# `prepare_ligands`：一个 worker 在「登记一个结构」的任务里自己走到准备受体、
+# 切换受体，把父会话的当前受体换掉。2026-11-13 P-79 之后主 agent 不再持有领域族，
+# 这三条禁令等于让这几个动作**没有任何会话能做**；于是改成按角色开放：
+#
+# - `prepare_receptor` / `prepare_ligands` 属于 `screening`（receptor / ligand 族），
+#   调用时按 `DEFAULT_ASK` 问一次用户；
+# - `switch_receptor` 属于 `listing` 族，挂到 `structure_pocket` 的
+#   `structure_discovery` 能力上——选哪套结构是它的职责；但「换掉当前受体」是改共享
+#   状态，2026-11-13 P-83 起也进 `DEFAULT_ASK`，问一次再换。
+#
+# 共享状态本身没变（子会话与父会话仍共用同一份登记表），变的是「谁有权改」有据可依。
 
 # 按次计费的联网工具：5 元 / 1000 次成功请求（`docs/reference.md` 第三节）。
 # 单次约 0.005 元，为这个价钱每一步都弹一次窗只会把人逼成条件反射按 y，
@@ -293,8 +328,14 @@ class PermissionPolicy:
         agent_name: str,
         explicit: bool = False,
         cancelled: bool = False,
+        worker: bool = False,
     ) -> PermissionDecision:
-        """判定一次调用。"""
+        """判定一次调用。
+
+        `worker` 是子 agent 的标记，由循环层按会话深度给出。**它不再单独拦动作**：
+        2026-11-13 起准备受体/配体与切换受体按角色开放，只按 `DEFAULT_ASK` 问一次。
+        参数保留是因为调用方与判据都在传它，将来要加回按档位的判定不必改签名。
+        """
         if cancelled:
             return PermissionDecision(Verdict.DENY, reason="已经中断")
         if explicit:

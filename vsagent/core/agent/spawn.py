@@ -1,9 +1,10 @@
 """子 agent 的派发：把父会话的一段消息复制成一条独立会话，并交给它一个任务。
 
-这个模块只放两样东西：
+这个模块放三样东西：
 
 - `fork_messages`：纯数据复制，不碰事件、不碰界面；
-- `SpawnAgentTool`：模型能调用的那个工具，只做参数校验与守卫。
+- `DispatchCampaignTool`：唯一的派发工具，按任务规格派给专业角色；
+- `AgentStatusTool`：父会话取回子 agent 状态与报告的那条路。
 
 真正「起一条后台任务」的是 `AgentHost`（`host.py`）。分开的理由和 `task.py`
 一样：工具层不该知道怎么调度，调度层也不该知道模型的参数长什么样。
@@ -15,7 +16,8 @@ import json
 import time
 from typing import Any
 
-from ..models import Message, Part, PartType, Session, ToolStatus
+from ..models import Message, Part, PartType, Session
+from . import campaign_state
 from .prompt import estimate_tokens, translate_message
 from .tools import Tool, ToolError, ToolResult, ToolSpec
 
@@ -30,6 +32,9 @@ SKIPPED_PARTS = frozenset(
         PartType.RETRY,
         PartType.COMPACTION,
         PartType.AGENT,
+        # 父会话的意图解析：子 agent 的任务书由父会话重写，带上这一段只会
+        # 让它看见一份不是自己的任务规格。
+        PartType.ROUTE,
     }
 )
 
@@ -150,81 +155,62 @@ def task_preamble(
     return "\n".join(lines)
 
 
-def recent_start(messages: list[Message], turns: int) -> int:
-    """最近 N 个用户轮的起点下标。`turns` 小于 1 时返回末尾（不复制）。"""
-    if turns < 1:
-        return len(messages)
-    seen = 0
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].role == "user":
-            seen += 1
-            if seen >= turns:
-                return index
-    return 0
+class DispatchCampaignTool(Tool):
+    """按当前任务规格发起一次多角色执行。
 
-
-def history_end(messages: list[Message]) -> int:
-    """可复制的历史终点。
-
-    模型调 `spawn_agent` 时，最后一条助手消息正在写、里面就是这次调用本身。
-    把它复制进子会话，子 agent 会看到一条没有结果的工具调用——那是父会话的
-    半成品，不是它的历史。派发之后这条消息才补上结果，所以终点要往前退一条。
-    """
-    if not messages:
-        return 0
-    last = messages[-1]
-    if last.role == "assistant" and any(
-        part.type is PartType.TOOL
-        and part.tool_name == "spawn_agent"
-        and part.tool_status
-        in (ToolStatus.PENDING, ToolStatus.RUNNING, ToolStatus.AWAITING)
-        for part in last.parts
-    ):
-        return len(messages) - 1
-    return len(messages)
-
-
-class SpawnAgentTool(Tool):
-    """从当前会话 fork 一个子 agent，在后台独立运行。
-
-    与常见「子任务工具」的区别：它**立即返回**，不等待子 agent 跑完。
-    父会话该继续做自己的事；结果在右侧列表里看。
+    这是**唯一**的派发入口：角色、依赖与工具族都由能力计划算出来；`roles` 只能从
+    计划里减，不能加。子 agent 之间不递归派发，深度守卫在下面。
     """
 
     spec = ToolSpec(
-        name="spawn_agent",
+        name="dispatch_campaign",
         description=(
-            "从当前会话 fork 一个子 agent，在后台独立运行，立即返回、不等待结果。"
-            "子 agent 有独立上下文，但与本会话共享工作目录、runs/ 与登记表。"
-            "适合把一段可以并行推进的调研或计算分出去；同一个任务不要重复派发。"
-            "子 agent 内不能再派发新的 agent。"
-            "派发之后用一句话告诉用户：派了什么、去哪看结果。"
+            "当任务规格已经明确、需要专业角色分工时，用这个工具排一次计划并派发。"
+            "它按能力计划决定派谁、谁等谁，能并行的并行。`roles` 可以从计划里选子集"
+            "（上游会自动补上），也可以点名计划外的角色——按它的能力表补进来，"
+            "只选一个角色时 `task` 可以改写任务书。\n"
+            "不适用：一次调用就能做完的事、或下一步要用到你此刻的推理时，不要派"
+            "（子 agent 看不到你的推理）。缺任务规格时先让用户把目标、对象与交付物说清楚。\n"
+            "confirm=false 只返回计划预览（角色、谁等谁），不建会话、不跑计算；"
+            "用户同意后再用 confirm=true。同一份计划不会重复派发；同一会话同时只能有一场。\n"
+            "副作用：每个角色新建一个子会话，产物写进共享的运行目录与登记表。"
+            "返回计划文字；**不含结果**——之后用 agent_status 取。"
         ),
         parameters={
             "type": "object",
             "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "子 agent 的名字，两到八个字，会显示在右侧列表里",
+                "confirm": {
+                    "type": "boolean",
+                    "description": (
+                        "false=只预览计划（推荐第一次这样调用）；true=真正启动。"
+                        "必填，没有默认值。示例：{\"confirm\": false}"
+                    ),
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "只派这几种角色（括号内的名字，如 structure_pocket）；上游会自动补上。"
+                        "计划里没有的角色会按其能力表补进这次派发（用于中途发现要补一步）。"
+                        "不给则整份计划都派"
+                    ),
                 },
                 "task": {
                     "type": "string",
-                    "description": "交给子 agent 的完整任务书：做什么、产出什么、有什么限制",
-                },
-                "history": {
-                    "type": "string",
-                    "enum": ["all", "recent", "none"],
                     "description": (
-                        "复制多少父会话历史作为子 agent 的初始上下文："
-                        "all=整段；recent=最近若干轮（默认）；none=只给任务书"
+                        "自定义任务书，只给 roles 指定的那一个角色用；"
+                        "不给则按子目标自动拼"
                     ),
                 },
-                "recent_turns": {
-                    "type": "integer",
-                    "description": "history=recent 时复制最近几个用户轮，默认 6",
+                "timeout": {
+                    "type": "number",
+                    "description": (
+                        "整场最多等多少分钟（1–720）。留空按每个角色说明书里的时限；"
+                        "到点未完成记失败，不再等"
+                    ),
                 },
             },
-            "required": ["task"],
+            "required": ["confirm"],
             "additionalProperties": False,
         },
     )
@@ -233,50 +219,253 @@ class SpawnAgentTool(Tool):
     spawn_argument = "spawner"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        """校验参数、守卫深度，然后交给 host。"""
+        from .capability_router import (
+            CapabilityRouter,
+            RouterError,
+            Routing,
+            missing_prerequisites,
+        )
+        from .contracts import TaskSpec
+        from .coordinator import Coordinator, build_tasks, role_label
+        from .dispatcher import AgentDispatcher
+        from .scheduler import AgentScheduler
+
         session: Session = arguments["session"]
-        spawner = arguments["spawner"]
+        host = arguments["spawner"]
         if session.depth >= 1:
             raise ToolError(
-                "子 agent 内不能再创建 agent。把任务做完，把结论交回父会话；"
-                "如果确实需要拆分，把建议写进结论里。"
+                "子 agent 不能发起多角色执行：把这一段做完，把结论交回父会话。"
             )
-        task = arguments.get("task")
-        if not isinstance(task, str) or not task.strip():
-            raise ToolError("缺少参数 task：子 agent 需要一份完整任务书")
-        task = task.strip()
-        title = str(arguments.get("title") or "").strip()
-        if not title:
-            title = task.splitlines()[0][:20]
-        history = str(arguments.get("history") or "recent")
-        if history not in ("all", "recent", "none"):
-            raise ToolError("history 只能是 all / recent / none")
+        if not session.task_spec:
+            raise ToolError(
+                "还没有任务规格，不能发起多角色执行。先把要做什么说清楚"
+                "（目标、对象、交付物），再调用一次。"
+            )
+        try:
+            spec = TaskSpec.from_dict(session.task_spec)
+        except Exception as error:  # noqa: BLE001 - 坏状态当成"读不出来"，不往外抛协议错误
+            raise ToolError(f"当前任务规格读不出来：{error}") from error
 
-        if history == "all":
-            start, end = 0, history_end(session.messages)
-        elif history == "none":
-            start = end = history_end(session.messages)
-        else:
-            turns = arguments.get("recent_turns")
-            turns = 6 if not isinstance(turns, int) or turns < 1 else turns
-            end = history_end(session.messages)
-            start = recent_start(session.messages[:end], turns)
+        routing = CapabilityRouter().route(spec)
+        roles = _requested_roles(arguments)
+        if roles:
+            # 计划外的角色按能力表补进来：中途发现要结构盘点时，不必等用户改口
+            # 重新解析（P-83）。拼错的角色名由 `extend` 拒掉。
+            try:
+                extended = CapabilityRouter().extend(
+                    routing.plan, roles, provided=spec.available_inputs
+                )
+            except RouterError as error:
+                raise ToolError(str(error)) from error
+            if extended.plan is not routing.plan:
+                routing = Routing(
+                    plan=extended.plan,
+                    warnings=routing.warnings + extended.warnings,
+                )
+        custom = str(arguments.get("task") or "").strip()
+        tasks, warnings = build_tasks(routing.plan, spec, roles=roles, task=custom)
+        # 路由那边的告警也要带上：补派了哪些计划外角色、补了哪些前置，都在那里。
+        warnings = list(routing.warnings) + list(warnings)
+        if not tasks:
+            raise ToolError(
+                "这份任务规格里没有可派的角色：先确认要查什么、要交什么，再发起。"
+            )
+        if custom:
+            # 按**请求的**角色判，不按补完上游后的任务数：请求一个下游角色时，
+            # 上游是按依赖补进来的，不该因此把这条路堵死（P-83）。
+            single = list(roles) if roles is not None else list(routing.plan.selected_agents)
+            if len(single) != 1:
+                names = "、".join(single)
+                raise ToolError(
+                    f"自定义任务书一次只给一个角色；现在指定了 {len(single)} 个"
+                    f"（{names}）。用 roles 指定是哪一个，或去掉 task。"
+                )
+        preview = _campaign_preview(routing.plan, tasks, warnings)
+        minutes = _campaign_timeout(arguments.get("timeout"))
+        if minutes:
+            preview += f"\n整场上限：{minutes:g} 分钟，到点未完成记失败。"
+        # 前置不齐的节点不能派：调度器没有任何东西可以喂给它，跑起来也只是空转。
+        # 只判**这次要派的角色**——只派上游时，另一个分支缺前置不该拦这一场。
+        missing = missing_prerequisites(routing.plan, [task.role for task in tasks])
+        if missing:
+            blocked = (
+                "**不可派发：缺前置产物**\n- "
+                + "\n- ".join(missing)
+                + "\n先把缺的那一步加进计划（重新解析意图或补子目标），"
+                "或者只派已经齐了的上游角色。"
+            )
+            if not arguments.get("confirm"):
+                # 预演不建会话，留着让用户看见「本来要派谁、卡在哪」。
+                return ToolResult(
+                    output=preview + "\n\n" + blocked,
+                    meta={"confirm": False, "agents": len(tasks), "blocked": True},
+                )
+            raise ToolError(blocked)
+        # 计划编出来了：这一步就是「排计划」。预演也算——它确实排了一遍。
+        _advance_state(session, campaign_state.PLANNING)
+        if not arguments.get("confirm"):
+            return ToolResult(
+                output=preview + "\n\n这只是预览。确认之后用 confirm=true 启动。",
+                meta={"confirm": False, "agents": len(tasks)},
+            )
+        if host.campaign_running(session.id):
+            stale = campaign_state.PlanStamp(
+                session.campaign_task_id, session.campaign_revision
+            ).stale_reason(spec.task_id, spec.revision)
+            if stale:
+                raise ToolError(
+                    f"{stale}。现在这一场还在跑，先让用户决定要不要停："
+                    "停下之后按新规格重新发起。"
+                )
+            raise ToolError(
+                "这个会话已经有一场多角色执行在跑：用 agent_status 看进度，"
+                "不要重复发起。"
+            )
 
-        child = spawner.spawn(
+        _advance_state(session, campaign_state.DELEGATING)
+        coordinator = Coordinator(AgentScheduler(AgentDispatcher(host)))
+        started = host.start_campaign(
             session,
-            title=title,
-            task=task,
-            start=start,
-            end=end,
-            origin="agent",
+            coordinator.run(
+                session,
+                routing.plan,
+                spec,
+                timeout=(minutes * 60 if minutes else None),
+                roles=roles,
+                task=custom,
+            ),
+            on_done=lambda campaign: _record_campaign(session, campaign),
         )
+        if not started:
+            raise ToolError("启动失败：这个会话已经有一场多角色执行在跑。")
+        # 记下这份计划是按哪一版规格编的。之后用户改口，拿它比一次就知道该不该作废。
+        session.campaign_task_id = routing.plan.task_id
+        session.campaign_revision = spec.revision
         return ToolResult(
             output=(
-                f"已派发子 agent「{child.title}」（{child.id}），它在后台运行。"
-                "不要重复派发同一任务；用 agent_status 查看进度或等它给出结论。"
+                preview
+                + "\n\n已启动，在后台跑。用 agent_status 看进度与结论；"
+                "需要停下时告诉用户，由用户中断。"
             ),
-            meta={"session_id": child.id},
+            meta={"confirm": True, "agents": len(tasks), "task_id": routing.plan.task_id},
         )
+
+
+def _campaign_timeout(raw: Any) -> float:
+    """整场上限（分钟）。0 表示没给；超过一天按一天算。
+
+    不合法的值当没给：宁可跑完，也不要因为一个字符串把整次派发拒掉。
+    """
+    if raw is None:
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return min(720.0, value)
+
+
+def _requested_roles(arguments: dict[str, Any]) -> list[str] | None:
+    """解析 `roles`。不给返回 None；给了就只校验形状，角色名由 `extend` 判。
+
+    计划外的角色是允许的（按能力表补进计划），所以这里不能拿计划当白名单：
+    那样一来「中途发现要结构盘点」就又被拒一次。
+    """
+    raw = arguments.get("roles")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ToolError('roles 要写成数组，例如 ["structure_pocket"]')
+    roles = [str(item).strip() for item in raw if str(item).strip()]
+    if not roles:
+        raise ToolError("roles 里没有有效的角色名")
+    return roles
+
+
+def _campaign_line(session: Session) -> str:
+    """这件事走到哪一步，以及手上这份计划是不是已经作废。
+
+    只报「当前是什么」：调用方是模型，它要据此决定下一步做什么，不是看历史。
+    """
+    state = session.campaign_state
+    if not state:
+        return ""
+    line = f"多角色执行：{campaign_state.label(state)}（{state}）"
+    spec = session.task_spec or {}
+    stale = campaign_state.PlanStamp(
+        session.campaign_task_id, session.campaign_revision
+    ).stale_reason(
+        str(spec.get("task_id") or ""), int(spec.get("revision") or 0)
+    )
+    if stale:
+        line += f"\n注意：{stale}"
+    return line
+
+
+def _advance_state(session: Session, target: str) -> str:
+    """推进战役状态，返回跳不过去的理由（能跳时为空串）。
+
+    跳不过去不改状态：这是记账，不是闸门。真正需要拦住的情形（重复派发、
+    计划作废）由调用方单独判，不靠状态机兜。
+    """
+    state, reason = campaign_state.soft_advance(session.campaign_state, target)
+    session.campaign_state = state
+    return reason
+
+
+def _campaign_preview(plan: Any, tasks: list[Any], warnings: list[str]) -> str:
+    """派发前的预演：派谁、谁等谁。不查状态，只说计划本身。
+
+    导入放在函数里：`coordinator` → `scheduler` → `dispatcher` → `host` 这条链
+    会绕回本模块，放在文件顶部就成了循环导入。
+    """
+    from .coordinator import role_label
+
+    roles = {task.task_id: task.role for task in tasks}
+    lines = [f"这次会派 {len(tasks)} 个角色（计划 {plan.task_id}）："]
+    for task in tasks:
+        goal = task.objective
+        if len(goal) > 40:
+            goal = goal[:40] + "…"
+        waits = "、".join(
+            role_label(roles.get(dep, dep)) for dep in task.dependencies
+        )
+        tail = f"；等 {waits}" if waits else ""
+        lines.append(f"- {role_label(task.role)}（{task.role}）：{goal}{tail}")
+    if warnings:
+        lines.extend(f"注意：{item}" for item in warnings)
+    dispatched = {task.role for task in tasks}
+    pending = [role for role in plan.selected_agents if role not in dispatched]
+    if pending:
+        # 按子集派发时，计划里剩下的角色不会自己跑；不说的话，主 agent 会以为
+        # 整场已经跑完（2026-11-13 的 HA2 会话就是这样漏掉 screening 的）。
+        lines.append(
+            "计划里还有没派的角色："
+            + "、".join(f"{role_label(role)}（{role}）" for role in pending)
+            + "；要跑它们就单独派一次。"
+        )
+    return "\n".join(lines)
+
+
+def _record_campaign(session: Session, campaign: Any) -> None:
+    """把这次执行的结果写进任务状态。只追加，不清掉模型自己记的进度。"""
+    done, todo, blocked = campaign.progress()
+    pending = [str(role) for role in getattr(campaign, "pending", ()) or ()]
+    if pending:
+        # 没派的角色要进待办：不然下一轮看任务状态，会以为整份计划都跑过了。
+        todo = [*todo, f"计划里还没派：{'、'.join(pending)}（要跑就单独派一次）"]
+    state = session.task_state
+    updates: dict[str, list[str]] = {}
+    for name, fresh in (("done", done), ("todo", todo), ("blockers", blocked)):
+        if not fresh:
+            continue
+        current = list(getattr(state, name))
+        updates[name] = current + [item for item in fresh if item not in current]
+    if updates:
+        state.apply(**updates)
+    session.touch()
 
 
 # 一次报告里最多写几个子 agent、每个写多长。取小值：这份报告进的是父会话
@@ -340,6 +529,36 @@ def _output_files(session: Session) -> list[str]:
     return found
 
 
+def _report_lines(child: Session) -> list[str]:
+    """结构化派发的子 agent：补一段按角色判过的报告摘要。
+
+    自由文本派发的子会话没有角色，这里什么都不加——它们的结论已经在上一行。
+    不合格时不重写一份"看起来能做"的摘要，而是把缺什么直接写出来，
+    父会话据此决定要不要让它补交。
+    """
+    from .profiles import profile
+    from .reports import build
+
+    try:
+        spec = profile(child.agent_role)
+    except KeyError:
+        return [f"  报告：角色 {child.agent_role} 不在说明书里，无法判"]
+    built = build(
+        child, spec, task_id=child.task_id, campaign_id=child.campaign_id
+    )
+    if built.acceptable:
+        head = f"  报告：合格（{child.agent_role}）"
+    else:
+        head = f"  报告：不合格（{child.agent_role}）—— " + "；".join(built.problems)
+    lines = [head]
+    report = built.report
+    if report.artifact_refs:
+        lines.append(f"  产物句柄：{'、'.join(report.artifact_refs[:5])}")
+    if report.evidence_refs:
+        lines.append(f"  证据：{'、'.join(report.evidence_refs[:3])}")
+    return lines
+
+
 def _cap_report(text: str, limit: int = REPORT_TOKENS) -> str:
     """把整份报告压到限额以内：**按行**丢，末尾写明去哪看全文。
 
@@ -363,7 +582,7 @@ def _cap_report(text: str, limit: int = REPORT_TOKENS) -> str:
 class AgentStatusTool(Tool):
     """查看子 agent 的状态与结论，可选等它们跑完。
 
-    这是父会话取回结果的那条路：`spawn_agent` 只负责派出去，
+    这是父会话取回结果的那条路：`dispatch_campaign` 只负责派出去，
     跑完的结论不会自动进父会话的上下文——那样会把子 agent 的全文
     塞进来，把父会话的窗口吃掉。这里只取一份短报告，要细节再进那个界面。
     """
@@ -416,7 +635,10 @@ class AgentStatusTool(Tool):
                     "不填 session_id 可以看全部。"
                 )
         if not children:
-            return ToolResult(output="本会话还没有派出过子 agent。")
+            head = _campaign_line(session)
+            return ToolResult(
+                output=(head + "\n" if head else "") + "本会话还没有派出过子 agent。"
+            )
 
         timeout = arguments.get("timeout")
         timeout = 20 if not isinstance(timeout, int) else min(60, max(1, timeout))
@@ -425,6 +647,9 @@ class AgentStatusTool(Tool):
 
         shown = children[:MAX_REPORTS]
         lines: list[str] = []
+        head = _campaign_line(session)
+        if head:
+            lines.append(head)
         for child in shown:
             status = "待开始" if child.has_pending_prompt else _status_text(child.status)
             lines.append(
@@ -436,6 +661,8 @@ class AgentStatusTool(Tool):
                 lines.append(f"  说明：{child.status_note}")
             result = _last_result(child)
             lines.append("  结论：" + (result.replace("\n", "\n  ") if result else "（还没有回复）"))
+            if child.agent_role and child.status in ("done", "failed", "cancelled"):
+                lines.extend(_report_lines(child))
             files = _output_files(child)
             if files:
                 shown_files = "、".join(files[:5])

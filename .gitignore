@@ -4,7 +4,13 @@ runs/
 logs/
 tests/output/
 build/
-dist/
+# `dist/` 里只跟踪规则：`AGENTS.md` 与 `rules/` 是规则的**唯一一份**（2026-11-13 从仓根
+# 移进来，仓根不再保留副本）。exe 与临时产物照旧忽略。
+# 写成 `dist/*` 而不是 `dist/`：带斜杠会把整个目录排除掉，后面的 `!` 就再也进不去。
+dist/*
+!dist/AGENTS.md
+!dist/rules/
+!dist/rules/**
 __pycache__/
 *.pyc
 

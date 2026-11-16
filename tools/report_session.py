@@ -127,6 +127,7 @@ tbody tr.active{background:rgba(47,111,235,.12)}
   <a href="#turns">逐轮总览</a>
   <a href="#turn">轮次详情</a>
   <a href="#topics">主题</a>
+  <a href="#children">子会话</a>
   <a href="#issues">异常</a>
 </nav>
 <main>
@@ -166,10 +167,21 @@ tbody tr.active{background:rgba(47,111,235,.12)}
     <div id="issuelist"></div>
   </section>
 
+  <section id="children">
+    <h2>子会话</h2>
+    <div class="note" style="margin-bottom:12px">
+      子会话与根会话共写这一份记录，下面的步、工具与用量已经合进页首的总数。
+      子会话之间并行跑，时长单列，不与根会话相加。
+    </div>
+    <div id="childrows"></div>
+  </section>
+
   <section>
     <h2>口径</h2>
     <div class="note">
       耗时取 trace 时间戳之差（用户消息写入到 turn.done），不含两次输入之间的空闲。<br>
+      轮次终态先看有没有 turn.done；没有时才取窗口内最后一个 agent.status。<br>
+      步、工具、失败与用量含本会话派出的子会话；子会话之间的耗时并行，单列不相加。<br>
       token 与费用取状态文件里助手消息自带的 tokens / cost；逐步的输入、缓存、输出取 trace 的 context.metrics。<br>
       步按助手消息里的 STEP_START 数；装配记录与步按顺序一一对应，条数不同时只取两边都有的那一段。<br>
       缓存命中 = cached / input，逐步取该步的读数，整轮取各步算术平均。<br>
@@ -475,6 +487,33 @@ function renderTopics() {
     </tr>`).join('');
 }
 
+function renderChildren() {
+  const rows = data.children || [];
+  const box = document.getElementById('childrows');
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">这一场没有派出子会话</div>';
+    return;
+  }
+  box.innerHTML = `<table><thead><tr>
+    <th>编号</th><th>标题</th><th>角色</th><th>状态</th>
+    <th class="num">步</th><th class="num">工具</th><th class="num">失败</th>
+    <th class="num">输入</th><th class="num">输出</th><th class="num">耗时</th>
+    <th class="num">费用</th>
+  </tr></thead><tbody>` + rows.map((c) => `<tr>
+    <td class="mono">${esc(c.id)}</td>
+    <td>${esc(c.title)}</td>
+    <td class="mono">${esc(c.role || '—')}</td>
+    <td>${statusTag(c.status)}</td>
+    <td class="num">${c.steps}</td>
+    <td class="num">${c.tools}</td>
+    <td class="num">${c.failed || ''}</td>
+    <td class="num">${fmt(c.tokens.input)}</td>
+    <td class="num">${fmt(c.tokens.output)}</td>
+    <td class="num">${secs(c.seconds)}</td>
+    <td class="num">${money(c.cost)}</td>
+  </tr>`).join('') + '</tbody></table>';
+}
+
 function renderIssues() {
   const box = document.getElementById('issuelist');
   if (!data.issues.length) {
@@ -495,6 +534,7 @@ function renderIssues() {
 renderHead();
 renderTurns();
 renderTopics();
+renderChildren();
 renderIssues();
 const bar = document.getElementById('turnbar');
 bar.innerHTML = data.turns.map((t) =>
@@ -545,7 +585,9 @@ def main() -> int:
     if not trace:
         print(f"警告：{trace_path} 不存在或为空，逐步数据会缺失", file=sys.stderr)
 
-    data = build(session, trace)
+    # 子会话与根会话共写这一份 trace，报告要把它们的步与用量一起算。
+    children = manager.children_of(session_id)
+    data = build(session, trace, children=children)
     out = Path(args.out) if args.out else PROJECT_ROOT / ".probe" / f"report-{session_id}.html"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render(data), encoding="utf-8")

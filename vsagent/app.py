@@ -8,7 +8,6 @@ from pathlib import Path
 from textual.app import App
 from textual.screen import Screen
 
-from vsagent.core.agent.roles import toolprofiles
 from vsagent.core.agent.planning.context import event_line
 from .core.agent.coretools import build_core_tools
 from vsagent.core.agent.execution.coordinator import Coordinator
@@ -21,7 +20,7 @@ from vsagent.core.agent.state.event_log import render_event_detail
 from vsagent.core.agent.execution.hooks import HookRunner, default_hooks_paths, load_hooks
 from vsagent.core.agent.execution.host import AgentHost
 from vsagent.core.agent.state.ledger import LedgerError, SessionLedger
-from vsagent.core.agent.execution.loop import AgentLoop, max_steps_from_env
+from vsagent.core.agent.execution.loop import AgentLoop, max_steps_from_env, sar_mode_from_env
 from vsagent.core.agent.state.memory import MemoryKind, MemoryStore
 from .core.memory import MemoryError as MemoryStoreError
 from .core.agent.permission import (
@@ -179,9 +178,8 @@ class VSAgentApp(App[None]):
         # 建一次就够——工具清单在进程里是固定的。
         self._catalog: list[tuple[str, str]] | None = None
         self._memory: MemoryStore | None = None
-        # 工具注册表按 (档位, 角色) 缓存：主 agent 一份，子 agent 每个角色一份
-        #（角色只用来放行它自己声明的常驻工具，见 `toolprofiles.keeps`）。
-        self._registries: dict[tuple[str, str], ToolRegistry] = {}
+        # 工具注册表只装一份：全部工具都在里面，哪一步发哪些由角色名单过滤。
+        self._tool_registry: ToolRegistry | None = None
         # 判定规则读一次，每个循环层各拿一份新策略：本会话的「全部允许」
         # 不能顺着共享对象漏到子 agent 头上。
         self._policy_rules: tuple[dict, dict] | None = None
@@ -290,14 +288,11 @@ class VSAgentApp(App[None]):
         if session.model_id and session.model_id != config.model:
             config = config.for_model(session.model_id)
         memory = self._build_memory()
-        # 档位按「是不是子 agent」取；角色只用来放行它自己声明过的常驻工具
-        #（目前只有 hypothesis 角色要 hypothesis）。注册表按 (档位, 角色) 缓存。
-        profile = toolprofiles.profile_for(session.is_subagent)
-        role = session.agent_role if session.is_subagent else ""
-        registry = self._registries.get((profile, role))
+        # 注册表只装一份、含全部工具；可见清单由 `tool_specs()` 按角色名单过滤。
+        registry = self._tool_registry
         if registry is None:
-            registry = self._build_registry(memory, profile=profile, role=role)
-            self._registries[(profile, role)] = registry
+            registry = self._build_registry(memory)
+            self._tool_registry = registry
         return AgentLoop(
             self.event_bus,
             OpenAICompatProvider(config),
@@ -323,6 +318,9 @@ class VSAgentApp(App[None]):
             ),
             validator_mode=validators_mode_from_env(),
             max_steps=max_steps_from_env(),
+            # 搜索增强推理在应用层默认 shadow：照常建立状态、评估与整合，
+            # 最终正文仍用模型原稿。观察一段时间后再用 VSA_SAR=enforce 切换。
+            sar_mode=sar_mode_from_env(default="shadow"),
         )
 
     def _provider_config(self) -> ProviderConfig:
@@ -403,7 +401,7 @@ class VSAgentApp(App[None]):
         memory: MemoryStore,
         disabled: frozenset[str] | None = None,
         *,
-        profile: str = toolprofiles.FULL,
+        profile: str = "full",
         role: str = "",
     ) -> ToolRegistry:
         """装配全部工具。每个工具的工作基准都是项目目录，
@@ -420,25 +418,23 @@ class VSAgentApp(App[None]):
         `disabled` 传空集时装配一份「一个都不关」的注册表，`/tools` 面板靠它
         拿到完整清单：面板要能列出被关掉的那些，否则关掉之后就再也打不开了。
 
-        `profile` 决定常驻核心工具装哪一档（见 `toolprofiles.py`）。**只影响核心
-        工具，不影响领域工具族**：后者由 `load_tools` 按主题装入，两档一样。
-        `role` 只放行角色自己声明的常驻工具（`hypothesis` 角色的 `hypothesis`），
-        不改变别的东西。
+        注册表只装一份、含全部工具。**哪一步发哪些名字由 `agents.toml` 的角色名单
+        决定**，在 `tool_specs()` 处过滤；这里不再按档位裁。`profile` 与 `role`
+        两个参数留着只为旧调用不报错，装配结果与它们无关。
         """
         if disabled is None:
             disabled = self._disabled_tools()
         registry = ToolRegistry(disabled=disabled)
         # 装配顺序就是请求体里的顺序，模型按它挑工具，所以清单只写在一处
-        #（`coretools.build_core_tools`）。这里只按档位过滤，不重排。
+        #（`coretools.build_core_tools`）。这里不重排、不裁剪。
         for tool in build_core_tools(
             root=self.root,
             memory=memory,
             sessions=self.session_manager,
             bash_timeout=BASH_TIMEOUT,
-            allow_agents=toolprofiles.keeps(profile, "agent_status", role),
+            allow_agents=True,
         ):
-            if toolprofiles.keeps(profile, tool.spec.name, role):
-                registry.register(tool)
+            registry.register(tool)
         for tool in domain_tools():
             registry.register(tool)
         return registry
@@ -511,22 +507,10 @@ class VSAgentApp(App[None]):
             return self.tool_entries()
 
         self._disabled = load_tool_switches(self.root)[0]
-        # 缓存作废后按每个会话重建：子 agent 那份不能因为重建就把派发、
-        # 假设这些装回去，档位要按会话重新取一次。
-        self._registries.clear()
-        for session_id, loop in self.host.items():
-            session = self.session_manager.get_session(session_id)
-            loop.registry = self._build_registry(
-                self._build_memory(),
-                profile=toolprofiles.profile_for(
-                    session is not None and session.is_subagent
-                ),
-                role=(
-                    session.agent_role
-                    if session is not None and session.is_subagent
-                    else ""
-                ),
-            )
+        # 注册表只有一份，重建一次就够；每个循环层指向它。
+        self._tool_registry = self._build_registry(self._build_memory())
+        for _session_id, loop in self.host.items():
+            loop.registry = self._tool_registry
         actual, sources = load_tool_switches(self.root)
         if enabled and name in actual:
             self.show_toast(f"{name} 仍被 {sources[name]} 关着，先把那份文件里的 false 去掉", "warning")

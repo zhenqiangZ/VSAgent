@@ -178,14 +178,10 @@ class AdmetTool(Tool):
     spec = ToolSpec(
         name="predict_admet",
         description=(
-            "给一批分子算**类药性**（规则层）：ESOL 水溶解度、Veber 口服规则、"
-            "血脑屏障启发式、CYP 警示子结构。产出一份配体集（stage=admet），"
-            "原有 SMILES 与 id 不变，多出几列数值。" + CHEM_TOOL_DESCRIPTION_NOTE + "\n"
-            "**只做规则层**：每个数都能追到公式（写在产物 manifest 里），"
-            "不是模型预测。hPPB 与 CYP 抑制**明确标为不支持**——规则层给不出可信值，"
-            "宁可说没有也不编一个数。\n"
-            "溶解度单位是 log10(mol/L)，越低越难溶；Veber 只看「可旋转键 ≤ 10 且 TPSA ≤ 140」。"
-            "输入里解析失败的分子该行留空，不补默认值。"
+            "这批分子的类药性指标是多少？\n"
+            "输入：ligands 填配体集；endpoints 选要算的项，默认全算。\n"
+            "输出：状态 admet 的配体集，原有 id 与 SMILES 不变，多出几列数值。\n"
+            "边界：只做规则层，每个数都能追到公式；hPPB 与 CYP 抑制明确不支持，宁可说没有也不编一个数；解析失败的分子该行留空。"
         ),
         parameters={
             "type": "object",
@@ -217,7 +213,7 @@ class AdmetTool(Tool):
         raw = str(arguments.get("ligands") or "").strip()
         if not raw:
             return ToolResult(
-                output="缺少参数 ligands。先 import_ligandset 或 list_workspace。", failed=True
+                output="缺少参数 ligands。先 import_ligandset 或 registry。", failed=True
             )
         try:
             entry = ledger.get(raw)

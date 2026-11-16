@@ -1000,14 +1000,10 @@ class ImportLigandsetTool(Tool):
     spec = ToolSpec(
         name="import_ligandset",
         description=(
-            "导入**本机的一份配体文件**（.sdf / .sd / .smi / .csv），登记成一个**原始配体集**。"
-            "CSV 至少要有 smiles 列（也认 canonical_smiles；ChEMBL 结果的 molecule_chembl_id / "
-            "molecule_pref_name / pchembl_value 会一并保留）。每条会去盐（只留最大片段）、"
-            "canonical SMILES 去重；无效 SMILES 跳过并逐条报原因。"
-            f"{CHEM_TOOL_DESCRIPTION_NOTE}"
-            "**这是与 import_structure 并列的第二个收路径动作**：导入后一律用返回的 handle，"
-            "不要再传路径。同一份内容（sha256）与同参数重复导入不会重复登记。"
-            "单条 SMILES 请写成 .smi 的一行（`SMILES 名字`），本工具不直接收 SMILES 字符串。"
+            "本机这份配体文件里有多少个可用分子？\n"
+            "输入：path 填 .sdf、.sd、.smi 或 .csv；CSV 至少要有 smiles 列，也认 canonical_smiles。\n"
+            "输出：原始配体集；每条去盐、按规范 SMILES 去重，无效的跳过并逐条报原因。\n"
+            "边界：同一份内容与同参数重复导入不会重复登记；单条 SMILES 写成 .smi 的一行，不收 SMILES 字符串本身。"
         ),
         parameters={
             "type": "object",
@@ -1183,16 +1179,10 @@ class PrepareLigandsTool(Tool):
     spec = ToolSpec(
         name="prepare_ligands",
         description=(
-            "把原始配体集准备成**可以直接对接的 PDBQT**：去盐后的 SMILES → ETKDGv3 3D 构象 → "
-            "MMFF94（不可用时 UFF）→ Meeko 指派 AutoDock 原子类型与部分电荷。"
-            f"{CHEM_TOOL_DESCRIPTION_NOTE}"
-            "**默认只预演（confirm=false）**：只做解析/去重/性质统计，不写盘、不登记；"
-            "confirm=true 才生成 3D 与 PDBQT，并登记成**准备后的配体集**。"
-            "同一组参数按内容指纹复用，不覆盖旧产物。单条失败（3D 或 Meeko）不中断整批，"
-            "但整批一个都没成功时不登记。源可以是 import_ligandset 的产物，也可以是 "
-            "search_actives / search_analogs 直接落下的 CSV。"
-            "\n**大库用 offset 分批**：`limit` 是这一批取多少，`offset` 是从第几条开始。"
-            "两批之间不会重叠，也不会漏——`offset` 进缓存键，所以两批是两个产物目录。"
+            "这批原始配体能不能生成可对接的 3D 构象？\n"
+            "输入：ligands 填原始配体集；limit 与 offset 分批；confirm=true 才生成坐标。\n"
+            "输出：状态 prepared 的配体集（PDBQT），同一组参数按内容指纹复用，不覆盖旧产物。\n"
+            "边界：默认只预演，不写盘；单条失败不中断整批，整批一个都没成功时不登记；大库按 offset 分批，两批不重叠。"
         ),
         parameters={
             "type": "object",
@@ -1241,7 +1231,7 @@ class PrepareLigandsTool(Tool):
         raw_handle = str(arguments.get("ligands") or "").strip()
         if not raw_handle:
             return ToolResult(
-                output="缺少参数 ligands。先 list_workspace 看清有哪份配体集，再把它的 handle 传进来。",
+                output="缺少参数 ligands。先 registry 看清有哪份配体集，再把它的 handle 传进来。",
                 failed=True,
             )
         try:
@@ -1705,14 +1695,10 @@ class CurateLigandsTool(Tool):
     spec = ToolSpec(
         name="curate_ligands",
         description=(
-            "把**待筛库**过第一道闸：PAINS / Brenk 结构警报、去重、理化窗口，"
-            "产出一份筛过的配体集（可直接交给 prepare_ligands）。"
-            + CHEM_TOOL_DESCRIPTION_NOTE
-            + "\n"
-            "窗口都是**闭区间**（等于上限的保留），不给就不设限。`mode=drop`（默认）"
-            "真删，`mode=flag` 只标注、把命中的规则写进 `flags` 列——想先看看会删掉什么"
-            "就用它。\n"
-            "判据由代码算（RDKit FilterCatalog + 描述符），schema 里没有让模型自己判的开关。"
+            "待筛库该先去掉哪些分子？\n"
+            "输入：ligands 填配体集；理化窗口都是闭区间，不给就不设限；mode 选 drop（默认，真删）或 flag（只标注）。\n"
+            "输出：筛过的配体集，命中的规则写进 flags 列，可直接交给 prepare_ligands。\n"
+            "边界：判据由代码算（PAINS、Brenk、描述符），没有让模型自己判的开关；mode=flag 时一行都不删。"
         ),
         parameters={
             "type": "object",
@@ -1767,7 +1753,7 @@ class CurateLigandsTool(Tool):
         raw = str(arguments.get("ligands") or "").strip()
         if not raw:
             return ToolResult(
-                output="缺少参数 ligands。先 import_ligandset 或 list_workspace 看清有哪份配体集。",
+                output="缺少参数 ligands。先 import_ligandset 或 registry 看清有哪份配体集。",
                 failed=True,
             )
         try:
@@ -2085,7 +2071,7 @@ def _render_reference(
             "当参考分布用会不稳——放宽 min_pchembl 或换一个靶点。"
         )
     lines.append(f"产物目录：{target}")
-    lines.append(f"下一步：screen_similarity(query={handle}, library=...) 拿它当查询集。")
+    lines.append(f"下一步：rank_library(method=similarity, query={handle}, library=...) 拿它当查询集。")
     return "\n".join(lines)
 
 
@@ -2095,14 +2081,10 @@ class BuildReferenceSetTool(Tool):
     spec = ToolSpec(
         name="build_reference_set",
         description=(
-            "把 `search_actives` 的产物变成**参考活性集**：按 pChEMBL 下限过滤、"
-            "同一分子取最强的那条、按活性排序后截断。"
-            + CHEM_TOOL_DESCRIPTION_NOTE
-            + "\n"
-            "产物是一个配体集（`stage=reference`、`label=active`），可直接当 "
-            "`screen_similarity` 的查询集。PAINS 命中的**只标不删**——已知活性是真的活性，"
-            "删掉会把参考分布打歪。"
-            "\n少于 10 条时会标 `too_small`：那样的参考分布不稳，先看一眼再拿去分档。"
+            "哪些已知活性分子能当筛选的参考集？\n"
+            "输入：actives 填 search_actives 的产物；min_pchembl 是下限；max 控制条数。\n"
+            "输出：状态 reference、label=active 的配体集，按活性排序，可直接当 rank_library 的查询集。\n"
+            "边界：同一分子只取最强的那条；PAINS 命中只标不删；少于 10 条会标 too_small，分档之前先看一眼。"
         ),
         parameters={
             "type": "object",
@@ -2440,12 +2422,10 @@ class AlignLigandsTool(Tool):
     spec = ToolSpec(
         name="align_ligands",
         description=(
-            "把一组配体**叠到同一个参考系**：每个分子生成 3D 构象，再按最大公共子结构"
-            "（MCS）叠到参考分子上。" + CHEM_TOOL_DESCRIPTION_NOTE + "\n"
-            "叠不上的逐条列出原因（公共骨架太小、RMSD 超阈值），不静默丢掉——"
-            "它们本来就不是同一个系列，硬叠出来的药效团没有意义。\n"
-            "产物是一份 `stage=aligned` 的配体集（`aligned.sdf` + `ligands.csv`），"
-            "`build_pharmacophore` 认这个阶段，直接读坐标、不再重复叠合。"
+            "这组配体能不能叠到同一个参考分子上？\n"
+            "输入：ligands 填配体集；reference 指定参考分子；rmsd_cutoff 与 min_atoms 控制接受条件。\n"
+            "输出：状态 aligned 的配体集（aligned.sdf 与 ligands.csv），可直接交给 build_pharmacophore。\n"
+            "边界：叠不上的逐条列出原因，不静默丢掉；它们本来就不是同一个系列，叠出来的药效团没有意义。"
         ),
         parameters={
             "type": "object",

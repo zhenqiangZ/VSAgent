@@ -663,20 +663,13 @@ class RankCandidatesTool(Tool):
     spec = ToolSpec(
         name="rank_candidates",
         description=(
-            "把**多路**筛选分数合成一张候选表：先对齐分子，再按平均秩排共识名次，"
-            "最后按名次分档（前 5% 是 high、前 20% 是 medium，其余 low；"
-            "没过门禁的单列 below_cutoff）。\n"
-            "**分档之后并并列组**：同一来源里相邻、分数差 <1 kcal/mol 的分子并成一组，"
-            "档位取组内最高档，`tie` 列写组号。Vina 的标准误差约 2.5 kcal/mol，"
-            "1 分之内的先后读不出活性高低，结论里不要写「A 比 B 好」。\n"
-            "来源写 handle，逗号分隔（如 artifact#4,artifact#5）。分数方向由来源类型"
-            "决定——dock 的 kcal/mol 越低越好、affinity 的 pK 越高越好——**不要自己"
-            "换算方向，也没有这个参数**。\n"
-            "只合并、不重算：表里出现的分数与各路产物里逐字一致。某一路缺这个分子时"
-            "该列留空，不补 0。\n"
-            "**局限**：平均秩只是一个排序量，没有物理单位；只对两路都出现的分子可靠；"
-            "分层间隔较宽；排名只作原料，结论要另外写。\n"
-            "下一步：analyze_pose(docking=..., molecule=...) 看榜首那条的接触依据。"
+            "这批分子按多路分数合起来该怎么排，前几名里哪几个是对照？\n"
+            "输入：sources 必填，填产物 handle，逗号分隔；with_controls=true 时"
+            "再从生成的表里挑对照，可带 pocket 与 hypothesis。\n"
+            "输出：一张候选表（平均秩、分档、并列组），登记成 artifact；"
+            "with_controls=true 时后面附三类对照与各自的理由。\n"
+            "边界：只合并、不重算，某一路缺这个分子时该列留空；平均秩没有物理单位，"
+            "1 kcal/mol 以内分不出高低，结论里不要写「A 比 B 好」。"
         ),
         parameters={
             "type": "object",
@@ -696,6 +689,22 @@ class RankCandidatesTool(Tool):
                     "type": "integer",
                     "description": f"返回里列几行，默认 {DEFAULT_TOP}，上限 {MAX_TOP}",
                 },
+                "with_controls": {
+                    "type": "boolean",
+                    "description": "true 时在生成的候选表里挑正向、阴性、背离三类对照",
+                },
+                "pocket": {
+                    "type": "string",
+                    "description": "with_controls 时用：这批对照对应哪处口袋；可选",
+                },
+                "hypothesis": {
+                    "type": "string",
+                    "description": "with_controls 时用：这批对照检验哪条假设，如 hyp#1；可选",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "with_controls 时每类最多挑几个（默认 1，最多 3）",
+                },
                 "name": {"type": "string", "description": "显示名，只影响产物目录名"},
             },
             "required": ["sources"],
@@ -704,8 +713,30 @@ class RankCandidatesTool(Tool):
     )
     primary_argument = "sources"
     context_argument = "ledger"
+    # 挑对照时若给了 hypothesis，要按编号在任务状态里找那一条；其余时候用不到。
+    task_argument = "state"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        result = await self._rank(arguments)
+        if not arguments.get("with_controls") or result.failed:
+            return result
+        handle = str(result.meta.get("handle") or "")
+        if not handle:
+            return result
+        controls = await PickControlsTool().run(
+            {**arguments, "source": handle}
+        )
+        if controls.failed:
+            return ToolResult(
+                output=f"{result.output}\n\n对照没有挑出来：{controls.output}",
+                meta=result.meta,
+            )
+        return ToolResult(
+            output=f"{result.output}\n\n{controls.output}",
+            meta={**result.meta, "controls": controls.meta},
+        )
+
+    async def _rank(self, arguments: dict[str, Any]) -> ToolResult:
         ledger = arguments.get("ledger")
         if not isinstance(ledger, SessionLedger):
             return ToolResult(
@@ -716,7 +747,7 @@ class RankCandidatesTool(Tool):
         raw = str(arguments.get("sources") or "").strip()
         if not raw:
             return ToolResult(
-                output="缺少参数 sources。先 list_workspace 看清有哪些打分产物。",
+                output="缺少参数 sources。先 registry 看清有哪些打分产物。",
                 failed=True,
             )
         tokens = [piece.strip() for piece in raw.replace("，", ",").split(",") if piece.strip()]
@@ -1519,7 +1550,7 @@ def _docking_entry(
     raw = str(arguments.get("docking") or "").strip()
     if not raw:
         return None, ToolResult(
-            output="缺少参数 docking。先 list_workspace 看清有哪份对接产物。", failed=True
+            output="缺少参数 docking。先 registry 看清有哪份对接产物。", failed=True
         )
     try:
         entry = ledger.get(raw)
@@ -1662,17 +1693,10 @@ class AnalyzePoseTool(Tool):
     spec = ToolSpec(
         name="analyze_pose",
         description=(
-            "看**一个**分子的对接位姿：接触残基（含最短距离与接触原子数）、氢键、"
-            "原子冲突。只读，不登记任何东西。\n"
-            "分子用 id（如 mol-7），不是序号也不是路径——id 取自 dock 的产物。"
-            "距离一律由代码算，判据写在返回的第一段，口径变了会看得出来。\n"
-            "要判断「这个分子凭什么强」而不只是「碰到了谁」，把 interactions 打开："
-            "盐桥、π 堆积、疏水、卤键、水桥、金属配位都由 PLIP 认键级后给出，"
-            "接触距离看不出这些。它要多花 0.3–1 秒，且本机要装 PLIP"
-            "（与化学栈同一份 requirements-chem.txt）；没装时照常给接触与氢键，"
-            "只在末尾说明指纹没算成。\n"
-            "用途：榜首那条为什么排第一、某个取代基是不是多了一个氢键、"
-            "位姿有没有穿进受体。要给整张表排序用 rank_candidates。"
+            "这个分子的位姿靠哪些残基和氢键撑住？\n"
+            "输入：docking 填对接产物，molecule 填 id（不是序号）；interactions=true 才算键级指纹。\n"
+            "输出：接触残基（最短距离与接触原子数）、氢键、原子冲突；打开 interactions 时另给盐桥、π 堆积、疏水、卤键、水桥与金属配位。\n"
+            "边界：距离由代码算，口径写在第一段；PLIP 没装时照常给接触与氢键，只在末尾说明指纹没算成。"
         ),
         parameters={
             "type": "object",
@@ -1870,11 +1894,10 @@ class AlternativePosesTool(Tool):
     spec = ToolSpec(
         name="alternative_poses",
         description=(
-            "看**同一个分子的多个对接模式**：按位姿占的体积聚簇，报每簇的分数与接触残基"
-            "差异。回答的是「这次对接给出的第二种摆法是不是真的不同」。\n"
-            "只读 `dock` 产物里记的 `pose_pdbqt`（Vina 的 `--out` 含全部模式）；"
-            "只有一簇时明说「没有第二个可区分的摆法」——这是有用的读数，不是空结果。\n"
-            "簇的划分用重原子体积的 Jaccard ≥0.5，与 `pick_diverse` 的位姿去重同一口径。"
+            "这次对接给出的第二种摆法，是不是真的不同？\n"
+            "输入：docking 与 molecule 必填；max_poses 控制看几个模式；jaccard 是聚簇阈值。\n"
+            "输出：每簇的模式数、分数与接触残基差异。\n"
+            "边界：只读位姿文件里记的全部模式；只有一簇时明说没有第二个可区分的摆法，这是有用的读数，不是空结果。"
         ),
         parameters={
             "type": "object",
@@ -2120,13 +2143,10 @@ class ContactMapTool(Tool):
     spec = ToolSpec(
         name="contact_map",
         description=(
-            "把**一份对接产物里所有位姿**的残基接触并成一张表：每个残基在多少个位姿里"
-            "接触过、最近一次多远、一共碰到多少个原子。只读，不登记任何东西。\n"
-            "用途：判断这一批分子是不是都挤在同一个亚口袋（说明口袋选对了），"
-            "还是各占一处（说明盒子里有好几个可结合的位置，分数不可直接比）。"
-            "单个位姿的氢键与冲突用 analyze_pose。\n"
-            "频次的分母是**算得出位姿的分子数**，不是产物里的条数：转不出 PDB 的分子"
-            "不计入，第一行会写明可用几个、跳过了几个。"
+            "这一批分子是不是都挤在同一个亚口袋里？\n"
+            "输入：docking 填对接产物；cutoff 是接触判据；top 控制列几个残基。\n"
+            "输出：每个残基在多少个位姿里接触过、最近一次多远、一共碰到多少个原子。\n"
+            "边界：分母是算得出位姿的分子数，不是产物条数，第一行写明可用几个、跳过几个；单个位姿的氢键与冲突用 analyze_pose。"
         ),
         parameters={
             "type": "object",
@@ -2488,13 +2508,10 @@ class AnalyzeHydrophobicTool(Tool):
     spec = ToolSpec(
         name="analyze_hydrophobic",
         description=(
-            "把一个对接位姿的**疏水贡献拆开看**：HP（疏水接触对数）、"
-            "HM（配体疏水原子里有多少落在疏水口袋里）、以及**脱水账**"
-            "（埋进去却没成氢键的极性原子，逐个列出并给出最近受体极性原子的距离）。\n"
-            "用途：判断榜首那条的高分是真结合还是「又大又油」；判断某个极性基团埋进去是赚是亏。"
-            "HM 比 HP 更可靠——「疏水原子落进疏水口袋」比「接触数多」更能说明问题。\n"
-            "口径写在返回里，**这不是 HYDE**：不给 kcal，只给结构证据。"
-            "分子用 id（dock 产物里的 id 列）。只读，不登记任何东西。"
+            "这个位姿的高分是真结合，还是又大又油？\n"
+            "输入：docking 与 molecule 必填；radius 控制疏水口袋的范围。\n"
+            "输出：HP（疏水接触对数）、HM（配体疏水原子里落在疏水口袋的比例），以及脱水账：埋进去却没成氢键的极性原子与最近受体极性原子的距离。\n"
+            "边界：只给结构证据，不给 kcal，不是 HYDE；HM 比 HP 更可靠；只读，不登记。"
         ),
         parameters={
             "type": "object",
@@ -2753,15 +2770,10 @@ class EfficiencyProfileTool(Tool):
     spec = ToolSpec(
         name="efficiency_profile",
         description=(
-            "对**一份对接产物**做效率体检：LE（每颗重原子换来多少分）、"
-            "LELP（logP / LE，越低越好）、以及给了带活性的配体集时的 LLE（pChEMBL − logP）。"
-            "并把「大而油」的标出来（logP ≥ 4 且 LELP ≥ 6）。\n"
-            "用途：榜单前面那几个是不是分子肥胖——重原子越多、疏水接触越多，"
-            "原始分数天然越高，而 LE / LELP 把这一层扣掉。"
-            "给了 actives（带 pchembl_value 的配体集）时按规范 SMILES 联接算 LLE，"
-            "它扣掉的是「亲脂性带来的假活性」。\n"
-            "口径写在返回里：**从对接分数算的 LE 不等于从 ΔG 算的 LE**，"
-            "只能在同一批、同一引擎、同一力场里比。只读，不登记新东西。"
+            "榜单前面那几个是不是分子肥胖？\n"
+            "输入：docking 填对接产物；actives 填带 pchembl_value 的配体集时才算 LLE；sort 与 top 控制排序与条数。\n"
+            "输出：每个分子的 LE、LELP，有活性时另给 LLE，并标出「大而油」（logP 不低于 4 且 LELP 不低于 6）。\n"
+            "边界：从对接分数算的 LE 不等于从 ΔG 算的 LE，只能在同一批、同一引擎、同一力场里比；只读，不登记。"
         ),
         parameters={
             "type": "object",
@@ -2807,7 +2819,7 @@ class EfficiencyProfileTool(Tool):
         raw = str(arguments.get("docking") or "").strip()
         if not raw:
             return ToolResult(
-                output="缺少参数 docking。先 list_workspace 看清有哪份对接产物。", failed=True
+                output="缺少参数 docking。先 registry 看清有哪份对接产物。", failed=True
             )
         try:
             entry = ledger.get(raw)
@@ -3065,11 +3077,10 @@ class ValidateDockingTool(Tool):
     spec = ToolSpec(
         name="validate_docking",
         description=(
-            "**重对接验证**：把受体产物里的共晶配体当成普通配体对一次，量它的位姿"
-            "回到晶体位置有多远（RMSD）。这是对**对接协议**的体检，不是对候选分子的打分。"
-            "\n参照是 `prepare_receptor` 写出的 `ligand.pdb`；没有它就直接说「做不了」，"
-            "不假装通过。原子数或元素对不上时逐条说明原因，不给一个假的数。"
-            "\n结果会作为 `gates.redock_rmsd` 进候选表：超过阈值的分子降到 below_cutoff。"
+            "这套对接参数把共晶配体放回原位了吗？\n"
+            "输入：receptor 填准备后的受体（必须有 ligand.pdb），docking 填对接产物；cutoff 是 RMSD 阈值。\n"
+            "输出：重对接 RMSD，作为 gates.redock_rmsd 进候选表，超过阈值的分子降到 below_cutoff。\n"
+            "边界：这是对协议体检，不是对候选打分；没有参照结构时直接说做不了；原子数或元素对不上时逐条说明，不给一个假的数。"
         ),
         parameters={
             "type": "object",
@@ -3508,6 +3519,181 @@ def _pick_controls(
     return result
 
 
+class ComparePosesTool(Tool):
+    """两个位姿在同一受体坐标系里差在哪：配体 RMSD、接触残基、氢键。只读。"""
+
+    spec = ToolSpec(
+        name="compare_poses",
+        description=(
+            "同一个受体里，两个位姿差在哪？\n"
+            "输入：docking_a / molecule_a 与 docking_b / molecule_b 各一组，"
+            "两组对接必须用同一份受体。\n"
+            "输出：配体 RMSD（不叠合，直接在同一坐标系里量）、共有与各自独有的接触残基、"
+            "氢键的共有与差异。\n"
+            "边界：RMSD 按原子顺序配对，不做对称等价原子校正；原子数不同时不给整体 RMSD；"
+            "接触只算重原子，距离判据可调。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "docking_a": {"type": "string", "description": "第一份对接产物的 handle"},
+                "molecule_a": {"type": "string", "description": "第一份里的分子 id"},
+                "docking_b": {"type": "string", "description": "第二份对接产物的 handle"},
+                "molecule_b": {"type": "string", "description": "第二份里的分子 id"},
+                "cutoff": {
+                    "type": "number",
+                    "description": (
+                        f"接触判据（埃），默认 {CONTACT_CUTOFF:g}，"
+                        f"范围 {MIN_CONTACT_CUTOFF:g}–{MAX_CONTACT_CUTOFF:g}"
+                    ),
+                },
+                "top": {
+                    "type": "integer",
+                    "description": f"每类差异最多列几条，默认 {MAX_IDS_SHOWN}",
+                },
+            },
+            "required": ["docking_a", "molecule_a", "docking_b", "molecule_b"],
+            "additionalProperties": False,
+        },
+    )
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：compare_poses 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+        try:
+            cutoff = _number_argument(
+                arguments, "cutoff", CONTACT_CUTOFF, MIN_CONTACT_CUTOFF, MAX_CONTACT_CUTOFF
+            )
+            top = _int_argument(arguments, "top", MAX_IDS_SHOWN, 1, MAX_IDS_SHOWN)
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+
+        pose_a, failure = _resolve_pose(
+            ledger,
+            {
+                "docking": arguments.get("docking_a"),
+                "molecule": arguments.get("molecule_a"),
+            },
+            tool_name="compare_poses",
+        )
+        if failure is not None:
+            return failure
+        pose_b, failure = _resolve_pose(
+            ledger,
+            {
+                "docking": arguments.get("docking_b"),
+                "molecule": arguments.get("molecule_b"),
+            },
+            tool_name="compare_poses",
+        )
+        if failure is not None:
+            return failure
+
+        receptor_a = str(getattr(pose_a.receptor, "handle", ""))
+        receptor_b = str(getattr(pose_b.receptor, "handle", ""))
+        if receptor_a != receptor_b:
+            return ToolResult(
+                output=(
+                    f"两份对接用的受体不同（{receptor_a or '未知'} 与 {receptor_b or '未知'}），"
+                    "坐标系不同，RMSD 与接触差异都没有意义。"
+                    "换用同一受体的两份对接再比。"
+                ),
+                failed=True,
+            )
+
+        lines = [
+            f"两个位姿（受体 {receptor_a}）："
+            f"a={pose_a.entry.handle}/{pose_a.molecule}，"
+            f"b={pose_b.entry.handle}/{pose_b.molecule}"
+        ]
+        rmsd = _paired_rmsd(pose_a.ligand_atoms, pose_b.ligand_atoms)
+        if rmsd is None:
+            lines.append(
+                f"配体原子数不同（a {len(pose_a.ligand_atoms)}、b {len(pose_b.ligand_atoms)}），"
+                "不给整体 RMSD；下面只比接触与氢键。"
+            )
+        else:
+            lines.append(
+                f"配体 RMSD：{rmsd:.3f} 埃（同一坐标系直接量，按原子顺序配对，"
+                "未做对称等价原子校正）"
+            )
+
+        contacts_a = {item.label: item for item in _contacts(
+            pose_a.receptor_atoms, pose_a.ligand_atoms, cutoff
+        )}
+        contacts_b = {item.label: item for item in _contacts(
+            pose_b.receptor_atoms, pose_b.ligand_atoms, cutoff
+        )}
+        shared = sorted(set(contacts_a) & set(contacts_b))
+        only_a = sorted(set(contacts_a) - set(contacts_b))
+        only_b = sorted(set(contacts_b) - set(contacts_a))
+        lines.append(
+            f"接触残基：共有 {len(shared)} 个，只在 a 有 {len(only_a)} 个，"
+            f"只在 b 有 {len(only_b)} 个"
+        )
+        if shared:
+            lines.append("  共有：" + "、".join(shared[:top]) + ("……" if len(shared) > top else ""))
+        if only_a:
+            lines.append("  只在 a：" + "、".join(only_a[:top]) + ("……" if len(only_a) > top else ""))
+        if only_b:
+            lines.append("  只在 b：" + "、".join(only_b[:top]) + ("……" if len(only_b) > top else ""))
+
+        bonds_a = _hbonds(pose_a.receptor_atoms, pose_a.ligand_atoms)
+        bonds_b = _hbonds(pose_b.receptor_atoms, pose_b.ligand_atoms)
+        keys_a = {(bond.donor_label, bond.acceptor_label) for bond in bonds_a}
+        keys_b = {(bond.donor_label, bond.acceptor_label) for bond in bonds_b}
+        shared_bonds = sorted(keys_a & keys_b)
+        only_bonds_a = sorted(keys_a - keys_b)
+        only_bonds_b = sorted(keys_b - keys_a)
+        lines.append(
+            f"氢键：a {len(bonds_a)} 条、b {len(bonds_b)} 条，共有 {len(shared_bonds)} 条"
+        )
+        for label, items in (
+            ("共有", shared_bonds),
+            ("只在 a", only_bonds_a),
+            ("只在 b", only_bonds_b),
+        ):
+            if not items:
+                continue
+            shown = "、".join(f"{donor}–{acceptor}" for donor, acceptor in items[:top])
+            lines.append(f"  {label}：{shown}" + ("……" if len(items) > top else ""))
+        lines.append(
+            "只看两个具体的位姿；同一分子的多个摆法用 alternative_poses，"
+            "整批的接触频次用 contact_map。"
+        )
+        return ToolResult(
+            output="\n".join(lines),
+            meta={
+                "receptor": receptor_a,
+                "a": f"{pose_a.entry.handle}/{pose_a.molecule}",
+                "b": f"{pose_b.entry.handle}/{pose_b.molecule}",
+                "rmsd": None if rmsd is None else round(rmsd, 3),
+                "shared_contacts": shared,
+                "only_a": only_a,
+                "only_b": only_b,
+                "shared_hbonds": [f"{d}–{a}" for d, a in shared_bonds],
+            },
+        )
+
+
+def _paired_rmsd(
+    left: Sequence[pdbtext.AtomRecord],
+    right: Sequence[pdbtext.AtomRecord],
+) -> float | None:
+    """按原子顺序配对算 RMSD。原子数不同时返回 None——那种数没有意义。"""
+    if not left or len(left) != len(right):
+        return None
+    total = sum(
+        _distance(one.coord, other.coord) ** 2 for one, other in zip(left, right)
+    )
+    return math.sqrt(total / len(left))
+
+
 def domain_tools() -> list[Tool]:
     return [
         RankCandidatesTool(),
@@ -3517,7 +3703,7 @@ def domain_tools() -> list[Tool]:
         AnalyzeHydrophobicTool(),
         EfficiencyProfileTool(),
         ValidateDockingTool(),
-        PickControlsTool(),
+        ComparePosesTool(),
     ]
 
 

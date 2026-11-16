@@ -6,8 +6,8 @@
 
 这组工具负责这段收敛：
 
-1. `search_targets` —— 名称 / 基因 → 候选编号（带物种、长度、是否人工审阅）
-2. `fetch_target` —— 编号 → 完整注解（功能、定位、结构域、可用实验结构）
+1. 按名称查 —— 名称 / 基因 → 候选编号（带物种、长度、是否人工审阅）
+2. 按编号查 —— 编号 → 完整注解（功能、定位、结构域、可用实验结构）
 
 两条口径值得单独说明：
 
@@ -175,13 +175,13 @@ def normalize_accession(raw: str) -> str:
     if not text:
         raise ValueError(
             "accession 不能为空。它应当是 UniProt 编号，例如 P00533；"
-            "如果你手上是基因名或蛋白名，先用 search_targets 换成编号"
+            "如果你手上是基因名或蛋白名，先用 target_lookup 换成编号"
         )
     if not ACCESSION_PATTERN.match(text):
         raise ValueError(
             f"{raw!r} 不是 UniProt 编号。编号形如 P00533（6 位）或 A0A0B4J2D5（10 位），"
             "可带同工型后缀（P00533-2）。基因名、蛋白名、PDB 编号（如 1M17）都不是编号，"
-            "请先用 search_targets 查出对应编号"
+            "请先用 target_lookup 查出对应编号"
         )
     return text
 
@@ -447,7 +447,7 @@ def _render_search(rows: list[dict[str, Any]], *, query_text: str, notes: list[s
         )
     lines.extend(f"（{note}）" for note in notes)
     lines.append(
-        "下一步：用 fetch_target 取某个编号的详情与可用实验结构。"
+        "下一步：用 target_lookup 的 accession 取某个编号的详情与可用实验结构。"
         "命中不够准时可以加字段限定收窄，例如 gene:EGFR、organism_id:9606。"
     )
     return "\n".join(lines)
@@ -607,18 +607,19 @@ def _entry_meta(record: dict[str, Any], path: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
-class SearchTargetsTool(Tool):
-    """按名称 / 基因检索 UniProt 靶点。纯查询，不产生产物，所以不收登记表。"""
+class TargetLookupTool(Tool):
+    """按名称查靶点，或按编号取详情。两条路共用一份参数表。"""
 
     spec = ToolSpec(
-        name="search_targets",
+        name="target_lookup",
         description=(
-            "按蛋白名、基因名或关键词检索 UniProt 靶点，返回候选编号列表。"
-            "这是把「用户说的靶点」变成确定蛋白的入口：**先在这里查到编号，再用 fetch_target "
-            "取它的详情与可用实验结构**。不要凭记忆写编号——模型记得的编号看着都很合理，"
-            "但可能是别的物种或别的蛋白。单个词（EGFR、TP53）会优先按基因名精确匹配，命不中"
-            "才退回全文检索：全文检索会把「注释里提到过它」的蛋白一起捞上来。"
-            "每条依次是 编号、主基因名、序列长度、是否人工审阅、蛋白名与物种。"
+            "这个靶点在 UniProt 里是哪一条，它的功能与可用结构是什么？\n"
+            "输入：query 与 accession 二选一。query 填名称、基因名或 UniProt 检索式；"
+            "accession 填编号（形如 P00533）。\n"
+            "输出：按名称查给候选清单（编号、基因名、长度、是否人工审阅、蛋白名与物种）；"
+            "按编号查给功能、定位、结构域与实验结构，并把条目登记成 artifact。\n"
+            "边界：编号必须是查出来的，不要自己拼；同一编号再次调用读本地缓存，"
+            "只有确认远端注解已更新才带 refresh=true。"
         ),
         parameters={
             "type": "object",
@@ -628,6 +629,13 @@ class SearchTargetsTool(Tool):
                     "description": (
                         "检索词，例如 EGFR、epidermal growth factor receptor、kinase inhibitor。"
                         "可带 UniProt 检索语法（gene:EGFR、organism_id:9606）"
+                    ),
+                },
+                "accession": {
+                    "type": "string",
+                    "description": (
+                        "UniProt 编号，例如 P00533；可带同工型后缀（P00533-2）。"
+                        "填了这一项就不再按名称检索"
                     ),
                 },
                 "organism": {
@@ -648,19 +656,37 @@ class SearchTargetsTool(Tool):
                     "type": "integer",
                     "description": f"最多返回多少条候选，上限 {MAX_LIMIT}（再多就该细化检索式，而不是翻页）",
                 },
+                "refresh": {
+                    "type": "boolean",
+                    "description": "按编号查时忽略本地缓存强制重新下载（认为远端注解已更新时才用）",
+                },
             },
-            "required": ["query"],
         },
     )
     primary_argument = "query"
+    context_argument = "ledger"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        accession = str(arguments.get("accession") or "").strip()
+        if accession:
+            return await self._fetch(arguments)
+        if str(arguments.get("query") or "").strip():
+            return self._search(arguments)
+        return ToolResult(
+            output=(
+                "query 与 accession 不能为空，二选一：查靶点填 query（名称或基因名），"
+                "已知编号填 accession（形如 P00533）。"
+            ),
+            failed=True,
+        )
+
+    def _search(self, arguments: dict[str, Any]) -> ToolResult:
         text = str(arguments.get("query") or "").strip()
         if not text:
             return ToolResult(
                 output=(
                     "query 不能为空。填靶点的名称或基因名，例如 EGFR；"
-                    "如果你已经有 UniProt 编号，直接用 fetch_target 取详情"
+                    "如果你已经有 UniProt 编号，直接填 accession"
                 ),
                 failed=True,
             )
@@ -717,41 +743,11 @@ class SearchTargetsTool(Tool):
         )
 
 
-class FetchTargetTool(Tool):
-    """取 UniProt 编号的完整信息，并把条目登记进登记表。"""
-
-    spec = ToolSpec(
-        name="fetch_target",
-        description=(
-            "取一个 UniProt 编号的完整靶点信息：功能、亚细胞定位、结构域、可用实验结构。"
-            "返回里最要紧的是**结构那一行**：有几套实验结构、分辨率多少、各覆盖哪段序列，"
-            "以及有没有 AlphaFold 模型——这决定了这个靶点能不能直接对接。"
-            "编号必须来自 search_targets 的结果，不要自己拼；基因名或 PDB 编号都不是编号。"
-            "条目会写盘并登记成登记表里的 artifact，同一个编号再次调用直接读本地缓存、不再联网。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "accession": {
-                    "type": "string",
-                    "description": "UniProt 编号，例如 P00533；可带同工型后缀（P00533-2）",
-                },
-                "refresh": {
-                    "type": "boolean",
-                    "description": "true 时忽略本地缓存强制重新下载（认为远端注解已更新时才用）",
-                },
-            },
-            "required": ["accession"],
-        },
-    )
-    primary_argument = "accession"
-    context_argument = "ledger"
-
-    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+    async def _fetch(self, arguments: dict[str, Any]) -> ToolResult:
         ledger = arguments.get("ledger")
         if not isinstance(ledger, SessionLedger):
             return ToolResult(
-                output="内核装配问题：fetch_target 需要一个会话登记表，但这次调用没有拿到。",
+                output="内核装配问题：target_lookup 需要一个会话登记表，但这次调用没有拿到。",
                 failed=True,
             )
         try:
@@ -819,7 +815,7 @@ async def _to_thread(function, *args, **kwargs):
 
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具，按装配顺序。"""
-    return [SearchTargetsTool(), FetchTargetTool()]
+    return [TargetLookupTool()]
 
 if __name__ == "__main__":
     from debug_tools import main

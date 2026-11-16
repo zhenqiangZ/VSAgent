@@ -19,6 +19,18 @@ datas = [
     (str(root / "web"), "web"),
 ]
 
+# 每个角色装哪些工具由 `roles/agents.toml` 定。漏了它不会报错：`_read()` 把缺失
+# 当成空配置，`core.orchestrator` / `core.worker` 退化成空名单，请求里就不带任何
+# 工具定义，模型于是把工具调用写进正文（形如 `<｜｜DSML｜｜ invoke>`），界面上
+# 看着像「模型直接出错」。`agents.py` 现在会在两档为空时抛 `ConfigError`，但那份
+# 校验只有在文件进了包之后才看得见正确的配置，所以这一条必须跟着打包。
+datas.append(
+    (
+        str(root / "vsagent" / "core" / "agent" / "roles" / "agents.toml"),
+        "vsagent/core/agent/roles",
+    )
+)
+
 # `fit_affinity` 把 `fit_train.py` 当脚本交给 DTA 环境的解释器跑，路径是
 # `Path(__file__).with_name("fit_train.py")`。冻结后 `__file__` 指向解包目录，
 # 而脚本本身不会被 import、因此不在 PYZ 里，于是子进程报

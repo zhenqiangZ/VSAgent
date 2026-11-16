@@ -42,6 +42,7 @@ from urllib.parse import parse_qs, unquote, urlsplit, urlparse
 from .. import corpus, knowledge_refs, live
 from vsagent.core.agent.execution.report import build as build_report
 from vsagent.core.agent.execution.report import read_trace
+from vsagent.core.agent.search_reasoning.answer_state import latest_answer
 from vsagent.core.agent.state.trace import log_directory_for
 from ..paths import SURVEY_DIRECTORY, config_home, project_root
 from ..session_manager import SessionManager
@@ -1436,12 +1437,15 @@ ANALYSIS_TEXT_LIMIT = 600
 """
 
 
-def _session_analysis(request: "WebHandler", session) -> dict:
+def _session_analysis(request: "WebHandler", session, manager: SessionManager) -> dict:
     """一个会话的分析：轮、步、token、工具、主题与异常。
 
     trace 按会话分文件写在状态文件旁边，里面是每一步的装配读数与工具调用现场，
     状态文件里没有这些。没有 trace 时仍然给轮与主题的统计，页面按 `hasTrace`
     标明逐步读数缺失。
+
+    子会话与根会话共写这一份 trace，分析要按 `children_of` 取到子会话，
+    把它们的步与用量一起算；只读根会话会少一大半。
     """
     path = log_directory_for(request.server.state_path) / f"{session.id}.jsonl"
     if path.is_file():
@@ -1450,9 +1454,24 @@ def _session_analysis(request: "WebHandler", session) -> dict:
     else:
         trace = []
         size = 0
-    payload = build_report(session, trace, text_limit=ANALYSIS_TEXT_LIMIT)
+    payload = build_report(
+        session, trace, text_limit=ANALYSIS_TEXT_LIMIT,
+        children=manager.children_of(session.id),
+    )
     payload["traceBytes"] = size
     return payload
+
+
+def _session_answer(request: "WebHandler", session) -> dict:
+    """这一轮回答的完整答案状态：初始答案、说法、证据、评估、改动与核对。
+
+    从独立文件读，不解析状态文件：证据正文动辄几十条，放进 `state.toml`
+    会把启动时的解析拖慢。没有答案状态时返回 `present: false`。
+    """
+    state = latest_answer(request.server.state_path.parent, session.id)
+    if state is None:
+        return {"present": False, "sessionId": session.id}
+    return {"present": True, "sessionId": session.id, **state.to_dict()}
 
 
 def _session_detail(request: "WebHandler", rest: str) -> dict:
@@ -1489,7 +1508,9 @@ def _session_detail(request: "WebHandler", rest: str) -> dict:
         if action == "artifacts":
             return _session_artifacts(request, session)
         if action == "analysis":
-            return _session_analysis(request, session)
+            return _session_analysis(request, session, manager)
+        if action == "answer":
+            return _session_answer(request, session)
     raise HttpError(404, f"会话下面没有这个接口：{'/'.join(segments[1:])}")
 
 

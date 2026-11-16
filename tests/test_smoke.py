@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT))
 # 脚本应答，多出来的那一次会把整条脚本错开一位，后面的断言全部对不上。
 # 界面与循环的断言与那一次解析无关，整份冒烟测试关掉它。
 os.environ.setdefault("VSA_ROUTE", "off")
+# 搜索增强推理在应用层默认 shadow；冒烟检查按固定请求条数断言，先关掉。
+os.environ.setdefault("VSA_SAR", "off")
 
 import vsagent  # noqa: E402
 import re  # noqa: E402
@@ -360,13 +362,22 @@ async def run_coalesce_checks() -> None:
     class Demo(App):
         def compose(self) -> ComposeResult:
             self.fold = ReasoningPartView(Part(type=PartType.REASONING))
+            # 打开旧会话时，思考块是照已有正文新建的，之后不会再有更新送来。
+            self.saved = ReasoningPartView(
+                Part(type=PartType.REASONING, text="已经存好的思考正文")
+            )
             self.text = TextPartView(Part(type=PartType.TEXT))
             yield self.fold
+            yield self.saved
             yield self.text
 
     app = Demo()
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
+        check(
+            "已经存好的思考正文" in str(app.saved._body.render()),
+            f"照已有正文新建的思考块，一建好就有字：{str(app.saved._body.render())!r}",
+        )
         writes: list[str] = []
         real_write = app.fold.write_text
 
@@ -2908,6 +2919,13 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         chat._busy = True
         chat.refresh_status()
         check("● 生成中" in str(left.render()), f"生成中时路径后加标记：{left.render()}")
+        bar.update_phase("整理检索结果")
+        check(
+            "● 生成中 · 整理检索结果" in str(left.render()),
+            f"检索阶段写在生成中标记后面：{left.render()}",
+        )
+        bar.update_phase("")
+        check("整理检索结果" not in str(left.render()), "阶段结束后文字撤掉")
         chat._busy = False
         chat.refresh_status()
         check("● 生成中" not in str(left.render()), "生成结束后标记撤掉")
@@ -3938,6 +3956,7 @@ async def run_interface_checks(server: FakeModelServer) -> None:
             PartType.ERROR,
             PartType.SUMMARY,
             PartType.ROUTE,
+            PartType.SAR,
         }
         unrouted = sorted(item.value for item in set(PartType) - routed)
         check(not unrouted, f"每种 Part 都归入了渲染路径，未归入的：{unrouted}")
@@ -4125,6 +4144,15 @@ async def run_interface_checks(server: FakeModelServer) -> None:
         check(
             len(pane._tool_cards) == len(rebuilt_cards),
             f"重建后工具卡登记表仍然对得上：画面 {len(rebuilt_cards)}，登记 {len(pane._tool_cards)}",
+        )
+        # 重建出来的思考块没有后续的流式更新送来，正文必须在建块时就写好。
+        # 它和流式新建共用同一个 ReasoningPartView 构造函数，「照已有正文建块
+        # 立刻有字」由 run_coalesce_checks 那条判据守住。这里再对一遍画面上的
+        # 成品：切换后选中哪个会话不一定带思考块，所以不要求这里非空。
+        rebuilt_bodies = [str(view._body.render()) for view in rebuilt_reasoning]
+        check(
+            all(body.strip() for body in rebuilt_bodies),
+            f"重建出来的思考块展开不会是空白：{rebuilt_bodies[:2]}",
         )
 
         app.execute_command("model")

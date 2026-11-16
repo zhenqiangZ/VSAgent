@@ -4,7 +4,7 @@
 它出问题的四种样子，靠人眼读是看不出来的：
 
 1. **太长**：6604 token 那次占掉 18K 窗口的 36.7%，挤压的是最近几轮原文；
-2. **点名了看不见的工具**：写着「用 list_workspace 取 handle」，而它属于 `listing` 族、
+2. **点名了看不见的工具**：写着「用 registry 取 handle」，而它属于 `listing` 族、
    首步不可见——模型撞一次墙才知道要装族，一次撞墙就是一步；
 3. **枚举漂移**：写着「全库只有三个动作收路径」，而实际是四个。枚举写进提示的那天
    就开始过期，过期之后模型会照着错的清单推理；
@@ -26,8 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from vsagent.core.agent.roles.capabilities import ROLES
-from vsagent.core.agent.domain.all_tools import catalog, domain_tools  # noqa: E402
-from vsagent.core.agent.domain.campaign import AssessCampaignTool  # noqa: E402
+from vsagent.core.agent.domain.all_tools import all_names, domain_tools  # noqa: E402
 from vsagent.core.agent.domain.survey import SurveyStructuresTool  # noqa: E402
 from vsagent.core.agent.domain.export import OpenViewerTool, WriteRunTool  # noqa: E402
 from vsagent.core.agent.permission import PATH_ARGUMENTS, PLAN_DENY  # noqa: E402
@@ -48,8 +47,7 @@ from vsagent.core.agent.roles.prompt import (  # noqa: E402
     stage_rules,
 )
 from vsagent.core.agent.planning.stages import STAGES
-from vsagent.core.agent.toolset import hidden_names  # noqa: E402
-from vsagent.core.agent.roles.toolprofiles import ORCHESTRATOR, keeps
+from vsagent.core.agent.roles import agents  # noqa: E402
 from vsagent.core.agent.tools import (  # noqa: E402
     BashTool,
     GrepTool,
@@ -93,11 +91,9 @@ PLAN_ACTIONS: dict[str, str] = {
     "fit_affinity": "打分与微调",
     "write_run": "写运行目录",
     "rank_candidates": "批量筛选与排序",
+    "rank_library": "批量筛选与排序",
     "curate_ligands": "批量筛选与排序",
-    "screen_similarity": "批量筛选与排序",
-    "screen_shape": "批量筛选与排序",
     "build_pharmacophore": "药效团构建与筛选",
-    "screen_pharmacophore": "药效团构建与筛选",
     "align_ligands": "结构叠合",
     "predict_admet": "性质预测",
     "scaffold_analysis": "骨架与配对分析",
@@ -130,8 +126,8 @@ def tool_specs() -> dict[str, dict]:
 
     核心五个文件工具加全部领域工具就够这两条判据用了；记忆、任务、事件那几个
     不带路径参数，也不进 `PATH_ARGUMENTS`，装不装不影响结论。
-    **`assess_campaign` 要装**：它在前缀里被点名，不装的话「点名了看不见的工具」
-    这条判据永远查不到它。
+    常驻工具要装：前缀里点名的那些，不装的话「点名了看不见的工具」这条判据
+    永远查不到它。
     """
     registry = ToolRegistry()
     for tool in (
@@ -140,7 +136,6 @@ def tool_specs() -> dict[str, dict]:
         WriteTool(cwd=ROOT),
         PatchTool(cwd=ROOT),
         GrepTool(cwd=ROOT),
-        AssessCampaignTool(),
         SurveyStructuresTool(),
         WriteRunTool(),
         OpenViewerTool(),
@@ -203,29 +198,19 @@ def main() -> int:
 
     # 点名的工具：名字出现在前缀里，就得保证模型这一步拿得到，或者知道怎么装。
     #
-    # 可见性由 `hidden_names` 与主 agent 档位现算，不写死名单：新加一族领域工具、
+    # 可见性由角色名单现算，不写死名单：新加一个领域工具、
     # 或者把哪个常驻工具从主 agent 档位里移走时，谁被点名、它首步看不看得见，
-    # 都跟着那两处走。2026-11-13 就是后者：`assess_campaign` 移到角色档之后，
-    # 前缀里那句「查完调 assess_campaign」必须跟着改，否则模型会去调一个看不见的工具。
+    # 都跟着那两处走。常驻工具从主 agent 档位移走时，前缀里那些调用提示也必须
+    # 跟着改，否则模型会去调一个看不见的工具。
     named = sorted(
         name for name in specs if re.search(rf"\b{re.escape(name)}\b", prefix)
     )
-    hidden = hidden_names(Session(id="ses_check_prefix"))
-    need_family = sorted(name for name in named if name in hidden)
-    off_profile = sorted(
-        name for name in named if name not in hidden and not keeps(ORCHESTRATOR, name)
-    )
+    visible = set(agents.core_tools("orchestrator", ROOT)) - {"*"}
+    off_profile = sorted(name for name in named if name not in visible)
     print(f"  点名的工具 {len(named)} 个：{'、'.join(named) if named else '无'}")
-    if need_family:
-        print(f"  其中首步不可见（要先装族）：{'、'.join(need_family)}")
-        if "load_tools" not in prefix:
-            failures.append(
-                f"点名了首步不可见的工具 {need_family}，前缀里却没有 load_tools 的说明"
-            )
     if off_profile:
-        print(f"  其中不在主 agent 档位里：{'、'.join(off_profile)}")
         failures.append(
-            f"前缀点名了主 agent 档位里没有的工具 {off_profile}："
+            f"前缀点名了主控清单里没有的工具 {off_profile}："
             "它看不见，只会照着这句话去调一次"
         )
 
@@ -251,13 +236,15 @@ def main() -> int:
     tiers += [agent_rules(base, role) for role in ROLES]
     tiers += [stage_rules(stage, ROOT) for stage in STAGES]
     tier_text = "\n".join(tiers)
-    # 只查**首步看不见的**领域工具：`assess_campaign` 这类常驻工具本来就看得见，
-    # 在角色规则里点名它是正常的，不能和「要先装族」的混成一条。
-    _hidden = hidden_names(Session(id="ses_check_tiers"))
+    # 角色规则里点名的工具，必须至少属于某一个角色的名单或基础档。
+    usable: set[str] = set(agents.core_tools("orchestrator", ROOT))
+    usable |= set(agents.core_tools("worker", ROOT)) - {"*"}
+    for role in ROLES:
+        usable.update(agents.role_tools(role, ROOT))
     tier_named = sorted(
         name
         for name in specs
-        if name in _hidden and re.search(rf"\b{re.escape(name)}\b", tier_text)
+        if name not in usable and re.search(rf"\b{re.escape(name)}\b", tier_text)
     )
     print(f"  分级规则全部 {estimate_tokens(tier_text)} token（不会同时注入）")
     per_step = (
@@ -289,22 +276,17 @@ def main() -> int:
     # 把 DTA 当成对接之外的第二路。
     if "没有地址就不要发这段描述" not in prefix:
         failures.append("呈现纪律不在前缀里：结构描述会退回纯文字")
-    if "`docking` 族" not in prefix or "`affinity` 族" not in prefix or "微调" not in prefix:
+    if "打分是两路" not in prefix or "微调" not in prefix:
         failures.append("打分纪律不在前缀里：DTA 通道不会被想到")
-    visible_domain = {name for names in catalog().values() for name in names}
+    core_names = set(agents.core_tools("orchestrator", ROOT)) | set(
+        agents.core_tools("worker", ROOT)
+    )
     for name in ("write_run", "open_viewer"):
-        if name in visible_domain:
-            failures.append(f"{name} 仍在领域族里，首步看不见；它应当是常驻核心工具")
-    # 打分拆成两族：对接单独一族，DTA 单独一族。合起来的话「用户不要对接」这条
-    # 约束在族级加载上就是空的——装了评分族，dock 一定在清单里。
-    docking_family = set(catalog().get("docking", ()))
-    affinity_family = set(catalog().get("affinity", ()))
-    if docking_family != {"dock"}:
-        failures.append(f"docking 族不只放对接：{sorted(docking_family)}")
-    if affinity_family != {"fit_affinity", "score_affinity"}:
-        failures.append(f"affinity 族不是那对 DTA 工具：{sorted(affinity_family)}")
-    if "scoring" in catalog():
-        failures.append("scoring 族还在：它只应作为旧会话的别名保留")
+        if name not in core_names:
+            failures.append(f"{name} 不在基础档里：主控与子会话都看不见它")
+    if set(all_names()) & core_names - {"survey_structures", "hypothesis", "open_viewer", "registry", "add_evidence", "workspace"}:
+        overlap = sorted(set(all_names()) & core_names)
+        failures.append(f"这些工具既在领域清单又在基础档里：{overlap}")
 
     # 越界判定认的那些参数名，必须在工具的参数表里真的存在。
     # 参数改名之后，这张表会**静默失效**：路径不再被检查，而一切看起来正常。

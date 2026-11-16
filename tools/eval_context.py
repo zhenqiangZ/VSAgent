@@ -61,7 +61,6 @@ from vsagent.core.agent.roles.prompt import (  # noqa: E402
 )
 from vsagent.core.agent.execution.spawn import AgentStatusTool
 from vsagent.core.agent.state.task import TaskTool
-from vsagent.core.agent.toolset import LoadToolsTool, hidden_names  # noqa: E402
 from vsagent.core.agent.tools import (  # noqa: E402
     BashTool,
     GrepTool,
@@ -94,19 +93,11 @@ PROBES: tuple[tuple[str, str], ...] = (
 """压缩之后最该还能答上来的四类问题。尖括号里的部分要照着会话换。"""
 
 
-def tool_specs(
-    store: MemoryStore | None = None, families: tuple[str, ...] = ()
-) -> list[dict]:
-    """按应用的装配顺序拼出**这一步真会发出去**的工具定义。
+def tool_specs(store: MemoryStore | None = None) -> list[dict]:
+    """按应用的装配顺序拼出一份工具定义。
 
-    2026-10 起工具按族加载：核心那一批（文件、登记表、任务、事件、记忆、
-    `load_tools`）常驻，领域工具要模型自己装。所以这里不能直接拿全量去量——
-    全量 34 个约 11.3K token，默认只发 10 个约 2.1K，差了 5 倍，
-    拿全量算出来的「固定开销」会把预算说小一大截。
-    `families` 模拟「这一轮已经装过哪几族」。
-
-    顺序与 `all_tools.domain_tools` 一致。这里量的是 token 数量级，
-    不关心模型会选中哪一个——那件事得真跑一轮才看得出来。
+    这里返回全部工具，用来量「最贵的一份」固定开销；具体某个角色发多少，
+    看 `roles/agents.toml`。
     """
     registry = ToolRegistry()
     core: list[Tool] = [
@@ -117,7 +108,6 @@ def tool_specs(
         GrepTool(),
         ReadTurnTool(),
         TaskTool(),
-        LoadToolsTool(),
         AgentStatusTool(),
         *event_tools(),
     ]
@@ -127,9 +117,7 @@ def tool_specs(
         registry.register(tool)
     for tool in domain_tools():
         registry.register(tool)
-    session = Session(id="ses_eval")
-    session.tool_families = list(families)
-    return registry.specs(exclude=hidden_names(session))
+    return registry.specs()
 
 
 def build_at(
@@ -157,15 +145,6 @@ def build_at(
         profile_text=profile,
         task_text=task_text,
     )
-
-
-def parse_families(raw: str) -> tuple[str, ...]:
-    """解析 `--families docking,structure`；空串表示只发核心工具。
-
-    族名不校验：写错了 `tool_specs` 里那一族照旧不出现，量出来的数字会偏小。
-    这里宁可偏小也不擅自补——补上了会让人以为「装过」，而实际没装。
-    """
-    return tuple(piece.strip() for piece in raw.split(",") if piece.strip())
 
 
 def parse_windows(raw: str) -> tuple[int, ...]:
@@ -322,7 +301,6 @@ def sweep_table(
     memory: str,
     windows: tuple[int, ...],
     label: str,
-    families: tuple[str, ...] = (),
     profile: str = "",
 ) -> int:
     """把若干窗口的结果排成一张表。"""
@@ -332,10 +310,7 @@ def sweep_table(
         f"固定开销：稳定前缀 {estimate_tokens(prefix)}　工具定义 {budget.tools_tokens}"
         f"　常驻记忆 {estimate_tokens(memory) + estimate_tokens(profile)}"
     )
-    print(
-        "工具清单："
-        + (f"{len(specs)} 个（已装族 {'、'.join(families)}）" if families else f"{len(specs)} 个（只有核心）")
-    )
+    print(f"工具清单：{len(specs)} 个（全部）")
     print("窗口　　前缀命中　换占位步　丢过组　装不下　总输入")
     starred = False
     for window in windows:
@@ -700,11 +675,6 @@ def main() -> int:
     )
     parser.add_argument("--windows", default="", help="配合 --sweep：逗号分隔的窗口列表")
     parser.add_argument(
-        "--families",
-        default="",
-        help="模拟已经 load_tools 装过的族，逗号分隔（默认只有核心工具）",
-    )
-    parser.add_argument(
         "--turns", type=int, default=SAMPLE_TURNS, help="没有会话可量时造多少轮样本"
     )
     args = parser.parse_args()
@@ -750,8 +720,7 @@ def main() -> int:
         prefix = stable_prefix(workspace, target)
         store = MemoryStore(PROJECT_ROOT)
         store.load()
-        families = parse_families(args.families)
-        specs = tool_specs(store, families)
+        specs = tool_specs(store)
         return sweep_table(
             target,
             prefix,
@@ -759,7 +728,6 @@ def main() -> int:
             store.project_text(),
             windows,
             label,
-            families,
             profile=store.profile_text(),
         )
 
@@ -773,8 +741,7 @@ def main() -> int:
     prefix = stable_prefix(workspace, session)
     store = MemoryStore(PROJECT_ROOT)
     store.load()
-    families = parse_families(args.families)
-    specs = tool_specs(store, families)
+    specs = tool_specs(store)
     memory = store.project_text()
     profile = store.profile_text()
 

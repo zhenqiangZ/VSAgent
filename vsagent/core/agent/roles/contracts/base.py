@@ -12,11 +12,12 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 """当前协议版本。
 
 2：`IntentSpec` 增加 `turn_mode`（Phase 3，轮次类型并进同一次解析）。
-旧数据没有这个字段，读取时按 `new_task` 处理——升版本是为了让"读到更新版本的
+3：`AgentReport` 增加 `evidence`（子会话交回的证据对象），`evidence_refs` 保留。
+旧数据没有这个字段，读取时按空列表处理——升版本是为了让"读到更新版本的
 数据"能被拒绝，不是为了让旧数据读不进来。"""
 
 

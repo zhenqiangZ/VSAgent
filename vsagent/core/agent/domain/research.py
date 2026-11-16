@@ -1,6 +1,6 @@
-"""科研工作区的四个工具：登记对象、加证据、看索引、评审假设。
+"""科研工作区的三个工具：登记对象与看索引、加证据、评审假设。
 
-为什么要有这一族，而不是让模型继续在聊天里"记住"：
+为什么要有这一组工具，而不是让模型继续在聊天里"记住"：
 
 - **同一结构在不同 Agent 之间要能用同一个 ID 找到。** ID 由身份决定
   （`structure:4HJO`），不是自增号——两个 Agent 各从 1 开始数，得到两个不同的号，
@@ -10,12 +10,12 @@
 - **假设的状态只能由证据改。** 评审工具按证据强度给意见，模型不能凭印象把一条
   假设标成"已证实"。
 
-这一族**按根会话共享**：工作区实例由 `AgentHost.workspace_for()` 持有，子 Agent
+这一组工具**按根会话共享**：工作区实例由 `AgentHost.workspace_for()` 持有，子 Agent
 登记的对象父会话看得见，反过来也一样。工具只调它的方法，不认它的类型，
 所以这一层不必导入 host。
 
-**四个工具都不常驻。** 它们只在"整理证据、写结论"那几步用得上，常驻会一直占着
-每一步的额度；按族装入的代价是模型多花一步 `load_tools`。
+**三个工具都不常驻。** 它们只在"整理证据、写结论"那几步用得上，常驻会一直占着
+每一步的额度；由角色配置决定装什么，不必模型自己装。
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ __all__ = [
     "ListObjectsTool",
     "RegisterObjectTool",
     "ReviewHypothesisTool",
+    "WorkspaceTool",
     "domain_tools",
 ]
 
@@ -129,13 +130,10 @@ class AddEvidenceTool(Tool):
     spec = ToolSpec(
         name="add_evidence",
         description=(
-            "登记一条**证据**，并记下它支持（supports）或反驳（refutes）哪条假设。\n"
-            "等级从强到弱只有七种，登记之后**不能改**：要更正就换一个身份键，"
-            "让「什么时候改的口径」留在表里。\n"
-            "实测活性、实验结构、用户数据必须带至少一个引用（数据库编号、DOI/PMID、"
-            "产物 handle、数据文件路径）：没有出处的「实测结果」与模型自己编的预测"
-            "在文字上分不出来。\n"
-            "假设的两种写法都认：会话任务状态里的 hyp#1，工作区对象里的 hypothesis:<键>。"
+            "这条材料算不算证据，它支持或反驳哪条假设？\n"
+            "输入：evidence_class 与 key 必填；supports 与 refutes 填假设编号。\n"
+            "输出：一条证据，等级从强到弱共七种，登记之后不能改。\n"
+            "边界：实测活性、实验结构、用户数据必须带至少一个引用；没有出处的实测结果与模型编的预测在文字上分不出来；假设写 hyp#1 或 hypothesis:<键> 都认。"
         ),
         parameters={
             "type": "object",
@@ -224,7 +222,7 @@ class ListObjectsTool(Tool):
         name="list_objects",
         description=(
             "当你要看科研工作区里有哪些研究对象时用它。"
-            "与 `list_workspace` 的分工：那个列登记表里的产物 handle，这里列研究对象。\n"
+            "与 `registry` 的分工：那个列登记表里的产物 handle，这里列研究对象。\n"
             "返回一行汇总（总数与每类几个），再一行一个对象：ID、名称、来源、引用；"
             "超过 limit 条时末尾写「另有 N 个」。不给 kind 时列全部；停用的默认不列。"
         ),
@@ -271,17 +269,77 @@ class ListObjectsTool(Tool):
         return ToolResult(output="\n".join(lines), meta={"counts": counts, "total": len(items)})
 
 
+class WorkspaceTool(Tool):
+    """科研工作区的唯一入口：action=register 登记对象，action=list 看索引。"""
+
+    spec = ToolSpec(
+        name="workspace",
+        description=(
+            "科研工作区里有哪些对象，一个对象怎么登记？\n"
+            "输入：action 选 register 或 list。register 要给 kind 与 key，可带 label、source、refs；"
+            "list 可只列某一类，默认不含已停用的对象。\n"
+            "输出：register 回对象 ID 与版本，同一个身份键再登记一次是更新；"
+            "list 回总数、每类几个与逐条对象，超过 limit 时写明还剩多少。\n"
+            "边界：大文件不要放进来，只记 handle 或路径；证据走 add_evidence，"
+            "它还要定等级，登记之后不能改。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["register", "list"],
+                    "description": "register 登记一个对象；list 看工作区里有哪些",
+                },
+                "kind": {"type": "string", "enum": list(KINDS), "description": "对象类别"},
+                "key": {
+                    "type": "string",
+                    "description": (
+                        "register 必填：PDB 编号 / UniProt 登录号 / ChEMBL 编号 / "
+                        "受体 handle 加口袋序号 / 由输入拼出的位姿键"
+                    ),
+                },
+                "label": {"type": "string", "description": "一句话名称，例如「EGFR 激酶域」"},
+                "source": {"type": "string", "description": "谁产出的：工具名、数据库或文献出处"},
+                "refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "指向的登记表 handle 或 runs/ 下的路径",
+                },
+                "include_retired": {
+                    "type": "boolean",
+                    "description": "list 时连已经停用的对象一起列，默认不列",
+                },
+                "limit": {"type": "integer", "description": "list 时最多列多少条，默认 40"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    )
+    workspace_argument = "workspace"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        action = str(arguments.get("action") or "").strip().lower()
+        if action == "register":
+            return await RegisterObjectTool().run(arguments)
+        if action == "list":
+            return await ListObjectsTool().run(arguments)
+        return ToolResult(
+            output=f"action 只认 register / list，收到 {action!r}",
+            failed=True,
+        )
+
+
 class ReviewHypothesisTool(Tool):
     """把一条假设的支持与反证摆在一起，给出意见。"""
 
     spec = ToolSpec(
         name="review_hypothesis",
         description=(
-            "把一条假设的支持证据与反证摆在一起，给出五种意见之一：支持、削弱、"
-            "需要修正、暂缓、否定。**只有实验级证据能改假设状态**；预测与推断只记录，"
-            "不结案。\n"
-            "apply=true 才写回会话任务状态里的假设；找不到这个编号就不写，也不会新建。"
-            "证据不足时它会建议暂缓并说明缺什么，这时该提下一轮问题，而不是换个说法下结论。"
+            "这条假设现在站不站得住？\n"
+            "输入：hypothesis 填假设编号；apply=true 才写回状态。\n"
+            "输出：支持、削弱、需要修正、暂缓、否定五种意见之一，并摆出支持与反证。\n"
+            "边界：只有实验级证据能改假设状态，预测与推断只记录；找不到编号就不写，也不新建；证据不足时建议暂缓并说明缺什么。"
         ),
         parameters={
             "type": "object",
@@ -340,12 +398,7 @@ class ReviewHypothesisTool(Tool):
 
 
 def domain_tools() -> list[Tool]:
-    return [
-        RegisterObjectTool(),
-        AddEvidenceTool(),
-        ListObjectsTool(),
-        ReviewHypothesisTool(),
-    ]
+    return [WorkspaceTool(), AddEvidenceTool(), ReviewHypothesisTool()]
 
 
 if __name__ == "__main__":  # pragma: no cover

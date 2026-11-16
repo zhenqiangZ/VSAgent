@@ -2,7 +2,7 @@
 
 **纯规则，不调用模型。** 理由不是"规则更聪明"，而是三条可验证的：
 
-1. 意图类型只有十四种，且是本项目自己定义的，不存在"没写过的类型"这种常态；
+1. 意图类型只有十五种，且是本项目自己定义的，不存在"没写过的类型"这种常态；
    模板数量可控。
 2. `TaskSpec` 的验收条件必须机器可查（Phase 8 的交付校验按它判）。模板天然产出
    `kind` + `target`，模型天然产出句子。
@@ -92,15 +92,32 @@ TEMPLATES: dict[str, dict[str, object]] = {
         "approvals": (),
     },
     "virtual_screening": {
-        "capability": "virtual_screening",
-        "subgoal": "按确认的受体与口袋执行筛选并给出候选集",
-        "outputs": ("CandidateSet",),
+        # 一步分两步：准备与对接不是一个角色的事。两段各自有产物与验收，
+        # 中间那个确认点（受体准备确认）本来就在两段之间。
+        "steps": (
+            ("receptor_preparation", "把受体与配体准备成可以直接对接的产物"),
+            ("docking_run", "按确认的口袋与参数执行对接，产出带分数的位姿表"),
+        ),
+        "outputs": ("PreparedReceptor", "PreparedLigandSet", "CandidateSet"),
         "checks": (
+            ("handle_registered", "PreparedReceptor", "PreparedReceptor"),
+            ("artifact_exists", "PreparedLigandSet", "PreparedLigandSet"),
             ("handle_registered", "CandidateSet", "CandidateSet"),
             ("artifact_exists", "CandidateSet", "CandidateSet"),
             ("approval_recorded", "受体准备与对接参数已确认", "CandidateSet"),
         ),
         "approvals": (PREPARE_APPROVAL, DOCKING_APPROVAL),
+    },
+    "affinity_prediction": {
+        "capability": "affinity_prediction",
+        "subgoal": "用该靶点的实测活性微调模型，并给出亲和力预测",
+        "outputs": ("AffinityModel", "AffinityPrediction"),
+        "checks": (
+            ("artifact_exists", "AffinityModel", "AffinityModel"),
+            ("artifact_exists", "AffinityPrediction", "AffinityPrediction"),
+            ("evidence_ref", "每条预测所用的模型与输入配体", "AffinityPrediction"),
+        ),
+        "approvals": (DOCKING_APPROVAL,),
     },
     "scoring_evaluation": {
         "capability": "scoring_evaluation",
@@ -293,12 +310,18 @@ class TaskCompiler:
         else:
             plans = [(kind, TEMPLATES[kind]) for kind in kinds]
         for kind, item in plans:
-            goal = str(item["subgoal"])
-            if goal not in seen_subgoals:
+            # 一份模板可以带一步，也可以带几步（虚拟筛选就是准备加对接两步）。
+            # 能力名由模板给，不拿意图类型顶替：`ligand_discovery` 对应的能力
+            # 叫 `ligand_intelligence`，两者不是同一套命名。
+            steps = item.get("steps")
+            if steps:
+                pairs = [(str(capability), str(goal)) for capability, goal in steps]  # type: ignore[union-attr]
+            else:
+                pairs = [(str(item.get("capability") or ""), str(item["subgoal"]))]
+            for capability, goal in pairs:
+                if goal in seen_subgoals:
+                    continue
                 row: dict[str, object] = {"goal": goal}
-                # 能力名由模板给，不拿意图类型顶替：`ligand_discovery` 对应的能力
-                # 叫 `ligand_intelligence`，两者不是同一套命名。
-                capability = str(item.get("capability") or "")
                 if capability:
                     row["capability"] = capability
                 subgoals.append(row)

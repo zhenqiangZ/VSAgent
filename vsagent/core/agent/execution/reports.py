@@ -27,6 +27,7 @@ HANDLE_RE = re.compile(r"\b(receptor|ligandset|artifact)#(\d+)\b")
 URL_RE = re.compile(r"https?://[^\s，。；、）)]+")
 MAX_CONCLUSIONS = 20
 MAX_REFS = 12
+MAX_EVIDENCE = 30
 DIGEST_LIMIT = 1200
 
 
@@ -111,6 +112,33 @@ def _failures(session: Session) -> list[str]:
     return names
 
 
+def _evidence(session: Session) -> list[dict]:
+    """把子会话里查回来的结果转成证据对象。
+
+    只处理适配层认得的查询工具；计算产物另成一类。同一条证据只留一次，
+    最多 `MAX_EVIDENCE` 条：报告进父会话的上下文，证据太多会把结论挤掉。
+    """
+    from vsagent.core.agent.search_reasoning.adapters import adapter_for
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for message in session.messages:
+        for part in message.parts:
+            if part.type is not PartType.TOOL or part.tool_status is not ToolStatus.COMPLETED:
+                continue
+            adapter = adapter_for(part.tool_name or "")
+            if adapter is None:
+                continue
+            for item in adapter.convert(part):
+                if item.id in seen:
+                    continue
+                seen.add(item.id)
+                out.append(item.to_dict())
+                if len(out) >= MAX_EVIDENCE:
+                    return out
+    return out
+
+
 def _status(session: Session) -> str:
     reason = session.last_exit_reason or ""
     if reason == "cancelled":
@@ -134,6 +162,7 @@ def build(
     conclusions = [{"text": line} for line in _lines(answer)]
     refs, findings = _handles(session)
     urls = _urls(session)
+    evidence = _evidence(session)
     failures = _failures(session)
 
     status = _status(session)
@@ -155,6 +184,7 @@ def build(
         status=status,
         findings=[{"text": item} for item in findings],
         evidence_refs=tuple(urls),
+        evidence=evidence,
         artifact_refs=tuple(refs),
         conclusions=conclusions,
         limitations=tuple(limitations),
@@ -174,6 +204,8 @@ def digest(report: AgentReport, *, limit: int = DIGEST_LIMIT) -> str:
         lines.append(f"产物：{'、'.join(report.artifact_refs[:6])}")
     if report.evidence_refs:
         lines.append(f"证据：{'、'.join(report.evidence_refs[:6])}")
+    if report.evidence:
+        lines.append(f"证据对象：{len(report.evidence)} 条（按编号在答案状态里查）")
     if report.limitations:
         lines.append(f"局限：{'；'.join(report.limitations[:3])}")
     if report.unresolved_questions:

@@ -121,6 +121,8 @@ class PartType(Enum):
     COMPACTION = "compaction"
     ERROR = "error"
     SUMMARY = "summary"
+    # 搜索增强推理的过程记录。只给界面看，不进入模型上下文。
+    SAR = "sar"
     # 这一轮的意图解析与任务定义（`route_adapter.describe` 写的那段文本）。
     # 它是过程记录，不进模型上下文；两种界面都按可折叠的块画。
     ROUTE = "route"
@@ -800,6 +802,9 @@ class Event:
     # 主题的显示状态从它来：`cancelled` 画成中断，`error` / `tool_failed` 画成失败。
     # 不存这一项的话，取消之后照常封存，事后分不出「做完的」与「被停下的」。
     exit_reason: str = ""
+    # 这一段的结论由哪一份答案状态产生。空串表示这一段没有走搜索增强推理。
+    # 只存编号，正文在答案状态文件里，事件日志不重复抄证据。
+    answer_id: str = ""
     created_at: float = field(default_factory=time.time)
 
     @property
@@ -896,6 +901,7 @@ class Event:
             "kind": self.kind,
             "degraded": self.degraded,
             "exit_reason": self.exit_reason,
+            "answer_id": self.answer_id,
             "created_at": self.created_at,
         }
 
@@ -962,6 +968,7 @@ class Event:
             kind=kind if kind in EVENT_KINDS else "manual",
             degraded=bool(data.get("degraded")),
             exit_reason=str(data.get("exit_reason") or ""),
+            answer_id=str(data.get("answer_id") or ""),
             created_at=float(data.get("created_at") or time.time()),
         )
 
@@ -1012,21 +1019,6 @@ class Session:
     # 上一轮为什么停下（`exhausted` / `error` / `tool_failed` / `cancelled`）。
     # 空串表示正常跑完。整轮的停因记在这里，不记在最后一段主题上。
     last_exit_reason: str = ""
-    # 已经用 load_tools 装入的领域工具族。核心工具不受它影响，
-    # 装在会话上而不是注册表上：注册表按「根 / 子 agent」共享两份，
-    # 记在那里会让一个会话装过的工具漏到另一个会话。
-    tool_families: list[str] = field(default_factory=list)
-    # 下一个主题要预装的族（`close_topic(next_tools=...)` 写入）。
-    # 封存时消费一次：只留这些，其余领域族全部释放。只在内存里，
-    # 因为它的作用就是把「下一段」接上，不需要跨进程保留。
-    next_tools: list[str] = field(default_factory=list)
-    # 每一族是第几个主题装进来的。收敛（`toolset.prune_families`）用它判断
-    # 「刚装、还没轮到用」的族，别刚装完就卸掉。
-    family_topic: dict[str, int] = field(default_factory=dict)
-    # 这一轮主 agent 只做编排：路由给出了可执行计划，领域动作交给计划里的角色。
-    # **只在一轮内有效**：路由关掉或解析失败时不置位，退回「主 agent 自己干」的旧
-    # 路径——否则路由一挂，谁都做不了领域工作。不落盘，重启后按下一轮重新判。
-    principal_only: bool = False
     # 结构化的任务状态：目标、用户约束、进度、阻塞。整块进上下文的 TASK 层，不参与淘汰
     task_state: TaskState = field(default_factory=TaskState)
     # 当前任务的规格（`contracts.TaskSpec` 的字典形式）。与 `task_state` 分工：
@@ -1199,8 +1191,6 @@ class Session:
             "events": [event.to_dict() for event in self.events],
             "event_seq": self.event_seq,
             "step_seq": self.step_seq,
-            "tool_families": list(self.tool_families),
-            "family_topic": dict(self.family_topic),
             "task_state": self.task_state.to_dict(),
             # 空字典而不是 None：状态文件是 TOML，没有 null。读回来时 {} 还原成 None。
             "task_spec": dict(self.task_spec) if self.task_spec else {},
@@ -1282,16 +1272,6 @@ class Session:
         session.step_seq = int(data.get("step_seq") or 0)
         for event in session.events:
             session.step_seq = max(session.step_seq, event.step_end - 1)
-        raw_families = data.get("tool_families")
-        if isinstance(raw_families, list):
-            session.tool_families = [str(item) for item in raw_families if str(item)]
-        raw_topics = data.get("family_topic", data.get("family_phase"))
-        if isinstance(raw_topics, dict):
-            session.family_topic = {
-                str(key): int(value)
-                for key, value in raw_topics.items()
-                if str(key) and isinstance(value, int) and not isinstance(value, bool)
-            }
         # 读回来就校验一次：手工改过状态文件、或者旧版本写了一半的事件，
         # 都在进装配之前被裁掉，而不是等到发请求时才露馅。
         session.sanitize_events()

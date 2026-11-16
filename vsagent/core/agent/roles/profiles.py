@@ -24,14 +24,11 @@ Profile 是"角色说明书"，不是运行期对象。它由三样东西拼出�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
 
 from vsagent.core.agent.roles.capabilities import (
     CAPABILITIES,
     capabilities_for,
-    families_for,
     roles_with_capabilities,
-    standalone_for,
 )
 from vsagent.core.agent.roles.contracts import AgentReport, AgentTask
 
@@ -43,62 +40,59 @@ REPORT_FIELDS: tuple[str, ...] = (
 )
 
 TITLES: dict[str, str] = {
-    "principal": "主 Agent：拆解目标、派发与汇总",
-    "target": "靶点情报",
-    "structure_pocket": "结构与口袋",
-    "conformation": "构象与口袋画像",
-    "ligand": "配体情报",
-    "literature": "文献证据",
-    "screening": "筛选执行",
-    "scoring": "评分与一致性",
-    "mechanism": "机制解释",
-    "hypothesis": "假设评审",
+    "principal": "主控：拆解目标、派发与汇总",
+    "research": "调研：靶点、受体与配体情报",
+    "pocket": "口袋：识别与画像",
+    "ligand": "配体：发现与化学空间",
+    "prepare": "准备：受体与配体",
+    "docking": "对接：位姿与构象搜索",
+    "affinity": "亲和力：预测与模型微调",
+    "analysis": "分析：结果整合与候选评价",
+    "mechanism": "机制：构象关系与假设",
+    "visualization": "展示：交互与视图",
 }
 
 REPORT_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "principal": (),
-    "target": ("evidence_refs",),
-    "structure_pocket": ("evidence_refs", "artifact_refs"),
-    "conformation": ("artifact_refs", "limitations"),
-    "ligand": ("evidence_refs",),
-    "literature": ("evidence_refs",),
-    "screening": ("artifact_refs", "limitations"),
-    "scoring": ("evidence_refs", "limitations"),
+    "research": ("evidence_refs",),
+    "pocket": ("evidence_refs", "artifact_refs"),
+    "ligand": ("evidence_refs", "artifact_refs"),
+    "prepare": ("artifact_refs", "limitations"),
+    "docking": ("artifact_refs", "limitations"),
+    "affinity": ("artifact_refs", "limitations"),
+    "analysis": ("evidence_refs", "artifact_refs"),
     "mechanism": ("evidence_refs", "unresolved_questions"),
-    "hypothesis": ("evidence_refs", "unresolved_questions"),
+    "visualization": ("artifact_refs",),
 }
-"""每个角色交报告时不能空的字段。空一项就算报告不合格，由 Phase 10 的派发处判。"""
+"""每个角色交报告时不能空的字段。空一项就算报告不合格，由派发处判。"""
 
 TIMEOUT_MINUTES: dict[str, float | None] = {
-    "principal": None,  # 主 agent 不派发，没有自己的执行时限
-    "target": 20,
-    "structure_pocket": 40,
-    "conformation": 30,
-    "ligand": 30,
-    "literature": 20,
-    "screening": 90,  # 对接可能跑很久，给足；超过这个数基本是卡住了
-    "scoring": 30,
+    "principal": None,  # 主控不派发，没有自己的执行时限
+    "research": 30,
+    "pocket": 45,
+    "ligand": 40,
+    "prepare": 60,
+    "docking": 120,  # 对接是真在算，给足；再长基本是卡住了
+    "affinity": 90,  # 微调要几分钟
+    "analysis": 40,
     "mechanism": 30,
-    "hypothesis": 20,
+    "visualization": 20,
 }
 """单个角色的安全网（分钟）。**不是性能指标**：到点中断一个卡住的子会话，
-把"还在跑"变成"失败，卡在这一步"，父会话才能决定重派还是换路。
-
-`screening` 给 90 是刻意放宽的：对接是真在算，不是卡住。要更紧的场合用
-`dispatch_campaign(timeout=...)` 给整场加一个更短的上限。
+把「还在跑」变成「失败，卡在这一步」，父会话才能决定重派还是换路。
 """
 
 NOTES: dict[str, str] = {
     "principal": "只做拆解、派发与汇总，不亲自执行领域动作。",
-    "target": "只读检索；不产生产物，不替用户做决定。",
-    "structure_pocket": "结构检索与口袋发现；改共享状态的动作由父会话确认后执行。",
-    "conformation": "只读分析口袋几何与理化特征；不准备受体。",
-    "ligand": "汇总已知配体与活性；不生成新分子。",
-    "literature": "检索与整理证据；结论必须带出处。",
-    "screening": "执行受体准备、对接与筛选；每一步都要留下可复查的产物。",
-    "scoring": "对已有产物做独立评分；不重新对接。",
-    "mechanism": "解释结合模式与关键残基；区分证据与推断。",
-    "hypothesis": "整理支持与反证，更新假设状态；不替用户裁决。",
+    "research": "只读检索与入库；不替用户做决定。",
+    "pocket": "结构、口袋与画像；改共享状态的动作由父会话确认后执行。",
+    "ligand": "找配体、排化学空间；不生成新分子。",
+    "prepare": "把原始结构准备成可对接的产物；每个动作先预演再确认。",
+    "docking": "执行对接并检查位姿质量；不替用户改参数。",
+    "affinity": "微调模型并预测亲和力；样本不足时直说做不了。",
+    "analysis": "把多路结果合成候选表并做效率体检；不重新对接。",
+    "mechanism": "解释结合模式与关键残基，写假设并评审；区分证据与推断。",
+    "visualization": "只出视图页；取数与计算交给前面的角色。",
 }
 
 
@@ -116,14 +110,6 @@ class AgentProfile:
     timeout_minutes: float | None = None
 
     @property
-    def families(self) -> tuple[str, ...]:
-        return families_for(self.role)
-
-    @property
-    def standalone_tools(self) -> tuple[str, ...]:
-        return standalone_for(self.role)
-
-    @property
     def permissions(self) -> tuple[str, ...]:
         """角色能做的动作类：能力里声明的并集，按固定顺序。"""
         seen: list[str] = []
@@ -135,8 +121,10 @@ class AgentProfile:
 
     def check_report(self, report: AgentReport) -> list[str]:
         """报告是否满足这个角色的要求。返回问题清单，空列表表示合格。"""
+        from vsagent.core.agent.roles.capabilities import canonical
+
         problems: list[str] = []
-        if report.agent_role != self.role:
+        if canonical(report.agent_role) != self.role:
             problems.append(f"报告署名是 {report.agent_role}，这张说明书是 {self.role} 的")
         for field in self.report_requirements:
             value = getattr(report, field, None)
@@ -144,27 +132,22 @@ class AgentProfile:
                 problems.append(f"{self.role} 的报告缺 {field}：{note_for(field)}")
         return problems
 
-    def check_task(self, task: AgentTask, families: Iterable[str] = ()) -> list[str]:
+    def check_task(self, task: AgentTask) -> list[str]:
         """这份任务有没有超出角色的授权范围。
 
-        `families` 是派发时打算给它的工具族（来自能力计划）。两样都要在说明书里
-        才能派：动作类（读/分析/执行/写）与工具族。少一样就在派发前拦下，而不是
-        等它跑起来用了不该用的工具再发现。
+        动作类（读/分析/执行/写）要在说明书里才能派。工具名由 `agents.toml`
+        定死，派发时不再另给一份清单，所以这里不查工具。
         """
+        from vsagent.core.agent.roles.capabilities import canonical
+
         problems: list[str] = []
-        if task.role != self.role:
+        if canonical(task.role) != self.role:
             problems.append(f"任务派给 {task.role}，这张说明书是 {self.role} 的")
         extra_permissions = [item for item in task.permissions if item not in self.permissions]
         if extra_permissions:
             problems.append(
                 f"{self.role} 没有授权 {'、'.join(extra_permissions)}："
                 f"它能做的只有 {'、'.join(self.permissions) or '无'}"
-            )
-        extra_families = [item for item in families if item not in self.families]
-        if extra_families:
-            problems.append(
-                f"{self.role} 没有授权 {'、'.join(extra_families)} 族："
-                f"它能用的只有 {'、'.join(self.families) or '无'}"
             )
         return problems
 
@@ -182,9 +165,12 @@ def note_for(field: str) -> str:
 
 
 def profile(role: str) -> AgentProfile:
-    """按角色取说明书。取不到时列出可用角色。"""
+    """按角色取说明书。旧角色名按 `LEGACY_ROLES` 查，认不出来时列出可用角色。"""
+    from vsagent.core.agent.roles.capabilities import canonical
+
+    name = canonical(role)
     for item in PROFILES:
-        if item.role == role:
+        if item.role == name:
             return item
     raise KeyError(f"没有这个角色：{role}。可用：{'、'.join(item.role for item in PROFILES)}")
 

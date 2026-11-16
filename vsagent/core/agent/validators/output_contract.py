@@ -58,7 +58,27 @@ CONTRACTS: dict[str, Contract] = {
     "LigandCatalog": Contract(
         "LigandCatalog", "handle", "ligandset", "配体清单要有一份配体集"
     ),
+    "PreparedReceptor": Contract(
+        "PreparedReceptor", "handle", "receptor", note="准备后的受体仍登记成受体"
+    ),
+    "PreparedLigandSet": Contract(
+        "PreparedLigandSet", "handle", "ligandset", note="准备后的配体集仍是配体集"
+    ),
     "CandidateSet": Contract("CandidateSet", "handle", "ligandset", note="候选集应当是配体集"),
+    "AffinityModel": Contract(
+        "AffinityModel",
+        "handle",
+        "artifact",
+        "微调产出的模型是 artifact（kind=model）",
+        meta_kind="model",
+    ),
+    "AffinityPrediction": Contract(
+        "AffinityPrediction",
+        "handle",
+        "artifact",
+        "亲和力预测表是 artifact（kind=affinity）",
+        meta_kind="affinity",
+    ),
     "ScoringReport": Contract("ScoringReport", "path", "runs", note="评分报告写在运行目录下"),
     "MechanismReport": Contract("MechanismReport", MANUAL, note="机制解释由评审判断"),
     "EvidenceReport": Contract("EvidenceReport", MANUAL, note="证据整理由评审判断"),

@@ -37,10 +37,10 @@
 | 模块 | 内容 |
 |---|---|
 | `http.py` | 全仓唯一的网络出口，测试整体替换的就是它 |
-| `uniprot.py` | 靶点检索与取详情（2 个工具） |
+| `uniprot.py` | 靶点检索与取详情（`target_lookup`，1 个） |
 | `pdbtext.py` | PDB 纯文本编辑层（零第三方依赖，不登记工具） |
 | `preprocess.py` | 结构清洗与杂原子组几何筛查（不登记工具） |
-| `structure.py` | 取结构（实验 PDB / AlphaFold 预测）、导结构、结构评估（4 个工具） |
+| `structure.py` | 取结构（实验 PDB / AlphaFold 预测）、导结构、结构评估、按 CA 叠合（5 个工具） |
 | `chembl.py` | 已知活性与类似物（2 个工具；分子画像的库函数在这里，入口在 `pubchem.py`） |
 | `pubchem.py` | 化合物身份（PubChem + ChEMBL 两半）、全库相似检索（2 个工具） |
 | `opentargets.py` | 靶点可成药性 / 化学探针 / 安全性 / 疾病关联，疾病 → 候选靶点（2 个工具） |
@@ -52,25 +52,24 @@
 | `products.py` | 内容寻址产物目录、`params.json` 提交标记、原子写盘（不登记工具） |
 | `pockets.py` | 四层口袋来源的装配点 + `detect_pockets` / `define_pocket` 两个工具（第 2 步） |
 | `pocketcmp.py` | 口袋之间的比较：`compare_pockets`（同家族两个受体逐残基比差异）、`similar_pockets`（按口袋窗口的局部序列相似性找可借配体的邻近受体） |
-| `campaign.py` | 开工前的盘点 `assess_campaign`：两侧各看几个数，给一条推荐与 2–4 条并列候选策略（各带成本档与能区分什么）。**常驻，不登记族** |
-| `survey.py` | 全部实验结构的全景 `survey_structures`：按配体分组、每组套数与最佳分辨率，产物进页面。**常驻，不登记族** |
-| `analysis.py` | 把多路分数合成候选表（对齐、平均秩、分档与并列组）、看位姿的接触与 PLIP 指纹、同一分子多个对接模式按体积聚簇并比接触差异、接触频次、拆疏水（HP/HM/脱水账）、效率体检（LE/LELP/LLE）、重对接验证、挑对照；8 个工具 |
+| `survey.py` | 全部实验结构的全景 `survey_structures`：按配体分组、每组套数与最佳分辨率，产物进页面。**常驻** |
+| `analysis.py` | 候选表合成（平均秩、分档与并列组）、位姿的接触与 PLIP 指纹、同一分子多个对接模式按体积聚簇并比接触差异、接触频次、疏水与脱水账、效率体检（LE/LELP/LLE）、重对接验证、两个位姿逐原子比较；8 个工具 |
 | `interactions.py` | 位姿的相互作用：接触 / 几何氢键 / 冲突 + PLIP 指纹，整理成 Mol* 能画的三维端点（不登记工具，`analyze_pose` 与 `write_run` 共用） |
-| `screen.py` | 不看靶点的通道：2D 指纹相似度、3D 形状（USR）、按位姿去重与骨架配额挑一批交给实验；3 个工具 |
+| `screen.py` | 不看靶点的通道：2D 指纹相似度与 3D 形状（USR）由 `rank_library` 收口；按位姿去重与骨架配额挑一批交给实验；2 个工具 |
 | `admet.py` | 类药性规则层：ESOL / Veber / BBB / CYP 警示（1 个工具） |
-| `sar.py` | 构效关系：骨架分组、共同子结构（最大共同子结构）、匹配分子对、类似物枚举、实验回填（5 个工具） |
-| `pharmacophore.py` | 共识药效团：从活性里提炼特征点 + 按距离指纹筛库（2 个工具） |
-| `align.py` | 先验清单的取证与叠合：核序列、按 CA 把配体搬进受体参考系（不登记工具） |
+| `sar.py` | 构效关系：骨架分组与共同子结构（`scaffold_analysis` 一个入口两种模式）、匹配分子对、类似物枚举、实验回填（4 个工具） |
+| `pharmacophore.py` | 共识药效团：从活性里提炼特征点、按距离指纹筛库，构建与筛库收在 `build_pharmacophore` 一件里（1 个工具） |
+| `align.py` | 先验清单的取证与叠合：核序列、按 CA 求变换（不登记工具，`align_structures` 与口袋借用共用） |
 | `rsearch.py` | 搜索工具（一）：RCSB 文本/属性搜 + GraphQL 批量取配体（1 个工具） |
-| `literature.py` | 搜索工具（二）：PubMed 检索 + Europe PMC 检索与开放全文（3 个工具） |
-| `websearch.py` | 搜索工具（三）：联网搜索与单页抓取（2 个工具，结果落进本地语料） |
+| `literature.py` | 搜索工具（二）：PubMed 与 Europe PMC 检索（`search_literature` 的 `source` 参数）+ 开放全文（2 个工具） |
+| `websearch.py` | 搜索工具（三）：联网搜索与单页抓取（2 个工具，结果进本地语料） |
 | `corpus.py` | 本地语料：入库 / 检索 / 按页读原文（3 个工具，免费离线；检索是三路 RRF） |
 | `finetune.py` | 用已测活性微调 VCrossFormer（1 个工具） |
 | `affinity.py` | 用微调后的权重给位姿打 pK（1 个工具；分数方向与 dock 相反，两者不可比较） |
 | `fit_train.py` | 训练脚本本体（不登记工具，交给 DTA 环境跑） |
 | `receptor.py` | 准备受体（1 个工具） |
 | `ligand.py` | 导入 / 准备 / 筛库 / 参考集 / 叠合（5 个工具） |
-| `listing.py` | 浏览登记表（3 个工具） |
+| `listing.py` | 浏览登记表与切换当前受体（`registry` / `switch_receptor`，2 个） |
 | `all_tools.py` | 把上面各模块的工具合成一份，供应用一次装完 |
 
 调试入口在**仓库根目录**的 `debug_tools.py`（不在包内，也不登记工具）：它被各模块
@@ -84,7 +83,6 @@ __all__ = [
     "affinity",
     "align",
     "analysis",
-    "campaign",
     "chembl",
     "chemistry",
     "complexes",

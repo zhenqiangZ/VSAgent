@@ -1,10 +1,10 @@
 """常驻核心工具的那一份装配清单。
 
 **顺序就是请求体里的顺序**，模型按它挑工具，所以这里只排一次、由应用与判据
-共同读取，不各写一份。加一个常驻工具只改这里与 `toolprofiles.py`。
+共同读取，不各写一份。加一个常驻工具只改这里与 `roles/agents.toml`。
 
 与领域工具的分界：这些工具一步都不缺席；`domain/` 下的工具由 `FAMILIES`
-分组、按族装入（见 `toolset.py`）。
+每个角色的可见清单由 `roles/agents.toml` 决定。
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .domain.campaign import AssessCampaignTool
 from .domain.export import OpenViewerTool, WriteRunTool
 from .domain.survey import SurveyStructuresTool
 from vsagent.core.agent.state.event_log import domain_tools as event_tools
@@ -22,7 +21,6 @@ from vsagent.core.agent.state.memory import RecallTool, RememberTool
 from vsagent.core.agent.execution.spawn import AgentStatusTool, DispatchCampaignTool
 from vsagent.core.agent.state.task import TaskTool
 from .tools import BashTool, GrepTool, PatchTool, ReadTool, ReadTurnTool, Tool, WriteTool
-from .toolset import LoadToolsTool
 
 
 def build_core_tools(
@@ -50,15 +48,13 @@ def build_core_tools(
         # 任务状态与假设都挂在会话上，由内核每次调用现取，不需要传东西进来。
         TaskTool(),
         HypothesisTool(),
-        # 开工前的盘点与结构全景：常驻、不登记族。它决定这一轮装哪几族，
-        # 一个「决定装哪族」的工具本身要先装族才看得见，顺序就反了。
-        AssessCampaignTool(),
+        # 结构全景：常驻、不登记族。开工盘点由角色各自做，主控只读报告。
         SurveyStructuresTool(),
         ReadTurnTool(),
         SearchHistoryTool(sessions),
     ]
     tools.extend(event_tools(sessions))
-    tools.extend([LoadToolsTool(), WriteRunTool(), OpenViewerTool()])
+    tools.extend([WriteRunTool(), OpenViewerTool()])
     if allow_agents:
         tools.extend([AgentStatusTool(), DispatchCampaignTool()])
     return tools

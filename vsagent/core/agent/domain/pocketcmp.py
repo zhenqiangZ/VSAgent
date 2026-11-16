@@ -34,7 +34,7 @@ MAX_CANDIDATES = 8
 """候选上限。每个候选要取一次 UniProt 条目与一次 ChEMBL 计数，多了等不起。"""
 
 ACTIVES_FLOOR = 7.0
-"""数活性条数用的 pChEMBL 下限，与 `assess_campaign` 同一口径。"""
+"""数活性条数用的 pChEMBL 下限，与开工盘点的口径一致。"""
 
 MIN_WINDOW_IDENTITY = 0.40
 """窗口同一性低于它就不建议借配体。不同家族之间随便取一段也能撞到 20% 上下，
@@ -199,13 +199,10 @@ class ComparePocketsTool(Tool):
     spec = ToolSpec(
         name="compare_pockets",
         description=(
-            "把本靶的口袋与抗靶的受体逐残基比一遍，只报口袋中心 8 埃以内的位置。"
-            "两条序列先做全局对齐，再按对齐结果配对，所以两边的编号不一致也能对上。\n"
-            "每条差异写明抗靶那边是大了还是小了、性质变了没有——"
-            "「抗靶在该处更小，加大取代基会撞上」这类假设就从这个结果来。\n"
-            "`pocket` 给 `define_pocket` 的产物；也可以直接用 `residues` 报残基（`A:745,A:788`）。\n"
-            "**两个靶点的对接分数不能互相比较**：蛋白不同，分数没有共同零点；"
-            "选择性比只能从实测活性算。"
+            "本靶的口袋与抗靶的同名口袋差在哪几个残基？\n"
+            "输入：target 与 anti 填靶点编号；pocket 给 define_pocket 的产物，或直接用 residues 写残基（A:745,A:788）。\n"
+            "输出：只报口袋中心 8 埃以内的残基，逐条写明抗靶那边更大还是更小、性质变了没有。\n"
+            "边界：两个靶点的对接分数不能互相比较，蛋白不同、没有共同零点；选择性只能从实测活性算。"
         ),
         parameters={
             "type": "object",
@@ -445,15 +442,10 @@ class SimilarPocketsTool(Tool):
     spec = ToolSpec(
         name="similar_pockets",
         description=(
-            "本靶点没有可用起点时，去邻近受体借配体：按**口袋窗口的局部序列相似性**"
-            "给候选受体排序，同时给出每个候选在 ChEMBL 里 pChEMBL ≥7 的活性条数。\n"
-            "`candidates` 是候选的 UniProt 编号（逗号分隔，至多 8 个），"
-            "通常先用 `search_targets` 按蛋白名或基因名检索同家族成员。\n"
-            "窗口按 **UniProt 编号**取：`residues` 直接写编号（`741,745,788`），"
-            "给 `pocket` 时先把结构编号对齐到 UniProt 序列再取窗口。\n"
-            "挑法：相似度最高且活性 ≥20 条的那一个；都不到 20 条时取活性最多的，"
-            "并在结论里写明参考集不足。借来的配体排序误差比同受体大，"
-            "下一轮只挑 20 个左右做实测，不直接大规模对接。"
+            "本靶点没有可用配体时，哪个邻近受体的口袋最像、能借它的配体？\n"
+            "输入：accession 填 UniProt 编号；candidates 填候选编号（至多 8 个，逗号分隔）；residues 或 pocket 定窗口。\n"
+            "输出：候选按口袋窗口的局部序列相似度排序，各带 ChEMBL 里 pChEMBL 不低于 7 的活性条数，并给一个推荐。\n"
+            "边界：相似度高不等于活性多，哪一边不足都会写明；借来的配体排序误差更大，下一轮只挑 20 个左右做实测。"
         ),
         parameters={
             "type": "object",
@@ -499,7 +491,7 @@ class SimilarPocketsTool(Tool):
             candidates = _candidates(arguments.get("candidates"))
             if not candidates:
                 return ToolResult(
-                    output="candidates 是空的：先用 search_targets 找同家族成员，再把这几个编号传进来。",
+                    output="candidates 是空的：先用 target_lookup 找同家族成员，再把这几个编号传进来。",
                     failed=True,
                 )
             window = int(_number(arguments.get("window"), WINDOW, "window"))
@@ -577,7 +569,7 @@ class SimilarPocketsTool(Tool):
             lines.append(
                 f"没有相近的候选：最高窗口同一性只有 {chosen[0]:.0%}（判据 ≥{MIN_WINDOW_IDENTITY:.0%}）。"
                 "不要借——不同家族里随便取一段也能撞到 20% 上下，借来的是别人的化学型。"
-                "先补候选：用 search_targets 按同一蛋白家族检索，或回到文献里的位点与突变数据。"
+                "先补候选：用 target_lookup 按同一蛋白家族检索，或回到文献里的位点与突变数据。"
             )
             return ToolResult(
                 output="\n".join(lines),
@@ -600,7 +592,7 @@ class SimilarPocketsTool(Tool):
             lines.append("候选里没有一个到 20 条活性：参考集不足，结论里要写明这一条。")
         lines.append(
             f"借它的配体：search_actives(accession=\"{chosen[1]}\")；"
-            "之后 build_reference_set → screen_similarity → pick_diverse(limit=20)。"
+            "之后 build_reference_set → rank_library(method=similarity) → pick_diverse(limit=20)。"
         )
         return ToolResult(
             output="\n".join(lines),

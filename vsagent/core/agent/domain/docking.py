@@ -982,27 +982,10 @@ class DockTool(Tool):
     spec = ToolSpec(
         name="dock",
         description=(
-            "用 AutoDock Vina 把一个**已准备**的受体与一组**已准备**的配体对接。"
-            "分数**越低越好**（kcal/mol），只能在同一受体、同一盒子、**同一力场**内比较，"
-            "不是结合自由能，也不能跨靶点比较。\n"
-            "scoring 选力场：vina（默认）/ vinardo / ad4（AutoDock4 力场）。"
-            "**三种力场的分数互不可比**——官方文档明写 AutoDock 与 Vina 的分数不能互相比。"
-            "换力场重跑是另一个产物目录，不会覆盖旧的。"
-            "适用与局限：vina 是经验打分，没有显式静电与去溶剂化，疏水、体积大的分子"
-            "容易拿到更好的分数；只作位姿与结构过滤。vinardo 是 vina 的权重变体，"
-            "仍没有显式静电；分数与 vina 不可比。ad4 有静电与去溶剂化，适合带电口袋、"
-            "金属位点与盐桥主导的结合；需要 autogrid4 与 ≤40 Å 盒子，比 vina 慢，"
-            "分数与 vina、vinardo 不可比。"
-            "ad4 要先用 autogrid4 算亲和力图（缺它时返回安装指引，vina/vinardo 不受影响），"
-            "且盒子边长限 40 Å（图的代价是三次方）；vina 与 vinardo 只要受体与盒子。"
-            f"{CHEM_TOOL_DESCRIPTION_NOTE}"
-            "默认 exhaustiveness=8、num_modes=9、limit=50、单配体超时 300 秒；"
-            "参数由用户决定，不要自己替用户改。缺 Vina 可执行文件时返回安装指引，不抛异常。"
-            "单条失败（超时/非零退出/没有结果）不中断整批，失败原因逐条写进 manifest。"
-            "**大库用 offset 分批**：limit 是这一批多少个、offset 从第几个开始，两批不重叠；"
-            "offset 进缓存键，不同批次是两个产物目录。"
-            "受体必须来自 prepare_receptor 的 confirm=true，配体集必须来自 "
-            "prepare_ligands 的 confirm=true；盒子从受体的 box.txt 读，不收模型传的坐标。"
+            "已准备的受体和一组配体，对出来哪个位姿最可信？\n"
+            "输入：receptor 与 ligands 都必须来自确认过的准备产物；scoring 选 vina（默认）、vinardo 或 ad4；limit 与 offset 分批。\n"
+            "输出：对接产物（每个分子的位姿、分数与结果表），分数越低越好，登记成 artifact。\n"
+            "边界：三种力场的分数互不可比，也不能跨受体、跨盒子、跨靶点比较；vina 与 vinardo 没有显式静电，疏水而体积大的分子容易拿到更好的分数；ad4 需要 autogrid4 且盒子边长不超过 40 埃；参数由用户定，不替用户改。"
         ),
         parameters={
             "type": "object",
@@ -1085,12 +1068,12 @@ class DockTool(Tool):
         raw_ligands = str(arguments.get("ligands") or "").strip()
         if not raw_receptor:
             return ToolResult(
-                output="缺少参数 receptor。先 list_workspace 看清有哪份已准备的受体。",
+                output="缺少参数 receptor。先 registry 看清有哪份已准备的受体。",
                 failed=True,
             )
         if not raw_ligands:
             return ToolResult(
-                output="缺少参数 ligands。先 list_workspace 看清有哪份已准备的配体集。",
+                output="缺少参数 ligands。先 registry 看清有哪份已准备的配体集。",
                 failed=True,
             )
         try:

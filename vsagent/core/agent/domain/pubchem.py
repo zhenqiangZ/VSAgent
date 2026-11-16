@@ -23,7 +23,7 @@ InChIKey 是哈希，比「两边规范化出来的 SMILES 字符串相等」可
 
 **相似检索没有分数。** PUG 的相似性接口只回 CID 列表（按相似度从高到低排），不给
 Tanimoto 值。所以这里也不编一个分数出来，只如实说「按接口顺序」——编一个 0–1 的数
-会让模型以为它能拿去和本地 `screen_similarity` 的分数比较，而那是两套指纹。
+会让模型以为它能拿去和本地 `rank_library` 的分数比较，而那是两套指纹。
 
 **相似性走 `fastsimilarity_2d`，不走 `/similarity/`。** 标准路径是异步的：先回 202 与
 一个 `ListKey`，再轮询 `/compound/listkey/<key>/cids/JSON`，实测要 1–2 秒、多一次请求；
@@ -455,19 +455,10 @@ class FetchCompoundTool(Tool):
     spec = ToolSpec(
         name="fetch_compound",
         description=(
-            "查一个化合物的**身份**：PubChem 给结构、计算性质与 CID，ChEMBL 有记录时再补上"
-            "「是不是药、类药性如何、作用于哪些靶点、治什么病」。输入可以是名称（aspirin）、"
-            "CID（2244）、SMILES、InChIKey 或 ChEMBL 编号（CHEMBL25）——对接产物与枚举出来的"
-            "新结构没有 ChEMBL 编号，但一定有 SMILES，这是把它们对上「已知化合物」的入口。\n\n"
-            "两半靠 InChIKey 接起来，所以给编号与给结构拿到的是同一份东西。PubChem 那半给"
-            "CID、分子式、分子量、电荷、规范 SMILES（含 / 不含立体各一份）、InChIKey、IUPAC 名，"
-            "以及 XLogP / TPSA / 氢键供受体 / 可旋转键（**这些是算出来的，不是实验值**）。"
-            "ChEMBL 那半给 max_phase（**到 4 就是已上市**，那这个「新发现」并不新）、已撤市与"
-            "黑框警告、Lipinski 违反项与 QED、作用靶点、适应症。\n\n"
-            "**同名多义时不补 ChEMBL**：一个名字对多个 CID 时先确认是哪个，再拿 CID 查一次。"
-            "ChEMBL 里没有这个结构时会明说——那不是失败，只说明它没被收录。"
-            "每次调用 2–6 秒（两个库各一两次请求，ChEMBL 那边偏慢）。"
-            "要找这个结构的近亲用 search_similar_compounds。"
+            "这个化合物是什么，是不是已经上市的药？\n"
+            "输入：compound 可以填名称、CID、SMILES、InChIKey 或 ChEMBL 编号；对接与枚举出来的分子没有编号，填 SMILES。\n"
+            "输出：PubChem 给 CID、分子式、分子量、规范 SMILES、InChIKey 与计算性质；ChEMBL 有记录时补最高临床阶段、撤市与黑框警告、类药性、作用靶点与适应症。\n"
+            "边界：计算性质（XLogP、TPSA、氢键数、可旋转键）不是实验值；一个名字对多个 CID 时不补 ChEMBL，先确认是哪一个。"
         ),
         parameters={
             "type": "object",
@@ -582,15 +573,10 @@ class SearchSimilarCompoundsTool(Tool):
     spec = ToolSpec(
         name="search_similar_compounds",
         description=(
-            "按结构相似度在 **PubChem 全库**里找已知化合物（2D 指纹，阈值 50–100，默认 90）。"
-            "用在「这个结构是不是别人早就做过」与「找一批可买的类似物」这两步："
-            "本地 screen_similarity 只能比登记表里的分子，这条能比到上亿条记录。\n\n"
-            "返回命中总数与前几条的身份（CID、名称、分子式、MW、XLogP、SMILES）。"
-            "**接口不给相似度分数**，所以这里也不编：结果按 PubChem 的相似度从高到低排列，"
-            "但它与本地的 Tanimoto 分数不是一套指纹，不能互相比较。\n\n"
-            "**与 search_analogs 的分工**：那条在 ChEMBL 里按 ChEMBL 编号找类似物（带活性）；"
-            "这条只认 SMILES、覆盖全库（带结构但不保证有活性）。阈值调低命中会迅速变多"
-            "（90 时阿司匹林已有近七千条），所以默认只列前 10 条。"
+            "PubChem 全库里有没有和这个结构相近的已知化合物？\n"
+            "输入：smiles 必填；threshold 是 50–100 的相似度阈值，默认 90；limit 默认 10。\n"
+            "输出：命中总数与前几条的身份（CID、名称、分子式、MW、XLogP、SMILES）。\n"
+            "边界：接口不给相似度分数，不编一个；它与本地的 Tanimoto 不是同一套指纹，不能互相比较；阈值调低时命中会迅速变多。"
         ),
         parameters={
             "type": "object",

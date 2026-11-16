@@ -835,7 +835,7 @@ def run_checks(base, state_path, runs_dir, link_session, other_session):
         "工具单元的输入与输出都在",
         all(part["toolName"] for part in got_tools)
         # `toolInput` 只要求是**字典**，不要求非空：有工具本来就不收参数
-        # （`list_workspace` 的入参全是可选的），空字典是它正确的输入而不是
+        # （`registry` 的入参全是可选的），空字典是它正确的输入而不是
         # 丢了字段。按「非空」判会把这一类合法调用当成缺陷，而字段真的丢了
         # 时它是 `None`——下面两处要盯的是这个。
         and all(isinstance(part["toolInput"], dict) for part in got_tools)

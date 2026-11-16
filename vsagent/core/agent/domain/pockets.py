@@ -1495,16 +1495,10 @@ class DetectPocketsTool(Tool):
     spec = ToolSpec(
         name="detect_pockets",
         description=(
-            "把一个受体的**结合口袋**列出来，登记成口袋集。四层来源：这份结构自带的"
-            "共晶配体 → 用户给的先验编号（candidates）→ 该蛋白的复合物（uniprot）→ "
-            "p2rank 预测（pdb_id）。中心、半径与盒子一律现算，**不接受模型传的坐标**。\n"
-            "sources=auto（默认）按上述顺序取**第一个非空的来源**，不会白跑网络；"
-            "要叠加来源就显式写 `ligand,complex`。\n"
-            "脂质、磷脂、去垢剂不算配体，算口袋前就剔掉，剔了几个会写在结论里。\n"
-            "每处口袋附一份**画像**：配体的元素组成与伸展尺寸、壁按芳香/疏水/极性/带电"
-            "分四类计数、最近残基与 3.5 埃内的个数、一句判断。画像里**没有分数**。\n"
-            "空集不是失败：会分清「查了确实没有」与「没查成」，并说明缺哪个参数才能再试。\n"
-            "下一步用 define_pocket 选一处，把它的 handle 交给 prepare_receptor 的 pocket。"
+            "这个受体上有哪些结合口袋，各自长什么样？\n"
+            "输入：receptor 必填；sources 选来源，auto（默认）按共晶配体、先验编号、复合物、p2rank 的顺序取第一个非空的，也可写 ligand,complex 叠加。\n"
+            "输出：口袋集（中心、半径与盒子现算），每处附画像：配体的元素组成与尺寸、壁按芳香/疏水/极性/带电四类计数、最近残基与 3.5 埃内的残基数。\n"
+            "边界：不接受模型传的坐标；脂质、磷脂与去垢剂先剔掉并报数；空集不是失败，会分清「确实没有」与「没查成」；画像里没有分数。"
         ),
         parameters={
             "type": "object",
@@ -1569,7 +1563,7 @@ class DetectPocketsTool(Tool):
         raw = str(arguments.get("receptor") or "").strip()
         if not raw:
             return ToolResult(
-                output="缺少参数 receptor。先 list_workspace 看清有哪份受体。",
+                output="缺少参数 receptor。先 registry 看清有哪份受体。",
                 failed=True,
             )
         try:
@@ -1850,7 +1844,7 @@ class DetectPocketsTool(Tool):
                 return ToolResult(
                     output=(
                         "要走复合物来源就得给 uniprot（如 P00519）。"
-                        "不知道编号就先 search_targets 查。"
+                        "不知道编号就先 target_lookup 查。"
                     ),
                     failed=True,
                 )
@@ -2013,13 +2007,10 @@ class DefinePocketTool(Tool):
     spec = ToolSpec(
         name="define_pocket",
         description=(
-            "从口袋集里选一处，或用残基 / 显式坐标定义一处，登记成**单个口袋**，"
-            "供 prepare_receptor 的 pocket 参数使用。\n"
-            "三路互斥：pockets+index（选现成的）/ residues（链:序号，逗号分隔）/ "
-            "center+size（显式坐标）。同时给两路会直接报错。\n"
-            "**盒子由代码算**：残基那一路取残基重原子的包围盒再四周外扩 padding，"
-            "不接受模型心算的边长。\n"
-            "residues 里写错一个残基会被列出来（连同该链的实际编号范围），不会静默丢掉。"
+            "口袋集里该选哪一处，或者按残基自己定一处？\n"
+            "输入：三路互斥：pockets 加 index 选现成的，residues 写链:序号，center 与 size 给坐标；同时给两路直接报错。\n"
+            "输出：单个口袋，登记成口袋集里的一条，供 prepare_receptor 的 pocket 使用。\n"
+            "边界：盒子由代码算，残基那一路取重原子包围盒再四周外扩；写错的残基会连同该链的实际编号范围一起列出，不会静默丢掉。"
         ),
         parameters={
             "type": "object",

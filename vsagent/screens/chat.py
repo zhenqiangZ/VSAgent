@@ -17,6 +17,7 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ..core.models import Message, Part, PartType, Session, ToolStatus
+from ..core.agent.search_reasoning import events as sar_events
 from ..core.session_manager import RAIL_MAX, RAIL_MIN, SIDE_MAX, SIDE_MIN
 from ..widgets.command_palette import CommandPalette
 from ..widgets.editor_pane import EditorPane
@@ -39,6 +40,17 @@ MIN_MAIN_WIDTH = 40
 ARTIFACT_ROWS = 6
 # 聊天左栏只列最近这几条会话；更早的会话走 /sessions 选择器查看。
 CHAT_SESSION_LIMIT = 8
+
+# 检索增强各阶段在状态栏里的短说法。
+SAR_PHASES: dict[str, str] = {
+    sar_events.RETRIEVAL_OBSERVED: "整理检索结果",
+    sar_events.ANSWER_INITIALIZED: "建立先验答案",
+    sar_events.EVIDENCE_ASSESSED: "评估证据",
+    sar_events.CLAIM_UPDATED: "整合证据",
+    sar_events.ANSWER_VERIFIED: "核对答案",
+    sar_events.ANSWER_FINALIZED: "完成",
+    "search_reasoning.error": "检索增强出错",
+}
 
 
 def _short(text: str, width: int) -> str:
@@ -372,6 +384,13 @@ class ChatScreen(Screen):
             bus.subscribe("context.metrics", self._on_context_metrics),
             bus.subscribe("agent.created", self._on_agent_changed),
             bus.subscribe("agent.status", self._on_agent_changed),
+            *[
+                bus.subscribe(
+                    name,
+                    lambda payload, phase=phase: self._on_sar_phase(payload, phase),
+                )
+                for name, phase in SAR_PHASES.items()
+            ],
         ]
         self.side_toggle.render_state(self.side_panel.has_class("-visible"))
         self.apply_widths()
@@ -801,6 +820,7 @@ class ChatScreen(Screen):
             return
         self._busy = False
         self.messages.set_running(False)
+        self.status.update_phase("")
         self.messages.flush_text()
         self.refresh_rail()
         self.refresh_status()
@@ -811,6 +831,11 @@ class ChatScreen(Screen):
         """事件总线：状态刷新。"""
         if self._belongs(data):
             self.refresh_status()
+
+    def _on_sar_phase(self, data: dict[str, object], phase: str) -> None:
+        """事件总线：检索增强走到哪一步，写进状态栏。"""
+        if self._belongs(data):
+            self.status.update_phase(phase)
 
     def _on_context_metrics(self, data: dict[str, object]) -> None:
         """事件总线：这一步的装配度量到了。
@@ -852,6 +877,8 @@ class ChatScreen(Screen):
         status = str(data.get("status", ""))
         if session_id == self.session.id:
             self._busy = status == "running"
+            if not self._busy:
+                self.status.update_phase("")
         elif status in ("done", "failed", "cancelled"):
             # 子 agent 在后台跑完时给一句提示：右栏的状态点会变，但用户
             # 正盯着消息区，不看右栏的话不会注意到。

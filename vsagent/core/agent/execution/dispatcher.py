@@ -48,20 +48,19 @@ def _title_for(spec: AgentProfile) -> str:
     return spec.title.split("：")[0]
 
 
-def _task_book(task: AgentTask, spec: AgentProfile, families: Iterable[str] = ()) -> str:
+def _task_book(task: AgentTask, spec: AgentProfile) -> str:
     """把任务写成子 agent 读得懂的一段话。
 
     写成用户消息而不是系统提示：它只该在这个子会话里出现一次，进稳定前缀会
     跟着每一次请求，而任务书是这**一个**任务的东西。
 
-    `families` 要写进去：子会话继承的是父会话当时装过的那几族，不一定包含
-    这份任务要用的（比如 `research`）。不写的话，它得自己猜要装哪一族，
-    而任务书里只写了「报告里不能空：evidence_refs」——做不到又不知道缺什么。
+    工具清单由角色配置决定，任务书只写「有几件、按配置装配」，不再列族名：
+    列出来就是一份会过期的清单，改了配置还要回来改这里。
     """
     lines = ["[结构化任务]", task.objective, f"角色：{spec.title}（{task.role}）"]
-    wanted = [item for item in families if item] or list(spec.families)
-    if wanted:
-        lines.append(f"工具族：{'、'.join(wanted)}（没装过的先用 load_tools 装）")
+    from vsagent.core.agent.roles.agents import role_tools
+
+    lines.append(f"工具：{len(role_tools(task.role))} 件，按角色配置装配，不必自己装")
     if spec.note:
         lines.append(f"边界：{spec.note}")
     if task.input_refs:
@@ -112,7 +111,6 @@ class AgentDispatcher:
         task: AgentTask,
         *,
         title: str = "",
-        families: Iterable[str] = (),
         run: bool = True,
     ) -> Dispatch:
         """派发一份结构化任务。被拒绝时抛 `DispatcherError`，不建空会话。"""
@@ -134,7 +132,7 @@ class AgentDispatcher:
             spec = profile(task.role)
         except KeyError as error:
             raise DispatcherError(str(error)) from error
-        problems = spec.check_task(task, families)
+        problems = spec.check_task(task)
         if problems:
             raise DispatcherError("；".join(problems))
 
@@ -143,7 +141,7 @@ class AgentDispatcher:
         child = self.host.spawn(
             parent,
             title=title.strip() or _title_for(spec),
-            task=_task_book(task, spec, families),
+            task=_task_book(task, spec),
             start=end,
             end=end,
             origin="agent",

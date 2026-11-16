@@ -2,20 +2,21 @@
 
 三种模式，靠 `VSA_ROUTE` 切换：
 
-- `off`　　：一概不做，与加入路由之前完全一致；
-- `shadow` ：照常解析与路由，**只记录，不改工具清单**。用来量"计划与实际用族"的
-             一致率；解析失败也只是少一条记录，不影响这一轮；
-- `enforce`：计划照常成立并交给派发；主 agent 自己一族都不装。它现在与 `shadow`
-             对工具清单的作用一致（改工具清单的那一步已经删掉，见 P-79），差别只在
-             trace 里记下的模式名，保留它是为了显式选择"严格路径"。
+- `off`　　：一概不做，与加入路由之前完全一致；根会话也不按角色名单过滤工具；
+- `shadow` ：照常解析与路由，写出计划与过程记录。用来观察计划与实际派发的一致率；
+             解析失败也只是少一条记录，不影响这一轮；
+- `enforce`：与 `shadow` 走同一条路。差别只在 trace 里记下的模式名，保留它是为了
+             显式选择「严格路径」。
+
+工具清单不随模式变：每个角色装什么由 `agents.toml` 决定，会话建立时定稿。
 
 三条边界：
 
 - **失败不改行为**：解析两次仍失败、路由抛错，都只是记一条 `route.error`，
   这一轮照旧走原来的路径。路由是新加的一层，不能成为新的故障点。
 - **子 agent 不路由**：它的任务书由父会话给，自己没有"用户意图"可解析。
-- **shadow 也写任务规格**：否则下一轮没有当前任务可继承，"继续""改目标"永远
-  判不出来，样本就白采了。写的是会话状态，不动工具清单。
+- **计划写进会话状态**：下一轮靠它判「继续」「改目标」，所以解析成功就要落成
+  `task_spec`，哪怕这一轮最终没有派发。
 """
 
 from __future__ import annotations
@@ -61,13 +62,12 @@ def _clip(text: str, limit: int) -> str:
 
 @dataclass(frozen=True)
 class RouteDecision:
-    """这一轮路由做了什么。调用方据此决定装不装族、记什么日志。"""
+    """这一轮路由做了什么。调用方据此写计划、记日志。"""
 
     mode: str
     intent: IntentSpec | None = None
     task: TaskSpec | None = None
     plan: CapabilityPlan | None = None
-    families: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     error: str = ""
 
@@ -143,18 +143,11 @@ class RouteAdapter:
             plan = routing.plan
             warnings.extend(routing.warnings)
 
-        families: list[str] = []
-        if plan is not None:
-            for names in plan.tool_families.values():
-                for family in names:
-                    if family not in families:
-                        families.append(family)
         return RouteDecision(
             mode=self.mode,
             intent=intent,
             task=task,
             plan=plan,
-            families=tuple(families),
             warnings=tuple(warnings),
         )
 
@@ -240,12 +233,12 @@ def describe(decision: RouteDecision, *, hint: str = "") -> str:
                 upstream = "、".join(role_label(dep) for dep in waits[role])
                 row += f"  ← 等 {upstream}"
             rows.append(row)
-            # 族按角色分行写。原先压成一行并集，读起来像「这个会话装了这十族」——
-            # 而它其实是两个角色各自要用的，主 agent 一族都不装（P-79）。
-            names = list(plan.tool_families.get(role) or [])
-            if names:
-                tail = "…" if len(names) > FAMILY_LIMIT else ""
-                rows.append(f"    族：{'、'.join(names[:FAMILY_LIMIT])}{tail}")
+            # 每个角色这一场能用多少工具，按配置现数。
+            from vsagent.core.agent.roles.agents import role_tools
+
+            count = len(role_tools(role))
+            if count:
+                rows.append(f"    工具：{count} 个（来自 agents.toml）")
         rows.append("  应用：计划按角色派发，主 agent 不装族")
         if plan.unresolved_inputs:
             # 与告警不同：这句是「这一场不能派」，不是提醒。`dispatch_campaign`

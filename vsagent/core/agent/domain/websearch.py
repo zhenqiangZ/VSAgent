@@ -306,15 +306,10 @@ class SearchWebTool(Tool):
     spec = ToolSpec(
         name="search_web",
         description=(
-            "联网搜索网页。**计费**：5 元 / 1000 次成功请求（空结果、失败、超时不计费）。"
-            "**结果会自动存进本地语料**，每条给一个引用号 `web#xxxxxxxxxx`。\n\n"
-            "**先查本地**（`search_corpus`，免费、离线、不联网），不够再来这里——"
-            "已经搜过的问题答案多半在盘上。同一个 query 有本地档案，再搜不花钱；"
-            "要拿最新结果给 `refresh: true`。\n\n"
-            "返回每条结果的引用号、标题、站点、日期、权威度（0～4）与 400 字摘要。"
-            "**命中 0 条不是失败**（那是「查了，确实没有」），换个说法或加站点/时间限定再试。\n\n"
-            "`query` 最长 128 个字符，支持 `site:`、`-site:`、`\"精确短语\"`、"
-            "`after:`/`before:`、`lang:` 这些写法。"
+            "网上有没有关于这个问题的资料？\n"
+            "输入：query 最长 128 个字符，支持 site:、-site:、精确短语、after:、before:、lang:；count 控制条数。\n"
+            "输出：每条给引用号（web#…）、标题、站点、日期、权威度与 400 字摘要，结果自动存进本地语料。\n"
+            "边界：计费，5 元 / 1000 次成功请求；先查 search_corpus，本地已有同样的 query 再搜不花钱；命中 0 条不是失败，换个说法再试。"
         ),
         parameters={
             "type": "object",
@@ -437,13 +432,10 @@ class FetchWebpageTool(Tool):
     spec = ToolSpec(
         name="fetch_webpage",
         description=(
-            "抓取单个网页的正文（Markdown），存进本地语料成**全文源**（`web#xxxxxxxxxx`）。"
-            "**计费**：5 元 / 1000 次成功请求。\n\n"
-            "本地已经有全文时**不再联网、不再计费**（除非 `refresh: true`）；"
-            "只想看某段内容的话，先用 `read_source` 读本地那份。"
-            "抓过的页面可以反复读，引用号不变。\n\n"
-            "只给 `url`。抓不到时如实说明（站点拒绝 / 页面没有可提取正文 / 太大），"
-            "此时本地那份摘要还在，只是没有全文。"
+            "这个网页的正文写了什么？\n"
+            "输入：url 必填；max_chars 控制长度；refresh=true 才重新联网。\n"
+            "输出：正文（Markdown）存进本地语料成全文源，引用号不变，之后可以反复读。\n"
+            "边界：计费，5 元 / 1000 次成功请求；本地已有全文时不再联网；抓不到时如实说明，本地那份摘要仍在。"
         ),
         parameters={
             "type": "object",

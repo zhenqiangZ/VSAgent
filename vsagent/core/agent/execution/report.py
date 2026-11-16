@@ -27,11 +27,16 @@ trace 是全集，一份长会话有十几万条；分析只关心这四类，�
 
 
 def read_trace(path: Path, session_id: str) -> list[dict]:
-    """读一个会话的 trace，只留分析要用的四类事件。
+    """读一份会话记录，只留分析要用的四类事件。
 
-    文件按会话分，正常不会混进别的会话；`session_id` 仍然要核，因为
-    `--session` 指错时读到的是另一份，把它的装配记录算进这一份会得出
-    看起来合理、实际对不上的数字。
+    文件名是根会话的编号，但一份记录由根会话与它派出的子会话共同写入，
+    每条事件的 `payload.session_id` 标明是谁写的。多角色执行之后，
+    「文件按会话分」这个假设不成立：以前按根会话编号过滤，会把子会话的
+    步数、工具与失败整段丢掉，报告只算到父会话那一小部分。
+
+    所以这里不再按编号丢事件。`session_id` 仍保留在签名里，由调用方保证
+    读到的是这一场的那份文件；返回的每条事件都带自己的归属，交给
+    `build` 分组统计。
     """
     events: list[dict] = []
     with path.open(encoding="utf-8") as handle:
@@ -45,22 +50,26 @@ def read_trace(path: Path, session_id: str) -> list[dict]:
                 continue
             if str(event.get("event") or "") not in REPORT_EVENTS:
                 continue
-            payload = event.get("payload") or {}
-            owner = payload.get("session_id")
-            if owner and owner != session_id:
-                continue
             events.append(event)
     return events
 
 
 def turn_windows(session, trace: list[dict]) -> tuple[list[dict], list[tuple[float, str]]]:
-    """按用户消息切轮，时间取自 trace；trace 缺条目时退回消息自带的时间戳。"""
+    """按用户消息切轮，时间取自 trace；trace 缺条目时退回消息自带的时间戳。
+
+    trace 里混着子会话的事件。切轮与状态只看本会话写的那几条：子会话的
+    `message.add` / `turn.done` 会让父会话的窗口错位，`agent.status`
+    也会把子会话的「完成」算成父会话这一轮的终态。
+    """
     added_at: dict[str, float] = {}
     done_at: dict[str, float] = {}
     last_at: dict[str, float] = {}
     status_at: list[tuple[float, str]] = []
     for event in trace:
         payload = event.get("payload") or {}
+        owner = payload.get("session_id")
+        if owner and owner != session.id:
+            continue
         message_id = payload.get("message_id")
         at = event.get("at")
         if at is None:
@@ -102,6 +111,10 @@ def turn_windows(session, trace: list[dict]) -> tuple[list[dict], list[tuple[flo
                 "reply": reply,
                 "start": start,
                 "end": max(end, start),
+                # 这一轮有没有收到 turn.done。它是「这一轮确实结束了」的
+                # 直接证据；`agent.status` 只是状态栏的最后一个值，campaign
+                # 关闭时不一定补发到父会话。
+                "done": reply is not None and reply.id in done_at,
             }
         )
     return windows, status_at
@@ -191,7 +204,62 @@ def metric_row(payload: dict) -> dict:
     }
 
 
-def build(session, trace: list[dict], *, text_limit: int = 0) -> dict:
+def session_row(session) -> dict:
+    """一条子会话的汇总：步、工具、失败、正文与用量。
+
+    读的是子会话自己的消息，不读父会话 trace：子会话的步与工具调用都在
+    它自己的 `Session.messages` 里，父会话只拿得到一份短报告。按消息里的
+    `STEP_START` 与 `TOOL` 计数，与父会话轮次用的是同一套口径。
+    """
+    steps = 0
+    tools = 0
+    failed = 0
+    failed_tools: list[str] = []
+    reasoning = 0
+    text_chars = 0
+    for message in session.messages:
+        for part in message.parts:
+            if part.type is PartType.STEP_START:
+                steps += 1
+            elif part.type is PartType.TOOL:
+                tools += 1
+                if part.tool_status is ToolStatus.FAILED:
+                    failed += 1
+                    if part.tool_name and len(failed_tools) < 8:
+                        failed_tools.append(part.tool_name)
+            elif part.type is PartType.REASONING:
+                reasoning += len(part.text or "")
+            elif part.type is PartType.TEXT:
+                text_chars += len(part.text or "")
+    start = session.spawned_at or session.created_at
+    end = session.updated_at or start
+    return {
+        "id": session.id,
+        "title": session.title,
+        "role": session.agent_role,
+        "status": session.status,
+        "depth": session.depth,
+        "parent_id": session.parent_id,
+        "topics": len(session.events),
+        "messages": len(session.messages),
+        "steps": steps,
+        "tools": tools,
+        "failed": failed,
+        "failed_tools": failed_tools,
+        "reasoning_chars": reasoning,
+        "text_chars": text_chars,
+        "seconds": round(max(end - start, 0.0), 1),
+        "tokens": {
+            "input": session.total_uncached() + session.total_cached(),
+            "cached": session.total_cached(),
+            "uncached": session.total_uncached(),
+            "output": session.total_output(),
+        },
+        "cost": round(session.total_cost(), 6),
+    }
+
+
+def build(session, trace: list[dict], *, text_limit: int = 0, children: list | None = None) -> dict:
     """把一个会话汇成分析数据。
 
     `text_limit` 大于 0 时截断用户原话与助手正文。网页端只要一段引子，
@@ -199,14 +267,22 @@ def build(session, trace: list[dict], *, text_limit: int = 0) -> dict:
 
     `hasTrace` 说明这份数据里有没有逐步读数。没有 trace 时 token 只取
     消息自带的数，缓存命中与分层占用是空的，页面上要说明这一点。
+
+    `children` 是这个根会话派出的子会话。它们与根会话共写一份 trace，
+    报告要把两边的步、工具与用量合起来算，单看根会话会少一大半。
     """
     windows, status_at = turn_windows(session, trace)
+    child_rows = [session_row(child) for child in (children or [])]
 
     metrics_all = []
     for event in trace:
         if event.get("event") != "context.metrics":
             continue
         payload = dict(event.get("payload") or {})
+        owner = payload.get("session_id")
+        if owner and owner != session.id:
+            # 子会话的装配读数属于子会话，混进父会话的轮次会让步数对不上。
+            continue
         payload["_at"] = event.get("at", 0.0)
         metrics_all.append(payload)
 
@@ -258,7 +334,12 @@ def build(session, trace: list[dict], *, text_limit: int = 0) -> dict:
                 "ended_at": end,
                 "seconds": seconds,
                 "has_reply": reply is not None,
-                "status": (statuses[-1] if statuses else "done") if reply is not None else "no-reply",
+                # 终态先看 turn.done：它是这一轮真的写完的直接证据。
+                # 没有时才退回窗口内最后一个 agent.status。campaign 关闭
+                # 只发 campaign.done，父会话可能停在 running 上不再更新。
+                "status": (
+                    "done" if window["done"] else (statuses[-1] if statuses else "done")
+                ) if reply is not None else "no-reply",
                 "steps": step_rows(reply, metrics, end) if reply is not None else [],
                 "tools": tools,
                 "failed": sum(1 for t in tools if t["status"] == "failed"),
@@ -292,6 +373,7 @@ def build(session, trace: list[dict], *, text_limit: int = 0) -> dict:
                 "step_end": event.step_end,
                 "degraded": event.degraded,
                 "exit_reason": event.exit_reason,
+                "answer_id": event.answer_id,
                 "artifacts": event.artifacts,
                 "issues": event.issues,
                 "actions": event.actions,
@@ -300,10 +382,14 @@ def build(session, trace: list[dict], *, text_limit: int = 0) -> dict:
         )
 
     total_tokens = {
-        "input": sum(t["tokens"]["input"] for t in turns),
-        "cached": sum(t["tokens"]["cached"] for t in turns),
-        "uncached": sum(t["tokens"]["uncached"] for t in turns),
-        "output": sum(t["tokens"]["output"] for t in turns),
+        "input": sum(t["tokens"]["input"] for t in turns)
+        + sum(c["tokens"]["input"] for c in child_rows),
+        "cached": sum(t["tokens"]["cached"] for t in turns)
+        + sum(c["tokens"]["cached"] for c in child_rows),
+        "uncached": sum(t["tokens"]["uncached"] for t in turns)
+        + sum(c["tokens"]["uncached"] for c in child_rows),
+        "output": sum(t["tokens"]["output"] for t in turns)
+        + sum(c["tokens"]["output"] for c in child_rows),
     }
     model = ""
     for window in reversed(windows):
@@ -357,6 +443,19 @@ def build(session, trace: list[dict], *, text_limit: int = 0) -> dict:
             add("warn", turn["index"],
                 f"第 {turn['index']} 轮走了 {len(turn['steps'])} 步，达到主题步数上限",
                 f"step-limit-{turn['index']}")
+    # 子会话的收束失败与步数上限也要进异常表：它们以前随着 session_id 过滤
+    # 一起消失了，而「两个 worker 都跑满步数」恰恰是最该看见的那一条。
+    for child in child_rows:
+        if child["steps"] >= STEP_LIMIT:
+            add("warn", None,
+                f"子会话 {child['id']}（{child['title']}）走了 {child['steps']} 步，"
+                "达到主题步数上限",
+                f"child-steps-{child['id']}")
+        if child["failed"]:
+            names = "、".join(child["failed_tools"]) or "未记工具名"
+            add("error", None,
+                f"子会话 {child['id']}（{child['title']}）有 {child['failed']} 次工具失败：{names}",
+                f"child-failed-{child['id']}")
     for event in events:
         if event["exit_reason"]:
             add("error", None, f"{event['id']} 停在 {event['exit_reason']}：{event['title']}",
@@ -374,12 +473,17 @@ def build(session, trace: list[dict], *, text_limit: int = 0) -> dict:
             "model": model,
             "status": session.status,
             "last_exit_reason": session.last_exit_reason,
-            "messages": len(session.messages),
-            "topics": len(events),
+            "messages": len(session.messages) + sum(c["messages"] for c in child_rows),
+            "root_messages": len(session.messages),
+            "topics": len(events) + sum(c["topics"] for c in child_rows),
             "turns": len(turns),
-            "steps": sum(len(t["steps"]) for t in turns),
-            "tools": sum(len(t["tools"]) for t in turns),
-            "failed": sum(t["failed"] for t in turns),
+            "children": len(child_rows),
+            "steps": sum(len(t["steps"]) for t in turns)
+            + sum(c["steps"] for c in child_rows),
+            "tools": sum(len(t["tools"]) for t in turns)
+            + sum(c["tools"] for c in child_rows),
+            "failed": sum(t["failed"] for t in turns)
+            + sum(c["failed"] for c in child_rows),
             "refused": sum(
                 1
                 for t in turns
@@ -387,14 +491,19 @@ def build(session, trace: list[dict], *, text_limit: int = 0) -> dict:
                 if tool["status"] == "failed" and tool["error"].startswith("本轮步数快用完了")
             ),
             "tokens": total_tokens,
-            "cost": round(sum(t["cost"] for t in turns), 6),
+            "cost": round(
+                sum(t["cost"] for t in turns) + sum(c["cost"] for c in child_rows), 6
+            ),
             "cache_reuse": round(total_tokens["cached"] / total_tokens["input"], 4)
             if total_tokens["input"]
             else 0.0,
             "active_seconds": round(sum(t["seconds"] for t in turns), 1),
+            # 子会话与父会话并行跑，时长不能直接相加；单列一份供对照。
+            "child_seconds": round(sum(c["seconds"] for c in child_rows), 1),
             "created_at": session.created_at,
         },
         "turns": turns,
+        "children": child_rows,
         "events": events,
         "issues": issues,
         "hasTrace": bool(trace),

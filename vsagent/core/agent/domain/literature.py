@@ -5,10 +5,11 @@
 
 两条来源，分工不同：
 
-- PubMed（`search_literature`）：两步 `esearch` → `efetch`，给标题、期刊、年份、作者
-  与摘要**片段**。只收 PubMed 收录的期刊文献。
-- Europe PMC（`search_europepmc` / `read_fulltext`）：一步检索就能拿到摘要、被引次数、
-  OA 标志与 PMCID，还能**读开放全文的某一节正文**，并且覆盖预印本与专利。
+- PubMed（`search_literature` 的默认来源）：两步 `esearch` → `efetch`，给标题、期刊、
+  年份、作者与摘要**片段**。只收 PubMed 收录的期刊文献。
+- Europe PMC（`search_literature(source=europepmc)` / `read_fulltext`）：一步检索就能
+  拿到摘要、被引次数、OA 标志与 PMCID，还能**读开放全文的某一节正文**，并且覆盖
+  预印本与专利。
 
 **摘要片段是片段，不是全文。** 想知道方法里用了什么、结果里写了哪些数，用
 `read_fulltext` 拿那一节；但只有 `isOpenAccess=Y` 的条目有全文，其余只能点链接看。
@@ -43,7 +44,6 @@ __all__ = [
     "MAX_LIMIT",
     "Paper",
     "ReadFulltextTool",
-    "SearchEuropePmcTool",
     "SearchLiteratureTool",
     "domain_tools",
     "esearch",
@@ -72,6 +72,16 @@ MAX_LIMIT = 50
 
 EPMC_DEFAULT_LIMIT = 10
 EPMC_MAX_LIMIT = 50
+
+SORT_ORDERS = {
+    "relevance": "",
+    "cited": "CITED desc",
+    "date": "P_PDATE_D desc",
+}
+"""给模型看的三种排序 → 接口的排序表达式。
+
+**不做透传**：让模型直接填 `CITED desc` 这种表达式，它写错时接口回的是空结果，
+而空结果在这里读起来和「真的没有」一样。"""
 EPMC_ABSTRACT_CHARS = 400
 """Europe PMC 的摘要片段长度。与 PubMed 那条取同一个数量级——两条路的返回要能并排看。"""
 
@@ -291,18 +301,18 @@ def search_literature(
 # 工具
 # ---------------------------------------------------------------------------
 class SearchLiteratureTool(Tool):
-    """检索 PubMed 文献。纯查询，不产生产物，所以不收登记表。"""
+    """检索文献：PubMed 或 Europe PMC（含预印本与开放全文入口）。纯查询。"""
 
     spec = ToolSpec(
         name="search_literature",
         description=(
-            "检索 PubMed 文献，返回**候选清单**：PMID、标题、期刊、年份、作者与摘要片段。"
-            "同时报出**命中总数**——只列前若干条时，别以为一共就这么多。\n\n"
-            "**这是候选，不是结论。** 本工具不判「哪篇讲了结合位点」「这篇可不可信」"
-            "——那是读文献的人（模型）的活。摘要只给片段，要判断详情请点 PubMed 链接。\n\n"
-            "支持 PubMed 检索语法：`SCN9A AND \"PDB:6J8I\"` 可以按 PDB 编号反查文献；"
-            "`Nav1.7 structure cryo-EM` 是按主题找。要预印本或要读开放全文的正文，"
-            "换 search_europepmc / read_fulltext（这条只查 PubMed、只给摘要片段）。"
+            "这个主题在文献库里有哪些候选，哪几篇有开放全文？\n"
+            "输入：query 填检索式；source 选 pubmed（默认，只查期刊文献）或 europepmc"
+            "（含预印本与开放全文入口）。\n"
+            "输出：候选清单（编号、标题、期刊、年份、作者与摘要片段）与命中总数；"
+            "europepmc 另给 PMCID，可直接交给 read_fulltext。\n"
+            "边界：这是候选，不含「哪篇相关、可不可信」的判断；摘要只是片段，"
+            "要读正文用 read_fulltext。"
         ),
         parameters={
             "type": "object",
@@ -310,13 +320,26 @@ class SearchLiteratureTool(Tool):
                 "query": {
                     "type": "string",
                     "description": (
-                        "PubMed 检索式，例如 SCN9A Nav1.7 cryo-EM complex，"
+                        "检索式，例如 SCN9A Nav1.7 cryo-EM complex，"
                         "或 SCN9A AND \"PDB:6J8I\"（按 PDB 编号反查）"
                     ),
                 },
                 "limit": {
                     "type": "integer",
                     "description": f"最多列多少条，上限 {MAX_LIMIT}",
+                },
+                "source": {
+                    "type": "string",
+                    "enum": ["pubmed", "europepmc"],
+                    "description": (
+                        "pubmed（默认）只查期刊文献；europepmc 多含预印本，"
+                        "检索式里加 SRC:PPR 可只看预印本"
+                    ),
+                },
+                "sort": {
+                    "type": "string",
+                    "enum": list(SORT_ORDERS),
+                    "description": "source=europepmc 时的排序：relevance（默认）/ cited / date",
                 },
             },
             "required": ["query"],
@@ -325,6 +348,17 @@ class SearchLiteratureTool(Tool):
     primary_argument = "query"
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        source = str(arguments.get("source") or "pubmed").strip().lower()
+        if source == "europepmc":
+            return _search_europepmc(arguments)
+        if source != "pubmed":
+            return ToolResult(
+                output=f"source 只认 pubmed / europepmc，收到 {source!r}",
+                failed=True,
+            )
+        return self._pubmed(arguments)
+
+    def _pubmed(self, arguments: dict[str, Any]) -> ToolResult:
         query = str(arguments.get("query") or "").strip()
         if not query:
             return ToolResult(
@@ -493,17 +527,6 @@ def _paper_from(item: dict[str, Any]) -> Paper:
     )
 
 
-SORT_ORDERS = {
-    "relevance": "",
-    "cited": "CITED desc",
-    "date": "P_PDATE_D desc",
-}
-"""给模型看的三种排序 → 接口的排序表达式。
-
-**不做透传**：让模型直接填 `CITED desc` 这种表达式，它写错时接口回的是空结果，
-而空结果在这里读起来和「真的没有」一样。"""
-
-
 def search_europepmc(
     query: str,
     *,
@@ -586,7 +609,7 @@ def _resolve_article(article: str, *, timeout: float = http.DEFAULT_TIMEOUT) -> 
     else:
         raise LiteratureError(
             f"{article!r} 认不出来。给 PMCID（PMC12545111）、PMID（41142240）或 DOI"
-            "（10.3389/fphar.2025.1628024）——前两种在 search_europepmc 的每一行里都有"
+            "（10.3389/fphar.2025.1628024）——前两种在 europepmc 来源的每一行里都有"
         )
 
     try:
@@ -853,86 +876,47 @@ def _render_fulltext(view: Fulltext, *, section: str) -> str:
     return "\n".join(lines)
 
 
-class SearchEuropePmcTool(Tool):
-    """检索 Europe PMC（含预印本），纯查询。"""
+def _search_europepmc(arguments: dict[str, Any]) -> ToolResult:
+    """Europe PMC 那一路：由 search_literature 按 source 分派进来。"""
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        return ToolResult(
+            output="query 不能为空。填检索式，例如 EGFR T790M resistance。",
+            failed=True,
+        )
+    try:
+        requested = int(arguments.get("limit") or EPMC_DEFAULT_LIMIT)
+    except (TypeError, ValueError):
+        return ToolResult(output="limit 应当是整数", failed=True)
+    size = max(1, min(requested, EPMC_MAX_LIMIT))
+    sort = str(arguments.get("sort") or "relevance").strip().lower()
+    if sort not in SORT_ORDERS:
+        return ToolResult(
+            output=f"sort 只认 {'/'.join(SORT_ORDERS)}，收到 {sort!r}",
+            failed=True,
+        )
 
-    spec = ToolSpec(
-        name="search_europepmc",
-        description=(
-            "检索 Europe PMC（PubMed + PMC 全文 + 预印本 + 专利），返回**候选清单**："
-            "PMID / PMCID / DOI、标题、期刊、年份、被引次数与摘要片段。\n\n"
-            "**与 search_literature 的分工**：那条只查 PubMed 的期刊文献、只给摘要片段；"
-            "这条多两样东西——**预印本**（检索式里加 `SRC:PPR`，覆盖 bioRxiv / medRxiv）"
-            "与**全文入口**：带 `可读全文：read_fulltext article=PMC…` 那几行，可以直接读"
-            "方法或结果那一节的正文，而不是只有 400 字摘要。\n\n"
-            "检索语法：`TITLE_ABS:\"T790M\"`、`AUTH:\"Zhang Y\"`、`SRC:PPR`、"
-            "`PUB_YEAR:2024`；直接写主题词也可以。排序用 sort。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "Europe PMC 检索式，例如 EGFR T790M resistance，"
-                        "或 SRC:PPR AND EGFR（只看预印本）"
-                    ),
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": f"最多列多少条，上限 {EPMC_MAX_LIMIT}",
-                },
-                "sort": {
-                    "type": "string",
-                    "enum": list(SORT_ORDERS),
-                    "description": "relevance（默认）/ cited（被引多的在前）/ date（新的在前）",
-                },
-            },
-            "required": ["query"],
+    try:
+        papers, total = search_europepmc(query, limit=size, sort=sort)
+    except LiteratureError as error:
+        return ToolResult(output=f"这次没搜成（Europe PMC「{query}」）：{error}", failed=True)
+
+    if not papers:
+        return ToolResult(
+            output=f"这次没搜成（Europe PMC「{query}」）：命中 0 篇，没有可列的文献。",
+            meta={"count": 0, "total": total, "ids": [], "papers": []},
+        )
+    return ToolResult(
+        output=_render_papers(papers, total=total, query=query),
+        meta={
+            "count": len(papers),
+            "total": total,
+            "truncated": total > len(papers),
+            "ids": [paper.ident for paper in papers],
+            "pmcids": [paper.pmcid for paper in papers if paper.pmcid],
+            "papers": [paper.as_dict() for paper in papers],
         },
     )
-    primary_argument = "query"
-
-    async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        query = str(arguments.get("query") or "").strip()
-        if not query:
-            return ToolResult(
-                output="query 不能为空。填检索式，例如 EGFR T790M resistance。",
-                failed=True,
-            )
-        try:
-            requested = int(arguments.get("limit") or EPMC_DEFAULT_LIMIT)
-        except (TypeError, ValueError):
-            return ToolResult(output="limit 应当是整数", failed=True)
-        size = max(1, min(requested, EPMC_MAX_LIMIT))
-        sort = str(arguments.get("sort") or "relevance").strip().lower()
-        if sort not in SORT_ORDERS:
-            return ToolResult(
-                output=f"sort 只认 {'/'.join(SORT_ORDERS)}，收到 {sort!r}",
-                failed=True,
-            )
-
-        try:
-            papers, total = search_europepmc(query, limit=size, sort=sort)
-        except LiteratureError as error:
-            return ToolResult(output=f"这次没搜成（Europe PMC「{query}」）：{error}", failed=True)
-
-        if not papers:
-            return ToolResult(
-                output=f"这次没搜成（Europe PMC「{query}」）：命中 0 篇，没有可列的文献。",
-                meta={"count": 0, "total": total, "ids": [], "papers": []},
-            )
-        return ToolResult(
-            output=_render_papers(papers, total=total, query=query),
-            meta={
-                "count": len(papers),
-                "total": total,
-                "truncated": total > len(papers),
-                "ids": [paper.ident for paper in papers],
-                "pmcids": [paper.pmcid for paper in papers if paper.pmcid],
-                "papers": [paper.as_dict() for paper in papers],
-            },
-        )
 
 
 class ReadFulltextTool(Tool):
@@ -941,14 +925,10 @@ class ReadFulltextTool(Tool):
     spec = ToolSpec(
         name="read_fulltext",
         description=(
-            "读一篇**开放获取**论文的正文（Europe PMC 全文 XML），不是摘要片段。"
-            "不给 section 时返回摘要与**可读章节清单**；给了就返回那一节，按标题子串匹配"
-            "（results / methods / discussion / abstract 都能匹配到带编号的标题）。\n\n"
-            "**只有 isOpenAccess=Y 的条目有全文**：预印本与订阅文献通常没有，这时会明说"
-            "而不是给一段空文本。返回内容按 max_chars 截断，并在末尾写清本节原本多长。\n\n"
-            "入口：search_europepmc 的每一行都带着 PMCID（`PMC12545111`），也接受 PMID"
-            "与 DOI。想知道「这组实验到底怎么做的、数字是多少」用它；只想知道「有没有这类"
-            "文献」用 search_europepmc 就够。本地语料里的原文用 `read_source`，不要在这里读。"
+            "这篇论文的正文里，方法与结果那一节写了什么？\n"
+            "输入：article 填 PMCID、PMID 或 DOI；section 按标题子串匹配，不给就返回摘要与可读章节清单。\n"
+            "输出：那一节的正文，按 max_chars 截断，并在末尾写清本节原本多长。\n"
+            "边界：只有开放获取的条目有全文，预印本与订阅文献会明说没有；本地语料里的原文用 read_source。"
         ),
         parameters={
             "type": "object",
@@ -1017,7 +997,7 @@ class ReadFulltextTool(Tool):
 
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具。"""
-    return [SearchLiteratureTool(), SearchEuropePmcTool(), ReadFulltextTool()]
+    return [SearchLiteratureTool(), ReadFulltextTool()]
 
 if __name__ == "__main__":
     from debug_tools import main

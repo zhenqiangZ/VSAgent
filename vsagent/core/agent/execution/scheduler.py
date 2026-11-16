@@ -101,7 +101,7 @@ def _feed(task: AgentTask, reports: Mapping[str, Built]) -> AgentTask:
 class AgentScheduler:
     """把一组 `AgentTask` 跑完。
 
-    `families` 按**角色**给（来自能力计划的 `tool_families`）：同一份计划里一个角色
+    `allowed` 不再按角色给：工具清单由会话的角色配置决定，调度器只负责启动。
     只有一套族，按任务给反而要抄一遍。
     """
 
@@ -121,7 +121,6 @@ class AgentScheduler:
         parent: Any,
         tasks: list[AgentTask] | tuple[AgentTask, ...],
         *,
-        families: Mapping[str, Iterable[str]] | None = None,
         timeout: float | None = None,
         role_timeouts: Mapping[str, float] | None = None,
         on_report: Callable[[AgentTask, Built], None] | None = None,
@@ -136,7 +135,6 @@ class AgentScheduler:
             raise SchedulerError("；".join(graph.problems))
 
         host = self.dispatcher.host
-        plans = dict(families or {})
         budgets = {str(role): float(sec) for role, sec in (role_timeouts or {}).items() if sec}
         done: set[str] = set()
         failed: set[str] = set()
@@ -167,7 +165,7 @@ class AgentScheduler:
                 task = candidates[0]
                 try:
                     result = self.dispatcher.dispatch(
-                        parent, _feed(task, reports), families=plans.get(task.role, ())
+                        parent, _feed(task, reports)
                     )
                 except DispatcherError as error:
                     started.add(task.task_id)

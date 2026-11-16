@@ -293,7 +293,6 @@ class Coordinator:
         schedule = await self.scheduler.run(
             parent,
             tasks,
-            families=plan.tool_families,
             timeout=timeout,
             role_timeouts=budgets,
         )

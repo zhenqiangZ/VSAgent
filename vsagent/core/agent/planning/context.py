@@ -262,12 +262,19 @@ class Turn:
         """组内**原文还完整在 RECENT 里**的工具调用 id。
 
         已归档的那几条要排除：它们的正文已经换成一行占位，原文只能靠
-        `read_turn` 取回。证据层如果把它们当成「还看得见」，就会连关键行
-        都不展开——那一段内容在上下文里就彻底消失了。
+        `read_turn` 取回。被 SAR 单通道接走的检索结果同样排除：模型看到的是
+        「已整理为证据」的提示，证据层应当展开正文。
         """
+        suppressed = {
+            part.id
+            for part in self.tool_parts
+            if isinstance(part.tool_meta, dict) and part.tool_meta.get("sar_suppressed")
+        }
         visible: set[str] = set()
         for item in self.messages:
             if item.get("role") != "tool" or not item.get("tool_call_id"):
+                continue
+            if item["tool_call_id"] in suppressed:
                 continue
             if (item.get("content") or "").startswith(TOOL_ARCHIVE_MARK):
                 continue
@@ -294,6 +301,22 @@ def event_line(event: Event) -> str:
     """一条事件的索引行：标题行 + 结论。`/events` 与 `recall_event` 清单用它。"""
     summary = one_line(event.summary, EVENT_SUMMARY_LIMIT)
     return f"{event_head(event)}：{summary}" if summary else event_head(event)
+
+
+def artifacts_line(event: Event, *, prefix: str) -> str:
+    """一段主题产出了哪些编号，单独一行给下一段看。
+
+    产物本来就在 `Event.artifacts` 里（从每一步聚合），只是过去没显示给模型，
+    于是新主题一开头又去 `ls runs/` 重新盘点。格式与 `history.render_hit` 一致：
+    最多列 4 个，多了写「等 N 件」。没有产物返回空串，调用方据此决定显不显示。
+    """
+    items = event.artifacts
+    if not items:
+        return ""
+    shown = "、".join(items[:4])
+    if len(items) > 4:
+        shown += f" 等 {len(items)} 件"
+    return f"{prefix}{shown}"
 
 
 def render_step_line(step: Step) -> str:
@@ -1330,6 +1353,12 @@ class ContextAssembler:
             lines.append(f"当前阻塞：{state.blockers[0]}")
         if session.last_exit_reason:
             lines.append(f"上一轮停在：{_EXIT_TEXT.get(session.last_exit_reason, session.last_exit_reason)}")
+        if session.events:
+            # 产物排在交接之前：这一段整体有 FOCUS_LIMIT，超了 _cap_text 从末尾削，
+            # 排前面才保得住「下一段手上有哪些编号」这句最不该丢的信息。
+            produced = artifacts_line(session.events[-1], prefix="上一段产物：")
+            if produced:
+                lines.append(produced)
         if session.events and session.events[-1].handoff.strip():
             lines.append(f"上一段交接：{session.events[-1].handoff.strip()}")
         return _cap_text("\n".join(lines), FOCUS_LIMIT)
@@ -1562,9 +1591,14 @@ class ContextAssembler:
                 lines.extend(render_step_line(step) for step in steps[-STEPS_TAIL:])
         if event.summary:
             lines.append("  结论：" + one_line(event.summary, EVENT_SUMMARY_LIMIT))
+        # 产物由内核从每一步算好，放在 detail 判断之外：事件被压成一行时，
+        # 「这一段产出了什么」比「怎么走到的」更该留下。
+        produced = artifacts_line(event, prefix="  产物：")
+        if produced:
+            lines.append(produced)
         if event.handoff:
-            # 交接是「下一个主题依赖什么」，产物与未决由内核算不出来：那几句话
-            # 说的是后续怎么用这些结果，只有模型知道。
+            # 交接是「下一个主题依赖什么」，说的是后续怎么用这些结果，只有模型知道；
+            # 未决同理，都由模型写，内核算不出来。
             lines.append("  交接：" + one_line(event.handoff, EVENT_SUMMARY_LIMIT))
         if detail and event.issues:
             lines.append("  未决：" + one_line("；".join(event.issues[:3]), EVENT_SUMMARY_LIMIT))

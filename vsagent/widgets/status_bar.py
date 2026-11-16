@@ -147,6 +147,7 @@ class StatusBar(Container):
         self._branch = ""
         self._busy = False
         self._title = ""
+        self._phase = ""
         self._written: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
@@ -209,6 +210,14 @@ class StatusBar(Container):
             context_tokens, context_window
         )
 
+    def update_phase(self, phase: str) -> None:
+        """生成中的阶段文字；空串表示没有额外阶段。"""
+        text = (phase or "").strip()
+        if text == self._phase:
+            return
+        self._phase = text
+        self._render_left()
+
     def _render_left(self) -> None:
         """拼出左端的会话名、目录、分支与生成中标记。"""
         parts: list[str] = []
@@ -219,7 +228,8 @@ class StatusBar(Container):
             parts.append(self._branch)
         left = "  ".join(parts)
         if self._busy:
-            left = f"{left}  ● 生成中"
+            suffix = f" · {self._phase}" if self._phase else ""
+            left = f"{left}  ● 生成中{suffix}"
         self._write("#status-left", left)
 
     def _write(self, selector: str, text: str) -> None:

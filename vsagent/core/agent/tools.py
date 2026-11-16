@@ -314,7 +314,7 @@ class Tool(ABC):
     # 在哪」，工作区回答「我们在研究什么」。一个结构对象可以引用 `receptor#1`
     # 这个 handle，反过来不成立。混成一个口子，工具就得自己判断手里是哪一个。
     workspace_argument: ClassVar[str] = ""
-    # 收工具登记表本身的参数名。只有 `load_tools` 声明。
+    # 收工具登记表本身的参数名。
     #
     # 别的工具拿登记表是为了写条目；它拿的是**注册表**，只为读一件事：哪些工具
     # 被 `tools.toml` 关掉了。不读这个的话，它会对着被关掉的工具说「已装入」——
@@ -416,20 +416,22 @@ class ToolRegistry:
         return list(self._tools)
 
     def specs(
-        self, exclude: frozenset[str] | set[str] | None = None
+        self,
+        exclude: frozenset[str] | set[str] | None = None,
+        *,
+        only: frozenset[str] | set[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         """工具的参数模式，直接作为请求体的 tools 字段。
 
-        `exclude` 是**不给模型看**的名字——按族加载靠它把还没装的几族挡在外面。
-        用排除而不是允许清单：新工具忘了登记族时仍然每步都在，坏处是白占额度，
-        好处是「写了却没装、模型看不见」这种查不出来的毛病不会发生。
+        `only` 是**只发给模型看**的名字：配置里的角色名单靠它落地。`None` 表示
+        不过滤（调试与回滚）。`exclude` 留给开关文件关掉的那些。
         过滤按**装配顺序**遍历：顺序影响模型选哪个工具，不能因为调用方传进来
         一个集合就变掉。
         """
         return [
             tool.spec.to_openai()
             for name, tool in self._tools.items()
-            if not exclude or name not in exclude
+            if (only is None or name in only) and (not exclude or name not in exclude)
         ]
 
 

@@ -1,20 +1,21 @@
 """会话登记表的浏览与切换工具。
 
-这三个工具**与领域无关**——它们只操作登记表，手里拿的是受体还是配体集，
+这几个工具**与领域无关**——它们只操作登记表，手里拿的是受体还是配体集，
 它们并不需要知道。放在这里而不是内核那批里的理由：它们是把「收 handle 不收路径」
-这条纪律交到模型手上的那一处——从这三个工具里拿到 handle，再交给领域工具，全程不碰路径。
+这条纪律交到模型手上的那一处——从这些工具里拿到 handle，再交给领域工具，全程不碰路径。
 
 **不给模型看登记表的工具，等于登记表白建。** 表建好了却不可见，模型只会退回
 用猜的：猜 handle、猜路径，而它猜出来的东西看上去都很合理。
 
-三个工具共用一个中间层：
+几个工具共用模块级函数，而不是各写一份：
 
 - `render_entries` —— 把一批条目渲染成逐行摘要，超量只报条数
 - `path_display` —— 把条目路径渲染成一行文字，目录补一个尾斜杠
+- `render_entry_detail` —— 把一个条目展开成几行完整信息，单条详查与批量查询共用
 
-这两个都是模块级函数而不是各自的私有方法，因为**截断口径只能有一份**：
-列表工具、切换工具的影响范围、以及将来其它要列条目的地方，都走同一个 `render_entries`。
-各写一份的话，改了其中一处，另一处会在长会话里把上下文吃干，而且看上去完全正常。
+因为**显示与截断的口径只能有一份**：列表工具、切换工具的影响范围、
+以及单条详查与批量查询，都走同一套写法。各写一份的话，改了其中一处，
+另一处会在长会话里把上下文吃干或给出对不上的路径，而且看上去完全正常。
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from ..tools import Tool, ToolResult, ToolSpec
 # 一次列出的条目上限。超出的只报条数——剩下的该用筛选参数去问，不是靠翻完整清单。
 MAX_ENTRIES_INLINE = 50
 
-# `describe_entry` 展开 meta 的字符上限。
+# `registry` 展开 meta 的字符上限。
 #
 # meta 是自由形状的，一个配体集往里塞一万条 SMILES 也没人拦——但那属于产物文件
 # 的职责，不是回注给模型的内容。
@@ -43,6 +44,10 @@ MAX_META_CHARS = 600
 
 # 条目路径为空时显示的那句话。单条详查与列表共用同一个说法。
 EMPTY_PATH_NOTE = "（纯内存对象，还没有写盘）"
+
+# 一次批量查询最多展开几个条目的完整信息。留空查全部时按这个数收口，
+# 免得一张大登记表把上下文吃光；剩下的编号仍逐条点名，改用单个编号再查。
+MAX_LOOKUP_ENTRIES = 20
 
 
 # ---------------------------------------------------------------------------
@@ -95,35 +100,86 @@ def _file_state_note(state: str) -> str:
     return _FILE_STATE_NOTES.get(state, state)
 
 
+def render_entry_detail(
+    entry: Entry,
+    ledger: SessionLedger,
+    *,
+    include_lineage: bool = True,
+) -> str:
+    """把一个条目展开成几行完整信息：编号、摘要、路径、状态、指纹、血缘、附带字段。
+
+    单条详查（`registry(handles=…)`）都走这里——
+    「同一个编号长什么样」只能有一份写法，两处各写一遍迟早会给出对不上的路径
+    或文件状态，而那种差异在长会话里看上去完全正常。
+    """
+    lines = [
+        f"{entry.handle}",
+        f"  摘要：{entry.summary or '（无）'}",
+        f"  路径：{path_display(entry.path)}",
+        # 正常也明说：单条详查就是要「一眼确认能不能用」，
+        # 而缺字段与状态正常在输出里长得一样
+        f"  文件状态：{_file_state_note(entry.file_state)}",
+        f"  指纹：{entry.fingerprint or '（未计算）'}",
+    ]
+    if entry.parents:
+        lines.append("  直接来源：" + "、".join(str(item) for item in entry.parents))
+    if include_lineage:
+        ancestors = ledger.lineage(entry.handle)
+        if ancestors:
+            chain = " ← ".join(str(item.handle) for item in [entry, *ancestors])
+            lines.append(f"  完整血缘：{chain}")
+    if entry.meta:
+        payload = json.dumps(entry.meta, ensure_ascii=False, sort_keys=True, default=str)
+        if len(payload) > MAX_META_CHARS:
+            payload = f"{payload[:MAX_META_CHARS]}…（已截断）"
+        lines.append(f"  附带字段：{payload}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
-class ListWorkspaceTool(Tool):
-    """列出登记表里的条目，并报告当前受体是哪一份。纯查询，不登记任何东西。"""
+class RegistryTool(Tool):
+    """登记表的唯一入口：不给编号就列清单，给编号就逐个展开。纯查询。"""
 
     spec = ToolSpec(
-        name="list_workspace",
+        name="registry",
         description=(
-            "列出当前会话登记表里已登记的资源与产物，并报告**当前受体**是哪一份。"
-            "在引用任何产物之前先看它——不要凭记忆写 handle，也不要手写文件路径，"
-            "返回的每一行开头就是可以直接拿去用的 handle。"
-            "输出里 receptor 那一项决定后续工具的默认作用对象。"
-            "本工具会**现核对一遍磁盘**：文件被删或被改的条目会在行尾标出来，"
-            "别拿它们去算——那会拿一个不存在的输入去启动一次昂贵的计算。"
+            "登记表里有哪些产物，某个编号指的是哪一份？\n"
+            "输入：handles 填编号清单，逐个展开；不填则列清单，可用 kind 与 include_archived 过滤。\n"
+            "输出：清单模式报当前受体与全部条目，每行开头就是可直接使用的 handle；"
+            "展开模式给出路径、摘要、指纹、血缘、文件状态与附带字段。\n"
+            "边界：路径只供核对，传参一律用 handle；文件状态是现核对磁盘的结果，"
+            "标出异常的那几条不要直接拿去算。"
         ),
         parameters={
             "type": "object",
             "properties": {
+                "handles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "要展开的编号，例如 [\"receptor#1\", \"artifact#3\"]；"
+                        "留空或不给则列出清单"
+                    ),
+                },
                 "kind": {
                     "type": "string",
                     "enum": ["receptor", "ligandset", "artifact"],
-                    "description": "只看某一类；留空则全看",
+                    "description": "清单模式下只看某一类；留空则全看",
                 },
                 "include_archived": {
                     "type": "boolean",
                     "description": (
-                        "是否连被搁置的条目一起列出。切换受体后旧受体的产物会被移出"
-                        "默认视图，只有这一项为 true 才看得到它们"
+                        "清单模式下连被搁置的条目一起列出。切换受体后旧受体的产物"
+                        "会被移出默认视图，只有这一项为 true 才看得到它们"
+                    ),
+                },
+                "include_lineage": {
+                    "type": "boolean",
+                    "description": (
+                        "展开模式下是否回溯完整血缘（这个产物由哪些东西一步步算出来的），"
+                        "默认 true"
                     ),
                 },
             },
@@ -135,9 +191,66 @@ class ListWorkspaceTool(Tool):
         ledger = arguments.get("ledger")
         if not isinstance(ledger, SessionLedger):
             return ToolResult(
-                output="内核装配问题：list_workspace 需要一个会话登记表，但这次调用没有拿到。",
+                output="内核装配问题：registry 需要一个会话登记表，但这次调用没有拿到。",
                 failed=True,
             )
+        raw = arguments.get("handles")
+        if raw is not None and not isinstance(raw, list):
+            return ToolResult(output="参数 handles 要写成编号清单（数组）。", failed=True)
+        wanted = [str(item).strip() for item in (raw or []) if str(item).strip()]
+        if wanted:
+            return self._detail(ledger, wanted, arguments)
+        return self._list(ledger, arguments)
+
+    def _detail(
+        self,
+        ledger: SessionLedger,
+        wanted: list[str],
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        include_lineage = arguments.get("include_lineage")
+        include_lineage = True if include_lineage is None else bool(include_lineage)
+
+        # 与清单模式走同一次核对：两处显示的条目必须来自同一个口径，
+        # 否则会出现「清单说还在、展开说没了」这种解释不清的差异。
+        ledger.reconcile()
+
+        chunks: list[str] = []
+        resolved = 0
+        missing: list[str] = []
+        overflow: list[str] = []
+        for value in wanted:
+            try:
+                entry = ledger.get(value)
+            except Exception as error:  # LedgerError：这个编号没查到，逐条记下
+                missing.append(f"  {value}：{error}")
+                continue
+            resolved += 1
+            if len(chunks) >= MAX_LOOKUP_ENTRIES:
+                overflow.append(value)
+                continue
+            chunks.append(render_entry_detail(entry, ledger, include_lineage=include_lineage))
+
+        lines: list[str] = []
+        if chunks:
+            lines.append(f"查到 {resolved} 个编号，逐个说明如下：")
+            lines.append("\n\n".join(chunks))
+        else:
+            lines.append("一个编号也没查到。先用 registry 列出登记表，确认编号再展开。")
+        if missing:
+            lines.append(f"以下 {len(missing)} 个编号没有查到：")
+            lines.extend(missing)
+        if overflow:
+            lines.append(
+                f"另有 {len(overflow)} 个编号在本次展开上限之外：{'、'.join(overflow)}；"
+                "分批再查即可。"
+            )
+        return ToolResult(
+            output="\n".join(lines),
+            meta={"requested": len(wanted), "found": resolved, "missing": len(missing)},
+        )
+
+    def _list(self, ledger: SessionLedger, arguments: dict[str, Any]) -> ToolResult:
         kind = _read_kind(arguments.get("kind"))
         if kind is _BAD_KIND:
             return ToolResult(
@@ -192,97 +305,16 @@ class ListWorkspaceTool(Tool):
         )
 
 
-class DescribeEntryTool(Tool):
-    """查看某一个条目的详细信息。纯查询，不登记任何东西。"""
-
-    spec = ToolSpec(
-        name="describe_entry",
-        description=(
-            "查看登记表里某一条目的详细信息：路径、摘要、指纹、血缘、文件状态与附带字段。"
-            "在引用某个产物之前用它确认那确实是你要的那个——同类产物在会话里会越攒越多，"
-            "看摘要比看序号可靠。其中的路径仅供核对，**传参请继续用 handle**。"
-            "路径末尾带 / 的是**目录**（一组产物，例如准备后的受体）；不带的是单个文件。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "handle": {
-                    "type": "string",
-                    "description": "条目引用，例如 ligandset#3。**不要传文件路径**",
-                },
-                "include_lineage": {
-                    "type": "boolean",
-                    "description": "是否回溯完整血缘（这个产物是由哪些东西一步步算出来的）",
-                },
-            },
-            "required": ["handle"],
-        },
-    )
-    primary_argument = "handle"
-    context_argument = "ledger"
-
-    async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        ledger = arguments.get("ledger")
-        if not isinstance(ledger, SessionLedger):
-            return ToolResult(
-                output="内核装配问题：describe_entry 需要一个会话登记表，但这次调用没有拿到。",
-                failed=True,
-            )
-        raw = arguments.get("handle")
-        if not isinstance(raw, str) or not raw.strip():
-            return ToolResult(output="缺少参数 handle（形如 ligandset#3）", failed=True)
-        include_lineage = arguments.get("include_lineage")
-        include_lineage = True if include_lineage is None else bool(include_lineage)
-
-        # 与 list_workspace 走同一次核对：两处显示的状态必须来自同一个口径，
-        # 否则会出现「列表说还在、详查说没了」这种解释不清的差异。
-        ledger.reconcile()
-        try:
-            entry = ledger.get(raw)
-        except Exception as error:  # LedgerError：交回去让模型改参数
-            return ToolResult(output=str(error), failed=True)
-
-        lines = [
-            f"{entry.handle}",
-            f"  摘要：{entry.summary or '（无）'}",
-            f"  路径：{path_display(entry.path)}",
-            # 正常也明说：单条详查就是要「一眼确认能不能用」，
-            # 而缺字段与状态正常在输出里长得一样
-            f"  文件状态：{_file_state_note(entry.file_state)}",
-            f"  指纹：{entry.fingerprint or '（未计算）'}",
-        ]
-        if entry.parents:
-            lines.append("  直接来源：" + "、".join(str(item) for item in entry.parents))
-
-        if include_lineage:
-            ancestors = ledger.lineage(entry.handle)
-            if ancestors:
-                chain = " ← ".join(str(item.handle) for item in [entry, *ancestors])
-                lines.append(f"  完整血缘：{chain}")
-
-        if entry.meta:
-            payload = json.dumps(entry.meta, ensure_ascii=False, sort_keys=True, default=str)
-            if len(payload) > MAX_META_CHARS:
-                payload = f"{payload[:MAX_META_CHARS]}…（已截断）"
-            lines.append(f"  附带字段：{payload}")
-
-        return ToolResult(
-            output="\n".join(lines),
-            meta={"handle": str(entry.handle), "file_state": entry.file_state},
-        )
-
-
 class SwitchReceptorTool(Tool):
     """切换当前受体，两阶段：不带 confirm 只预演，带 confirm 才真做。"""
 
     spec = ToolSpec(
         name="switch_receptor",
         description=(
-            "把会话的**当前受体**换成另一个，并报告哪些旧结果会因此失效。"
-            "这会改变后续工具的默认作用对象：属于旧受体的产物会被移出登记表的默认视图。"
-            "它们**不会被删除**，磁盘上的文件原样保留，之后仍能用 "
-            "list_workspace(include_archived=true) 查到。"
-            "**默认只做预演**，带 confirm=true 才真正切换。"
+            "这个会话现在用的是哪一份受体，换一份会作废哪些结果？\n"
+            "输入：receptor 填受体 handle；confirm 默认 false，只预演影响范围。\n"
+            "输出：预演列出会移出默认视图的条目；confirm=true 才真正切换，文件保留在磁盘上。\n"
+            "边界：只改默认作用对象，不删除任何产物；旧产物用 registry(include_archived=true) 仍可查到。"
         ),
         parameters={
             "type": "object",
@@ -369,7 +401,7 @@ class SwitchReceptorTool(Tool):
             lines.append("之前没有别的受体，因此没有条目被搁置。")
         lines.append(
             "后续工具默认作用在新受体上。如需引用被搁置的旧产物，"
-            "用 list_workspace(include_archived=true) 查看。"
+            "用 registry(include_archived=true) 查看。"
         )
         return ToolResult(
             output="\n".join(lines),
@@ -403,7 +435,7 @@ def _read_kind(raw: Any) -> Kind | None | _BadKind:
 
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具，按装配顺序。"""
-    return [ListWorkspaceTool(), DescribeEntryTool(), SwitchReceptorTool()]
+    return [RegistryTool(), SwitchReceptorTool()]
 
 if __name__ == "__main__":
     from debug_tools import main

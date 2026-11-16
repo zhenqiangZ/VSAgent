@@ -314,7 +314,7 @@ class ScreenSimilarityTool(Tool):
         raw_library = str(arguments.get("library") or "").strip()
         if not raw_library:
             return ToolResult(
-                output="缺少参数 library。先 list_workspace 看清有哪份待筛配体集。", failed=True
+                output="缺少参数 library。先 registry 看清有哪份待筛配体集。", failed=True
             )
         raw_query = str(arguments.get("query") or "").strip()
         raw_smiles = str(arguments.get("smiles") or "").strip()
@@ -1081,15 +1081,10 @@ class PickDiverseTool(Tool):
     spec = ToolSpec(
         name="pick_diverse",
         description=(
-            "从一批候选里挑出**彼此不像**的那些，交给实验或对接。产出是一个配体集"
-            "（`stage=selected`），列里有骨架、簇号、与已选集合的最大相似度、名次。\n"
-            "四步，**都不看分数**：① 位姿去重（给了 `poses` 才做）：按对接位姿的重原子"
-            "体积，Jaccard ≥0.5 判同簇，每簇只留名次最高的一个；② MaxMin：从名次最高的"
-            "开始，每步取「与已选集合最大相似度最小」的那个；③ 骨架配额：同一骨架最多"
-            "`per_scaffold` 个；④ 给了 `previous` 就报与上一轮前 N 个的重合、新增骨架数。\n"
-            "选不满 `limit` 时如实报数，不降低门槛凑数。`source` 收候选表（相似度、形状、"
-            "共识表）与配体集；`poses` 收 dock 的产物。\n"
-            "**为什么需要它**：按分数截断留下的是近邻，一个骨架换几个基团就能占满名额。"
+            "这批候选里，哪几个彼此不像、值得一起送去做实验？\n"
+            "输入：source 填候选表或配体集；poses 填 dock 产物时才做位姿去重；limit 控制个数。\n"
+            "输出：状态 selected 的配体集，列里有骨架、簇号、与已选集合的最大相似度、名次。\n"
+            "边界：四步都不看分数——位姿去重、MaxMin、骨架配额、与上一轮的重合；选不满时如实报数，不降低门槛凑数。"
         ),
         parameters={
             "type": "object",
@@ -1140,7 +1135,7 @@ class PickDiverseTool(Tool):
         raw = str(arguments.get("source") or "").strip()
         if not raw:
             return ToolResult(
-                output="缺少参数 source。先 list_workspace 看清有哪些候选表或配体集。",
+                output="缺少参数 source。先 registry 看清有哪些候选表或配体集。",
                 failed=True,
             )
         try:
@@ -1522,8 +1517,87 @@ def _selected_csv(rows: Sequence[dict[str, Any]]) -> str:
     return buffer.getvalue()
 
 
+class RankLibraryTool(Tool):
+    """一个入口，按 method 分派到 2D 相似度、3D 形状或药效团。"""
+
+    spec = ToolSpec(
+        name="rank_library",
+        description=(
+            "这个库按哪种相似性排序，最像参考的前几条是哪几个？\n"
+            "输入：library 必填；method 选 similarity（默认，2D 指纹）、shape（3D 形状）"
+            "或 pharmacophore（药效团），再按方法给 query、smiles 或 pharmacophore。\n"
+            "输出：一张候选表（分数列随方法变化），登记成配体集，可直接交给 rank_candidates。\n"
+            "边界：三种分数不可比，不要混着排序；shape 与 pharmacophore 是粗筛，"
+            "精细排序靠 dock。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "enum": ["similarity", "shape", "pharmacophore"],
+                    "description": "similarity（默认）/ shape / pharmacophore",
+                },
+                "library": {"type": "string", "description": "待筛配体集 handle"},
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "similarity：参考集 handle（与 smiles 二选一）；"
+                        "shape：已备 3D 的配体集或准备过的受体"
+                    ),
+                },
+                "smiles": {"type": "string", "description": "similarity 时的单个查询分子"},
+                "pharmacophore": {
+                    "type": "string",
+                    "description": "pharmacophore 时用：build_pharmacophore 的产物",
+                },
+                "metric": {
+                    "type": "string",
+                    "description": "similarity：ecfp4（默认）/ maccs / atompair；shape：shape_tanimoto / overlap",
+                },
+                "smarts": {
+                    "type": "string",
+                    "description": "similarity 时的子结构查询；给了它就不再算相似度",
+                },
+                "cutoff": {
+                    "type": "number",
+                    "description": "similarity 与 shape 的分数下限（0–1），默认 0",
+                },
+                "tolerance": {
+                    "type": "number",
+                    "description": "pharmacophore 时距离直方图的档宽（埃），默认 1.5",
+                },
+                "top": {
+                    "type": "integer",
+                    "description": f"最多保留多少条，默认 {DEFAULT_TOP}，上限 {MAX_TOP}",
+                },
+                "name": {"type": "string", "description": "显示名，只影响产物目录名"},
+            },
+            "required": ["library"],
+            "additionalProperties": False,
+        },
+    )
+    primary_argument = "library"
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        method = str(arguments.get("method") or "similarity").strip().lower()
+        if method == "similarity":
+            return await ScreenSimilarityTool().run(arguments)
+        if method == "shape":
+            return await ScreenShapeTool().run(arguments)
+        if method == "pharmacophore":
+            from .pharmacophore import ScreenPharmacophoreTool
+
+            return await ScreenPharmacophoreTool().run(arguments)
+        return ToolResult(
+            output=f"method 只认 similarity / shape / pharmacophore，收到 {method!r}",
+            failed=True,
+        )
+
+
 def domain_tools() -> list[Tool]:
-    return [ScreenSimilarityTool(), ScreenShapeTool(), PickDiverseTool()]
+    return [RankLibraryTool(), PickDiverseTool()]
 
 
 if __name__ == "__main__":  # pragma: no cover

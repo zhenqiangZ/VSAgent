@@ -262,6 +262,13 @@ class ReasoningPartView(FoldBlock):
     def __init__(self, part: Part) -> None:
         super().__init__(title="思考过程", classes="part part-reasoning")
         self.part_id = part.id
+        # 建块时就把已有正文写进去。打开旧会话、切换会话时，部件由
+        # MessageView.compose 照记录新建，之后不会再有更新送来；只等 sync 补字的话，
+        # 这些块展开后是一片空白。同时把这份正文记成「已经画出去的」，
+        # 后面送来相同内容时就不必再画一遍。
+        body = part.text or ""
+        self._start_window(body)
+        self.write_text(body)
 
     def sync(self, part: Part) -> None:
         """刷新思考正文。"""
@@ -417,13 +424,17 @@ class ToolCard(Container):
         return f"  {note}"
 
     def _detail_text(self) -> str:
+        meta = self._part.tool_meta if isinstance(self._part.tool_meta, dict) else {}
+        badge = ""
+        if meta.get("sar_suppressed"):
+            badge = f"  已整理为 {meta.get('sar_evidence_count', 0)} 条证据 · 原文可展开"
         if not self._part.tool_input:
-            return ""
+            return badge.strip()
         first_key = next(iter(self._part.tool_input))
         value = str(self._part.tool_input[first_key])
         if len(value) > 40:
             value = value[:37] + "..."
-        return f"  {first_key}={value}"
+        return f"  {first_key}={value}{badge}"
 
     def _params_text(self) -> str:
         """展开之后的参数清单，一行一个键。
@@ -645,7 +656,24 @@ class SimplePartView(Static):
             return f"· {part.text}"
         if part.type is PartType.SUMMARY:
             return part.text
+        if part.type is PartType.SAR:
+            return f"· {part.text}"
         return part.text
+
+
+class SarPartView(SimplePartView):
+    """检索增强推理的过程行。只给界面看，不进入模型上下文。"""
+
+    DEFAULT_CSS = palette.css("""
+    SarPartView {
+        color: $vsa-text-3;
+    }
+    """)
+
+    def sync(self, part: Part) -> None:
+        """证据行会原地更新，这里直接换正文。"""
+        self.part = part
+        self.update(self.render_part_text(part))
 
 
 class PatchPartView(SimplePartView):
@@ -1991,6 +2019,8 @@ class MessagesPane(ScrollableContainer):
             return SummaryPartView(part)
         if part.type is PartType.ROUTE:
             return RoutePartView(part)
+        if part.type is PartType.SAR:
+            return SarPartView(part)
         return SimplePartView(part)
 
     def _build_and_register(

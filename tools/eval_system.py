@@ -14,7 +14,7 @@
 - 交付物落位：要求的产物恰好挂在一个终点上；多个终点时不硬分；
 - 依赖有效：每条边都指向真实任务、没有环、方向与能力的先后一致；
 - 不重复派：同一个角色只出现一次；
-- 工具暴露：计划给每个角色的族都在它的说明书授权之内。
+- 工具暴露：计划里每个被派出的角色都有一份非空的工具名单。
 
 **不能离线判的（要模型或人）**——意图准确率、用户意图保真、证据覆盖率、
 产物可追溯率、成本与延迟。前两项要真实模型跑解析，后三项要一场真实运行留下的
@@ -70,18 +70,19 @@ CASES: tuple[Case, ...] = (
         why="两步有先后：口袋要从结构里找，不能并行。",
     ),
     Case(
-        name="配体与筛选",
+        name="配体、准备与对接",
         spec=TaskSpec(
             task_id="eval_ligand",
-            objective="汇总 4HJO 的已知配体，再筛一批相似分子",
+            objective="汇总 4HJO 的已知配体，准备好受体与配体，再跑一轮对接",
             subgoals=[
                 {"goal": "汇总已知配体与活性", "capability": "ligand_intelligence"},
-                {"goal": "按相似性筛一批", "capability": "virtual_screening"},
+                {"goal": "准备受体与配体", "capability": "receptor_preparation"},
+                {"goal": "跑一轮对接", "capability": "docking_run"},
             ],
             constraints=("活性数据要带 pChEMBL", "候选不超过 200 个"),
-            required_outputs=[{"name": "CandidateSet"}],
+            required_outputs=[{"name": "PoseSet"}],
         ),
-        why="筛选依赖配体集：没有参考分子就无从算相似性。",
+        why="三段有先后：配体集与口袋定了才能准备，准备好了才能对接。",
     ),
     Case(
         name="机制解释",
@@ -108,7 +109,7 @@ CASES: tuple[Case, ...] = (
             exclusions=("查文献就行，不要顺手做对接",),
             required_outputs=[{"name": "EvidenceNote"}],
         ),
-        why="跨阶段能力：它没有阶段规则，但仍要有角色与工具族。",
+        why="跨阶段能力：它没有阶段规则，但仍要有角色与工具名单。",
     ),
 )
 
@@ -229,18 +230,15 @@ def evaluate(case: Case) -> list[Result]:
         Result("不重复派", not dupes, "" if not dupes else f"这些角色被派了不止一次：{dupes}")
     )
 
-    # 7. 工具暴露：给每个角色的族都在它自己的说明书授权之内。
-    over = {}
-    for role, families in plan.tool_families.items():
-        allowed = set(profile(role).families)
-        extra = sorted(set(families) - allowed)
-        if extra:
-            over[role] = extra
+    # 7. 工具暴露：每个被派出的角色都有一份非空的配置名单。
+    from vsagent.core.agent.roles import agents
+
+    empty = [role for role in roles if not agents.role_tools(role)]
     results.append(
         Result(
             "工具暴露",
-            not over,
-            "" if not over else f"这些角色被塞了没授权的族：{over}",
+            not empty,
+            "" if not empty else f"这些角色没有配任何工具：{empty}",
         )
     )
 

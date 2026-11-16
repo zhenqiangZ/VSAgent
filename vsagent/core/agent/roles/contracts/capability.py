@@ -36,8 +36,6 @@ class CapabilityPlan:
     task_id: str
     selected_capabilities: tuple[str, ...] = ()
     selected_agents: tuple[str, ...] = ()
-    tool_families: dict[str, list[str]] = field(default_factory=dict)
-    standalone_tools: dict[str, list[str]] = field(default_factory=dict)
     dependencies: list[dict[str, Any]] = field(default_factory=list)
     parallel_groups: list[list[str]] = field(default_factory=list)
     denied_capabilities: tuple[str, ...] = ()
@@ -73,25 +71,8 @@ class CapabilityPlan:
             raise ContractError(f"这些能力既被选中又被拒绝：{'、'.join(both)}")
 
         agents = set(self.selected_agents)
-        self.tool_families = self._per_agent(
-            self.tool_families, "CapabilityPlan.tool_families", agents
-        )
-        self.standalone_tools = self._per_agent(
-            self.standalone_tools, "CapabilityPlan.standalone_tools", agents
-        )
         self.dependencies = self._dependencies(agents)
         self.parallel_groups = self._parallel(self.parallel_groups, agents)
-
-    @staticmethod
-    def _per_agent(value: Any, field_name: str, agents: set[str]) -> dict[str, list[str]]:
-        table = mapping(value, field_name)
-        out: dict[str, list[str]] = {}
-        for name, items in table.items():
-            agent = text(name, f"{field_name} 的键")
-            if agent not in agents:
-                raise ContractError(f"{field_name} 里给了没选中的角色：{agent}")
-            out[agent] = list(texts(items, f"{field_name}.{agent}"))
-        return out
 
     def _dependencies(self, agents: set[str]) -> list[dict[str, Any]]:
         rows = records(self.dependencies, "CapabilityPlan.dependencies")
@@ -147,8 +128,6 @@ class CapabilityPlan:
             "revision": self.revision,
             "selected_capabilities": list(self.selected_capabilities),
             "selected_agents": list(self.selected_agents),
-            "tool_families": {key: list(value) for key, value in self.tool_families.items()},
-            "standalone_tools": {key: list(value) for key, value in self.standalone_tools.items()},
             "dependencies": [dict(row) for row in self.dependencies],
             "parallel_groups": [list(group) for group in self.parallel_groups],
             "denied_capabilities": list(self.denied_capabilities),
@@ -184,8 +163,6 @@ class CapabilityPlan:
             task_id=data.get("task_id"),
             selected_capabilities=tuple(data.get("selected_capabilities") or ()),
             selected_agents=tuple(data.get("selected_agents") or ()),
-            tool_families=data.get("tool_families") or {},
-            standalone_tools=data.get("standalone_tools") or {},
             dependencies=data.get("dependencies") or [],
             parallel_groups=data.get("parallel_groups") or [],
             denied_capabilities=tuple(data.get("denied_capabilities") or ()),

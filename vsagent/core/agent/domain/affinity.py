@@ -159,9 +159,9 @@ def dta_python() -> str:
 
 
 def dta_readiness() -> tuple[bool, str]:
-    """环境能不能用，给 `assess_campaign` 的一行。
+    """环境能不能用，给盘点报告的一行。
 
-    只看路径，不导入 torch：盘点工具是常驻的，每一步都可能调。
+    只看路径，不导入 torch：调用它的角色可能每一步都要问一次。
     """
     try:
         root = dta_root()
@@ -354,7 +354,7 @@ def _model_inputs(
     if str(entry.meta.get("kind") or "") != "model":
         raise ToolError(
             f"{entry.handle} 不是模型（kind={entry.meta.get('kind')!r}）。"
-            "用 list_workspace kind=artifact 找 fit_affinity 登记的那一条。"
+            "用 registry kind=artifact 找 fit_affinity 登记的那一条。"
         )
     config = Path(str(entry.meta.get("config") or ""))
     pocket = Path(str(entry.meta.get("pocket") or ""))
@@ -614,19 +614,10 @@ class ScoreAffinityTool(Tool):
     spec = ToolSpec(
         name="score_affinity",
         description=(
-            "DTA 通道的第二段：用 `fit_affinity` 微调后的模型，给**已准备**的受体与配体"
-            "预测结合亲和力（pK）。**分数越高越好**（pK 越大结合越强），与 dock 的"
-            "kcal/mol 方向相反；只能在同一受体、同一模型、同一 aff_unit 条件下比较，"
-            "不能跨靶点或跨口袋比较。pK 是预测值，不是实验值。\n"
-            "**适用**：与 dock 同一批位姿、同一受体、同一口袋，对前 50 条做第二路证据；"
-            "与 dock 名次对照，找两路一致与背离的分子。\n"
-            "**局限**：只对训练时的口袋有效；对训练集覆盖不到的化学型外推弱；"
-            "40–100 个活性时排序力有限，结论要报样本量；不能与 dock 的分数直接比大小。\n"
-            "`model` 是必填参数，来自 `fit_affinity` 的 artifact（kind=model）。"
-            "先用该靶点的实测活性微调，再推理；零样本不进入流程。"
-            "需要 DTA 的独立 Python 环境（torch + dgl）；缺环境时返回安装指引，不抛异常。"
-            "默认 aff_unit=Ki、pocket_radius=10、limit=50、整批超时 900 秒。"
-            "单条失败不中断整批，失败原因逐条写进 manifest。"
+            "这批配体的结合亲和力大概是多少？\n"
+            "输入：receptor 与 ligands 填准备产物；model 填 fit_affinity 的产物；aff_unit 默认 Ki。\n"
+            "输出：预测表（pK），分数越高越好（pK 越大结合越强），登记成 artifact。\n"
+            "边界：与 dock 的 kcal/mol 方向相反，不能跨受体、跨口袋、跨模型比较；pK 是预测值，不是实验值；外推弱，结论要报样本量；需要 DTA 的独立 Python 环境（torch 与 dgl）。"
         ),
         parameters={
             "type": "object",
@@ -698,12 +689,12 @@ class ScoreAffinityTool(Tool):
         raw_ligands = str(arguments.get("ligands") or "").strip()
         if not raw_receptor:
             return ToolResult(
-                output="缺少参数 receptor。先 list_workspace 看清有哪份已准备的受体。",
+                output="缺少参数 receptor。先 registry 看清有哪份已准备的受体。",
                 failed=True,
             )
         if not raw_ligands:
             return ToolResult(
-                output="缺少参数 ligands。先 list_workspace 看清有哪份已准备的配体集。",
+                output="缺少参数 ligands。先 registry 看清有哪份已准备的配体集。",
                 failed=True,
             )
         raw_model = str(arguments.get("model") or "").strip()

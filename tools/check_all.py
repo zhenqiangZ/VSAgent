@@ -3,8 +3,8 @@
 判据分成两组，各自守一件事：
 
 - `tests/test_agent.py`（内核）与 `tests/test_smoke.py`（界面）是主判据，项数最多；
-- `tools/check_*.py` 是窄判据：能力表与工具目录是否对得上、族名有没有前缀冲突、
-  色值与样式、仓库里有没有把密钥提交上去。
+- `tools/check_*.py` 是窄判据：能力表与工具目录是否对得上、工具名有没有前缀冲突、
+  色值与样式、仓库里有没有把密钥提交上去、生成的工具清单有没有落后于注册表。
 
 以前这些是「想起来才跑一个」，于是最常见的失败形态不是判据红了，而是**根本没跑**。
 这个脚本按固定顺序全跑一遍，任何一条非零退出就停在那儿并打印它的末尾几十行——
@@ -34,6 +34,8 @@ JUDGES: tuple[tuple[str, str], ...] = (
     ("smoke", "tests/test_smoke.py"),
     ("capabilities", "tools/check_capabilities.py"),
     ("toolset", "tools/check_toolset.py"),
+    ("descriptions", "tools/check_tool_descriptions.py"),
+    ("toolsdoc", "tools/check_tools_doc.py"),
     ("prefix", "tools/check_prefix.py"),
     ("style", "tools/check_style.py"),
     ("repo", "tools/check_repo.py"),

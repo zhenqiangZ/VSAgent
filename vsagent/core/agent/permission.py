@@ -56,24 +56,23 @@ DEFAULT_ASK = frozenset(
 PLAN_DENY = frozenset(
     {"write", "patch", "bash", "prepare_receptor", "prepare_ligands", "dock",
      "score_affinity", "fit_affinity", "write_run", "detect_pockets", "define_pocket",
-     "rank_candidates", "curate_ligands", "screen_similarity", "screen_shape",
+     "rank_candidates", "curate_ligands", "rank_library",
      "validate_docking", "build_reference_set", "predict_admet", "scaffold_analysis",
      "matched_pairs", "enumerate_analogs", "record_assay",
-     "build_pharmacophore", "screen_pharmacophore", "align_ligands"}
+     "build_pharmacophore", "align_ligands"}
 )
 
-# 子 agent 与主 agent 的权限差别，现在只剩工具档位与 `PLAN_DENY`。
+# 子 agent 与主 agent 的权限差别，现在只剩工具名单与 `PLAN_DENY`。
 #
 # 2026-11-12 曾经在这里禁掉 `switch_receptor` / `prepare_receptor` /
 # `prepare_ligands`：一个 worker 在「登记一个结构」的任务里自己走到准备受体、
-# 切换受体，把父会话的当前受体换掉。2026-11-13 P-79 之后主 agent 不再持有领域族，
+# 切换受体，把父会话的当前受体换掉。2026-11-13 P-79 之后主 agent 不再持有领域工具，
 # 这三条禁令等于让这几个动作**没有任何会话能做**；于是改成按角色开放：
 #
-# - `prepare_receptor` / `prepare_ligands` 属于 `screening`（receptor / ligand 族），
+# - `prepare_receptor` / `prepare_ligands` 在 `prepare` 角色的名单里，
 #   调用时按 `DEFAULT_ASK` 问一次用户；
-# - `switch_receptor` 属于 `listing` 族，挂到 `structure_pocket` 的
-#   `structure_discovery` 能力上——选哪套结构是它的职责；但「换掉当前受体」是改共享
-#   状态，2026-11-13 P-83 起也进 `DEFAULT_ASK`，问一次再换。
+# - `switch_receptor` 在 `pocket` 角色的名单里——选哪套结构是它的职责；但
+#   「换掉当前受体」是改共享状态，2026-11-13 P-83 起也进 `DEFAULT_ASK`，问一次再换。
 #
 # 共享状态本身没变（子会话与父会话仍共用同一份登记表），变的是「谁有权改」有据可依。
 
@@ -572,7 +571,7 @@ def load_disabled(root: Path) -> tuple[frozenset[str], Path | None]:
 
         [tools]
         bash = false        # 不装 bash
-        list_workspace = false
+        registry = false
 
     值为真或键写错都不报错——**这份文件的语义是「关」，不是「配」**：
     没有把握的键按「没关」处理，比让整个应用起不来强。这与 `load_permissions`

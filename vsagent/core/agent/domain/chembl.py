@@ -429,7 +429,7 @@ def _resolve_target(accession: str, *, timeout: float) -> _TargetChoice:
     if not targets:
         raise http.ToolError(
             f"ChEMBL 里没有以 {accession} 为组分的靶点。"
-            "先确认这确实是 UniProt 编号（用 search_targets / fetch_target 取得），"
+            "先确认这确实是 UniProt 编号（用 target_lookup 取得），"
             "并且它是人的蛋白——ChEMBL 的靶点以人为主，其他物种覆盖很少"
         )
 
@@ -1879,9 +1879,8 @@ def activity_snapshot(
 ) -> tuple[_Snapshot, _TargetChoice, str]:
     """取一个靶点的定量活性快照：缓存优先，没有就联网。
 
-    **不登记任何东西**，也不写产物目录以外的文件。`search_actives` 与
-    `assess_campaign` 共用这一份取数：盘点要在会话里问「这个靶点有多少活性」，
-    但它不该在登记表里留下模型没打算用的产物。
+    **不登记任何东西**，也不写产物目录以外的文件。开工盘点要问「这个靶点有多少
+    活性」，也走这一份取数；它不该在登记表里留下模型没打算用的产物。
 
     `spread=True` 时额外取回最弱的 `want` 条，与最强的那些合在一起。默认的
     「按活性降序取前 N 条」在活性记录很多的靶点上只覆盖到最高的一小段：实测
@@ -1995,18 +1994,17 @@ class SearchActivesTool(Tool):
     spec = ToolSpec(
         name="search_actives",
         description=(
-            "检索某靶点在 ChEMBL 里的已知活性化合物，并登记成一个配体集（可直接喂给对接）。"
-            "输入是 UniProt 编号，另给一行摘要：总记录数、命中数、最强活性、有没有上市药。"
-            "**pChEMBL 越大活性越强**（摩尔浓度负对数），排序与阈值都用它，不要用原始浓度。"
-            "默认只取单一蛋白靶点、精确定量、置信度 8 以上的记录，已剔除重复与无结构的化合物；"
-            "到达取回上限时留下的是活性最强的那些。单页一千条约 5–11 秒。"
+            "这个靶点在 ChEMBL 里有哪些已知活性的化合物？\n"
+            "输入：accession 填 UniProt 编号；min_pchembl 是活性下限，排序与阈值都用 pChEMBL，不用原始浓度。\n"
+            "输出：配体集（可直接交给对接），附总记录数、命中数、最强活性与有没有上市药。\n"
+            "边界：默认只取单一蛋白靶点、精确定量、置信度 8 以上的记录；到达上限时留下的是活性最强的那些；分页取数，单页约 5–11 秒。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "accession": {
                     "type": "string",
-                    "description": "UniProt 编号，例如 P00533；来自 fetch_target",
+                    "description": "UniProt 编号，例如 P00533；来自 target_lookup",
                 },
                 "min_pchembl": {
                     "type": "number",
@@ -2135,12 +2133,10 @@ class SearchAnalogsTool(Tool):
     spec = ToolSpec(
         name="search_analogs",
         description=(
-            "按结构相似性找出 ChEMBL 里已知的类似化合物，并登记成一个配体集。"
-            "用途：新颖性检查（命中的分子是不是早就有人做过）、骨架跃迁（换一副骨架）。"
-            "query 给 ChEMBL 编号（CHEMBL939）或 SMILES；min_similarity 是 40–100 的整数百分比，"
-            "85≈同一系列、70≈同一母核，50 以下动辄几千个分子。结果按相似度降序、按母体归并，"
-            "查询分子自身已排除。**手上有编号就给编号**：按编号能把盐型、共晶、立体异构一并排掉，"
-            "只给结构串时只能按全等排除。**相似只看结构、与活性无关**；到上限时留下最像的那些。"
+            "ChEMBL 里有没有和这个分子结构相近的已知化合物？\n"
+            "输入：query 填 ChEMBL 编号或 SMILES，有编号优先给编号；min_similarity 是 40–100 的百分比，85 约同一系列、70 约同一母核。\n"
+            "输出：配体集，按相似度降序、按母体归并，查询分子自身已排除。\n"
+            "边界：相似只看结构、与活性无关；阈值调到 50 以下动辄几千个分子；到上限时留下最像的那些。"
         ),
         parameters={
             "type": "object",

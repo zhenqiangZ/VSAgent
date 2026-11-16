@@ -12,7 +12,7 @@ ChEMBL 回答了**已知答案是什么**，但对接要的是一套**具体的�
 四条口径值得单独说明：
 
 **只认 PDB 编号，不认 UniProt 编号。** 一个 UniProt 编号对应多套结构，选哪套是一个
-决定，工具不该替用户做。方向是单向的：`fetch_target` 的返回值里带着可用结构清单
+决定，工具不该替用户做。方向是单向的：`target_lookup` 的返回值里带着可用结构清单
 （含分辨率与链覆盖范围），从那里挑一个编号喂进来。
 
 **元数据全部从坐标文件里就地解析，不额外查接口。** 标题 / 分类 / 沉积日期 / 方法 /
@@ -67,7 +67,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from vsagent.core.agent.state.ledger import SessionLedger, fingerprint_bytes, fingerprint_text
-from ..tools import Tool, ToolResult, ToolSpec
+from ..tools import Tool, ToolError, ToolResult, ToolSpec
 from ...file_log import record as log_read
 from . import http, uniprot
 from .pdbtext import (
@@ -435,7 +435,7 @@ def normalize_pdb_id(raw: str) -> str:
         raise ValueError(
             f"{raw!r} 不是 PDB 条目编号。编号是四位、首位为数字，例如 1M17、6VXX。"
             "UniProt 编号（P00533）与 AlphaFold 编号（AF-P00533-F1）都不是它——"
-            "要取结构，先用 fetch_target 查这个靶点的可用结构清单，从里面挑一个编号"
+            "要取结构，先用 target_lookup 查这个靶点的可用结构清单，从里面挑一个编号"
         )
     return text
 
@@ -507,7 +507,7 @@ def _download(pdb_id: str, *, timeout: float) -> tuple[str, str]:
         if cif_text is None:
             raise http.ToolError(
                 f"RCSB 里没有编号为 {pdb_id} 的条目。请核对编号——"
-                "它必须来自 fetch_target 返回的可用结构清单"
+                "它必须来自 target_lookup 返回的可用结构清单"
             )
         try:
             converted = _cif_to_pdb(cif_text)
@@ -515,7 +515,7 @@ def _download(pdb_id: str, *, timeout: float) -> tuple[str, str]:
             raise http.ToolError(
                 f"{pdb_id} 超出了 PDB 格式的上限（约 62 条链 / 10 万原子），RCSB 对这类"
                 "条目只提供 mmCIF、不提供 .pdb，而受体准备读不了 mmCIF。可行的做法："
-                "换一个覆盖同一蛋白、规模小一些的结构（用 fetch_target 看有没有别的"
+                "换一个覆盖同一蛋白、规模小一些的结构（用 target_lookup 看有没有别的"
                 "条目），或者缩小范围（只取其中一个结构域）"
             ) from None
         except Exception as error:
@@ -629,7 +629,7 @@ def _chain_lines(
     if extra > 0:
         lines.append(
             f"  （另有 {extra} 条链未列出{omitted}；完整链清单在条目 meta 里，"
-            "用 describe_entry 展开）"
+            "用 registry(handles=[…]) 展开）"
         )
     return lines
 
@@ -812,16 +812,10 @@ class FetchStructureTool(Tool):
     spec = ToolSpec(
         name="fetch_structure",
         description=(
-            "取一套实验结构的坐标文件（PDB 条目），写盘并登记成一个**受体**（状态：原始"
-            "结构，还没准备）。返回这套结构里有什么：方法、分辨率、每条链声明与观测的残基"
-            "范围（缺口就是对接用不上的那几段）、共晶配体、水、交替构象。**同一个编号"
-            "第二次调用直接读盘、不联网**（要重新下载用 refresh=true）。"
-            "编号形如 1M17，必须来自 fetch_target 返回的可用结构清单——UniProt 编号"
-            "（P00533）与 AlphaFold 编号（AF-P00533-F1）都不是它。**超大条目（约 62 条链 / "
-            "10 万原子）RCSB 只提供 mmCIF**：本机装了 gemmi 时会自动转成 PDB 再登记"
-            "（`meta.source_format` 会写 mmCIF），没装时明确报错并建议换一个小一些的结构。"
-            "返回的链清单是准备受体的必要输入（同源二聚体会给出几条几乎一样的链），"
-            "用哪条链必须显式指定。"
+            "这个 PDB 条目里有什么，坐标能不能直接用于对接？\n"
+            "输入：pdb_id 填四位条目号，必须来自 target_lookup 的结果；refresh=true 才重新下载。\n"
+            "输出：坐标写盘并登记成状态 raw 的受体，返回方法、分辨率、每条链的残基范围、共晶配体、水与交替构象。\n"
+            "边界：UniProt 编号与 AlphaFold 编号都不是条目号；大条目只提供 mmCIF，本机没有 gemmi 时会明确报错。"
         ),
         parameters={
             "type": "object",
@@ -1076,7 +1070,7 @@ def _af_entries(accession: str) -> list[dict[str, Any]]:
     except http.NotFound:
         raise http.ToolError(
             f"AlphaFold DB 里没有 {accession} 这个条目。先确认它确实是 UniProt 编号"
-            "（fetch_target 的返回值里会写这个靶点有没有 AlphaFold 模型）"
+            "（target_lookup 按编号查的返回值里会写这个靶点有没有 AlphaFold 模型）"
         ) from None
     if not isinstance(payload, list) or not payload:
         raise http.ToolError(
@@ -1163,15 +1157,10 @@ class FetchAlphafoldTool(Tool):
     spec = ToolSpec(
         name="fetch_alphafold",
         description=(
-            "按 UniProt 编号取 AlphaFold DB 的单体预测模型，写盘并登记成一个**受体**"
-            "（状态：原始结构，还没准备）。**这是预测结构，不是实验结构**：没有密度图、"
-            "没有配体、没有水、没有分辨率，侧链取向与柔性区都是模型算出来的。返回逐残基 "
-            "pLDDT（均值、四档占比、最长的几段低置信区）——口袋残基普遍低于 70 时，"
-            "后面的对接位姿只能当排序参考，不能当结合模式。一个编号可能对应多个模型"
-            "（同工型 / 片段），本工具只取 `AF-<编号>-F1`；坐标文件第二次调用读本地缓存"
-            "（元数据仍查一次接口，refresh=true 会连坐标一起重下）。"
-            "编号形如 P00533，也接受 AF-P00533-F1；不知道编号就先用 search_targets，"
-            "fetch_target 的返回值里会写明这个靶点有没有 AlphaFold 模型。"
+            "这个靶点有没有 AlphaFold 预测模型，模型可不可信？\n"
+            "输入：uniprot_id 填 UniProt 编号或 AF- 编号；refresh=true 会连坐标一起重下。\n"
+            "输出：只取 AF-<编号>-F1，写盘并登记成状态 raw 的受体，附逐残基 pLDDT 与低置信区。\n"
+            "边界：这是预测结构，没有配体、水与分辨率；口袋残基的 pLDDT 普遍低于 70 时，位姿只能当排序参考。"
         ),
         parameters={
             "type": "object",
@@ -1402,7 +1391,7 @@ def _check_importable(source: Path) -> bytes:
             raise http.ToolError(
                 f"{source} 是一个目录。导入要的是**一个坐标文件**——"
                 "若这是一份准备后的受体产物，它已经作为 receptor 条目登记过，"
-                "用 list_workspace 找到它的 handle 即可"
+                "用 registry 找到它的 handle 即可"
             )
         payload = source.read_bytes()
         log_read(source, purpose="import.structure", size=len(payload))
@@ -1417,7 +1406,7 @@ def _check_importable(source: Path) -> bytes:
         raise http.ToolError(
             f"{source.name} 是 mmCIF 格式，本工具不收：下游的受体准备读不了 mmCIF。"
             "可行的做法：用 gemmi / PyMOL 之类先转成 .pdb 再导入，"
-            "或者换一个同样覆盖这个蛋白的小一些的条目（用 fetch_target 看可用结构清单）"
+            "或者换一个同样覆盖这个蛋白的小一些的条目（用 target_lookup 看可用结构清单）"
         )
     if suffix not in PDB_SUFFIXES:
         raise http.ToolError(
@@ -1475,18 +1464,10 @@ class ImportStructureTool(Tool):
     spec = ToolSpec(
         name="import_structure",
         description=(
-            "导入**本机的一份坐标文件**（.pdb / .ent），登记成一个**受体**（状态：原始"
-            "结构，还没准备）。自备结构的入口：同源建模的模型、突变体、冷冻电镜的局部"
-            "重建、从别的渠道拿到的结构文件都从这里进。"
-            "这份文件会被**复制进结构目录**：用户那个文件可能待会儿就被覆盖或删掉，而"
-            "准备受体是按指纹缓存的，原地引用会让整条链在下游以看不出病因的方式重跑一遍。"
-            "导入后它和远端取回的条目完全一样——用返回的 handle，不要再传路径。"
-            "**这是全套工具里两个收路径的动作之一**（另一个是 import_ligandset；其余"
-            "一律收 handle）：模型编不出 ligandset#3，却编得出 D:/work/model.pdb，"
-            "而自备结构是真实需求，所以把「收路径」压缩到这两个动作上。若同一个文件已经"
-            "导入过（内容相同），"
-            "**不会重复登记**，直接告诉你已有哪一个。想从 RCSB 取编号对应的结构请用"
-            " fetch_structure；mmCIF 不收（下游读不了）。"
+            "本机这份坐标文件能不能导进来，之前是不是已经导过？\n"
+            "输入：path 填本机 .pdb 或 .ent 文件，mmCIF 不收。\n"
+            "输出：文件复制进结构目录，登记成状态 raw 的受体；内容相同的不重复登记，直接给出已有编号。\n"
+            "边界：导入后一律用 handle，不要再传路径；判重按文件内容，不按文件名。"
         ),
         parameters={
             "type": "object",
@@ -1700,13 +1681,10 @@ class AssessStructureTool(Tool):
     spec = ToolSpec(
         name="assess_structure",
         description=(
-            "评估一套**结构**的质量与适用性：实验方法、分辨率、模型套数、每条链的"
-            "声明/观测残基与缺口、只出现在杂原子里的链、金属离子、共晶配体、交替构象。"
-            "只读，不登记任何东西。\n"
-            "缺口是 SEQRES 与 ATOM 的差集：它直接决定「哪几段对接时不存在」。"
-            "没有 SEQRES 时写「无法判断」，**不报 0**——「没声明」和「一个都不缺」是两件事。"
-            "NMR 的多套模型只统计第一套。\n"
-            "用途：拿到结构先看一眼，或者在两个候选结构之间做选择。"
+            "这套结构的质量够不够用来对接，缺了哪几段？\n"
+            "输入：structure 填结构或受体的 handle。\n"
+            "输出：实验方法、分辨率、模型套数、每条链声明与观测的残基范围、缺口、金属离子、共晶配体与交替构象。\n"
+            "边界：没有 SEQRES 时缺口写「无法判断」，不报 0；NMR 的多套模型只统计第一套；只读，不登记。"
         ),
         parameters={
             "type": "object",
@@ -1733,7 +1711,7 @@ class AssessStructureTool(Tool):
         raw = str(arguments.get("structure") or "").strip()
         if not raw:
             return ToolResult(
-                output="缺少参数 structure。先 list_workspace 看清有哪份受体。", failed=True
+                output="缺少参数 structure。先 registry 看清有哪份受体。", failed=True
             )
         try:
             entry = ledger.get(raw)
@@ -1747,7 +1725,7 @@ class AssessStructureTool(Tool):
             return ToolResult(
                 output=(
                     f"{entry.handle} 找不到坐标文件（准备产物不完整？）。"
-                    "先 describe_entry 看这条登记的是什么。"
+                    "先 registry(handles=[…]) 看这条登记的是什么。"
                 ),
                 failed=True,
             )
@@ -1779,6 +1757,248 @@ class AssessStructureTool(Tool):
         )
 
 
+class AlignStructuresTool(Tool):
+    """把两套结构按 CA 原子叠起来：整体 RMSD、逐残基差值、变换矩阵。只读。"""
+
+    spec = ToolSpec(
+        name="align_structures",
+        description=(
+            "两套结构叠得上不上，哪个残基的位置差得最多？\n"
+            "输入：fixed 是参考结构，moving 是要搬过去的那一套；mode 选 chain（默认，"
+            "整条链配对）或 residue（只按 residues 里列出的残基配对）。\n"
+            "输出：整体 RMSD、差值最大的几个残基、把 moving 搬到 fixed 的 4×4 变换矩阵；"
+            "不输出坐标。\n"
+            "边界：只按 CA 原子算，不做侧链叠合；两套结构的链序列对不上时明说，"
+            "不勉强给一个数。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "fixed": {"type": "string", "description": "参考结构或受体的 handle"},
+                "moving": {"type": "string", "description": "要叠到参考上的结构或受体的 handle"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["chain", "residue"],
+                    "description": "chain 用整条链的 CA（默认）；residue 只用 residues 列的残基",
+                },
+                "residues": {
+                    "type": "string",
+                    "description": "mode=residue 时用：残基号，逗号分隔，例如 745,788,790",
+                },
+                "top": {
+                    "type": "integer",
+                    "description": "偏差最大的残基列几个，默认 10，上限 50",
+                },
+            },
+            "required": ["fixed", "moving"],
+            "additionalProperties": False,
+        },
+    )
+    context_argument = "ledger"
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        ledger = arguments.get("ledger")
+        if not isinstance(ledger, SessionLedger):
+            return ToolResult(
+                output="内核装配问题：align_structures 需要一个会话登记表，但这次调用没有拿到。",
+                failed=True,
+            )
+        mode = str(arguments.get("mode") or "chain").strip().lower()
+        if mode not in ("chain", "residue"):
+            return ToolResult(output=f"mode 只认 chain / residue，收到 {mode!r}", failed=True)
+        top = arguments.get("top", 10)
+        if isinstance(top, bool) or not isinstance(top, int) or not 1 <= top <= 50:
+            return ToolResult(output="top 要在 1 到 50 之间", failed=True)
+
+        fixed_text, failure = _structure_text(ledger, arguments.get("fixed"), "fixed")
+        if failure is not None:
+            return failure
+        moving_text, failure = _structure_text(ledger, arguments.get("moving"), "moving")
+        if failure is not None:
+            return failure
+
+        try:
+            from . import align
+
+            fixed_seqs = align.sequences(fixed_text)
+            moving_seqs = align.sequences(moving_text)
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+        if not fixed_seqs or not moving_seqs:
+            return ToolResult(
+                output="有一侧读不出聚合物链，没法按 CA 配对（只有配体或水的坐标不算结构）。",
+                failed=True,
+            )
+        pair = align.best_pair(fixed_seqs, moving_seqs)
+        assert pair is not None
+        fixed_chain, moving_chain, identity, coverage = pair
+
+        try:
+            fixed_ca = _ca_by_residue(fixed_text, fixed_chain)
+            moving_ca = _ca_by_residue(moving_text, moving_chain)
+        except ToolError as error:
+            return ToolResult(output=str(error), failed=True)
+        common = sorted(set(fixed_ca) & set(moving_ca))
+        if len(common) < 3:
+            return ToolResult(
+                output=(
+                    f"两条链共同带 CA 的残基只有 {len(common)} 个，叠不起来（至少要 3 个）。"
+                    f"配到的链是 {fixed_chain}→{moving_chain}。"
+                ),
+                failed=True,
+            )
+
+        wanted = common
+        if mode == "residue":
+            numbers = _residue_numbers(arguments.get("residues"))
+            if not numbers:
+                return ToolResult(
+                    output="mode=residue 时 residues 不能为空：写残基号，逗号分隔，例如 745,788,790。",
+                    failed=True,
+                )
+            wanted = [number for number in common if number in numbers]
+            missing = sorted(numbers - set(common))
+            if len(wanted) < 3:
+                return ToolResult(
+                    output=(
+                        "指定的残基里带 CA 的不足 3 个，叠不起来："
+                        f"可用 {len(common)} 个，缺 {', '.join(str(v) for v in missing) or '无'}。"
+                    ),
+                    failed=True,
+                )
+
+        import numpy as np
+
+        fixed_xyz = np.array([fixed_ca[number] for number in wanted], dtype=float)
+        moving_xyz = np.array([moving_ca[number] for number in wanted], dtype=float)
+        matrix, offset, rmsd = _kabsch(moving_xyz, fixed_xyz)
+        moved = (matrix @ moving_xyz.T).T + offset
+        deltas = {
+            number: float(np.linalg.norm(moved[index] - fixed_xyz[index]))
+            for index, number in enumerate(wanted)
+        }
+
+        lines = [
+            f"叠合 {arguments.get('moving')} 到 {arguments.get('fixed')}："
+            f"链 {fixed_chain}→{moving_chain}，按 {len(wanted)} 个 CA 原子，"
+            f"整体 RMSD {rmsd:.3f} 埃",
+            f"链序列同一性 {identity:.3f}，覆盖 {coverage:.2f}"
+            + ("（两侧可能不是同一个蛋白，下面的差值是硬叠出来的）" if identity < 0.5 else ""),
+        ]
+        ranked = sorted(deltas.items(), key=lambda item: (-item[1], item[0]))
+        lines.append(f"差值最大的 {min(top, len(ranked))} 个残基：")
+        for number, delta in ranked[:top]:
+            lines.append(f"  {fixed_chain}:{number}  {delta:.2f} 埃")
+        lines.append("变换矩阵（4×4，把 moving 搬到 fixed）：")
+        for row in matrix:
+            lines.append("  " + "  ".join(f"{value: .4f}" for value in row))
+        lines.append("  " + "  ".join(f"{value: .4f}" for value in offset) + "  0.0000  1.0000")
+        lines.append(
+            "只读，不出坐标；要出叠合后的图，把这份矩阵交给 write_run 或 visualization。"
+        )
+        return ToolResult(
+            output="\n".join(lines),
+            meta={
+                "rmsd": round(rmsd, 3),
+                "chain": f"{fixed_chain}->{moving_chain}",
+                "paired": len(wanted),
+                "identity": round(identity, 3),
+                "coverage": round(coverage, 2),
+                "worst": [
+                    {"residue": f"{fixed_chain}:{number}", "delta": round(delta, 3)}
+                    for number, delta in ranked[:top]
+                ],
+            },
+        )
+
+
+def _structure_text(
+    ledger: SessionLedger, raw: Any, name: str
+) -> tuple[str, ToolResult | None]:
+    """把 handle 解成一份坐标文本。受体走准备产物的坐标，结构条目走它自己的文件。"""
+    value = str(raw or "").strip()
+    if not value:
+        return "", ToolResult(output=f"缺少参数 {name}（结构或受体的 handle）", failed=True)
+    try:
+        entry = ledger.get(value)
+    except Exception as error:
+        return "", ToolResult(output=str(error), failed=True)
+
+    kind = str(getattr(entry.handle, "kind", ""))
+    path: Path | None = None
+    if kind == "receptor":
+        path = _coordinate_path(entry)
+    else:
+        candidate = Path(str(entry.path))
+        if candidate.is_file():
+            path = candidate
+        elif candidate.is_dir():
+            for filename in ("receptor.pdb", "structure.pdb"):
+                if (candidate / filename).is_file():
+                    path = candidate / filename
+                    break
+    if path is None or not path.is_file():
+        return "", ToolResult(
+            output=f"{name} 指向的条目找不到坐标文件（{value}）。用结构或准备后的受体。",
+            failed=True,
+        )
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except OSError as error:
+        return "", ToolResult(output=f"读坐标失败：{error}", failed=True)
+
+
+def _ca_by_residue(text: str, chain: str) -> dict[int, tuple[float, float, float]]:
+    """指定链上每个残基的 CA 坐标，按残基号索引。"""
+    from . import pdbtext
+
+    try:
+        document = pdbtext.parse(text)
+    except pdbtext.PdbEditError as error:
+        raise ToolError(f"坐标解析不了：{error}") from error
+    found: dict[int, tuple[float, float, float]] = {}
+    for atom in document.atoms:
+        if atom.is_hetero or atom.chain != chain or atom.name.strip().upper() != "CA":
+            continue
+        try:
+            number = int(atom.number)
+        except ValueError:
+            continue
+        found.setdefault(number, atom.coord)
+    return found
+
+
+def _residue_numbers(raw: Any) -> set[int]:
+    numbers: set[int] = set()
+    for piece in str(raw or "").replace("，", ",").split(","):
+        text = piece.strip()
+        if not text:
+            continue
+        try:
+            numbers.add(int(text))
+        except ValueError:
+            continue
+    return numbers
+
+
+def _kabsch(moving: Any, fixed: Any) -> tuple[Any, Any, float]:
+    """求把 moving 搬到 fixed 的旋转与平移，返回 (3×3 矩阵, 平移向量, RMSD)。"""
+    import numpy as np
+
+    moving_center = moving.mean(axis=0)
+    fixed_center = fixed.mean(axis=0)
+    centered_moving = moving - moving_center
+    centered_fixed = fixed - fixed_center
+    covariance = centered_moving.T @ centered_fixed
+    left, _values, right = np.linalg.svd(covariance)
+    sign = 1.0 if np.linalg.det(right.T @ left.T) >= 0 else -1.0
+    matrix = right.T @ np.diag([1.0, 1.0, sign]) @ left.T
+    offset = fixed_center - matrix @ moving_center
+    moved = (matrix @ moving.T).T + offset
+    rmsd = float(np.sqrt(((moved - fixed) ** 2).sum(axis=1).mean()))
+    return matrix, offset, rmsd
+
+
 def domain_tools() -> list[Tool]:
     """这组模块登记的全部工具，按装配顺序。
 
@@ -1790,6 +2010,7 @@ def domain_tools() -> list[Tool]:
         FetchAlphafoldTool(),
         ImportStructureTool(),
         AssessStructureTool(),
+        AlignStructuresTool(),
     ]
 
 if __name__ == "__main__":

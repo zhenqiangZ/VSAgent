@@ -20,12 +20,12 @@ from vsagent.core.agent.planning import intent
 from vsagent.core.agent.roles.contracts import TaskSpec
 from vsagent.core.agent.planning.route_adapter import describe as describe_route
 from vsagent.core.agent.validators import check_tool
-from vsagent.core.agent.toolset import family_of, hidden_names, release_families
 from vsagent.core.agent.execution.hooks import POST_TOOL_USE, PRE_TOOL_USE, STOP, HookReport, HookRunner
 from vsagent.core.agent.permission import PermissionDecision, PermissionPolicy, Verdict
 from vsagent.core.agent.roles.prompt import (
     KEEP_MESSAGES,
     environment_block,
+    estimate_tokens,
     stable_prefix,
     summary_messages,
 )
@@ -38,6 +38,25 @@ from vsagent.core.agent.provider import (
 )
 from vsagent.core.agent.tools import RetryableToolError, Tool, ToolError, ToolRegistry, argument_error
 from vsagent.core.agent.research.workspace import Workspace
+from vsagent.core.agent.search_reasoning import (
+    AnswerState,
+    SearchReasoningError,
+    assess,
+    capture_prior,
+    integrate,
+    save_answer,
+    select_for_context,
+    verify_and_repair,
+)
+from vsagent.core.agent.search_reasoning.adapters import is_trigger_tool
+from vsagent.core.agent.search_reasoning import events as sar_events
+from vsagent.core.agent.search_reasoning.evidence import (
+    assessment_for,
+    is_duplicate,
+    items_from,
+    merge,
+)
+from vsagent.core.agent.search_reasoning.models import SearchEvidence
 
 # 一轮里最多问模型这么多次，防止模型在工具之间来回不收敛
 MAX_STEPS = 24
@@ -80,6 +99,16 @@ MAX_SUMMARY_FAILURES = 3
 CONTEXT_PATH_LIMIT = 6
 # 用环境变量覆盖步数上限时的名字
 MAX_STEPS_ENV = "VSA_MAX_STEPS"
+# 搜索增强推理的开关与三种取值。
+#
+# `off` 与原来的路径一致；`shadow` 照常建立答案状态、评估与整合，但最终正文
+# 仍用模型自己写的那一份；`enforce` 用整合并核对过的正文。应用装配层默认
+# `shadow`，直接构造这一层时默认 `off`，见 `sar_mode_from_env` 的说明。
+SAR_ENV = "VSA_SAR"
+SAR_MODES = ("off", "shadow", "enforce")
+# 「本轮回答状态」那一段放在 TASK 层，最多这么多文字单位。
+# 完整状态在独立文件里；上下文每一步只带这一小份。
+SAR_ANSWER_LIMIT = 800
 # 留着多少步的上下文度量。`/context` 只显示最近 10 步，留 40 步是为了
 # 一倍于显示窗口的余量：用户翻看时前面几步不会刚好已经被挤掉。
 CONTEXT_HISTORY_LIMIT = 40
@@ -105,6 +134,25 @@ def max_steps_from_env(environ: dict[str, str] | None = None) -> int:
         return MAX_STEPS
     # 下限给 1：0 或负数会让循环一次都不进，看起来像「什么都没做就结束了」。
     return value if value >= 1 else MAX_STEPS
+
+
+def sar_mode_from_env(
+    environ: dict[str, str] | None = None, *, default: str = "off"
+) -> str:
+    """从环境变量取搜索增强推理的模式。
+
+    写错时回到 `default`，与步数上限那边同一个理由：这个词是顺手的调参口，
+    拼错一个字母不该让应用起不来。取值本身只认三个，认不出的一律按默认。
+
+    `default` 由装配处决定：应用层给 `shadow`（先在真实会话里观察），
+    测试与直接构造给 `off`（不改变原有请求条数）。
+    """
+    import os
+
+    source = os.environ if environ is None else environ
+    fallback = default if default in SAR_MODES else "off"
+    raw = source.get(SAR_ENV, "").strip().lower()
+    return raw if raw in SAR_MODES else fallback
 # 每次重发之前等多久
 RETRY_DELAYS = (1.0, 3.0)
 # Stop 钩子拦下来时写进会话的那句话
@@ -138,7 +186,7 @@ def missing_tool_reason(
     三种情形要说成三种话，因为模型该做的事不同：
 
     - 在禁用清单里 → 这个工具是被人为关掉的，**重试无用**，也不该换个方式绕。
-    - 属于一个还没装的族 → 装那一族就好，这是按需加载唯一的真实失败路径。
+    - 不在这个角色的名单里 → 换角色或改配置，这是角色装配唯一的真实失败路径。
       不说清楚的话，模型最可能做的是绕道 bash 或凭记忆写参数，两条都是错的。
     - 真的没有 → 报名字，让它自己改。
 
@@ -146,7 +194,7 @@ def missing_tool_reason(
     （历史现场：`unknown tool: read`，当时注册表里确实只有 bash），
     那句话与「被你关掉了」混在一起会让用户以为是自己配错了。
 
-    模块级函数而不是循环层的方法：它只读注册表的禁用清单与会话装过哪几族，
+    模块级函数而不是循环层的方法：它只读注册表的禁用清单与会话的角色名单，
     是纯的，测试直接调它验这一句话即可，不必为此起一整层循环、配总线与模型。
     `session` 留成可选：不给时按「真的没有」处理，与按需加载之前的行为一致。
     """
@@ -159,13 +207,15 @@ def missing_tool_reason(
             "不要用 bash 自己实现它，也不要换数据源绕过——"
             "把这件事告诉用户，由用户决定是否打开它。"
         )
-    family = family_of(name)
-    if family and session is not None and family not in session.tool_families:
-        return (
-            f"{name} 还没装进来：它属于 {family} 族。"
-            f"先调 load_tools family={family}，下一步起它就在清单里；"
-            "不要绕道 bash 去调等价的东西，也不要凭记忆写参数。"
-        )
+    if session is not None:
+        from vsagent.core.agent.roles.agents import allowed_tools
+
+        allowed = allowed_tools(session)
+        if allowed is not None and name in registry.names() and name not in set(allowed):
+            return (
+                f"这个角色没有装配 {name}。要它请改 agents.toml，"
+                "或把这件事派给装了它的角色。"
+            )
     return f"unknown tool: {name}"
 
 # 让模型写收尾总结时给的指令。
@@ -225,6 +275,7 @@ class AgentLoop:
         route_adapter: Any = None,
         validator_mode: str = "off",
         max_steps: int = MAX_STEPS,
+        sar_mode: str | None = None,
     ) -> None:
         self.bus = bus
         self.provider = provider
@@ -256,6 +307,18 @@ class AgentLoop:
         self.route_adapter = route_adapter
         # 校验器模式：off / shadow / enforce。由应用层按环境变量取值。
         self.validator_mode = validator_mode
+        # 搜索增强推理：off / shadow / enforce。默认按环境变量取。
+        self.sar_mode = sar_mode if sar_mode in SAR_MODES else sar_mode_from_env()
+        # 这一轮的答案状态。`None` 表示这一轮没有进入 SAR（DIRECT 或开关关闭）。
+        self.answer_state: AnswerState | None = None
+        self._sar_active = False
+        # 模型最后一步的正文先留在这里，核对完成后再一次性发布。
+        # 只有 SAR 生效的轮次才用得到；其余轮次正文照常边生成边发。
+        self._held_parts: list[tuple[Message, Part]] = []
+        # 这一轮的 SAR 过程行，按阶段索引，证据行会原地更新。
+        self._sar_parts: dict[str, Part] = {}
+        # 被单通道压掉的检索结果。失败或轮末全部放开，原始结果回到上下文。
+        self._sar_suppressed: list[tuple[Message, Part]] = []
         # 这一轮的计划与任务，供校验器读；每轮开始时清空。
         self._turn_plan: Any = None
         self._turn_task: TaskSpec | None = None
@@ -390,6 +453,15 @@ class AgentLoop:
         self.cancelled = False
         self.last_exit_reason = None
         self._closing = False
+        # 答案状态按轮清空：上一轮的说法与证据不进入这一轮。
+        self.answer_state = None
+        self._sar_active = False
+        self._held_parts = []
+        self._sar_parts = {}
+        self._sar_suppressed = []
+        # 上一轮如果被中断，抑制标记可能留在状态文件里；新一轮没有证据层接手，
+        # 先清掉，保证原文可见。
+        self._release_stale_suppressed(session)
         # 证据是「本步相关」的，一轮开始时清空：上一轮 recall 出来的记忆，
         # 到这一轮多半已经不相干，留着只会占掉证据层的额度。
         self.evidence.clear()
@@ -424,7 +496,6 @@ class AgentLoop:
         self._turn_hint = None
         # 每轮先退回「主 agent 可以自己干」：只有路由真的给出计划才置位。路由关上
         # 或解析失败时保持 False，否则新加的这一层会把旧路径一起锁死。
-        session.principal_only = False
         await self._prepare_route(session, message)
         try:
             message, step, elapsed_ms, exit_reason = await self._run_steps(
@@ -439,6 +510,9 @@ class AgentLoop:
             # 用户最不知道发生了什么的时候。
             if exit_reason:
                 await self._wrap_up(session, message, exit_reason)
+            # 整合与核对排在收尾总结之后、整轮收尾之前：核对要看的是最终
+            # 交给用户的那一段正文；异常结束的轮次不整合，只把状态记成失败。
+            await self._finalize_answer(session, message, exit_reason)
             # 整轮的停因记在会话上，供下一轮的复述使用。事件上那一份记的是
             # 「这一段是在什么结局下结束的」，两者回答的问题不同，都保留。
             session.last_exit_reason = exit_reason or ""
@@ -453,6 +527,10 @@ class AgentLoop:
                 exit_reason=exit_reason or "",
             )
         finally:
+            # 兜底：中途抛错时，已经生成但还没发布的正文也要让用户看见。
+            # 正常情况下由 `_finalize_answer` 发过一次，这里再调是空操作。
+            self._flush_held()
+            self._release_suppressed()
             self.last_latency_ms = int((time.time() - started) * 1000)
         # 中断那一条不收尾：`_finish` 会发 turn.done，而这一轮是用户按停的，
         # 界面已经在中断那一步回到可用状态了，再发一次收尾事件会把状态机推错。
@@ -549,6 +627,15 @@ class AgentLoop:
         发了整份上下文，把它们漏掉会让「窗口快满了」这件事晚一步才被发现。
         """
         metrics = dict(context.metrics)
+        if self._sar_active:
+            # 回答状态与筛选后的证据各占多少，单独报一份：它们混在 TASK 与
+            # EVIDENCE 两层里，不单列就看不出搜索增强这一步花了多少额度。
+            metrics["answer_tokens"] = estimate_tokens(self._answer_text())
+            metrics["sar_evidence_tokens"] = sum(
+                estimate_tokens(item.detail)
+                for item in self.evidence.items()
+                if item.ref.startswith("sar:")
+            )
         metrics.update(
             {
                 "step": step,
@@ -635,7 +722,7 @@ class AgentLoop:
         过程记录（`PartType.ROUTE`）、把任务规格记到会话上（shadow 也记，否则下一轮
         没有上下文）、把这一轮标记成「主 agent 只编排」。
 
-        **族不装进本会话**：计划里的 `tool_families` 按角色分，派发时由
+        **工具清单不随计划变**：角色在 `agents.toml` 里定死了自己那一份，派发时由
         `coordinator` 交给子会话。装到根会话上等于让主 agent 自己去做领域动作，
         那正是这一层要避免的。
 
@@ -687,7 +774,6 @@ class AgentLoop:
                 "revision": decision.task.revision if decision.task else 0,
                 "capabilities": list(plan.selected_capabilities) if plan else [],
                 "agents": list(plan.selected_agents) if plan else [],
-                "families": list(decision.families),
                 "warnings": list(decision.warnings),
             },
         )
@@ -701,13 +787,6 @@ class AgentLoop:
             self._note_task_change(session, previous, decision.task)
         self._turn_plan = decision.plan
         self._turn_task = decision.task
-        # 有可执行计划 = 这一轮主 agent 只编排。族不再装进本会话：计划里的族是
-        # 派发时按角色给子会话的（`coordinator.run(families=plan.tool_families)`），
-        # 装到根会话上只会让主 agent 自己把领域工作做掉。计划里一个角色都没有时
-        # 不置位——那份计划没有接手的人，锁死工具只会让这一轮什么也做不了。
-        session.principal_only = bool(
-            decision.plan is not None and decision.plan.selected_agents
-        )
 
     def _note_task_change(self, session: Session, previous: dict, task: Any) -> None:
         """任务规格变了，把战役状态推到「定规格」。
@@ -731,6 +810,540 @@ class AgentLoop:
             session.campaign_state, campaign_state.SPECIFICATION
         )
         session.campaign_state = state
+
+    # ------------------------------------------------------------------
+    # 搜索增强推理：查询前、工具结果回写后、最终答复前三个入口
+    # ------------------------------------------------------------------
+
+    def _sar_ask(self, message: Message):
+        """造一个「问一次模型」的闭包，用量记在当前这条助手消息上。"""
+
+        async def ask(messages: list[dict[str, Any]]) -> str:
+            return await self._ask_plain(message, messages)
+
+        return ask
+
+    async def _ask_plain(self, message: Message, messages: list[dict[str, Any]]) -> str:
+        """跑一次不带工具的请求，只返回正文。先验答案、整合与核对都走它。"""
+        chunks: list[str] = []
+        async for event in self.provider.stream(messages, [], ""):
+            if self.cancelled:
+                break
+            if event.type is ProviderEventType.TEXT_DELTA:
+                chunks.append(event.text)
+            elif event.type is ProviderEventType.USAGE:
+                self._add_usage(message, event.usage)
+        return "".join(chunks).strip()
+
+    def _sar_failed(self, session: Session, message: Message, error: Exception) -> None:
+        """SAR 某一步走不通：保存失败状态，放开原始结果，退回原路径。"""
+        state = self.answer_state
+        if state is not None:
+            state.status = "failed"
+            try:
+                save_answer(state, self.state_dir, session.id)
+            except Exception:
+                # 写盘失败不遮住真正的错误；事件里仍然有原因。
+                pass
+        self._release_suppressed()
+        self.answer_state = None
+        self._sar_active = False
+        self.bus.publish(
+            "search_reasoning.error",
+            {"session_id": session.id, "error": str(error)},
+        )
+        self._publish(
+            message,
+            Part(type=PartType.ERROR, text=f"检索增强没有走通，这一轮按原路径回答：{error}"),
+        )
+
+    def _sar_line(
+        self, message: Message, stage: str, text: str, **extra: Any
+    ) -> None:
+        """写一条 TUI 可见的过程行；同一阶段再次调用时原地更新。"""
+        part = self._sar_parts.get(stage)
+        if part is None:
+            part = Part(
+                type=PartType.SAR,
+                text=text,
+                tool_meta={"stage": stage, **extra},
+            )
+            self._sar_parts[stage] = part
+            self._publish(message, part)
+            return
+        part.text = text
+        part.tool_meta.update(extra)
+        self.bus.publish(
+            "part.update",
+            {
+                "session_id": message.session_id,
+                "message_id": message.id,
+                "part_id": part.id,
+            },
+        )
+
+    def _pre_tool_text(self, message: Message) -> str:
+        """当前助手消息里、第一个工具调用之前写下的内容。"""
+        chunks: list[str] = []
+        for part in message.parts:
+            if part.type is PartType.TOOL:
+                break
+            if part.type is PartType.TEXT and part.text:
+                chunks.append(part.text)
+        return "".join(chunks).strip()
+
+    def _prior_answer_text(self, session: Session, message: Message) -> str:
+        """上一轮助手答复，截短之后给先验答案当背景。"""
+        for item in reversed(session.messages):
+            if item is message or item.role != "assistant":
+                continue
+            text = " ".join(
+                part.text
+                for part in item.parts
+                if part.type is PartType.TEXT and part.text
+            ).strip()
+            if text:
+                return text[:800]
+        return ""
+
+    @staticmethod
+    def _trigger_parts(calls: list[Part]) -> list[Part]:
+        """这一步里能启动 SAR 的检索结果：文献、网页、语料，且调用成功。"""
+        return [
+            part
+            for part in calls
+            if is_trigger_tool(part.tool_name)
+            and part.tool_status is ToolStatus.COMPLETED
+        ]
+
+    async def _start_from_retrieval(
+        self,
+        session: Session,
+        message: Message,
+        trigger: Part,
+        count: int,
+        step: int,
+    ) -> bool:
+        """第一次检索结果返回：先写先验答案，再让结果进入证据层。"""
+        tool_name = trigger.tool_name or "检索"
+        self.bus.publish(
+            sar_events.RETRIEVAL_OBSERVED,
+            sar_events.observed(session.id, tool_name, step, count, count),
+        )
+        self._sar_line(
+            message,
+            "retrieval",
+            f"检索 · {tool_name} 返回 {count} 条候选",
+            tool=tool_name,
+            step=step,
+            count=count,
+        )
+        question = self._last_user_text(session)
+        if not question.strip():
+            return False
+        try:
+            state = await capture_prior(
+                question,
+                self._sar_ask(message),
+                task_text=self._task_text(session),
+                narration=self._pre_tool_text(message),
+                recent=self._prior_answer_text(session, message),
+                memory=self._memory_text(session),
+                trigger_tool=tool_name,
+                trigger_step=step,
+            )
+        except SearchReasoningError as error:
+            self._sar_failed(session, message, error)
+            return False
+        except Exception as error:
+            self._sar_failed(session, message, error)
+            return False
+        self.answer_state = state
+        self._sar_active = True
+        self.bus.publish(
+            sar_events.ANSWER_INITIALIZED, sar_events.initialized(state, session.id)
+        )
+        save_answer(state, self.state_dir, session.id)
+        self._sar_line(
+            message,
+            "baseline",
+            f"先验答案 · {len(state.initial_claims)} 条说法，"
+            f"{len(state.knowledge_gaps)} 个知识缺口",
+            claims=len(state.initial_claims),
+            gaps=len(state.knowledge_gaps),
+        )
+        return True
+
+    def _suppress_retrieval(self, message: Message, step: int) -> None:
+        """把文献、网页、语料的原始结果挡在模型上下文之外。
+
+        数据库与计算结果不压：它们的表格与分数需要按原文看。原始正文仍留在
+        Part 上，界面与 `read_turn` 都能取回。
+        """
+        for part in message.parts:
+            if part.type is not PartType.TOOL:
+                continue
+            if part.tool_status is not ToolStatus.COMPLETED:
+                continue
+            if not is_trigger_tool(part.tool_name):
+                continue
+            meta = dict(part.tool_meta or {})
+            if meta.get("sar_suppressed"):
+                continue
+            count = len(items_from([part]))
+            if count <= 0:
+                continue
+            meta["sar_suppressed"] = True
+            meta["sar_evidence_count"] = count
+            meta["sar_model_output"] = (
+                f"（这次检索返回 {count} 条候选，已按说法筛选后放进证据层；"
+                f"原文用 read_turn step={step} 取回）"
+            )
+            part.tool_meta = meta
+            self._sar_suppressed.append((message, part))
+            self.bus.publish(
+                "part.update",
+                {
+                    "session_id": message.session_id,
+                    "message_id": message.id,
+                    "part_id": part.id,
+                },
+            )
+
+    def _release_suppressed(self) -> None:
+        """SAR 没走通或这一轮结束：把原始结果放回模型上下文。"""
+        released, self._sar_suppressed = self._sar_suppressed, []
+        for message, part in released:
+            meta = dict(part.tool_meta or {})
+            meta.pop("sar_suppressed", None)
+            meta.pop("sar_evidence_count", None)
+            meta.pop("sar_model_output", None)
+            part.tool_meta = meta
+            self.bus.publish(
+                "part.update",
+                {
+                    "session_id": message.session_id,
+                    "message_id": message.id,
+                    "part_id": part.id,
+                },
+            )
+
+    @staticmethod
+    def _release_stale_suppressed(session: Session) -> None:
+        """清掉上一轮遗留的抑制标记。
+
+        正常轮末会解除；进程中途退出时标记会留在状态文件里。新一轮开始时
+        没有证据层接手这些结果，留着标记会让模型永远看不到原文。
+        """
+        for message in session.messages:
+            for part in message.parts:
+                if part.type is not PartType.TOOL:
+                    continue
+                meta = part.tool_meta if isinstance(part.tool_meta, dict) else {}
+                if not meta.get("sar_suppressed"):
+                    continue
+                cleaned = dict(meta)
+                cleaned.pop("sar_suppressed", None)
+                cleaned.pop("sar_evidence_count", None)
+                cleaned.pop("sar_model_output", None)
+                part.tool_meta = cleaned
+
+    async def _process_search_results(
+        self, session: Session, message: Message, calls: list[Part], step: int
+    ) -> None:
+        """检索结果回写之后：第一次触发先写先验答案，然后整理证据。"""
+        if self.sar_mode == "off":
+            return
+        state = self.answer_state
+        if state is None:
+            trigger = self._trigger_parts(calls)
+            if not trigger:
+                return
+            trigger_items = items_from([trigger[0]])
+            if not trigger_items:
+                return
+            # 初始扫描把同一轮早先的计算结果一起收进来，避免漏掉触发之前的对接或分析。
+            completed = [
+                part
+                for part in message.parts
+                if part.type is PartType.TOOL
+                and part.tool_status is ToolStatus.COMPLETED
+            ]
+            initial = items_from(completed)
+            if not initial:
+                return
+            started = await self._start_from_retrieval(
+                session, message, trigger[0], len(trigger_items), step
+            )
+            if not started:
+                return
+            state = self.answer_state
+            if state is None:
+                return
+            added = merge(initial, state)
+            self._suppress_retrieval(message, step)
+        else:
+            added = merge(items_from(calls), state)
+            if added:
+                self._suppress_retrieval(message, step)
+            # 多 Agent：子会话报告带着证据对象，状态已经存在时并进同一场证据池。
+            for part in calls:
+                if part.tool_name != "agent_status":
+                    continue
+                for row in (part.tool_meta or {}).get("evidence") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        item = SearchEvidence.from_dict(row)
+                    except SearchReasoningError:
+                        continue
+                    if is_duplicate(item, state.evidence_pool):
+                        continue
+                    state.add_evidence(item)
+                    added += 1
+
+        if not added:
+            return
+        state.status = "searching"
+        self.bus.publish(
+            sar_events.EVIDENCE_COLLECTED,
+            sar_events.collected(state, session.id, added, len(state.evidence_pool)),
+        )
+        try:
+            counts = await assess(
+                state, question=state.question, ask=self._sar_ask(message), refine=False
+            )
+        except SearchReasoningError as error:
+            self._sar_failed(session, message, error)
+            return
+        except Exception as error:
+            self._sar_failed(session, message, error)
+            return
+        self.bus.publish(
+            sar_events.EVIDENCE_ASSESSED, sar_events.assessed(state, session.id, counts)
+        )
+        self._sync_sar_evidence()
+        selected = len(select_for_context(state))
+        self._sar_line(
+            message,
+            "evidence",
+            f"证据 · {len(state.evidence_pool)} 条候选，{selected} 条进入上下文"
+            f"（支持 {counts.get('supporting', 0)}、补充 {counts.get('supplementary', 0)}、"
+            f"冲突 {counts.get('contradictory', 0)}）",
+            total=len(state.evidence_pool),
+            selected=selected,
+            relations=dict(counts),
+        )
+        save_answer(state, self.state_dir, session.id)
+
+    def _sync_sar_evidence(self) -> None:
+        """把筛选后的证据放进本步的证据层，最多五条。
+
+        完整证据池留在答案状态文件里；上下文只带当前说法需要的那几条。
+        每次覆盖同一批引用，避免多步之后同一批结果在证据层堆成几十条。
+        """
+        state = self.answer_state
+        if state is None:
+            return
+        self.evidence.drop("sar:")
+        for item in select_for_context(state):
+            assessment = assessment_for(state, item.id)
+            relation = assessment.relation if assessment else "supplementary"
+            level = assessment.support_level if assessment else "contextual"
+            claims = "、".join(assessment.related_claim_ids) if assessment else ""
+            title = item.title or item.content[:60]
+            summary = (
+                f"{item.source}｜{item.source_type}｜{relation}/{level}"
+                f"→{claims or '未挂说法'}｜{title}"
+            )
+            self.evidence.add(f"sar:{item.id}", summary, item.content[:600])
+
+    def _answer_text(self) -> str:
+        """把答案状态的摘要渲染成 TASK 层的一段。没有状态时是空串。"""
+        state = self.answer_state
+        if not self._sar_active or state is None:
+            return ""
+        snap = state.snapshot(answer_limit=400, claim_limit=6, gap_limit=5)
+        lines = ["本轮回答基线（第一次检索结果返回前建立，供对照）"]
+        lines.append(f"先验答案：{snap['initial_answer']}")
+        if snap["claims"]:
+            lines.append("说法：")
+            for item in snap["claims"]:
+                lines.append(
+                    f"- {item['id']}（{item['category']}/{item['status']}）：{item['content']}"
+                )
+        if snap["knowledge_gaps"]:
+            lines.append("知识缺口：" + "；".join(snap["knowledge_gaps"]))
+        lines.append(
+            f"已收证据 {snap['evidence_count']} 条，已评估 {snap['assessment_count']} 条，"
+            f"冲突 {snap['conflict_count']} 组。"
+        )
+        text = "\n".join(lines)
+        if len(text) > SAR_ANSWER_LIMIT:
+            text = text[: SAR_ANSWER_LIMIT - 1] + "…"
+        return text
+
+    async def _finalize_answer(
+        self, session: Session, message: Message, exit_reason: str | None
+    ) -> None:
+        """整合、核对，然后决定交给用户的是哪一份正文。
+
+        `shadow` 照常跑整合与核对，但最终正文仍是模型自己写的那一份；
+        `enforce` 用整合并核对过的正文替换草稿。异常结束的轮次不整合。
+        """
+        state = self.answer_state
+        if not self._sar_active or state is None:
+            return
+        if exit_reason:
+            state.status = "failed"
+            save_answer(state, self.state_dir, session.id)
+            self._flush_held()
+            self._release_suppressed()
+            return
+
+        draft = "".join(
+            part.text for owner, part in self._held_parts if owner is message and part.text
+        ).strip()
+        if not draft:
+            draft = "".join(
+                part.text for part in message.parts if part.type is PartType.TEXT
+            ).strip()
+        limits = list(session.task_state.constraints)
+        if session.task_spec:
+            try:
+                limits.extend(
+                    item for item in TaskSpec.from_dict(session.task_spec).constraints
+                    if item not in limits
+                )
+            except Exception as error:
+                # 旧数据或手工改坏的任务规格：读不出时记一条事件，不因此拦住这一轮。
+                self.bus.publish(
+                    "search_reasoning.error",
+                    {"session_id": session.id, "error": f"任务规格读不出来：{error}"},
+                )
+
+        if not select_for_context(state):
+            # 这一轮没有收到可用证据：不调用整合，保留原答案，只做机械核对。
+            state.final_answer = draft
+            state.status = "final"
+            report = await verify_and_repair(state, limits=limits, ask=None)
+            self.bus.publish(
+                sar_events.ANSWER_VERIFIED,
+                sar_events.verified(state, session.id, report.passed, report.issues),
+            )
+            self._sar_line(
+                message,
+                "verify",
+                "核对 · 通过" if report.passed else f"核对 · {len(report.issues)} 处待核实",
+                passed=report.passed,
+                issues=len(report.issues),
+            )
+            self._publish_final(session, message, state, draft, report)
+            return
+
+        ask = self._sar_ask(message)
+        try:
+            # 收尾时允许模型复核规则判不准的证据；这一步只做一次。
+            counts = await assess(
+                state, question=state.question, ask=ask, refine=True
+            )
+            self.bus.publish(
+                sar_events.EVIDENCE_ASSESSED,
+                sar_events.assessed(state, session.id, counts),
+            )
+            selected = len(select_for_context(state))
+            self._sar_line(
+                message,
+                "evidence",
+                f"证据 · {len(state.evidence_pool)} 条候选，{selected} 条进入上下文"
+                f"（支持 {counts.get('supporting', 0)}、补充 {counts.get('supplementary', 0)}、"
+                f"冲突 {counts.get('contradictory', 0)}）",
+                total=len(state.evidence_pool),
+                selected=selected,
+                relations=dict(counts),
+            )
+            actions, _notes = await integrate(state, ask, limits=limits)
+            self.bus.publish(
+                sar_events.CLAIM_UPDATED, sar_events.updated(state, session.id, actions)
+            )
+            changed = (
+                actions.get("append", 0)
+                + actions.get("strengthen", 0)
+                + actions.get("revise", 0)
+            )
+            self._sar_line(
+                message,
+                "integrate",
+                f"整合 · 修改 {changed} 条，保留 {actions.get('retain', 0)} 条，"
+                f"冲突 {len(state.conflicts)} 组",
+                actions=dict(actions),
+                conflicts=len(state.conflicts),
+            )
+            report = await verify_and_repair(state, limits=limits, ask=ask)
+        except SearchReasoningError as error:
+            self._sar_failed(session, message, error)
+            self._flush_held()
+            return
+        except Exception as error:
+            self._sar_failed(session, message, error)
+            self._flush_held()
+            return
+
+        self.bus.publish(
+            sar_events.ANSWER_VERIFIED,
+            sar_events.verified(state, session.id, report.passed, report.issues),
+        )
+        self._sar_line(
+            message,
+            "verify",
+            "核对 · 通过" if report.passed else f"核对 · {len(report.issues)} 处待核实",
+            passed=report.passed,
+            issues=len(report.issues),
+        )
+        if self.sar_mode == "shadow":
+            # 观察模式：整合与核对的结果写进文件与事件，正文仍是模型原稿。
+            self._publish_final(session, message, state, draft, report)
+            return
+        final = state.final_answer.strip() or draft
+        if not report.passed:
+            # 修过一轮仍不通过：把不确定处写清楚，交给用户判断。
+            notes = "；".join(report.texts()[:3])
+            if notes:
+                final = f"{final}\n\n（未核实的部分：{notes}）"
+        self._replace_held(message, final)
+        self._publish_final(session, message, state, final, report)
+
+    def _publish_final(
+        self,
+        session: Session,
+        message: Message,
+        state: AnswerState,
+        published: str,
+        report: Any,
+    ) -> None:
+        """收尾：发布正文、写答案状态、发最后一条事件。"""
+        state.final_answer = state.final_answer or published
+        state.status = "final"
+        self._flush_held()
+        # 这一轮结束，原始检索结果放回上下文；下一轮追问还能看到原文。
+        self._release_suppressed()
+        save_answer(state, self.state_dir, session.id)
+        self.bus.publish(
+            sar_events.ANSWER_FINALIZED,
+            {
+                **sar_events.finalized(state, session.id, len(published)),
+                "shadow": self.sar_mode != "enforce",
+                "repaired": bool(getattr(report, "repaired", False)),
+                "passed": bool(getattr(report, "passed", False)),
+            },
+        )
+
+    def _replace_held(self, message: Message, text: str) -> None:
+        """丢掉草稿，发布整合后的正文。"""
+        held, self._held_parts = self._held_parts, []
+        for owner, part in held:
+            owner.parts = [item for item in owner.parts if item is not part]
+        self._publish(message, Part(type=PartType.TEXT, text=text))
 
     def _note_delivery(self, session: Session) -> None:
         """这一轮回答已经发出去了：收齐的结果就此交付。
@@ -785,7 +1398,13 @@ class AgentLoop:
                 task = TaskSpec.from_dict(session.task_spec)
             except Exception:
                 task = None
-        return check_tool(name, plan=self._turn_plan, task=task)
+        from vsagent.core.agent.roles.agents import allowed_tools
+
+        return check_tool(
+            name,
+            allowed=allowed_tools(session, self.workspace_root),
+            task=task,
+        )
 
     def _intent_text(self, session: Session) -> str:
         """按最后一条用户消息给一行「可能在问哪几类来源」。
@@ -854,6 +1473,16 @@ class AgentLoop:
         state = session.task_state
         return "" if state.is_empty() else state.render()
 
+    def _task_with_answer(self, session: Session) -> str:
+        """任务状态加上本轮回答状态，合成 TASK 层的一段。
+
+        两者回答的是同一类问题：这一步要做什么、已经立了哪些说法。放在一段里
+        减少标题数；回答状态为空时原样返回任务状态。
+        """
+        return "\n\n".join(
+            piece for piece in (self._task_text(session), self._answer_text()) if piece
+        )
+
     def _env_text(self) -> str:
         """易变区的运行环境：日期、工作目录、状态目录。
 
@@ -872,13 +1501,16 @@ class AgentLoop:
         return digest() if callable(digest) else ""
 
     def tool_specs(self, session: Session) -> list[dict[str, Any]]:
-        """这一步该发出去的工具定义：全部减去还没 `load_tools` 装过的族。
+        """这一步该发出去的工具定义：按角色名单过滤。
 
-        按族加载把 34 个工具的 11.3K 定义压到核心那 10 个（约 2.1K），没装的
-        那几族连名字都不出现——模型不会去调它不存在的东西。用排除而不是允许
-        清单：新工具忘了登记族时它仍然每步都在（白占额度），而不是悄悄消失。
+        名单来自 `agents.toml`（见 `roles/agents.py`），会话建立时定稿、运行当中
+        不变。名单外的工具连名字都不出现，模型不会去调它不存在的东西；真去调时
+        执行处还会按同一份名单拒绝（`capability_guard`）。
         """
-        return self.registry.specs(exclude=hidden_names(session))
+        from vsagent.core.agent.roles.agents import allowed_tools
+
+        only = allowed_tools(session, self.workspace_root)
+        return self.registry.specs(only=only)
 
     def _assemble(
         self,
@@ -906,7 +1538,7 @@ class AgentLoop:
             memory_text=self._memory_text(session),
             profile_text=self._profile_text(),
             hint_text=hint_text,
-            task_text=self._task_text(session),
+            task_text=self._task_with_answer(session),
             digest_text=self._digest_text(),
             env_text=self._env_text(),
             evidence=self.evidence.items(),
@@ -1010,12 +1642,17 @@ class AgentLoop:
                 if stop_retries >= MAX_STOP_RETRIES:
                     break
                 stop_retries += 1
+                # 这一条已经写完但被 Stop 拦下；正文先放出去，接着另起一条。
+                self._flush_held()
                 message = self._start_continuation(session)
                 continue
             tool_steps += 1
             if not await self._run_tools(session, message, calls):
                 exit_reason = EXIT_CANCELLED
                 break
+            # 查询结果在写回 Part 之后立刻整理成证据。只处理适配层认得的查询
+            # 工具，其余工具照原样；SAR 没生效时这一步立即返回。
+            await self._process_search_results(session, message, calls, tool_steps)
             # 这一步做完了，立刻记进当前主题的流水。**零请求**：读的是 Part 上
             # 已经算好的工具名、参数、状态与 handle，不碰 reasoning。
             self._record_step(session, message, calls)
@@ -1070,14 +1707,10 @@ class AgentLoop:
         )
 
     def _seal_range(self, session: Session, **options: Any) -> Event | None:
-        """在消息边界封存一个主题，顺手收敛工具族（P2-1）。
+        """在消息边界封存一个主题。
 
-        两件事绑在一起：换轮就是「换事情」的地方，准备受体的那一轮用不到
-        `docking` 族。族只装不卸的话，装到八族之后每一步都发 12K token 的定义，
-        而典型一轮只用得上两三个。
-
-        模型自己在轮中途换主题（`close_topic`）时**不收敛**：一轮里换三个主题
-        不该把工具清单来回装卸，每次装卸都改动请求体，缓存整段失效。
+        封存只改事件层怎么分组：这一段折成一条流水，主题视图就此定下来。
+        工具清单不随主题变，它由角色配置决定，会话一开始就固定。
         """
         return self._after_seal(session, seal_range(session, **options))
 
@@ -1115,26 +1748,19 @@ class AgentLoop:
         )
 
     def _after_seal(self, session: Session, event: Event | None) -> Event | None:
-        """封存之后的收尾：先说一声，再按主题释放工具族。
+        """封存之后的收尾：先说一声，再交给记忆抽取。
 
-        主题就是一次工作的边界：过了边界只保留 `close_topic(next_tools=...)`
-        点名的族（预装给下一个主题），其余领域族全部释放。实测一次装 10 族
-        之后每一步的工具定义是 25,870 token，比正文还大；按主题释放能把下一段
-        压回「核心 8,409 + 1–3 族」。
-
-        封存本身已经改了事件块与摘要，请求前缀本来就要失效；在同一个边界上
-        换工具清单，不会额外多一次缓存未命中。
+        工具清单不随主题变：它由角色配置在会话建立时定稿，封存只影响事件块与
+        摘要，不再改动请求体里的工具数组。
         """
         if event is None:
             return None
+        # 这一段的结论由哪一份答案状态产生。只记编号，正文在答案状态文件里。
+        if self.answer_state is not None:
+            event.answer_id = self.answer_state.answer_id
         self._announce_seal(session, event)
         if not event.steps:
             return event
-        keep = list(session.next_tools)
-        session.next_tools = []
-        dropped = release_families(session, keep)
-        if dropped or keep:
-            self.bus.publish("status.update", {"session_id": session.id})
         # 抽取排在封存之后：五条封存路径都在这里汇合，不必各接一次。
         # 开关默认关闭，没打开时这一行立即返回。
         from vsagent.core.memory import extractor as memory_extractor
@@ -1503,14 +2129,24 @@ class AgentLoop:
         attempt = 0
         while True:
             try:
-                return await self._consume_stream(message, messages, tools, reasoning_effort)
+                calls = await self._consume_stream(message, messages, tools, reasoning_effort)
+                # 有工具调用说明这一步不是最终答复，压着的正文可以放了。
+                if calls:
+                    self._flush_held()
+                return calls
             except ProviderError as error:
                 if not error.retryable or attempt >= MAX_RETRIES:
+                    # 不再重试：已经流出来的正文交给用户，不能因为末尾出错
+                    # 把前半段一起吞掉。
+                    self._flush_held()
                     self._publish(
                         message,
                         Part(type=PartType.ERROR, text=f"请求没有成功：{error}"),
                     )
                     return []
+                # 还要重试：这一版的半截正文丢掉，下一次从空开始，
+                # 免得两次生成的文字接在同一段里。
+                self._drop_held()
                 attempt += 1
                 self._publish(
                     message,
@@ -1535,6 +2171,9 @@ class AgentLoop:
             elif event.type is ProviderEventType.REASONING_DELTA:
                 self._append_text(message, PartType.REASONING, event.text)
             elif event.type is ProviderEventType.TOOL_CALL:
+                # 这一步已经有工具调用了，先把还没发布的正文放出去：
+                # 既保持正文在工具卡之前的顺序，也说明这一步不是最终答复。
+                self._flush_held()
                 calls.append(
                     self._publish(
                         message,
@@ -1633,7 +2272,7 @@ class AgentLoop:
             模型给的东西：写进 `Part.tool_input` 会让界面与网页端看到一份带内核
             对象的调用。这里只记注入之前的那一份。
 
-            **空字典不覆盖已有值**：模型可能真的一次都没传参数（`list_workspace`
+            **空字典不覆盖已有值**：模型可能真的一次都没传参数（`registry`
             就是这样，`tool_input` 在发出请求时就已经是 `{}`），也可能什么都没
             给、由流式层写成 `None`。后者才需要补成空字典——否则网页端按
             「有没有输入」判断时会把它当成缺字段。
@@ -1774,13 +2413,47 @@ class AgentLoop:
         )
 
     def _append_text(self, message: Message, part_type: PartType, text: str) -> None:
-        """把增量接到当前这一类 Part 上，最后一个是别的类型时另起一个。"""
+        """把增量接到当前这一类 Part 上，最后一个是别的类型时另起一个。
+
+        SAR 生效的轮次，`TEXT` 先不发布：模型最后一步的正文只是草稿，要等
+        整合与核对完成之后一次性交给用户。`REASONING` 照常流式发布——
+        用户仍能看见正在做什么，只是最终答复不会先出一版再被改写。
+        """
+        hold = self._sar_active and part_type is PartType.TEXT
         last = message.parts[-1] if message.parts else None
         if last is not None and last.type is part_type:
             last.text += text
+            if hold:
+                if not any(item[1] is last for item in self._held_parts):
+                    self._held_parts.append((message, last))
+                return
             self.bus.publish("part.update", {"session_id": message.session_id, "message_id": message.id, "part_id": last.id})
             return
-        self._publish(message, Part(type=part_type, text=text))
+        part = Part(type=part_type, text=text)
+        if hold:
+            message.add_part(part)
+            self._held_parts.append((message, part))
+            return
+        self._publish(message, part)
+
+    def _flush_held(self) -> None:
+        """把压着的正文一次性发布出去。"""
+        held, self._held_parts = self._held_parts, []
+        for message, part in held:
+            self.bus.publish(
+                "part.add",
+                {
+                    "session_id": message.session_id,
+                    "message_id": message.id,
+                    "part_id": part.id,
+                },
+            )
+
+    def _drop_held(self) -> None:
+        """丢掉还没发布的半截正文，用于重试之前清场。"""
+        held, self._held_parts = self._held_parts, []
+        for message, part in held:
+            message.parts = [item for item in message.parts if item is not part]
 
     @staticmethod
     def _add_usage(message: Message, usage: dict[str, int]) -> None:

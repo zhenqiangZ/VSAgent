@@ -154,6 +154,9 @@ class AgentReport:
     campaign_id: str = ""
     findings: list[dict[str, Any]] = field(default_factory=list)
     evidence_refs: tuple[str, ...] = ()
+    # 子会话查回来的证据对象（编号、正文、来源、类别、时间）。父会话据此
+    # 建立一场的证据池；`evidence_refs` 留着给旧报告读取。
+    evidence: list[dict[str, Any]] = field(default_factory=list)
     artifact_refs: tuple[str, ...] = ()
     conclusions: list[dict[str, Any]] = field(default_factory=list)
     limitations: tuple[str, ...] = ()
@@ -169,6 +172,7 @@ class AgentReport:
         self.findings = self._claims(self.findings, "AgentReport.findings")
         self.conclusions = self._claims(self.conclusions, "AgentReport.conclusions")
         self.evidence_refs = texts(self.evidence_refs, "AgentReport.evidence_refs")
+        self.evidence = self._evidence(self.evidence, "AgentReport.evidence")
         self.artifact_refs = texts(self.artifact_refs, "AgentReport.artifact_refs")
         self.limitations = texts(self.limitations, "AgentReport.limitations")
         self.unresolved_questions = texts(
@@ -190,6 +194,21 @@ class AgentReport:
             row[key] = text(row.get(key), f"{field_name}[{index}].{key}")
         return out
 
+    @staticmethod
+    def _evidence(rows: Any, field_name: str) -> list[dict[str, Any]]:
+        """校验证据对象：编号、正文、来源、类别四项必填。
+
+        这里不按 `SearchEvidence` 的全套字段判：报告是跨进程交付的，
+        旧报告与手工写的报告可能只给这四项；缺的字段由读取方补默认值。
+        """
+        out = records(rows, field_name)
+        for index, row in enumerate(out):
+            for key in ("id", "content", "source", "source_type"):
+                row[key] = text(row.get(key), f"{field_name}[{index}].{key}")
+            row.setdefault("title", "")
+            row.setdefault("url", "")
+        return out
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -199,6 +218,7 @@ class AgentReport:
             "status": self.status,
             "findings": [dict(row) for row in self.findings],
             "evidence_refs": list(self.evidence_refs),
+            "evidence": [dict(row) for row in self.evidence],
             "artifact_refs": list(self.artifact_refs),
             "conclusions": [dict(row) for row in self.conclusions],
             "limitations": list(self.limitations),
@@ -218,6 +238,7 @@ class AgentReport:
                 "status",
                 "findings",
                 "evidence_refs",
+                "evidence",
                 "artifact_refs",
                 "conclusions",
                 "limitations",
@@ -233,6 +254,7 @@ class AgentReport:
             campaign_id=data.get("campaign_id", ""),
             findings=data.get("findings") or [],
             evidence_refs=tuple(data.get("evidence_refs") or ()),
+            evidence=data.get("evidence") or [],
             artifact_refs=tuple(data.get("artifact_refs") or ()),
             conclusions=data.get("conclusions") or [],
             limitations=tuple(data.get("limitations") or ()),

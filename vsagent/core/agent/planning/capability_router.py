@@ -33,10 +33,13 @@ PREREQUISITES: dict[str, tuple[str, ...]] = {
     "pocket_profiling": ("pocket_discovery",),
     "ligand_intelligence": (),
     "literature_evidence": (),
-    "virtual_screening": ("pocket_discovery", "ligand_intelligence"),
-    "scoring_evaluation": ("virtual_screening",),
+    "receptor_preparation": ("pocket_discovery", "ligand_intelligence"),
+    "docking_run": ("receptor_preparation",),
+    "affinity_prediction": ("receptor_preparation",),
+    "scoring_evaluation": ("docking_run",),
     "mechanism_analysis": ("pocket_profiling", "ligand_intelligence"),
     "hypothesis_validation": ("mechanism_analysis", "literature_evidence"),
+    "visualization": (),
 }
 """能力之间的前置关系。
 
@@ -49,9 +52,10 @@ PREREQUISITES: dict[str, tuple[str, ...]] = {
 AUTO_PREREQUISITES: dict[str, tuple[str, ...]] = {
     # 没有口袋就没有可画像的位点。
     "pocket_profiling": ("pocket_discovery",),
-    # 筛选要两条输入：一个定义好的口袋、一组配体。两样都没有就开不了跑，
-    # 所以补成节点。用户已经给了库时，配体那一步就是给这份库做盘点，不白跑。
-    "virtual_screening": ("pocket_discovery", "ligand_intelligence"),
+    # 准备要有口袋才能算盒子；对接要有准备好的受体；亲和力沿同一条链。
+    "receptor_preparation": ("pocket_discovery", "ligand_intelligence"),
+    "docking_run": ("receptor_preparation",),
+    "affinity_prediction": ("receptor_preparation",),
 }
 """缺了就必须现做的前置：补成计划里的节点，不留成告警。
 
@@ -66,8 +70,8 @@ AUTO_PREREQUISITES: dict[str, tuple[str, ...]] = {
 # 用户说"不要 X"时，哪项能力被明确排除。与 Phase 4 的模板过滤是同一件事的两端：
 # 那边删模板，这边在计划里留一条"为什么没有它"。
 DENIAL_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("对接", "分子对接"), ("virtual_screening",)),
-    (("筛选", "虚拟筛选"), ("virtual_screening",)),
+    (("对接", "分子对接"), ("docking_run",)),
+    (("筛选", "虚拟筛选"), ("docking_run",)),
 )
 
 
@@ -79,6 +83,7 @@ PROVIDED_KEYS: dict[str, str] = {
     "structure_discovery": "structure",
     "pocket_discovery": "pocket",
     "ligand_intelligence": "ligand_set",
+    "receptor_preparation": "receptor",
 }
 """能力对应的「用户已经给了」的输入键。
 
@@ -230,8 +235,6 @@ class CapabilityRouter:
         """按能力清单装配计划，返回（计划, 未决输入）。"""
         given = [str(item) for item in provided]
         agents = self._agents(capabilities)
-        families = {agent: self._families(capabilities, agent) for agent in agents}
-        standalone = {agent: self._standalone(capabilities, agent) for agent in agents}
         dependencies, unresolved = self._dependencies(capabilities, agents, given)
         groups = self._parallel(agents, dependencies)
         rationale = tuple(
@@ -243,8 +246,6 @@ class CapabilityRouter:
             revision=revision,
             selected_capabilities=tuple(capabilities),
             selected_agents=tuple(agents),
-            tool_families={agent: list(names) for agent, names in families.items() if names},
-            standalone_tools={agent: list(names) for agent, names in standalone.items() if names},
             dependencies=list(dependencies),
             parallel_groups=groups,
             denied_capabilities=tuple(denied),
@@ -338,7 +339,10 @@ class CapabilityRouter:
         out: list[str] = []
         for capability in capabilities:
             for row in TEMPLATES.values():
-                if str(row.get("capability") or "") != capability:
+                # 模板可能只带一个能力，也可能带几步（准备加对接）。
+                listed = [str(row.get("capability") or "")]
+                listed.extend(str(step[0]) for step in (row.get("steps") or ()))
+                if capability not in listed:
                     continue
                 for name in row.get("approvals") or ():
                     if str(name) not in out:

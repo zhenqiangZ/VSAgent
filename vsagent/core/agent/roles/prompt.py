@@ -12,7 +12,6 @@ from typing import Any
 from vsagent.core.file_log import record as log_read
 from vsagent.core.models import Message, Part, PartType, Session, ToolStatus
 from vsagent.core.paths import project_root
-from vsagent.core.agent.roles import toolprofiles
 from vsagent.core.agent.research.workspace import Workspace
 
 # 单个工具输出发给模型的那一份总长度，超过就压。按字符卡是个上界：
@@ -211,6 +210,11 @@ COMPRESS_HINT_MIN = 8
 OMISSION_MARK = "… 压缩掉"
 # 更狠那一档留下的标记，与上一档分开，免得两档互相把对方当成「已压过」。
 DEEP_MARK = "… 只留要点"
+# 输出被压短后，省略说明里那句「怎么取回」的提示上限。
+#
+# 提示放在省略说明那一行里、不追加到正文末尾：正文有 4000 字符的硬上限，
+# 追加会把刚压好的内容重新顶破。这句自己也要有上限，否则说明倒把额度吃回去。
+COMPRESSION_HINT_LIMIT = 200
 
 # 工具输出里必须逐字留下的两类行。
 #
@@ -239,7 +243,42 @@ def is_key_line(line: str) -> bool:
     return any(lowered.startswith(marker) for marker in (*RESULT_MARKERS, *TRACEBACK_PREFIXES))
 
 
-def compress_tool_output(text: str, deep: bool = False) -> str | None:
+def compression_hint(
+    tool_name: str = "",
+    tool_input: dict[str, Any] | None = None,
+    step_no: int = 0,
+) -> str:
+    """工具输出被压短后，写清三件事：压过、完整内容还在、用哪条更窄的命令取回。
+
+    这句进的是省略说明那一行，不是正文末尾：正文有 4000 字符的硬上限，
+    追加到末尾会把刚压好的内容重新顶破。整句还有字数上限，免得说明把额度吃回去。
+
+    只说「省略了多少」而不说怎么取回，模型会以为数据没了，换着法子重跑同一条
+    命令（实测同一份 meta.json 用 bash+python3 读了四次）。前两句是通用写法，
+    `check_output_limit` 认那几处命令字样，照实留着；拿得到这次的工具与参数时，
+    再点出读的是哪个文件、原来那一步怎么取回，让模型不必猜要重跑哪条命令。
+    """
+    parts = [
+        "这段输出的中间被压短了，完整内容还留在会话记录里，没有删除。",
+        "要全文：read <path> offset=0 limit=2000 分段读，或 grep 定位关键行。"
+        f"单次最多给 {MODEL_OUTPUT_LIMIT} 字符——重读同一个文件也一样。",
+    ]
+    target = ""
+    if isinstance(tool_input, dict):
+        for key in ("path", "file", "command"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.strip():
+                target = value.strip()
+                break
+    if target:
+        source = f"（来自 {tool_name}）" if tool_name else ""
+        parts.append(f"这次读的是 {target[:60]}{source}。")
+    if step_no:
+        parts.append(f"要看原来那一步，用 read_turn step={step_no} 取回。")
+    return "".join(parts)[:COMPRESSION_HINT_LIMIT]
+
+
+def compress_tool_output(text: str, deep: bool = False, hint: str = "") -> str | None:
     """把一段工具输出按内容挑着留。改短了返回新正文，没什么可改返回 None。
 
     先保住关键行（报错原文、结论行），中间段再均匀抽样留下骨架，首尾几行补回上下文，
@@ -275,8 +314,11 @@ def compress_tool_output(text: str, deep: bool = False) -> str | None:
         note = f"{mark} {omitted} 行"
         # 只写「省略 N 行」时，模型会以为数据没了，转头重跑一遍命令（实测过一次：
         # 它下一句就是「The output got compressed」）。省得少的时候不加这句——
-        # 说明本身也有长度，加了反而不划算。
-        if omitted >= COMPRESS_HINT_MIN:
+        # 说明本身也有长度，加了反而不划算。`hint` 由翻译层传进来：把「压了什么、
+        # 怎么取回」写全，两条压缩路径用同一句话；装配器那一路不传，保持原样。
+        if hint:
+            note += f"；{hint}"
+        elif omitted >= COMPRESS_HINT_MIN:
             note += "（原文可用 read_turn 取回）"
         blocks.append(note)
     blocks.extend(tail)
@@ -288,36 +330,38 @@ def compress_tool_output(text: str, deep: bool = False) -> str | None:
     return result
 
 
-def truncate_for_model(text: str) -> str:
+def truncate_for_model(
+    text: str,
+    *,
+    tool_name: str = "",
+    tool_input: dict[str, Any] | None = None,
+    step_no: int = 0,
+) -> str:
     """把工具输出裁成发给模型的那一份。
 
     给模型看的那一份与给人看的那一份要求不同：人要看结论，模型要能接上下一句。
     先按内容挑着留（保报错原文与结论行）；挑完仍超长才按位置兜底，
     兜底那一档只保证不超上限，正常走不到。会话里那条 Part 存的是完整原文，
     不受这里影响。
+
+    被压短的那一份，无论走「按内容挑着留」还是「按位置留首尾」，省略说明里
+    都带同一句 `compression_hint`：写清压过、完整内容还在、用哪条更窄的命令取回。
+    只报「省略多少」不说怎么取回，模型会以为数据没了、换着法子重跑同一条命令
+    （实测同一份 meta.json 用 bash+python3 读了四次）。三个参数都带默认值，
+    装配器与旧调用点直接调用时行为不变。
     """
     original = len(text)
     if original <= MODEL_OUTPUT_LIMIT:
         return text
+    hint = compression_hint(tool_name, tool_input, step_no)
     for deep in (False, True):
-        shrunk = compress_tool_output(text, deep=deep)
+        shrunk = compress_tool_output(text, deep=deep, hint=hint)
         if shrunk is None:
             continue
         text = shrunk
         if len(text) <= MODEL_OUTPUT_LIMIT:
             return text
-    return _cut_middle(
-        text,
-        MODEL_OUTPUT_HALF,
-        total=original,
-        # 这三句是给**被截断之后**的模型看的：只报「省略多少」而不报原文多长、
-        # 不说怎么拿全文，模型会以为输出坏了，换着法子重读同一个文件
-        # （实测同一份 meta.json 用 bash+python3 读了四次）。
-        hint=(
-            "要全文：read <path> offset=0 limit=2000 分段读，或 grep 定位关键行。"
-            f"单次最多给 {MODEL_OUTPUT_LIMIT} 字符——重读同一个文件也一样。"
-        ),
-    )
+    return _cut_middle(text, MODEL_OUTPUT_HALF, total=original, hint=hint)
 
 
 def rules_directory(root: Path | None = None) -> Path:
@@ -449,8 +493,8 @@ def select_rules(text: str, *, user_facing: bool) -> str:
 
 
 def _user_facing(session: Session) -> bool:
-    """这个会话会不会直接和用户说话。与工具档位共用同一个开关。"""
-    return toolprofiles.profile_for(session.depth > 0) != toolprofiles.WORKER
+    """这个会话会不会直接和用户说话：根会话会，子会话不会。"""
+    return session.depth <= 0
 
 
 def project_rules(root: Path) -> str:
@@ -549,8 +593,14 @@ def global_rules(root: Path) -> str:
 
 
 def agent_rules(root: Path, role: str) -> str:
-    """一个角色的规则。角色为空时取 `principal`——那是根会话的身份。"""
-    name = (role or "principal").strip()
+    """一个角色的规则。角色为空时取 `principal`——那是根会话的身份。
+
+    旧会话里存着改名前的角色，先按 `LEGACY_ROLES` 换成现在的名字，再读文件；
+    否则读到一个不存在的文件只会返回空串，模型就少了整段角色规则。
+    """
+    from vsagent.core.agent.roles.capabilities import canonical
+
+    name = canonical((role or "principal").strip())
     return read_rule(rules_home(root) / ROLE_RULE_DIR / f"{name}.md")
 
 
@@ -608,16 +658,16 @@ HYPOTHESIS_CONTRACT = (
 
 # 开工前的路线判断。**只给根会话**：子 agent 的任务书由父会话给，它不决定走哪条路。
 #
-# 盘点交给角色，不自己取数：`assess_campaign` 与 `survey_structures` 已经从主 agent
-# 的档位里去掉，领域族也不发给它（P-79）。主 agent 要做的是把两侧盘点写成任务、
-# 派出去、读报告，再按下面的规则选策略。
+# 盘点交给角色，不自己取数：`survey_structures` 已经从主 agent 的档位里去掉，
+# 领域族也不发给它（P-79）。主 agent 要做的是把两侧盘点写成任务、派出去、读报告，
+# 再按下面的规则选策略。
 #
 # 最后一句把派发条件并了进来。派发的触发条件本来就是盘点结果的一部分（口袋不唯一、
 # 候选结构 ≥3 才值得拆），两处分开写会各自漂移。
 PRINCIPAL_CAMPAIGN = (
     "**开工前先派盘点**：受体侧看实验结构、分辨率、共晶配体、缺口；\n"
     "配体侧看 pChEMBL ≥7 条数、骨架分组、抗靶活性数据。\n"
-    "这两侧由承担该能力的角色做（配体情报、结构与口袋），**你不要自己取数、也不要装族**；"
+    "这两侧由承担该能力的角色做（调研、口袋、配体），**你不要自己取数**；"
     "拿到盘点报告再往下定。\n"
     "候选不止一条时，比较证据、成本与能区分什么，选一条并把理由写成 strategy 假设；\n"
     "推荐的规则是：结构可用、活性 ≥20 条 → 同系物优化（共晶口袋、参考集、相似性、对接）；\n"
@@ -636,8 +686,7 @@ PRINCIPAL_CAMPAIGN = (
 # `docking` 与 `affinity` 两族里，首步不可见；前缀点名它们，模型会先撞一次墙。
 # 这一段只回答「走哪条通道、什么时候可用、两路怎么对照」。
 SCORING_DISCIPLINE = (
-    "**打分是两路**：对接给位姿与结构过滤（`docking` 族），DTA 给亲和力"
-    "（`affinity` 族）。要做 DTA 就派承担筛选/评分的角色，让它两族一起装；\n"
+    "**打分是两路**：对接给位姿与结构过滤，DTA 给亲和力。要做 DTA 就派亲和力角色；\n"
     "DTA 通道固定走「先用该靶点的实测活性微调，再用微调后的模型推理」，不用零样本。\n"
     "靶点有 ≥40 个带 pChEMBL 的化合物、受体留了共晶配体时这条通道才可用；"
     "少于此数只走对接单路，并说明原因。\n"
@@ -664,26 +713,22 @@ PRESENT_DISCIPLINE = (
     "「回召集」改说「召回检验」。第一次出现某个术语时用一句普通话解释。"
 )
 
-# 工具清单是**按族发**的：领域工具不常驻，要先装。这句话必须在前缀里，
-# 因为模型看不到清单里没有的工具时，最容易做的是「凭记忆写参数」或者
-# 「改用 bash 直接跑脚本」——两条都会把一次本来简单的调用变成一串失败。
+# 工具清单在会话建立时就定稿：由角色配置决定，运行当中不变。模型最容易做错的
+# 是「凭记忆写参数」或者「改用 bash 直接跑脚本」——两条都会把一次本来简单的
+# 调用变成一串失败，所以这两句留在前缀里。
 #
 # 复核那一条是现场量出来的：实测五次运行里复核占工具调用的 25–81%，
 # 钱不多但会撞满步数上限，还会把要核的那段上下文挤出窗口。
 WORK_DISCIPLINE = (
-    "工具按主题加载：**主 agent 不装领域族**（这一轮有可执行计划时，族一律不发给它，"
-    "`load_tools` 也会退回一句「派给角色」）；子 agent 要先用 load_tools 装那一族，"
-    "**下一步起**才出现在清单里，一个主题通常只装 1–3 族。"
-    "不要为了省一次缓存把整轮要用的族都装上——工具定义每一步都要发，装到 10 族时约 2.6 万 token。"
-    "主题结束时内核会卸载没有写进 close_topic(next_tools=...) 的族。\n"
+    "工具清单由你的角色决定，会话一开始就固定，**不必也不能自己装载**；"
+    "清单里没有的动作，说明这件事该由别的角色做，交回父会话。\n"
     "工具已经把结果写进返回的，**不要再用 bash 复核一遍**：要核对就用 read 一次看完，"
     "不要 ls、stat、md5sum 一项一项来。"
 )
 
 # 引用登记表里那些产物的纪律。身份段之后紧接着说，因为它影响每一次工具调用的写法。
 #
-# **不点名 `list_workspace` / `describe_entry`**：它们属于 `listing` 族，首步不可见。
-# 前缀教模型去用一个它现在看不见的工具，它撞一次墙才会知道要装族。
+# **不点名 `registry`**：主控的清单里没有它，点名等于教模型去撞墙。
 # handle 本身在 `TASK` 层的**工作区索引**里（`SessionLedger.digest()`，每步都在）。
 LEDGER_DISCIPLINE = (
     "登记表里记着已经拿到或算出来的东西（受体、配体集、产物）。"
@@ -891,6 +936,19 @@ def translate_message(message: Message) -> list[dict[str, Any]]:
     return translate_parts(message.role, message.parts)
 
 
+def model_tool_output(part: Part) -> str:
+    """工具结果进入模型上下文的那一份正文。
+
+    检索结果被 SAR 单通道接走之后，原文留在 Part 上给界面与 `read_turn`，
+    模型只看到一句「已整理为证据、原文按步号取回」的提示。数据库与计算
+    结果没有这个标记，照原样进入上下文。
+    """
+    meta = part.tool_meta if isinstance(part.tool_meta, dict) else {}
+    if meta.get("sar_suppressed"):
+        return str(meta.get("sar_model_output") or "（检索结果已整理为证据）")
+    return part.tool_output
+
+
 def translate_parts(role: str, parts: list[Part]) -> list[dict[str, Any]]:
     """把一段 Part 翻成模型消息。
 
@@ -961,7 +1019,11 @@ def _translate_assistant(parts: list[Part]) -> list[dict[str, Any]]:
                     {
                         "role": "tool",
                         "tool_call_id": part.id,
-                        "content": truncate_for_model(part.tool_output),
+                        "content": truncate_for_model(
+                            model_tool_output(part),
+                            tool_name=part.tool_name,
+                            tool_input=part.tool_input,
+                        ),
                     }
                 )
         elif content:

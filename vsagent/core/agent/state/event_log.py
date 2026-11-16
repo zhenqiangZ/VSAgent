@@ -298,7 +298,7 @@ def steps_from_messages(
     读的就是 Part，所以回填出来的流水与当场记的那份形状一致。
 
     **必须按 `STEP_START` 分段**：一条 assistant 消息装着一整轮的所有往返，
-    整条折成一步会把「第 1 步装了族、第 2 步才用它」压成一行。
+    整条折成一步会把「第 1 步读了文件、第 2 步才改它」压成一行。
     """
     from vsagent.core.agent.planning.context import step_segments
 
@@ -413,8 +413,7 @@ _TOOL_LABELS = {
     "open_viewer": "查看结构",
     "survey_structures": "结构全景",
     "fetch_structure": "取回结构",
-    "fetch_target": "查靶点",
-    "assess_campaign": "开工盘点",
+    "target_lookup": "查靶点",
     "detect_pockets": "找口袋",
     "define_pocket": "定口袋",
     "prepare_receptor": "准备受体",
@@ -832,15 +831,6 @@ class CloseTopicTool(Tool):
                         "只在第一次封存时传，会话已经有名字就不传。"
                     ),
                 },
-                "next_tools": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "下一个主题还要用哪些工具族（1–3 个，如 pocket、ligand）。"
-                        "封存时只预装这些，其余领域族全部卸载；不写就只留核心工具，"
-                        "下一主题需要什么再 load_tools。"
-                    ),
-                },
             },
             "required": ["title"],
             "additionalProperties": False,
@@ -878,40 +868,9 @@ class CloseTopicTool(Tool):
                 ),
                 failed=True,
             )
-        next_tools = [
-            str(item or "").strip()
-            for item in (arguments.get("next_tools") or [])
-            if str(item or "").strip()
-        ]
-        # 旧族名先展开：`scoring` 现在是 `docking` 与 `affinity` 两族。
-        if next_tools:
-            from vsagent.core.agent.toolset import expand_families
-
-            next_tools = expand_families(next_tools)
-        # 预装的族名写错时当场拒绝：否则封存会成功，下一个主题却什么都没预装，
-        # 模型要到下一步才发现，白花一步。**校验放在写会话字段之前**：
-        # 失败不能留下 topic_title，否则下一步会被这个失败的标题触发封存。
-        if next_tools:
-            from vsagent.core.agent.domain.all_tools import catalog
-
-            known = catalog()
-            unknown = [name for name in next_tools if name not in known]
-            if unknown:
-                return ToolResult(
-                    output=(
-                        f"next_tools 里没有这些族：{'、'.join(unknown)}。"
-                        f"可用：{'、'.join(known)}"
-                    ),
-                    failed=True,
-                )
         session.topic_title = title
         session.topic_summary = str(arguments.get("summary") or "").strip()[:EVENT_SUMMARY_MAX]
         session.topic_handoff = str(arguments.get("handoff") or "").strip()[:EVENT_HANDOFF_MAX]
-        # 主 agent 这一轮只编排：族由计划按角色发给子会话（`coordinator.run`），
-        # 预装到根会话没有用处——`hidden_names` 本来就不发，提示语还会让人以为
-        # 它下一步能自己用。子会话照旧预装，省一次 `load_tools`（P-83）。
-        principal = bool(getattr(session, "principal_only", False))
-        session.next_tools = [] if principal else next_tools
         session.pending_session_title = (
             str(arguments.get("session_title") or "").strip()[:SESSION_TITLE_MAX]
         )
@@ -922,14 +881,7 @@ class CloseTopicTool(Tool):
                 if value not in artifacts:
                     artifacts.append(value)
         produced = "、".join(artifacts[:5]) if artifacts else "（还没有产物）"
-        if principal:
-            next_note = "下一主题由计划按角色给族，主 agent 不预装。"
-        else:
-            next_note = (
-                f"下一主题预装：{'、'.join(session.next_tools)}。"
-                if session.next_tools
-                else "下一主题从核心工具开始。"
-            )
+        next_note = "下一主题的工具清单不变（由角色配置决定，不随主题切换）。"
         return ToolResult(
             output=(
                 f"已记下主题「{title}」（{len(session.pending_steps)} 步）。"

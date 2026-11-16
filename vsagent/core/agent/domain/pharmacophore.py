@@ -238,13 +238,10 @@ class BuildPharmacophoreTool(Tool):
     spec = ToolSpec(
         name="build_pharmacophore",
         description=(
-            "从一组已知活性里提炼**共识药效团**：疏水、氢键供体、氢键受体、芳香四类特征点，"
-            "只保留出现在足够多分子同一位置上的那些。" + CHEM_TOOL_DESCRIPTION_NOTE + "\n"
-            "两种 3D 来源：给 `docking` 就用对接位姿（它们已经在同一坐标系里，最稳）；"
-            "只给 `actives` 就现场生成构象并按最大公共子结构叠到第一个分子上——叠不上的"
-            "分子会被列出来，不静默丢掉。\n"
-            "**少于 5 个可用分子直接拒绝**：两三个分子的「共识」是那两个分子的个性。"
-            "筛的时候不做叠合（见 screen_pharmacophore），所以这里的共识只用来定特征与距离。"
+            "这组已知活性分子有哪些共同的特征点？\n"
+            "输入：actives 填活性配体集；给 docking 就用对接位姿，否则现场生成构象并叠到第一个分子；min_support 是共识阈值。\n"
+            "输出：药效团产物，含疏水、氢键供体、氢键受体、芳香四类特征点。\n"
+            "边界：少于 5 个可用分子直接拒绝；叠不上的分子会列出来，不静默丢掉；筛的时候不叠合，共识只用来定特征与距离。"
         ),
         parameters={
             "type": "object",
@@ -648,7 +645,7 @@ class ScreenPharmacophoreTool(Tool):
 
 
 def domain_tools() -> list[Tool]:
-    return [BuildPharmacophoreTool(), ScreenPharmacophoreTool()]
+    return [BuildPharmacophoreTool()]
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -982,15 +982,10 @@ class PrepareReceptorTool(Tool):
     spec = ToolSpec(
         name="prepare_receptor",
         description=(
-            "在用户确认受体结构之前不要调用。把一套实验坐标准备成**可以直接对接的受体**："
-            "选链、去水去杂、取共晶配体、算盒子、模板匹配与 PDBQT 参数化。"
-            "产物是一个目录，并登记成一条**状态为 prepared 的受体**。\n"
-            "默认只**预演**（列出会删掉哪些水与杂原子、盒子在哪、哪些残基匹配不上），"
-            "什么都不写盘；`confirm=true` 才真正写盘与登记。\n"
-            "**严格起步**：匹配不上的残基会被拒绝并列出来，要不要用 `relax=true` 丢掉由你决定；"
-            "交替构象必须显式选 `altloc`。只出刚性受体，不生成 3D 坐标、不指派质子化态。"
-            "上游先用 fetch_structure 或 import_structure 拿到 raw 结构。"
-            f"{CHEM_TOOL_DESCRIPTION_NOTE}"
+            "这套原始结构要怎么准备，才能直接交给对接？\n"
+            "输入：structure 填状态 raw 的受体；chain 选链；pocket 给口袋；altloc 必须显式选；confirm=true 才写盘。\n"
+            "输出：一个受体目录（结构、参数、盒子、体检报告），登记成状态 prepared 的受体。\n"
+            "边界：默认只预演，列出会删掉的水与杂原子、盒子位置与匹配不上的残基；只出刚性受体，不生成 3D 坐标、不指派质子化态。"
         ),
         parameters={
             "type": "object",
@@ -1123,7 +1118,7 @@ class PrepareReceptorTool(Tool):
                     output=(
                         f"{entry.handle} 指向的是一个目录（{entry.path}），不是坐标文件。"
                         "准备受体要的是一份**原始结构的 .pdb**（状态 raw 的那一条受体）；"
-                        "若这是一条准备后的受体，用 list_workspace 看它的状态是 prepared"
+                        "若这是一条准备后的受体，用 registry 看它的状态是 prepared"
                     ),
                     failed=True,
                 )

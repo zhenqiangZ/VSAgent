@@ -127,8 +127,7 @@ def task_preamble(
 
     `digest` 是父会话的工作区索引（`SessionLedger.digest()`），**只在没复制历史
     时才给**：fork 过来的子会话在历史里已经见过那些 handle，再列一遍是重复；
-    而 fresh 的只带着任务书，不给它就得自己 `list_workspace` —— 那还得先确认
-    装过 listing 族，两件事都可能白烧一步。
+    而 fresh 的只带着任务书，不给它就得自己调一次 `registry`，白烧一步。
     """
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime())
     lines = [
@@ -158,7 +157,8 @@ def task_preamble(
 class DispatchCampaignTool(Tool):
     """按当前任务规格发起一次多角色执行。
 
-    这是**唯一**的派发入口：角色、依赖与工具族都由能力计划算出来；`roles` 只能从
+    这是**唯一**的派发入口：角色与依赖都由能力计划算出来，工具由每个角色的配置决定；
+    `roles` 只能从
     计划里减，不能加。子 agent 之间不递归派发，深度守卫在下面。
     """
 
@@ -190,7 +190,7 @@ class DispatchCampaignTool(Tool):
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "只派这几种角色（括号内的名字，如 structure_pocket）；上游会自动补上。"
+                        "只派这几种角色（括号内的名字，如 pocket）；上游会自动补上。"
                         "计划里没有的角色会按其能力表补进这次派发（用于中途发现要补一步）。"
                         "不给则整份计划都派"
                     ),
@@ -377,7 +377,7 @@ def _requested_roles(arguments: dict[str, Any]) -> list[str] | None:
     if raw is None:
         return None
     if not isinstance(raw, list) or not raw:
-        raise ToolError('roles 要写成数组，例如 ["structure_pocket"]')
+        raise ToolError('roles 要写成数组，例如 ["pocket"]')
     roles = [str(item).strip() for item in raw if str(item).strip()]
     if not roles:
         raise ToolError("roles 里没有有效的角色名")
@@ -579,6 +579,45 @@ def _cap_report(text: str, limit: int = REPORT_TOKENS) -> str:
     return "\n".join(kept) + note
 
 
+def _report_evidence(child: Session) -> list[dict]:
+    """子会话报告里的证据对象，供父会话建立一场的证据池。
+
+    与 `_report_lines` 用的是同一份报告；证据对象不塞进给模型看的那段文字，
+    只放进工具结果的 `meta` 里，由循环层交给答案状态。
+    """
+    from vsagent.core.agent.roles.profiles import profile
+    from vsagent.core.agent.execution.reports import build
+
+    try:
+        spec = profile(child.agent_role)
+    except KeyError:
+        return []
+    built = build(
+        child, spec, task_id=child.task_id, campaign_id=child.campaign_id
+    )
+    # 只带父会话建立证据池需要的字段，正文截短：这份元数据会写进状态文件，
+    # 一条证据的全文留在子会话的答案状态里。
+    trimmed: list[dict] = []
+    for item in built.report.evidence:
+        trimmed.append(
+            {
+                "id": item.get("id", ""),
+                "content": str(item.get("content") or "")[:400],
+                "source": item.get("source", ""),
+                "source_type": item.get("source_type", ""),
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "published_at": item.get("published_at", ""),
+                "metadata": {
+                    key: value
+                    for key, value in (item.get("metadata") or {}).items()
+                    if key in ("pmid", "doi", "ref", "handle")
+                },
+            }
+        )
+    return trimmed
+
+
 class AgentStatusTool(Tool):
     """查看子 agent 的状态与结论，可选等它们跑完。
 
@@ -647,6 +686,7 @@ class AgentStatusTool(Tool):
 
         shown = children[:MAX_REPORTS]
         lines: list[str] = []
+        evidence: list[dict] = []
         head = _campaign_line(session)
         if head:
             lines.append(head)
@@ -663,6 +703,7 @@ class AgentStatusTool(Tool):
             lines.append("  结论：" + (result.replace("\n", "\n  ") if result else "（还没有回复）"))
             if child.agent_role and child.status in ("done", "failed", "cancelled"):
                 lines.extend(_report_lines(child))
+                evidence.extend(_report_evidence(child))
             files = _output_files(child)
             if files:
                 shown_files = "、".join(files[:5])
@@ -676,5 +717,10 @@ class AgentStatusTool(Tool):
             )
         return ToolResult(
             output=_cap_report("\n".join(lines)),
-            meta={"count": len(children), "wait": bool(arguments.get("wait"))},
+            meta={
+                "count": len(children),
+                "wait": bool(arguments.get("wait")),
+                # 证据对象交给循环层，不进给模型看的那段文字。
+                "evidence": evidence[:30],
+            },
         )

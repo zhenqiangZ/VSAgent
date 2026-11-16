@@ -46,7 +46,7 @@ SNAPSHOT_VERSION = 1
 DIGEST_MAX_LINES = 10
 DIGEST_ARTIFACT_LIMIT = 5
 # 一行里摘要的长度上限。索引不是清单：摘要只是帮模型认出「这个是干什么的」，
-# 细节用 describe_entry 取。
+# 细节用 registry(handles=…) 取。
 DIGEST_LINE_CHARS = 60
 # 配体集只列 handle、不列摘要，一行最多这么多个。
 DIGEST_HANDLE_LIMIT = 5
@@ -507,7 +507,7 @@ class SessionLedger:
             entry = self._entries.get(key)
             if entry is None:
                 raise LedgerError(
-                    f"登记表里没有 {key}。先用 list_workspace 看清有哪些条目，"
+                    f"登记表里没有 {key}。先用 registry 看清有哪些条目，"
                     "不要凭记忆写 handle"
                 )
             return entry

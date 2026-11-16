@@ -259,17 +259,10 @@ class FitAffinityTool(Tool):
     spec = ToolSpec(
         name="fit_affinity",
         description=(
-            "DTA 通道的固定前置：用该靶点的**实测活性**把 VCrossFormer 微调到这个受体上，"
-            "产出登记成 artifact（kind=model），之后用 `score_affinity(model=…)` 推理。"
-            "训练在 DTA 的独立环境里跑，CPU 上 5–10 分钟。默认只预演，confirm=true 才真跑。\n"
-            "**适用**：靶点有 ≥40 个带 pChEMBL 的化合物，受体保留了与选定口袋对应的共晶"
-            "配体；要用结构模型给出亲和力排序，并愿意等几分钟。\n"
-            "**局限**：只对训练时的口袋有效，换口袋或换受体要重训；40–100 个活性时排序力"
-            "有限（100 个→ρ 0.04、300 个→0.18、726 个→0.39）；与「ECFP4 + LightGBM」打平，"
-            "不超越；`mode=head` 只修绝对尺度，排序不变好；验证集小，RMSE 波动大，"
-            "RMSE 不代表排序力；训练数据来自 ChEMBL，测定条件混杂。\n"
-            "需要 `search_actives` 产出的带 pchembl 的配体集；`search_analogs` / "
-            "`import_ligandset` 的产物没有实测值，训不了。"
+            "这个靶点的实测活性够不够微调一个亲和力模型？\n"
+            "输入：receptor 填已准备的受体，ligands 填带 pchembl 的活性配体集；confirm=true 才真训。\n"
+            "输出：kind=model 的 artifact，之后交给 score_affinity 推理。\n"
+            "边界：至少要 40 个带实测活性的化合物；只对训练时的口袋有效，换口袋要重训；40–100 个活性时排序力有限，结论要报样本量。"
         ),
         parameters={
             "type": "object",
@@ -329,7 +322,7 @@ class FitAffinityTool(Tool):
         if not raw_receptor or not raw_ligands:
             return ToolResult(
                 output="缺少参数：receptor 与 ligands 都要给。"
-                       "先 list_workspace 看清手上有什么。",
+                       "先 registry 看清手上有什么。",
                 failed=True,
             )
 

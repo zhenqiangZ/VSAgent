@@ -1,46 +1,34 @@
-"""能力守卫：这一步用的工具族，在不在计划里。
+"""能力守卫：这一步调用的工具，在不在这个会话的名单里。
 
-它守的是"计划说只做结构，模型却去调用对接"这一类越界。判据只有一条：
-工具所属的族必须在计划的 `tool_families` 里；常驻工具（不属于任何族）不在此列，
-它们由工具档位管。
+它守的是「计划说只做结构，模型却去调用对接」这一类越界。判据只有一条：
+工具名必须在 `Session` 的允许清单里（名单来自 `agents.toml` 与基础档）。
 
-**有意的宽松**：计划为空、或一个族都没写时，什么都不拦。原因是这条规则只在
-`enforce` 模式下才真的阻断，而计划缺失往往意味着解析失败——那种时候应当回退到
-原来的路径，不是把工具全锁死。
+**有意的宽松**：名单为 `None`（full 档、调试与回滚）时不拦。名单为空也不拦：
+那多半是装配出了问题，回退到原来的路径比把工具全锁死更安全。
 """
 
 from __future__ import annotations
 
-from vsagent.core.agent.roles.contracts import CapabilityPlan
-from ..toolset import family_of
+from typing import Iterable
+
 from .base import Finding
 
 NAME = "capability_guard"
 
 
-def check(tool_name: str, plan: CapabilityPlan | None) -> list[Finding]:
-    if plan is None:
+def check(tool_name: str, allowed: Iterable[str] | None = None) -> list[Finding]:
+    if allowed is None:
         return []
-    family = family_of(tool_name)
-    if not family:
-        # 常驻工具（bash、read、load_tools……）不属于任何族：它们是执行通道，
-        # 不是某一项科研能力的产物工具。
-        return []
-    allowed: list[str] = []
-    for names in plan.tool_families.values():
-        for name in names:
-            if name not in allowed:
-                allowed.append(name)
-    if family in allowed:
+    names = set(allowed)
+    if not names or tool_name in names:
         return []
     return [
         Finding(
             validator=NAME,
-            code="family_not_planned",
+            code="tool_not_allowed",
             message=(
-                f"{tool_name} 属于 {family} 族，但这次计划里只有 "
-                f"{'、'.join(allowed) or '（空）'}。先回到计划：确实需要这一族，"
-                "就说明理由并重新规划；不需要就换一条路。"
+                f"这个角色没有装配 {tool_name}。要它请改 agents.toml，"
+                "或把这件事派给装了它的角色。"
             ),
             severity="deny",
         )

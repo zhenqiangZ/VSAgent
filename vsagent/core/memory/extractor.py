@@ -18,7 +18,8 @@ EXTRACT_CONFIDENCE = 0.6
 
 SCHEMA_HINT = (
     '{"memories": [{"text": "一行事实", "kind": "fact|experience", '
-    '"refs": ["文件路径"], "confidence": 0.0-1.0, "expires_days": 0}]}'
+    '"refs": ["文件路径"], "source_type": "experiment|literature|database|corpus", '
+    '"confidence": 0.0-1.0, "expires_days": 0}]}'
 )
 
 
@@ -111,6 +112,13 @@ def apply(
         if kind is MemoryKind.PREFERENCE:
             kind = MemoryKind.FACT
         refs = _clean_refs(store.workspace_root, raw.get("refs"))
+        from . import admission
+
+        source_type = str(raw.get("source_type") or "experiment").strip()
+        decision = admission.check(text, refs, kind.value, source_type=source_type)
+        if not decision.allowed:
+            dropped += 1
+            continue
         live = [entry for entry in store.entries.values() if entry.is_live()]
         if any(overlap(text, entry.text) >= EXTRACT_DUP_OVERLAP for entry in live):
             dropped += 1

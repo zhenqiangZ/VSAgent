@@ -46,8 +46,11 @@ jobs:
       # 能力表与工具目录对账、常驻工具预算：读源码，不跑模型。
       - run: python tools/check_capabilities.py
       - run: python tools/check_toolset.py
+      - run: python tools/check_tool_descriptions.py
+      # 工具清单是生成物：与注册表逐字节比对，改了工具忘了重跑就红。
+      - run: python tools/check_tools_doc.py
       # 前缀判据：预算、点名工具首步可见性、越界参数表与工具 schema 一致、Plan 类别覆盖。
-      # 它要装全部 68 个工具、读真实的 AGENTS.md，比 test_agent 里那一组贵，所以单独跑。
+      # 它要装全部 72 个工具、读真实的 AGENTS.md，比 test_agent 里那一组贵，所以单独跑。
       - run: python tools/check_prefix.py
       # 样式判据：终端色值只在 palette.py，网页字号六档、间距八档，变量声明与引用两边都有。
       # 只读源码与 palette.py，不装依赖也能跑；挂在这个 job 上省一次 checkout 与 setup。

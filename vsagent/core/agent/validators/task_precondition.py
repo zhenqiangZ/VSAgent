@@ -16,7 +16,15 @@ from .base import Finding
 
 NAME = "task_precondition"
 
-_EXECUTE_FAMILIES = ("docking", "affinity", "screen", "pharmacophore", "receptor", "ligand")
+# 会产出新东西的工具。任务还是草稿时不让它们跑。
+_EXECUTE_TOOLS = frozenset({
+    "prepare_receptor", "prepare_ligands", "curate_ligands", "import_ligandset",
+    "build_reference_set", "dock", "validate_docking", "fit_affinity",
+    "score_affinity", "rank_library", "pick_diverse", "build_pharmacophore",
+    "align_ligands", "detect_pockets", "define_pocket", "switch_receptor",
+    "rank_candidates", "predict_admet", "efficiency_profile", "record_assay",
+    "enumerate_analogs", "write_run",
+})
 
 
 def check(tool_name: str, task: TaskSpec | None) -> list[Finding]:
@@ -46,9 +54,7 @@ def check(tool_name: str, task: TaskSpec | None) -> list[Finding]:
                 severity="warn",
             )
         )
-    from ..toolset import family_of
-
-    if family_of(tool_name) in _EXECUTE_FAMILIES and task.status == "draft":
+    if tool_name in _EXECUTE_TOOLS and task.status == "draft":
         findings.append(
             Finding(
                 validator=NAME,

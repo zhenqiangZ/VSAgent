@@ -274,32 +274,59 @@ def _render_scaffolds(handle: str, groups: Sequence[dict[str, Any]],
     return "\n".join(lines)
 
 
+# MCS 的默认口径。8 个原子大约是「两个并环」的规模：更小的共同子结构在多数
+# 分子之间都能找到，说明不了「这批有共同骨架」。
+DEFAULT_MCS_ATOMS = 8
+MAX_MCS_ATOMS = 50
+DEFAULT_MCS_TIMEOUT = 10
+MAX_MCS_TIMEOUT = 60
+MAX_MCS_GROUPS = 20
+MCS_MIN_GROUP = 3
+"""组内至少这么多个分子才单独算一次：两个分子的 MCS 就是它们各自的公共部分，
+在组里说「这组有共同骨架」没有意义。"""
+
+
 class ScaffoldAnalysisTool(Tool):
     """按 Murcko 骨架把一批分子分组。"""
 
     spec = ToolSpec(
         name="scaffold_analysis",
         description=(
-            "按 **Murcko 骨架**把一批分子分组：每个骨架下有多少个、代表分子是谁"
-            "（组内分数最好的那个）。" + CHEM_TOOL_DESCRIPTION_NOTE + "\n"
-            "输入可以是候选表（带分数，代表分子按分数取）或配体集（按出现顺序）。"
-            "`level=murcko` 保留原子的元素类型，`generic` 把杂原子抹成碳（看的是环的拓扑）。"
-            "无环分子单独归到 acyclic——它们没有骨架，混进别的组会让那一组失去意义。\n"
-            "小于 min_size 的组不单列但仍计数：一个骨架只有 1 个分子时，它说明不了什么，"
-            "可它确实占了库里的位置。"
+            "这批分子按骨架分成哪几组，跨组共有的子结构是什么？\n"
+            "输入：source 填候选表或配体集；mode 选 groups（默认，按 Murcko 骨架分组）"
+            "或 mcs（最大共同子结构，先组内、再跨组）。\n"
+            "输出：groups 给每组的分子数与代表分子；mcs 给共同子结构与覆盖不到的分子及原因。\n"
+            "边界：这是二维骨架，三维形状用 analyze_pose；无环分子单独归到 acyclic，"
+            "不混进别的组。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "source": {"type": "string", "description": "候选表或配体集的 handle"},
-                "level": {"type": "string", "description": "murcko（默认）/ generic"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["groups", "mcs"],
+                    "description": "groups 分组（默认）；mcs 找最大共同子结构",
+                },
+                "level": {
+                    "type": "string",
+                    "description": "groups 时用：murcko（默认，保留元素）/ generic（杂原子抹成碳）",
+                },
                 "min_size": {
                     "type": "integer",
-                    "description": "小于它的组不单列，默认 2",
+                    "description": "groups 时用：小于它的组不单列，默认 2",
+                },
+                "min_atoms": {
+                    "type": "integer",
+                    "description": f"mcs 时用：共同子结构至少几个原子，默认 {DEFAULT_MCS_ATOMS}",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": f"mcs 时用：每次最多算几秒，默认 {DEFAULT_MCS_TIMEOUT}",
                 },
                 "top": {
                     "type": "integer",
-                    "description": f"最多列几组，默认 20，上限 {MAX_TOP}",
+                    "description": f"最多列几组，groups 默认 20、mcs 默认 10，上限 {MAX_TOP}",
                 },
                 "name": {"type": "string", "description": "显示名，只影响产物目录名"},
             },
@@ -317,9 +344,17 @@ class ScaffoldAnalysisTool(Tool):
                 output="内核装配问题：scaffold_analysis 需要一个会话登记表，但这次调用没有拿到。",
                 failed=True,
             )
+        mode = str(arguments.get("mode") or "groups").strip().lower()
+        if mode == "mcs":
+            return await CommonFeaturesTool().run(arguments)
+        if mode != "groups":
+            return ToolResult(
+                output=f"mode 只认 groups / mcs，收到 {mode!r}",
+                failed=True,
+            )
         raw = str(arguments.get("source") or "").strip()
         if not raw:
-            return ToolResult(output="缺少参数 source。先 list_workspace。", failed=True)
+            return ToolResult(output="缺少参数 source。先 registry。", failed=True)
         try:
             entry = ledger.get(raw)
         except Exception as error:
@@ -540,18 +575,6 @@ def _render_mmp(handle: str, pairs: Sequence[dict[str, Any]], scanned: int,
     return "\n".join(lines)
 
 
-# MCS 的默认口径。8 个原子大约是「两个并环」的规模：更小的共同子结构在多数
-# 分子之间都能找到，说明不了「这批有共同骨架」。
-DEFAULT_MCS_ATOMS = 8
-MAX_MCS_ATOMS = 50
-DEFAULT_MCS_TIMEOUT = 10
-MAX_MCS_TIMEOUT = 60
-MAX_MCS_GROUPS = 20
-MCS_MIN_GROUP = 3
-"""组内至少这么多个分子才单独算一次：两个分子的 MCS 就是它们各自的公共部分，
-在组里说「这组有共同骨架」没有意义。"""
-
-
 def _mcs(mols: Sequence[Any], *, timeout: int) -> tuple[str, int, bool]:
     """跑一次最大共同子结构。返回 `(SMARTS, 原子数, 是否超时)`。
 
@@ -634,7 +657,7 @@ class CommonFeaturesTool(Tool):
             )
         raw = str(arguments.get("source") or "").strip()
         if not raw:
-            return ToolResult(output="缺少参数 source。先 list_workspace。", failed=True)
+            return ToolResult(output="缺少参数 source。先 registry。", failed=True)
         try:
             entry = ledger.get(raw)
         except Exception as error:
@@ -802,13 +825,10 @@ class MatchedPairsTool(Tool):
     spec = ToolSpec(
         name="matched_pairs",
         description=(
-            "找**匹配分子对**（MMP）：共用同一个骨架、只在**一侧**切掉一个基团而不同的"
-            "分子对，并给出活性差。" + CHEM_TOOL_DESCRIPTION_NOTE + "\n"
-            "分数方向按来源自动取（dock 越低越好、相似度越高越好），所以「谁更优」不用"
-            "模型判断。只做**单侧**切分（一次切一刀）：双侧切出来的对子证据力弱得多，"
-            "而且数量会爆炸。\n"
-            "最小差值 `min_delta` 过滤掉噪声级的差别。没有对子时返回空并说明，"
-            "不硬凑——这通常意味着库太小或分子之间差异太大。"
+            "同一骨架上只改一处基团，活性差多少？\n"
+            "输入：source 填候选表或配体集；min_delta 过滤噪声级的差别；max_cut 控制切分大小。\n"
+            "输出：匹配分子对，带两侧的分数与差值；分数方向按来源自动取。\n"
+            "边界：只做单侧切分，一次切一刀；双侧切出来的对子证据力弱得多；没有对子时返回空并说明，不勉强凑数。"
         ),
         parameters={
             "type": "object",
@@ -838,7 +858,7 @@ class MatchedPairsTool(Tool):
             )
         raw = str(arguments.get("source") or "").strip()
         if not raw:
-            return ToolResult(output="缺少参数 source。先 list_workspace。", failed=True)
+            return ToolResult(output="缺少参数 source。先 registry。", failed=True)
         try:
             entry = ledger.get(raw)
             expect_handle(entry, ArtifactHandle, "source")
@@ -1053,12 +1073,10 @@ class EnumerateAnalogsTool(Tool):
     spec = ToolSpec(
         name="enumerate_analogs",
         description=(
-            "把**骨架**与**替换基团**重新组合，生出一批候选分子（登记成配体集，"
-            "可直接进 prepare_ligands）。" + CHEM_TOOL_DESCRIPTION_NOTE + "\n"
-            "骨架与基团都来自 `scaffold_analysis` 的同一个分组：组里的分子在同一个核心上"
-            "换着不同的基团，把它们交叉组合就是「这个骨架还能怎么改」。\n"
-            "生成出来的分子**没算过活性**，只是结构上成立：化合价不合理或重复的会被跳过"
-            "并计数，性质窗口（与 curate_ligands 同名同义）可以顺手过滤。"
+            "这个骨架还能怎么改，能生出哪些分子？\n"
+            "输入：scaffold 与 group 填 scaffold_analysis 的分组；max 控制个数；max_mw 与 max_logp 过滤性质。\n"
+            "输出：新配体集，可直接进 prepare_ligands。\n"
+            "边界：生成的分子没有算过活性，只是结构上成立；化合价不合理或重复的会跳过并计数。"
         ),
         parameters={
             "type": "object",
@@ -1460,19 +1478,10 @@ class RecordAssayTool(Tool):
     spec = ToolSpec(
         name="record_assay",
         description=(
-            "把用户测回来的**实验数据**记进 `runs/<campaign>/assay.csv`。"
-            "这是全库**唯一**收文件路径的领域动作之一——实验数据来自用户，模型编不出来源。\n"
-            "CSV 至少要有分子标识与数值两列（列名认 molecule / id / compound 与 "
-            "value / ic50 / activity）；数值支持限定符 `>10000`、`<1`。"
-            "同一个 (分子, 测定) 重复出现时**保留最新的那条**，旧值进 "
-            "`assay-history.csv`，不丢。\n"
-            "**给了 `hypothesis` 就顺手结案**：把预期与这一批实测逐条比，"
-            "返回达标 / 不达标 / 判不了各几条，并把那条假设改成 supported / refuted / "
-            "inconclusive。这是假设闭环的唯一入口——没有它，假设提了就没人管。\n"
-            "**给了 `batch` 就算这一批的账**：本批挑出几个、实测几个、哪几个还没测、"
-            "达标几个、产出率多少。产出率的分母是实测数，不是挑出数——合成失败进不了"
-            "这张表，没排上实验的还能补测，两者不能混成一个数。\n"
-            "写盘是原子的：中途失败不会留下半截表。别的 campaign 的文件一个字节都不动。"
+            "用户测回来的这批数据怎么记，假设能不能结案？\n"
+            "输入：file 填实验数据 CSV（至少要有分子标识与数值两列）；campaign 与 assay 定这张表；batch 填这一批的配体集。\n"
+            "输出：写进 runs/<campaign>/assay.csv；给了 hypothesis 就逐条比预期，返回达标、不达标与判不了各几条，并改假设状态。\n"
+            "边界：同一个分子与测定的重复记录保留最新一条，旧值进 assay-history.csv；写盘是原子的，别的 campaign 一个字节都不动。"
         ),
         parameters={
             "type": "object",
@@ -1741,7 +1750,7 @@ class RecordAssayTool(Tool):
 
 
 def domain_tools() -> list[Tool]:
-    return [ScaffoldAnalysisTool(), CommonFeaturesTool(), MatchedPairsTool(),
+    return [ScaffoldAnalysisTool(), MatchedPairsTool(),
             EnumerateAnalogsTool(), RecordAssayTool()]
 
 

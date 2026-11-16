@@ -103,6 +103,15 @@ class RememberTool(Tool):
                         "数值更新用 supersedes 那种说法写新的一条即可"
                     ),
                 },
+                "source_type": {
+                    "type": "string",
+                    "enum": ["user", "experiment", "literature", "database", "corpus"],
+                    "description": (
+                        "这条内容的来源类别，默认 user（用户确认）。"
+                        "文献、数据库、语料与实验结果要带 refs；"
+                        "原始查询结果不要写进长期记忆。"
+                    ),
+                },
             },
             "required": ["text"],
             "additionalProperties": False,
@@ -138,12 +147,20 @@ class RememberTool(Tool):
             kind = parse_kind(arguments.get("kind") or MemoryKind.FACT.value)
         except MemoryError as error:
             raise ToolError(str(error)) from error
+        source_type = str(arguments.get("source_type") or "user").strip()
+        from vsagent.core.memory import admission
+
+        decision = admission.check(text, refs, kind.value, source_type=source_type)
+        if not decision.allowed:
+            raise ToolError(f"这条不写进长期记忆：{decision.reason}")
         try:
             entry = self.store.remember(
                 text,
                 refs,
                 kind=kind,
-                source="agent",
+                # 来源类别接在来源后面：事后查账能看出这条是用户确认的，
+                # 还是文献、数据库或实验记录。
+                source=f"agent:{source_type}",
                 ttl_days=float(raw_ttl),
                 conflicts=conflicts,
             )

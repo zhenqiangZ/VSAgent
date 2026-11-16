@@ -13,7 +13,6 @@
 
 **为什么不算「接触」与「打分」。** `contacts`（逐原子接触对）要真实位姿，
 `score` 要对接程序。本轮两样都没有，**字段本身不出现**——写 0 会被当成「算出来是零」。
-见 `docs/design.md` §八。
 
 数值一律现算，**绝不接受调用方传进来的距离**：模型心算的 `min_distance: 2.67`
 看上去永远很像对的，而页面上几十个这样的值没有一个是真的。
@@ -873,7 +872,7 @@ class WriteRunTool(Tool):
         raw = arguments.get("receptor")
         if raw is None or str(raw).strip() == "":
             return ToolResult(
-                output="缺少参数 receptor。先 list_workspace 看清有哪份受体，再把它的 handle 传进来。",
+                output="缺少参数 receptor。先 registry 看清有哪份受体，再把它的 handle 传进来。",
                 failed=True,
             )
         try:
@@ -1335,12 +1334,12 @@ def _no_coordinate_note(entry: Any) -> str:
     if path is not None and path.is_dir():
         return (
             f"{entry.handle} 指向的产物目录里没有坐标文件（{path}）："
-            "这份产物可能被覆盖或删过。用 list_workspace 核对工作区，"
+            "这份产物可能被覆盖或删过。用 registry 核对工作区，"
             "或回到原始结构（状态 raw 的那一条受体）重新准备一次。"
         )
     return (
         f"{entry.handle} 的坐标文件不在了（{path}）。"
-        "先用 list_workspace 核对工作区，或重新取一份结构。"
+        "先用 registry 核对工作区，或重新取一份结构。"
     )
 
 

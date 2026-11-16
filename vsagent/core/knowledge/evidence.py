@@ -217,6 +217,19 @@ class EvidenceStore:
         if len(self._items) > self.limit:
             del self._items[: len(self._items) - self.limit]
 
+    def drop(self, prefix: str) -> None:
+        """删掉引用名以某个前缀开头的证据。
+
+        搜索增强推理每一步会重新放一批筛选后的证据；按前缀删掉上一批，
+        证据层里就不会越积越多。前缀为空时什么都不做，避免误把整层清空。
+        """
+        name = (prefix or "").strip()
+        if not name:
+            return
+        self._items = [
+            item for item in self._items if not item.ref.startswith(name)
+        ]
+
     def add_from_part(self, part: Part, tool: Any = None) -> None:
         """把一次工具调用的结果提炼成一条证据。
 

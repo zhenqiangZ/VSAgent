@@ -32,12 +32,12 @@
   在一份登记表里串起来——单跑某个模块时没有这个保证，前置没做过的工具会照实报
   「依赖不存在」。
 - **注入物必须是真的。** `Tool.execute` 对「声明了某个通道却收到 None」直接返回
-  「内核装配问题」，而 `fetch_target` / `list_workspace` 这类工具里还有
+  「内核装配问题」，而 `target_lookup` / `registry` 这类工具里还有
   `isinstance(ledger, SessionLedger)` 的硬校验——所以这里造一个真的 `SessionLedger`，
   拿 None 糊弄只会得到一句与参数无关的报错。
 - **登记表写在 `.probe/debug-ledger.json`**，不碰 `~/.vsagent/ledger/` 里真实的
   会话快照。单个工具模式下它在两次命令之间是**接着用**的：先跑 `fetch_structure`，
-  再跑 `list_workspace`，能看到刚登记的那一条——正好当一轮会话使。全跑模式开跑前
+  再跑 `registry`，能看到刚登记的那一条——正好当一轮会话使。全跑模式开跑前
   清空，保证每次跑的都是同一份起点。
 - **handle 写占位，不写编号。** 参数里可以写 `{receptor:raw}`（最新的、阶段是 raw 的
   受体）或 `{artifact}`（最新的产物），开跑前从登记表现取。直接写 `receptor#3` 会在
@@ -81,14 +81,12 @@ from vsagent.env import load_env
 # 新加工具时在这里补一行（漏掉也不会丢，会接在末尾跑，只是顺序不一定对）。
 CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     # 先看空表——它会自己说「表是空的」，这就是它空手跑的意义
-    ("list_workspace", {}),
-    # 靶点：检索 → 取详情
-    ("search_targets", {"query": "EGFR", "limit": 5}),
-    ("fetch_target", {"accession": "P00533"}),
-    # 开工前的盘点：受体侧（结构数、最佳分辨率、AlphaFold）与配体侧（活性条数、
-    # 骨架分组、匹配对密度）一起看，给出四条候选起点与一条推荐。**不给 receptor**：
-    # 这一步还没有受体。它取 ChEMBL 时两端各拉一份（最强与最弱），所以要跑几十秒。
-    ("assess_campaign", {"accession": "P00533"}),
+    ("registry", {}),
+    # 展开一个编号：空表时会照实报「一个编号也没查到」
+    ("registry", {"handles": []}),
+    # 靶点：按名称检索 → 按编号取详情（同一件工具的两条路）
+    ("target_lookup", {"query": "EGFR", "limit": 5}),
+    ("target_lookup", {"accession": "P00533"}),
     # 全部实验结构的全景：按配体分组，每组套数与最佳分辨率。用 Q15858（Nav1.7，
     # 44 套）是因为它同时有小分子配体、肽类毒素与大量脂质——分组口径在这里最容易露馅。
     ("survey_structures", {"accession": "Q15858"}),
@@ -158,6 +156,7 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("rank_candidates", {
         "sources": "{artifact:docking},{artifact:affinity}",
         "top": 5,
+        "with_controls": True,
     }),
     # 看某一条的接触依据：只读，不登记。分子用 id（夹具里的名字，不是序号）。
     # interactions 打开 PLIP 指纹：本机没装 plip 时这一段变成一句安装说明，
@@ -169,27 +168,33 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     }),
     # 同一个分子的多个对接模式：看第二种摆法是不是真的不同。只读，不登记。
     ("alternative_poses", {"docking": "{artifact:docking}", "molecule": "aspirin"}),
+    # 两个位姿的差别：同一受体、同一坐标系里直接量 RMSD，再比接触与氢键。只读。
+    ("compare_poses", {
+        "docking_a": "{artifact:docking}",
+        "molecule_a": "aspirin",
+        "docking_b": "{artifact:docking}",
+        "molecule_b": "aspirin",
+    }),
     # 同一个位姿换个问法：分数是疏水堆出来的，还是极性原子白埋了。纯几何，不需要 plip。
     ("analyze_hydrophobic", {"docking": "{artifact:docking}", "molecule": "aspirin"}),
     # 整批的接触频次：这一批是不是都挤在同一个亚口袋。只读，不登记。
     ("contact_map", {"docking": "{artifact:docking}", "top": 10}),
     # 整批的效率体检：每颗重原子换来多少分、有没有靠亲脂性堆出来的「大而油」。
     ("efficiency_profile", {"docking": "{artifact:docking}", "top": 5}),
-    # 对照分子：正向 / 阴性 / 背离各挑一个，并说明为什么算对照。
-    # 只读候选表；候选表没生成时这一条会照实失败并说清缺哪个 handle。
-    ("pick_controls", {"source": "{artifact:candidates}"}),
     # 参考活性集：导一份带 pChEMBL 的 CSV（第三个收路径的动作），按活性下限筛一遍。
     # 4 条里 1 条低于 6、1 条命中 PAINS（只标不删），所以参考集只有 3 条 → too_small。
     ("import_ligandset", {"path": "tests/fixtures/actives.csv"}),
     ("build_reference_set", {"actives": "{ligandset:raw}", "min_pchembl": 6}),
     # 两条不看靶点的通道：2D 指纹（毫秒级）与 3D 形状（读已备的 PDBQT）。
     # 库用筛过的那一份；`{ligandset:raw}` 现在指向刚导入的活性集，别用错了。
-    ("screen_similarity", {
+    ("rank_library", {
+        "method": "similarity",
         "query": "{ligandset:reference}",
         "library": "{ligandset:curated}",
         "top": 5,
     }),
-    ("screen_shape", {
+    ("rank_library", {
+        "method": "shape",
         "query": "{receptor:prepared}",
         "library": "{ligandset:prepared}",
         "top": 5,
@@ -208,7 +213,7 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     # 候选表来自 rank_candidates；那一步没跑成时这几条会照实失败。
     ("scaffold_analysis", {"source": "{artifact:candidates}", "min_size": 1}),
     # 这批 hit 的共同子结构：组内一次、跨组一次。二维 MCS，不是三维形状。
-    ("common_features", {"source": "{artifact:candidates}", "min_atoms": 6}),
+    ("scaffold_analysis", {"source": "{artifact:candidates}", "mode": "mcs", "min_atoms": 6}),
     ("matched_pairs", {"source": "{artifact:candidates}", "min_delta": 0.5}),
     ("enumerate_analogs", {"scaffold": "{artifact:scaffolds}", "group": 1, "max": 10}),
     # 药效团：一份同系列 6 个分子（前一节的参考集只有 3 条，凑不出共识）。
@@ -216,7 +221,8 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("import_ligandset", {"path": "tests/fixtures/series.csv"}),
     ("align_ligands", {"ligands": "{ligandset:raw}"}),
     ("build_pharmacophore", {"actives": "{ligandset:aligned}", "min_support": 0.5}),
-    ("screen_pharmacophore", {
+    ("rank_library", {
+        "method": "pharmacophore",
         "pharmacophore": "{artifact:pharmacophore}",
         "library": "{ligandset:raw}",
         "top": 5,
@@ -250,8 +256,8 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("search_literature", {"query": "EGFR inhibitor resistance", "limit": 5}),
     # Europe PMC：一步检索（含预印本与被引次数），再从 OA 条目里读一节正文。
     # 后面那条用的是一篇 2025 年的开放获取文章（Frontiers in Pharmacology）；
-    # 它哪天被撤下，这一条会照实失败，换成 search_europepmc 结果里的任意 PMCID 即可。
-    ("search_europepmc", {"query": "EGFR T790M resistance", "limit": 5}),
+    # 它哪天被撤下，这一条会照实失败，换成 search_literature(source=europepmc) 结果里的任意 PMCID 即可。
+    ("search_literature", {"query": "EGFR T790M resistance", "source": "europepmc", "limit": 5}),
     ("read_fulltext", {"article": "PMC12545111", "section": "results", "max_chars": 800}),
     # 本地语料：把仓里那份夹具文献导进去 → 检索 → 按页读。
     # 导入会**真的写进 `corpus/doc/`**（已 gitignore），用一份小 PDF 而不是整篇论文。
@@ -294,8 +300,10 @@ CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
         "candidates": "P04626",
         "residues": "745,788,790",
     }),
+    # 结构叠合：原始结构当参考、准备后的当待叠（同一套坐标，RMSD 应当接近 0）。只读。
+    ("align_structures", {"fixed": "{receptor:raw}", "moving": "{receptor:prepared}"}),
     # 最后回来看准备后的受体那一条
-    ("describe_entry", {"handle": "{receptor:prepared}"}),
+    ("registry", {"handles": ["{receptor:prepared}"]}),
     # 微调：**这里只跑预演**（confirm=false）。真训一次要 5–10 分钟、还要 DTA 的
     # 独立环境，把它塞进全跑会让这个脚本从「几分钟」变成「半小时」。
     # 预演仍然走完整的前置校验：受体必须是 prepared 且留了 ligand.pdb，

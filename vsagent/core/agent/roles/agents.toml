@@ -1,0 +1,71 @@
+# 每个角色的工具清单。会话建立时定稿，运行当中不变。
+#
+# 三份按顺序读：这份包内默认 → 项目 <root>/.vsagent/agents.toml → 用户
+# ~/.vsagent/agents.toml。同一个角色以靠后的那一整段为准，不按工具逐个合并。
+#
+# `core` 只能取 orchestrator / worker / full；`tools` 里可以写领域工具，也可以写
+# 常驻工具（`hypothesis`、`open_viewer`、`survey_structures`）或共享设施
+# （`registry`、`add_evidence`、`workspace`），装配时并进这一档的名单。
+
+[core.orchestrator]
+tools = ["bash", "read", "write", "patch", "grep", "remember", "recall",
+         "task", "hypothesis", "read_turn", "search_history", "close_topic",
+         "recall_event", "write_run", "registry", "open_viewer", "agent_status",
+         "dispatch_campaign"]
+
+[core.worker]
+tools = ["bash", "read", "write", "patch", "grep", "recall", "task",
+         "close_topic", "recall_event", "write_run", "registry",
+         "add_evidence", "workspace"]
+
+# 调试与回滚用：全部工具。
+[core.full]
+tools = ["*"]
+
+[agents.research]
+core = "worker"
+tools = ["target_lookup", "check_druggability", "disease_targets",
+         "search_literature", "read_fulltext", "import_documents",
+         "search_corpus", "read_source", "search_web", "fetch_webpage"]
+
+[agents.pocket]
+core = "worker"
+tools = ["survey_structures", "search_pdb", "fetch_structure", "fetch_alphafold",
+         "import_structure", "assess_structure", "detect_pockets", "define_pocket",
+         "compare_pockets", "similar_pockets", "switch_receptor", "analyze_pose",
+         "contact_map", "analyze_hydrophobic"]
+
+[agents.ligand]
+core = "worker"
+tools = ["search_actives", "search_analogs", "fetch_compound",
+         "search_similar_compounds", "rank_library", "pick_diverse",
+         "scaffold_analysis", "matched_pairs", "enumerate_analogs", "record_assay",
+         "build_pharmacophore", "align_ligands"]
+
+[agents.prepare]
+core = "worker"
+tools = ["prepare_receptor", "prepare_ligands", "curate_ligands",
+         "import_ligandset", "build_reference_set"]
+
+[agents.docking]
+core = "worker"
+tools = ["dock", "validate_docking"]
+
+[agents.affinity]
+core = "worker"
+tools = ["fit_affinity", "score_affinity"]
+
+[agents.analysis]
+core = "worker"
+tools = ["rank_candidates", "analyze_pose", "alternative_poses", "contact_map",
+         "analyze_hydrophobic", "efficiency_profile", "predict_admet"]
+
+[agents.mechanism]
+core = "worker"
+tools = ["hypothesis", "review_hypothesis", "analyze_pose", "alternative_poses",
+         "contact_map", "analyze_hydrophobic", "compare_poses", "compare_pockets",
+         "similar_pockets", "align_structures"]
+
+[agents.visualization]
+core = "worker"
+tools = ["open_viewer"]

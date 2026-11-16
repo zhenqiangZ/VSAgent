@@ -9,7 +9,7 @@
 ```mermaid
 graph LR
   T["终端界面<br/>会话 · 主题 · 工具过程"] --> K["内核<br/>装配上下文 · 调工具 · 记流水"]
-  K --> D["领域工具<br/>56 个 · 18 族"]
+  K --> D["领域工具<br/>54 个 · 23 个模块"]
   K --> W["网页端<br/>结构与运行目录"]
   K --> C["本地语料<br/>检索 · 文献"]
 ```
@@ -112,15 +112,18 @@ python tests/verify_exe.py         # ConPTY 截图验证，需要 Windows
 
 ## 文档
 
-五份，按读法分工：
+文档按读法分工：
 
 | 文件 | 内容 |
 | --- | --- |
-| `docs/design.md` | 系统现在是什么样：分层、内核、上下文、事件层、工具族、界面、网页、状态 |
-| `dist/rules/` | 四档规则：不变式（`global/`）、每个角色交什么（`agents/`）、每一步做到什么算完成（`stages/`）、方法与阈值（`references/`，按需读取） |
+| `docs/design.md` | 系统现在是什么样：分层、内核、上下文、工具清单、语料、界面、网页、状态、多 Agent |
+| `docs/tools.md` | 72 个工具的用途、参数与限制；由 `tools/gen_tools_doc.py` 生成，不要手改 |
+| `docs/ten-agent-design.md` | 十个角色各负责什么、交什么、不许做什么 |
 | `docs/history.md` | 每个决定当时的约束、做法与依据 |
 | `docs/review.md` | 实测读数与失败模式 |
 | `docs/reference.md` | 判据来源、外部服务与本机路径、环境变量 |
+| `dist/rules/` | 四档规则：不变式（`global/`）、每个角色交什么（`agents/`）、每一步做到什么算完成（`stages/`）、方法与阈值（`references/`，按需读取） |
+| `docs/archive/` | 做完的计划与过程稿，不随代码更新 |
 
 `dist/AGENTS.md` 是给模型看的项目规则与判据，每个确认点末尾指向 `dist/rules/` 里的一节。
 

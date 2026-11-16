@@ -1,10 +1,12 @@
 # 现行设计
 
 > 角色：现行设计（这个系统现在是什么样）
-> 状态：随代码更新，最后核对 2026-11-13
+> 状态：随代码更新，最后核对 2026-11-16
 > 配套：`history.md`（为什么这么定）、`review.md`（实测读数）、`reference.md`（判据与外部资料）、
+> `tools.md`（工具清单，由 `tools/gen_tools_doc.py` 生成）、
+> `ten-agent-design.md`（十个角色的职责与边界）、
 > `dist/rules/`（四档规则：全局、角色、阶段、参考）、
-> `multi-agent-refactor/progress.md`（多 Agent 重构的逐阶段验收与问题台账）
+> `archive/progress.md`（多 Agent 重构的逐阶段验收与问题台账）
 
 这份文件描述当前实现的形状与不变式。改代码之前先读它；知道「为什么」去看 `history.md`，
 要数字去看 `review.md`。文中的数字都来自代码或判据脚本，代码一动就该复核一次。
@@ -58,10 +60,11 @@ graph TD
 ### 3.1 一轮的流程
 
 模型请求之前还有一段前置流程（`_prepare_route`，只在根会话跑）：取这一轮的用户原话 →
-意图解析 → 规格编译 → 能力路由 → 决定装哪几族。三档开关 `off / shadow / enforce` 决定它
-影响什么：`off` 什么都不做；`shadow` 只写 trace 与任务规格、不装族；`enforce` 才按计划装族。
-路由出错时 trace 照写，但**一个会话字段都不改**——宁可退回原来的路径，也不把一份半成品
-计划写进会话，下一轮再按它继续。
+意图解析 → 规格编译 → 能力路由 → 定下派哪几个角色、谁等谁。三档开关
+`off / shadow / enforce` 决定它做什么：`off` 什么都不做；`shadow` 与 `enforce`
+都写出计划与过程记录，不改工具清单——每个角色装哪些工具由 `agents.toml` 决定，
+会话建立时就定稿。路由出错时 trace 照写，但**一个会话字段都不改**——宁可退回
+原来的路径，也不把一份半成品计划写进会话，下一轮再按它继续。
 
 前置流程的结果同时落成消息开头的 `PartType.ROUTE`：`route_adapter.describe` 把意图、任务规格
 与角色计划写成一段纯文本（第一行是标题），TUI 与网页各画一个默认收起的折叠块。它只在
@@ -108,14 +111,15 @@ graph TD
 
 子 agent 另有两级时限（2026-11-13）：
 
-- **每个角色的安全网**（`profiles.TIMEOUT_MINUTES`）：target / literature / hypothesis 20 分钟，
-  ligand / conformation / scoring / mechanism 30，structure_pocket 40，screening 90。
+- **每个角色的安全网**（`profiles.TIMEOUT_MINUTES`）：research / mechanism 30 分钟，
+  ligand / analysis 40，pocket 45，prepare 60，affinity 90，docking 120，
+  visualization 20；principal 不派发，没有时限。
   到点由调度器 `host.cancel` 打断，记 `failed` 并写清「超过时限（N 分钟），产物可能只写了
   一半」。这不是性能指标，是把卡住的子会话从「一直在跑」变成可决策的失败。
 - **整场上限**：`dispatch_campaign(timeout=分钟)`，1–720 分钟。到期不再等剩下的人，
   未完成的任务记失败。
 
-角色时限刻意放宽了 `screening`：对接是真在算，不是卡住；要更紧的场合用整场上限。
+角色时限刻意放宽了 `docking`：对接是真在算，不是卡住；要更紧的场合用整场上限。
 
 退出原因有五种：`exhausted`（步数用尽）、`cancelled`（用户中断）、`error`（模型或装配出错）、
 `tool_failed`（连续失败）、`topic_full`（主题预算用满）。整轮停因写在 `Session.last_exit_reason`
@@ -137,7 +141,7 @@ graph TD
 | `evidence_argument` | `EvidenceStore` | 把关键行放进证据层 |
 | `viewer_argument` | 查看器入口 | 拼结构页地址 |
 | `event_argument` | 事件运行时 | 封存主题 |
-| `registry_argument` | 注册表（只读） | `load_tools` 读禁用清单 |
+| `registry_argument` | 注册表（只读） | 查某个名字有没有装 |
 
 子 agent 的入口不走上面这些通道：`dispatch_campaign` 与 `agent_status` 从参数里拿 `session`
 与 `spawner`，由装配处直接提供。4b 的子代理上下文隔离只有设计。
@@ -164,7 +168,7 @@ graph TD
 9. 默认：`write` / `patch` / `bash` / `dock`、准备受体 / 准备配体、切换当前受体需要询问。
 
 最后一条里那三个共享状态动作是 2026-11-13 定的：主 agent 改成纯编排之后，它们只能由角色做
-（`screening` 拿 receptor / ligand 族，`structure_pocket` 拿 listing 族），但「改登记表里的
+（`prepare` 的名单里有准备受体与准备配体，`pocket` 的名单里有切换当前受体），但「改登记表里的
 当前受体」影响整个会话家族，所以执行前问一次。
 
 会话 `allow_all` 排在除中断之外的一切之前：按下 a 就是「这个会话别再问我」，Plan 限制、
@@ -208,8 +212,8 @@ graph TD
 列表里推——推一条会在模型没要求的时候占用窗口。
 
 子会话的上下文隔离没有实现：`subagent_argument` 这个注入通道在代码里不存在。子 agent 的
-工具族按 `WORKER` 档裁剪；准备受体/配体与切换受体不再对子 agent 一律拒绝，而是按角色给
-（`screening` 拿 receptor / ligand 族，`structure_pocket` 拿 listing 族），准备类动作在
+工具清单按角色配置裁剪；准备受体/配体与切换受体不再对子 agent 一律拒绝，而是按角色给
+（`prepare` 有准备工具，`pocket` 有登记表与换受体），准备类动作在
 权限层问一次用户（`DEFAULT_ASK`）。2026-11-13 之前这三条是 `WORKER_DENY`，主 agent 改成
 纯编排之后等于没有任何会话能做，所以改成「谁有权改」有据可依。
 
@@ -412,53 +416,77 @@ agent 的引用必须存在（用户写入可以不存在，标 `unverified` 排
 
 ## 五、领域工具
 
-### 5.1 分族与装载
+### 5.1 配置决定清单
 
-全仓 80 个工具：20 个核心（文件、登记表、任务、假设、事件、记忆、`load_tools`、
-`assess_campaign`、`survey_structures`、`write_run`、`open_viewer` 等）常驻，60 个领域工具分成
-20 族，由 `load_tools` 现装现用。
+全仓 72 个工具：18 个常驻（文件、登记表、任务、假设、事件、记忆、
+`write_run`、`open_viewer`、`dispatch_campaign` 等），54 个领域工具。每个角色装哪些
+写在 `vsagent/core/agent/roles/agents.toml`：三份配置按顺序读（包内、项目
+`.vsagent/agents.toml`、用户 `~/.vsagent/agents.toml`），同一个角色以靠后的整段为准。
+会话建立时清单定稿，运行当中不变；换主题不改请求体，前缀缓存不会整段失效。
 
-| 族 | 工具数 | 族 | 工具数 |
-| --- | --- | --- | --- |
-| listing | 3 | corpus | 3 |
-| uniprot | 2 | websearch | 2 |
-| structure | 5 | receptor | 1 |
-| pocket | 4 | ligand | 5 |
-| chembl | 2 | screen | 3 |
-| pubchem | 2 | docking | 1 |
-| opentargets | 2 | affinity | 2 |
-| literature | 3 | analysis | 8 |
-| sar | 5 | admet | 1 |
-| pharmacophore | 2 | research | 4 |
+注册表只装一份、含全部工具。哪一步发哪些名字由 `roles/agents.py` 算出来：
+根会话取 `core.orchestrator`（18 件），子会话取 `core.worker`（13 件）加本角色的
+工具。`Registry.specs(only=...)` 按这份名单过滤；模型真去调名单外的工具时，
+`capability_guard` 按同一份名单拒绝，文案指向 `agents.toml`。
 
-族记在 `Session.tool_families` 上，不记在注册表上（注册表按根 / 子 agent 共享两份，记在那里
-会让一个会话装过的工具漏到另一个）；子 agent 从父会话继承。
+每个角色一步的清单开销由 `tools/check_capabilities.py` 量：超过 10,000 提示、
+超过 12,000 判失败。基础档的额度由 `tools/check_toolset.py` 量（主 8,000、子 5,300）。
 
-装载会随轮次结束而失效：`prune_families()` 把这一轮没用过的族卸掉。两条边界——这一轮一个
-工具都没用过就不卸；这一轮刚装的族也不卸（`Session.family_topic` 记着装载时的主题号），
-否则模型先装后用的那条路会被自己踩断。
+### 5.2 装配清单
 
-主题边界（`close_topic` / 自动封存）另有一条更硬的规则：`release_families()` 把领域族全部
-释放，只留 `close_topic(next_tools=...)` 点名的那些（预装给下一个主题），免得一段对话里
-装过的十族一路带着走——十族的工具定义约 25,870 token，比正文还大。2026-11-13 起主 agent
-在这一步**不预装**：它这一轮只做编排，族由计划按角色发给子会话（`coordinator.run`），
-预装到根会话既看不见也用不上。
+根目录的模块与它们各管什么：
 
-`hidden_names(session)` 给的是排除集：没登记族的工具默认常驻，新工具忘了登记族时坏处只是
-白占额度，不会「写了却没装、模型看不见」。模型看不见某个工具时最容易直接叫它的名字，
-`loop.missing_tool_reason` 认族，回「属于 docking 族，先 `load_tools family=docking`」。
+| 文件 | 内容 |
+| --- | --- |
+| `core/paths.py` | 项目根、语料根、运行目录根 |
+| `core/parse.py`、`chunker.py`、`index.py`、`embed.py`、`corpus.py` | 语料解析、切块、索引、向量、检索 |
+| `core/web/{routes,service}.py` | 网页服务与路由表 |
+| `core/agent/tools.py` | `Tool` / `ToolRegistry` / 内核文件工具 / 参数校验 |
+| `core/agent/roles/agents.py` | 读三份配置、算每个角色的工具清单 |
+| `core/agent/permission.py` | 权限判定（外部钩子在 `execution/hooks.py`） |
+| `core/agent/coretools.py` | 常驻核心工具的装配清单 |
+| `core/agent/provider.py` | 模型协议（OpenAI 兼容 SSE） |
+| `core/agent/validators/` | 四层运行时校验：能力守卫、任务前置、输出合同、交付验收 |
+| `core/agent/domain/` | 54 个领域工具、23 个模块，外加 `http.py`（唯一网络出口）与库层模块 |
+| `core/agent/{planning,roles,execution,state,research}/` | 其余模块按用途分五组，见下一张表 |
+| `core/agent/search_reasoning/` | 检索触发的搜索增强：先验答案、证据适配与评估、选择性整合、交付前核对；由 `VSA_SAR` 接入主循环 |
+| `dist/rules/` | 四档规则：`global/` 3、`agents/` 10、`stages/` 5、`references/` 5 |
+| `screens/`、`widgets/`、`styles/app.tcss`、`palette.py` | 屏幕、部件与样式；终端色值只在 `palette.py` |
+| `web/`、`viz/` | 网页前端与三维查看器的构建产物 |
+| `tests/test_agent.py`、`tests/test_smoke.py` | 内核判据与界面判据（直接跑的脚本） |
+| `tools/` | 判据脚本与探针 |
 
-`load_tools` 的「族 → 工具」表由 `catalog_text()` 从模块现数，并减去
-`registry.disabled`——对着被关掉的工具说「已装入」，模型下一步就会去调，撞墙之后转去 bash
-自己实现。这张表不再写进工具说明（60 行、约 500 token，每一步都发），改成**不带参数调用**
-时返回；说明里只留族名与用法。
+### 5.3 模块分组
 
-命名按动作分四组，新工具照此落位：`search_*` 按条件找一批（返回候选清单）、`fetch_*`
-按编号取一条完整记录、`list_*` 列清单、`screen_*` 用模型或规则从一批里筛。2026-11-13 把
-`lookup_compound` / `find_analogs` / `find_similar_compounds` 分别改成 `fetch_compound` /
-`search_analogs` / `search_similar_compounds`。
+`core/agent/` 原来三十来个文件平铺在一个目录里，「谁能改计划」「谁在跑」「谁只是数据」
+全靠记文件名。现在按**一个模块被谁用、什么时候被调**分五组，根上只留跨组的基础设施
+（`tools.py` / `coretools.py` / `permission.py` / `provider.py`）和两个
+本来就成包的目录（`domain/` 领域工具、`validators/` 运行时校验）。
 
-### 5.2 口袋
+| 组 | 模块 | 管什么 |
+| --- | --- | --- |
+| `planning/` | `intent.py`、`intent_parser.py`、`task_context.py`、`task_compiler.py`、`capability_router.py`、`route_adapter.py`、`stages.py`、`context.py` | 一句话怎么变成计划：意图规则、解析成 `IntentSpec`、编译成 `TaskSpec`、能力闭包与路由开关；`context.py` 是装配用的八层模型 |
+| `roles/` | `capabilities.py`、`profiles.py`、`agents.py`、`agents.toml`、`prompt.py`、`contracts/` | 角色本身：能力与权限、说明书与报告必填、每个角色的工具名单、系统提示与规则注入、五类协议 |
+| `execution/` | `coordinator.py`、`scheduler.py`、`dispatcher.py`、`dependency.py`、`spawn.py`、`host.py`、`campaign_state.py`、`reports.py`、`report.py`、`loop.py`、`hooks.py` | 跑起来的那一层：计划翻任务、建会话与判重、分层调度、子 agent 派发、会话宿主、状态机、报告抽取、唯一驱动与外部钩子 |
+| `state/` | `event_log.py`、`ledger.py`、`memory.py`、`hypothesis.py`、`hypothesis_review.py`、`history.py`、`task.py`、`topics.py`、`trace.py` | 落在磁盘上的东西：主题与步的流水、handle 登记表、跨会话记忆、假设与假设评审、任务状态、主题视图、追踪 |
+| `research/` | `research_objects.py`、`research_workspace.py`、`workspace.py`、`evidence_registry.py` | 科研对象与工作区、证据分级 |
+
+`search_reasoning/` 单独成包：它处理的是「查询结果怎么进入答案」，与五组里的
+计划、角色、执行、状态、科研对象都不同类。包内按阶段分文件：`jsonio.py`、
+`answer_state.py`、`evidence.py`、`integrator.py`、`verifier.py`，适配器在
+`adapters/`，阈值与权重在 `policy.py`。它不持有会话，也不改工具权限。
+
+分组只影响 import 路径，不改变任何调用顺序。移动时把**搬过的文件和指向它们的 import**
+改成绝对形式（其余相对 import 原地不动，免得整仓 diff 都是 `..` 换全路径）。顺带修了
+`roles/prompt.py` 里算仓根的 `parents[3]`：搬一层目录它就静默指到别处，规则文件读不到而
+程序照常启动——现在改走 `core/paths.py:project_root()`，与层数无关。
+
+内核文件工具五个：`bash` / `read` / `write` / `patch` / `grep`，外加 `read_turn`
+（按 `step N` 取回一步原文，默认不含思考过程，一次最多 4,000 token）。
+领域工具里有八个模块（`complexes` / `prankweb` / `align` / `chemistry` / `pdbtext` / `http` /
+`products` / `preprocess`）是库层，不登记工具。
+
+### 5.4 口袋
 
 口袋来源四层叠合：共晶配体 → 复合物 → p2rank 预测 → 先验叠合。四层在聚簇之前都先剔掉脂质与
 去垢剂（`preprocess.screen_lipids`）：碳数 ≥ 8、极性原子（N/O/S）≤ 2 或含磷、重原子 ≥ 16、
@@ -469,7 +497,7 @@ agent 的引用必须存在（用户写入可以不存在，标 `unverified` 排
 极性 / 带电四类计数、最近残基与 3.5 埃内的个数、一句判断。画像不给分，与「实验定位没有打分」
 同一口径；`detect_pockets`、`write_run`、网页端读的是同一份。
 
-### 5.3 配体与对接
+### 5.5 配体与对接
 
 配体链路：`import_ligandset`（文件 → 原始配体集）→ `prepare_ligands`（ETKDGv3 + MMFF/UFF +
 Meeko → 已准备配体集）→ `dock`（Vina → 对接产物）。
@@ -486,7 +514,7 @@ AutoDock4 原程序没有接：1–5 分钟一个配体，与批量筛选的形�
 `run_id` 是更新那一份（旧位姿会被清掉）；**别的会话**写同名目录时改存 `-2` 并在返回里说明，
 不覆盖前一份留档。归属看 `meta.json` 的 `provenance.session_id`，与登记表判会话同源。
 
-### 5.4 亲和力
+### 5.6 亲和力
 
 DTA 通道是另一条：`fit_affinity`（实测活性 → 模型产物）→ `score_affinity(model=…)`
 （同一批位姿 → 亲和力产物）。
@@ -502,40 +530,39 @@ DTA 通道是另一条：`fit_affinity`（实测活性 → 模型产物）→ `s
 两个工具都起外部进程，所以有环境变量入口：`VSA_DTA_PYTHON` 指定解释器，`VSA_DTA_ROOT`
 指定代码根。`VSA_VINA_BIN` / `VSA_AUTOGRID_BIN` 指定对接引擎。
 
-### 5.5 分析与对照
+### 5.7 分析与对照
 
-`analysis` 族的 8 个工具只读产物：
+分析模块的 8 个工具只读产物：
 
 | 工具 | 做什么 |
 | --- | --- |
-| `rank_candidates` | 多路合并排序 |
+| `rank_candidates` | 多路合并排序；`with_controls=true` 时按正向 / 阴性 / 背离三类挑对照，并写明每一条为什么算对照 |
 | `analyze_pose` | 接触 / 氢键 / 冲突 / 可选 PLIP 指纹 |
 | `alternative_poses` | 同一分子的多个对接模式按体积聚簇，报每簇分数与接触残基差异 |
 | `contact_map` | 一份产物里所有位姿的残基接触频次 |
 | `analyze_hydrophobic` | HP / HM / 脱水账 |
 | `efficiency_profile` | LE / LELP / LLE |
 | `validate_docking` | 重对接到晶体位姿的 RMSD |
-| `pick_controls` | 正向 / 阴性 / 背离三类对照，并写明每一条为什么算对照 |
+| `compare_poses` | 两个位姿逐原子比，给 RMSD 与接触差异 |
 
 `analyze_hydrophobic` 与 `efficiency_profile` 的输出里写明「没有计算熵与脱水代价」，不能让读者
 以为算过。`alternative_poses` 读 `pose_pdbqt` 里的全部模式，与 `screen` 的位姿去重共用
 `pose_volume_cells` / `pose_jaccard` / `cluster_by_similarity`。
 
-### 5.6 开工盘点与结构全景
+### 5.8 开工盘点与结构全景
 
-两个常驻工具，因为它们各自发生在「一族都还没装」的时候。
+`survey_structures` 常驻。宽泛的问题发生在第一轮，那时还没有派发任何角色，所以它不能挂在某个
+角色的名单里。
 
-`assess_campaign` 定这一轮从哪条路起手。它自己查 UniProt 与 ChEMBL，四条起点逐条判适用
-（条件不互斥），返回全部四条加一条推荐，每条带成本档与「这条能区分什么」，走不通的也列出来
-并写原因。每条可行起点各一份假设草稿，`meta.strategies` 按成本排。阈值与理由见
-`dist/rules/references/campaign_methods.md`。
-
-`survey_structures` 把一个靶点全部实验结构按共晶配体分组，每组给套数、最佳分辨率与代表条目；
-产物写 `~/.vsagent/surveys/`，聊天里给摘要，全表在 `#/survey/<id>`。标题里点过名的配体排在
-最前：膜蛋白结构里胆固醇与磷脂按套数永远最多（Nav1.7 的 44 套里胆固醇 26 套），按套数排会把
+它把一个靶点全部实验结构按共晶配体分组，每组给套数、最佳分辨率与代表条目；产物写
+`~/.vsagent/surveys/`，聊天里给摘要，全表在 `#/survey/<id>`。标题里点过名的配体排在最前：
+膜蛋白结构里胆固醇与磷脂按套数永远最多（Nav1.7 的 44 套里胆固醇 26 套），按套数排会把
 河豚毒素（9SR，3 套）挤进折叠行。它不下载坐标、不算口袋、不核对序列。
 
-### 5.7 网络出口
+「这一轮从哪条路起手」由 `research` 与 `pocket` 两个角色判断，各自在报告里写清适用条件与
+成本，不再由一个常驻工具代答。
+
+### 5.9 网络出口
 
 `domain/http.py` 是全仓唯一的网络出口，测试整体替换的就是它。4xx → `ToolError`，
 429/5xx/网络故障 → `RetryableToolError`。
@@ -919,59 +946,7 @@ multipart 是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 
 
 ---
 
-## 十、模块地图
-
-| 目录 / 文件 | 管什么 |
-| --- | --- |
-| `app.py` | 装配根与命令中枢，唯一把注册表、宿主、网页服务接起来的地方 |
-| `__main__.py`、`env.py` | 入口与 `.env` 装载（`override=False`） |
-| `core/models.py` | `Session` / `Message` / `Part` / `TaskState` / `Hypothesis` 等数据 |
-| `core/session_manager.py` | 状态文件读写、原子替换、ID 计数 |
-| `core/command_registry.py`、`keybind_manager.py` | 命令表与键位表（只用于渲染帮助） |
-| `core/live.py` | 实时快照 |
-| `core/paths.py` | 项目根、语料根、运行目录根 |
-| `core/parse.py`、`chunker.py`、`index.py`、`embed.py`、`corpus.py` | 语料解析、切块、索引、向量、检索 |
-| `core/web/{routes,service}.py` | 网页服务与路由表 |
-| `core/agent/tools.py` | `Tool` / `ToolRegistry` / 内核文件工具 / 参数校验 |
-| `core/agent/toolset.py` | 按族装载、轮末卸载、看不见工具时的解释 |
-| `core/agent/permission.py` | 权限判定（外部钩子在 `execution/hooks.py`） |
-| `core/agent/coretools.py` | 常驻核心工具的装配清单 |
-| `core/agent/provider.py` | 模型协议（OpenAI 兼容 SSE） |
-| `core/agent/validators/` | 四层运行时校验：能力守卫、任务前置、输出合同、交付验收 |
-| `core/agent/domain/` | 60 个领域工具、20 族，外加 `http.py`（唯一网络出口）与库层模块 |
-| `core/agent/{planning,roles,execution,state,research}/` | 其余模块按用途分五组，见下一张表 |
-| `dist/rules/` | 四档规则：`global/` 3、`agents/` 10、`stages/` 5、`references/` 5 |
-| `screens/`、`widgets/`、`styles/app.tcss`、`palette.py` | 屏幕、部件与样式；终端色值只在 `palette.py` |
-| `web/`、`viz/` | 网页前端与三维查看器的构建产物 |
-| `tests/test_agent.py`、`tests/test_smoke.py` | 内核判据与界面判据（直接跑的脚本） |
-| `tools/` | 判据脚本与探针 |
-
-`core/agent/` 原来三十来个文件平铺在一个目录里，「谁能改计划」「谁在跑」「谁只是数据」
-全靠记文件名。现在按**一个模块被谁用、什么时候被调**分五组，根上只留跨组的基础设施
-（`tools.py` / `toolset.py` / `coretools.py` / `permission.py` / `provider.py`）和两个
-本来就成包的目录（`domain/` 领域工具、`validators/` 运行时校验）。
-
-| 组 | 模块 | 管什么 |
-| --- | --- | --- |
-| `planning/` | `intent.py`、`intent_parser.py`、`task_context.py`、`task_compiler.py`、`capability_router.py`、`route_adapter.py`、`stages.py`、`context.py` | 一句话怎么变成计划：意图规则、解析成 `IntentSpec`、编译成 `TaskSpec`、能力闭包与路由开关；`context.py` 是装配用的八层模型 |
-| `roles/` | `capabilities.py`、`profiles.py`、`toolprofiles.py`、`prompt.py`、`contracts/` | 角色本身：能力与族、说明书与报告必填、两档工具、系统提示与规则注入、五类协议 |
-| `execution/` | `coordinator.py`、`scheduler.py`、`dispatcher.py`、`dependency.py`、`spawn.py`、`host.py`、`campaign_state.py`、`reports.py`、`report.py`、`loop.py`、`hooks.py` | 跑起来的那一层：计划翻任务、建会话与判重、分层调度、子 agent 派发、会话宿主、状态机、报告抽取、唯一驱动与外部钩子 |
-| `state/` | `event_log.py`、`ledger.py`、`memory.py`、`hypothesis.py`、`hypothesis_review.py`、`history.py`、`task.py`、`topics.py`、`trace.py` | 落在磁盘上的东西：主题与步的流水、handle 登记表、跨会话记忆、假设与假设评审、任务状态、主题视图、追踪 |
-| `research/` | `research_objects.py`、`research_workspace.py`、`workspace.py`、`evidence_registry.py` | 科研对象与工作区、证据分级 |
-
-分组只影响 import 路径，不改变任何调用顺序。移动时把**搬过的文件和指向它们的 import**
-改成绝对形式（其余相对 import 原地不动，免得整仓 diff 都是 `..` 换全路径）。顺带修了
-`roles/prompt.py` 里算仓根的 `parents[3]`：搬一层目录它就静默指到别处，规则文件读不到而
-程序照常启动——现在改走 `core/paths.py:project_root()`，与层数无关。
-
-内核文件工具五个：`bash` / `read` / `write` / `patch` / `grep`，外加 `read_turn`
-（按 `step N` 取回一步原文，默认不含思考过程，一次最多 4,000 token）。
-领域工具里有八个模块（`complexes` / `prankweb` / `align` / `chemistry` / `pdbtext` / `http` /
-`products` / `preprocess`）是库层，不登记工具。
-
----
-
-## 十一、筛选细则
+## 十、筛选细则
 
 四个确认点与开工盘点怎么讲、阈值多大、哪一步要用户点头，按角色与阶段拆在 `dist/rules/` 四档：
 `global/` 放不变式，`agents/` 放每个角色交什么，`stages/` 放每一步做到什么算完成，
@@ -979,7 +954,7 @@ multipart 是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 
 
 ---
 
-## 十二、打包与平台
+## 十一、打包与平台
 
 Windows 上 `pyinstaller --clean vsagent.spec` 产出 `dist/VSAgent.exe`，`tests/verify_exe.py`
 用 ConPTY 加 pyte 截图验证。`models/DTA/` 整个目录不进版本控制（代码 54 MB + 环境 1.6 GB +
@@ -1001,12 +976,12 @@ CI 只有 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，两份�
 
 ---
 
-## 十三、多 Agent 层
+## 十二、多 Agent 层
 
 这一层解决的是「一句话怎么变成一份有分工、有验收、有证据的任务」。逐阶段的验收与踩过的问题
-在 `multi-agent-refactor/progress.md`，这里只写现在的形状与不变式。
+在 `archive/progress.md`，这里只写现在的形状与不变式。
 
-### 13.1 五类对象各管什么
+### 12.1 五类对象各管什么
 
 | 对象 | 回答的问题 | 什么时候产生 |
 | --- | --- | --- |
@@ -1020,26 +995,30 @@ CI 只有 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，两份�
 执行结果记在 `Schedule.outcomes`；`IntentSpec` 标了要澄清就必须写出问什么，反过来允许
 一句补充提问而不降级成「没解析出来」。
 
-### 13.2 十个角色与十个能力
+### 12.2 十个角色与十三个能力
 
 九个专业角色加一个 `principal`（根会话的身份）。能力到角色的映射写死在 `capabilities.py`，
-不从族表推导——族名能推导，「口袋发现该用哪几族」推导不出来。
+不从工具清单推导——工具名能穷举，哪个角色该拿哪些工具是领域判断。一个职责单元对应一个角色，
+角色内部不再分成两个运行实体。
 
 | 角色 | 能力 | 备注 |
 | --- | --- | --- |
-| `target` | `target_intelligence` | 跨阶段 |
-| `structure_pocket` | `structure_discovery`、`pocket_discovery` | 两个能力同一角色，按子目标裁族 |
-| `conformation` | `pocket_profiling` | 只要求产物路径，不配 `research` 族 |
-| `ligand` | `ligand_intelligence` | |
-| `literature` | `literature_evidence` | 跨阶段 |
-| `screening` | `virtual_screening` | 同时要 `docking` 与 `affinity` |
-| `scoring` | `scoring_evaluation` | 不带 `docking`：它做的是对已有产物的独立评分 |
-| `mechanism` | `mechanism_analysis` | 单能力，族裁不动（9,596 token，最贵） |
-| `hypothesis` | `hypothesis_validation` | 常驻 `hypothesis` 工具 |
+| `research` | `target_intelligence`、`literature_evidence` | 一个角色做两件事，跨阶段 |
+| `pocket` | `structure_discovery`、`pocket_discovery`、`pocket_profiling` | 发现与画像在同一个会话里先后做 |
+| `ligand` | `ligand_intelligence` | 含化学空间与实验回填 |
+| `prepare` | `receptor_preparation` | 受体与配体两段准备 |
+| `docking` | `docking_run` | 对接与重对接验证 |
+| `affinity` | `affinity_prediction` | 单独一步，不并进评分 |
+| `analysis` | `scoring_evaluation` | 多路合成与效率体检 |
+| `mechanism` | `mechanism_analysis`、`hypothesis_validation` | 常驻 `hypothesis` 工具 |
+| `visualization` | `visualization` | 常驻 `open_viewer` 工具 |
 
-`research` 族跟着报告要求走，不跟着「谁做计算」走：凡报告要求 `evidence_refs` 的角色都配它。
+科研对象那组工具跟着报告要求走，不跟着「谁做计算」走：凡报告要求 `evidence_refs` 的角色，
+名单里都有 `workspace`、`add_evidence`、`review_hypothesis`。
+旧会话里的角色名（`target`、`structure_pocket`、`conformation`、`literature`、`screening`、
+`scoring`、`hypothesis`）由 `LEGACY_ROLES` 换成新名，恢复旧会话时不会当场查不到。
 
-### 13.3 一句话到一次派发
+### 12.3 一句话到一次派发
 
 ```
 原话 → intent_parser → task_context（合并新旧约束）→ task_compiler → capability_router
@@ -1055,16 +1034,16 @@ CI 只有 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，两份�
 两条同样必须记住的（2026-11-13）：
 
 - **计划要自己可执行**。路由把「没有输入就开不了跑」的前置补成节点
-  （`AUTO_PREREQUISITES`：筛选 ← 口袋 + 配体；口袋画像 ← 口袋发现），
-  用户已经给出对应输入时改记 `plan.provided_capabilities` 而不补。
-  否则 2026-11-13 的 HA2 会话会重演：计划只有配体与筛选，主 agent 想派结构角色被拒，
-  而纯编排之后它自己也没有那一族。
+  （`AUTO_PREREQUISITES`：受体准备 ← 口袋发现 + 配体情报；对接 ← 受体准备；
+  口袋画像 ← 口袋发现），用户已经给出对应输入时改记 `plan.provided_capabilities` 而不补。
+  否则 2026-11-13 的 HA2 会话会重演：计划只有配体与对接，主 agent 想派结构角色被拒，
+  而纯编排之后它自己也没有那些工具。
 - **派发可以改计划的两个方向**。`roles` 能减（上游自动补回，剩下的角色点名），
   也能加（按能力表补进来）；自定义任务书只给被点名的那一个角色。
   计划在一轮里是只读的，跨轮靠 `continue_task` 沿用，所以「中途发现要补一步」
   只能走 `roles`。
 
-### 13.4 战役状态机
+### 12.4 战役状态机
 
 ```
 UNDERSTANDING → CLARIFICATION → SPECIFICATION → PLANNING → DELEGATING
@@ -1084,7 +1063,7 @@ UNDERSTANDING → CLARIFICATION → SPECIFICATION → PLANNING → DELEGATING
 「多角色执行随上次退出中断，需要重新派发」；`planning` 不动——只做过预演也会停在这一格。
 留着旧状态只会让 `agent_status` 报一个不会动的进度，模型据此不去重新派发。
 
-### 13.5 验收与证据
+### 12.5 验收与证据
 
 四层校验，越靠后越晚：能力守卫（这一步能不能用这个工具）→ 任务前置（输入齐不齐）→
 输出合同（交付物有没有对应的验证方式）→ 交付验收（轮末有没有少交）。被拦一律写成
@@ -1100,7 +1079,7 @@ UNDERSTANDING → CLARIFICATION → SPECIFICATION → PLANNING → DELEGATING
 `supported` / `refuted`；计算预测最多给 `defer` 或 `inconclusive`。实测类证据必须带出处
 （数据库编号、DOI/PMID、产物句柄、数据文件路径），拿不出出处的只能按预测或推断记。
 
-### 13.6 系统评测
+### 12.6 系统评测
 
 `tools/eval_system.py`：四份标注规格 × 八条结构不变量（约束保留、排除项保留、子目标覆盖、
 交付物落位、依赖无环、不重复派发、工具暴露、未决输入有交代），32/32。这八条能离线判。

@@ -1,4 +1,9 @@
-# VSAgent Scientific Reference
+# 科学依据
+
+> 角色：科学依据（方法为什么适用、结论能说到哪一步）
+> 状态：随判据与文献更新
+> 配套：`design.md`（现在是什么样）、`history.md`（为什么这么定）、
+> `dist/rules/references/`（方法与阈值，按需读取）
 
 ## 1. 文档定位
 

@@ -40,6 +40,24 @@ class Contract:
 
 CONTRACTS: dict[str, Contract] = {
     "TargetBrief": Contract("TargetBrief", MANUAL, note="靶点简报是文字结论，由评审判断"),
+    "ResearchDossier": Contract("ResearchDossier", MANUAL, note="靶点与文献调研由评审判断"),
+    "PocketAtlas": Contract(
+        "PocketAtlas",
+        "handle",
+        "artifact",
+        "口袋图谱包含结构、口袋与画像",
+        meta_kind="pockets",
+    ),
+    "LigandDossier": Contract(
+        "LigandDossier", "handle", "ligandset", "配体清单要有一份配体集"
+    ),
+    "ViewPage": Contract(
+        "ViewPage",
+        "handle",
+        "artifact",
+        "视图页是登记过的页面产物",
+        meta_kind="view",
+    ),
     "StructureCatalog": Contract(
         "StructureCatalog",
         "handle",

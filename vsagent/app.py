@@ -39,7 +39,8 @@ from .core.agent.provider import (
     OpenAICompatProvider,
     ProviderConfig,
 )
-from vsagent.core.agent.planning.route_adapter import RouteAdapter, mode_from_env
+from vsagent.core.agent.planning.route_adapter import RouteAdapter
+from vsagent.core.route_config import mode as route_mode
 from vsagent.core.agent.execution.scheduler import AgentScheduler
 from .core.agent.validators import mode_from_env as validators_mode_from_env
 from .core.agent.tools import BASH_TIMEOUT, ToolRegistry
@@ -314,7 +315,7 @@ class VSAgentApp(App[None]):
             route_adapter=(
                 None
                 if session.is_subagent
-                else RouteAdapter(OpenAICompatProvider(config), mode=mode_from_env())
+                else RouteAdapter(OpenAICompatProvider(config), mode=route_mode(self.root))
             ),
             validator_mode=validators_mode_from_env(),
             max_steps=max_steps_from_env(),
@@ -783,11 +784,18 @@ class VSAgentApp(App[None]):
         self.push_screen(SubagentChatScreen(self.root, session_id=session_id))
 
     def _command_back(self) -> None:
-        """从子 agent 界面返回父会话。"""
-        if isinstance(self.screen, SubagentChatScreen):
-            self.pop_screen()
+        """从子 agent 界面返回父会话。
+
+        与返回栏那一个动作同一条规则：下面没有一层了就不再退，
+        让 `pop_screen` 去撞栈底只会把界面顶崩。
+        """
+        if not isinstance(self.screen, SubagentChatScreen):
+            self.show_toast("当前不在子 agent 界面", "info")
             return
-        self.show_toast("当前不在子 agent 界面", "info")
+        if len(self.screen_stack) <= 1:
+            self.show_toast("下面没有可返回的界面", "info")
+            return
+        self.pop_screen()
 
     def _command_agents(self) -> None:
         """把焦点交给右栏的子 agent 列表。
@@ -852,7 +860,11 @@ class VSAgentApp(App[None]):
             return
         was_subagent = target.is_subagent
         self.delete_session(target.id)
-        if was_subagent and isinstance(self.screen, SubagentChatScreen):
+        if (
+            was_subagent
+            and isinstance(self.screen, SubagentChatScreen)
+            and len(self.screen_stack) > 1
+        ):
             self.pop_screen()
 
     def _command_sessions(self) -> None:

@@ -1,35 +1,28 @@
-"""专业 Agent Profile：每个角色承担哪些能力、交回什么样的报告。
+"""专业 Agent Profile：每个角色做什么、交回什么样的报告。
 
-Profile 是"角色说明书"，不是运行期对象。它由三样东西拼出来：
+Profile 是“角色说明书”，不是运行期对象。数据全部来自 `roles/catalog.py`：
 
-- **能力**：来自 `capabilities.py`，不再抄一遍。角色承担哪些能力只有一处事实来源。
-- **工具族与常驻工具**：能力里已经有，这里只做汇总。
-- **报告要求**：这一层是新加的——它回答"这个角色交回的报告里，哪些字段不能空"。
+- **工作**：`DUTIES` 说明这个角色能做什么，只用于展示与提示词。
+- **权限**：`PERMISSIONS` 说明它允许哪几类动作，派发前核对任务授权。
+- **报告要求**：这一层回答“这个角色交回的报告里，哪些字段不能空”。
 
-报告要求的取值只允许四种，对应 `AgentReport` 里"能说明可信程度"的字段：
+报告要求的取值只允许四种，对应 `AgentReport` 里“能说明可信程度”的字段：
 
 - `evidence_refs`：结论要有出处（结构、文献、产物）。
 - `artifact_refs`：产物要能被找到。
 - `limitations`：要说明这次哪里没做到。
 - `unresolved_questions`：要留下没答的问题。
 
-不要求 `findings` 与 `conclusions`：它们在 `AgentReport` 的构造校验里已经管住了
-（标 completed 就必须有），重复一遍只会产生两条说法。
-
-除了报告，说明书还要能回答"这份任务能不能派给它"：`check_task()` 核对任务的动作类
-与工具族有没有超出这一角色的授权。派发前判一次，比跑起来之后再发现它用了不该用的
-工具便宜得多。
+不要求 `findings` 与 `conclusions`：它们在 `AgentReport` 的构造校验里已经管住了。
+但“非空”不等于“能用”：非正常结束的报告还要再说一条，见 `check_report`。
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
-from vsagent.core.agent.roles.capabilities import (
-    CAPABILITIES,
-    capabilities_for,
-    roles_with_capabilities,
-)
+from vsagent.core.agent.roles import catalog
 from vsagent.core.agent.roles.contracts import AgentReport, AgentTask
 
 REPORT_FIELDS: tuple[str, ...] = (
@@ -38,62 +31,40 @@ REPORT_FIELDS: tuple[str, ...] = (
     "limitations",
     "unresolved_questions",
 )
+# 非正常结束时，结论至少要有一句能判断的话。2026-11-18 的 ses_0060
+# 只交了「本轮写入：…/ha2_structure_catalog.md」，报告判据却因为引用非空
+# 判了合格。引用回答「东西在哪」，结论要回答「做到了哪一步、还差什么」。
+CONCLUSION_MIN_CHARS = 30
 
-TITLES: dict[str, str] = {
-    "principal": "主控：拆解目标、派发与汇总",
-    "research": "调研：靶点、受体与配体情报",
-    "pocket": "口袋：识别与画像",
-    "ligand": "配体：发现与化学空间",
-    "prepare": "准备：受体与配体",
-    "docking": "对接：位姿与构象搜索",
-    "affinity": "亲和力：预测与模型微调",
-    "analysis": "分析：结果整合与候选评价",
-    "mechanism": "机制：构象关系与假设",
-    "visualization": "展示：交互与视图",
-}
+TITLES: dict[str, str] = catalog.TITLES
+REPORT_REQUIREMENTS: dict[str, tuple[str, ...]] = catalog.REPORT_REQUIREMENTS
+TIMEOUT_MINUTES: dict[str, float | None] = catalog.TIMEOUT_MINUTES
+NOTES: dict[str, str] = catalog.NOTES
 
-REPORT_REQUIREMENTS: dict[str, tuple[str, ...]] = {
-    "principal": (),
-    "research": ("evidence_refs",),
-    "pocket": ("evidence_refs", "artifact_refs"),
-    "ligand": ("evidence_refs", "artifact_refs"),
-    "prepare": ("artifact_refs", "limitations"),
-    "docking": ("artifact_refs", "limitations"),
-    "affinity": ("artifact_refs", "limitations"),
-    "analysis": ("evidence_refs", "artifact_refs"),
-    "mechanism": ("evidence_refs", "unresolved_questions"),
-    "visualization": ("artifact_refs",),
-}
-"""每个角色交报告时不能空的字段。空一项就算报告不合格，由派发处判。"""
 
-TIMEOUT_MINUTES: dict[str, float | None] = {
-    "principal": None,  # 主控不派发，没有自己的执行时限
-    "research": 30,
-    "pocket": 45,
-    "ligand": 40,
-    "prepare": 60,
-    "docking": 120,  # 对接是真在算，给足；再长基本是卡住了
-    "affinity": 90,  # 微调要几分钟
-    "analysis": 40,
-    "mechanism": 30,
-    "visualization": 20,
-}
-"""单个角色的安全网（分钟）。**不是性能指标**：到点中断一个卡住的子会话，
-把「还在跑」变成「失败，卡在这一步」，父会话才能决定重派还是换路。
-"""
+def _conclusions(report: AgentReport) -> list[str]:
+    """报告里的结论行。契约已经规范成 `{"text": ...}`，这里只取非空行。"""
+    out: list[str] = []
+    for row in report.conclusions or ():
+        text = str(row.get("text") or "").strip() if isinstance(row, dict) else str(row).strip()
+        if text:
+            out.append(text)
+    return out
 
-NOTES: dict[str, str] = {
-    "principal": "只做拆解、派发与汇总，不亲自执行领域动作。",
-    "research": "只读检索与入库；不替用户做决定。",
-    "pocket": "结构、口袋与画像；改共享状态的动作由父会话确认后执行。",
-    "ligand": "找配体、排化学空间；不生成新分子。",
-    "prepare": "把原始结构准备成可对接的产物；每个动作先预演再确认。",
-    "docking": "执行对接并检查位姿质量；不替用户改参数。",
-    "affinity": "微调模型并预测亲和力；样本不足时直说做不了。",
-    "analysis": "把多路结果合成候选表并做效率体检；不重新对接。",
-    "mechanism": "解释结合模式与关键残基，写假设并评审；区分证据与推断。",
-    "visualization": "只出视图页；取数与计算交给前面的角色。",
-}
+
+# 路径、网址和一长串编号不算“说清了一件事”：`runs/ha2_structure_catalog.md`
+# 有三十多个字符，但它只回答东西在哪。量长度前先把这些片段去掉；只认带扩展名
+# 的文件路径，免得把 `kcal/mol` 这类单位也当成路径。
+_LOCATOR = re.compile(
+    r"https?://\S+"
+    r"|\S+\.(?:md|json|csv|txt|pdb|cif|sdf|mol2|png|html?|py|toml|log|ya?ml)\b"
+    r"|\b[A-Za-z0-9_.:-]{16,}\b"
+)
+
+
+def _readable_length(text: str) -> int:
+    """一句结论里“实际说了多少内容”的长度，去掉路径与编号。"""
+    return len(_LOCATOR.sub("", text).strip())
 
 
 @dataclass(frozen=True)
@@ -102,46 +73,43 @@ class AgentProfile:
 
     role: str
     title: str
-    capabilities: tuple[str, ...] = ()
+    duties: tuple[str, ...] = ()
+    permissions: tuple[str, ...] = ()
     report_requirements: tuple[str, ...] = ()
     note: str = ""
-    # 单个角色的安全网（分钟）。调度器到期中断它，记失败并写清卡在哪。
-    # `None` 表示不限；`principal` 不派发，所以是 None。
     timeout_minutes: float | None = None
-
-    @property
-    def permissions(self) -> tuple[str, ...]:
-        """角色能做的动作类：能力里声明的并集，按固定顺序。"""
-        seen: list[str] = []
-        for item in capabilities_for(self.role):
-            for permission in item.permissions:
-                if permission not in seen:
-                    seen.append(permission)
-        return tuple(seen)
 
     def check_report(self, report: AgentReport) -> list[str]:
         """报告是否满足这个角色的要求。返回问题清单，空列表表示合格。"""
-        from vsagent.core.agent.roles.capabilities import canonical
-
         problems: list[str] = []
-        if canonical(report.agent_role) != self.role:
+        if report.agent_role != self.role:
             problems.append(f"报告署名是 {report.agent_role}，这张说明书是 {self.role} 的")
         for field in self.report_requirements:
             value = getattr(report, field, None)
             if not value:
                 problems.append(f"{self.role} 的报告缺 {field}：{note_for(field)}")
+        if self.report_requirements:
+            rows = _conclusions(report)
+            if not rows:
+                problems.append(f"{self.role} 的报告缺结论：父会话拿不到可以判断的东西")
+            elif report.status != "completed" and not any(
+                _readable_length(row) >= CONCLUSION_MIN_CHARS for row in rows
+            ):
+                problems.append(
+                    f"{self.role} 的报告结论没有一条说清一件事"
+                    f"（去掉路径与编号后不足 {CONCLUSION_MIN_CHARS} 字）；"
+                    "非正常结束时要把做到哪一步、还差什么写清楚"
+                )
         return problems
 
     def check_task(self, task: AgentTask) -> list[str]:
         """这份任务有没有超出角色的授权范围。
 
-        动作类（读/分析/执行/写）要在说明书里才能派。工具名由 `agents.toml`
+        动作类（读、分析、执行、写）要在说明书里才能派。工具名由 `agents.toml`
         定死，派发时不再另给一份清单，所以这里不查工具。
         """
-        from vsagent.core.agent.roles.capabilities import canonical
-
         problems: list[str] = []
-        if canonical(task.role) != self.role:
+        if task.role != self.role:
             problems.append(f"任务派给 {task.role}，这张说明书是 {self.role} 的")
         extra_permissions = [item for item in task.permissions if item not in self.permissions]
         if extra_permissions:
@@ -165,27 +133,33 @@ def note_for(field: str) -> str:
 
 
 def profile(role: str) -> AgentProfile:
-    """按角色取说明书。旧角色名按 `LEGACY_ROLES` 查，认不出来时列出可用角色。"""
-    from vsagent.core.agent.roles.capabilities import canonical
-
-    name = canonical(role)
+    """按角色取说明书。认不出来时列出可用角色。"""
     for item in PROFILES:
-        if item.role == name:
+        if item.role == role:
             return item
     raise KeyError(f"没有这个角色：{role}。可用：{'、'.join(item.role for item in PROFILES)}")
 
 
+def role_label(role: str) -> str:
+    """角色的中文短名。取不到就退回角色名，不让一条进度把整场战役弄崩。"""
+    try:
+        return profile(role).title.split("：")[0]
+    except KeyError:
+        return role
+
+
 def _build() -> tuple[AgentProfile, ...]:
     out: list[AgentProfile] = []
-    for role in ("principal",) + roles_with_capabilities():
+    for role in catalog.ROLES:
         out.append(
             AgentProfile(
                 role=role,
-                title=TITLES[role],
-                capabilities=tuple(item.name for item in capabilities_for(role)),
-                report_requirements=REPORT_REQUIREMENTS[role],
-                note=NOTES[role],
-                timeout_minutes=TIMEOUT_MINUTES.get(role),
+                title=catalog.TITLES[role],
+                duties=tuple(catalog.DUTIES.get(role, ())),
+                permissions=tuple(catalog.PERMISSIONS.get(role, ())),
+                report_requirements=catalog.REPORT_REQUIREMENTS.get(role, ()),
+                note=catalog.NOTES[role],
+                timeout_minutes=catalog.TIMEOUT_MINUTES.get(role),
             )
         )
     return tuple(out)
@@ -195,30 +169,30 @@ PROFILES: tuple[AgentProfile, ...] = _build()
 
 
 def validate(profiles: tuple[AgentProfile, ...] = PROFILES) -> list[str]:
-    """核对说明书与能力表是否对得上。"""
-    problems: list[str] = []
+    """核对说明书与角色目录是否对得上。"""
+    problems: list[str] = catalog.validate()
     seen: set[str] = set()
     for item in profiles:
         if item.role in seen:
             problems.append(f"角色重复：{item.role}")
         seen.add(item.role)
-        if item.role not in TITLES:
-            problems.append(f"角色没有标题：{item.role}")
-        if item.role != "principal" and not item.capabilities:
-            problems.append(f"{item.role} 一项能力也没有：它做不了任何事")
-        for name in item.capabilities:
-            try:
-                capability = next(c for c in CAPABILITIES if c.name == name)
-            except StopIteration:
-                problems.append(f"{item.role} 引用了不存在的能力：{name}")
-                continue
-            if capability.role != item.role:
-                problems.append(f"{name} 属于 {capability.role}，却挂在 {item.role} 的名下")
+        if item.role not in catalog.ROLES:
+            problems.append(f"说明书里有不存在的角色：{item.role}")
+            continue
+        if item.title != catalog.TITLES[item.role]:
+            problems.append(f"{item.role} 的标题与目录不一致")
+        if item.duties != tuple(catalog.DUTIES.get(item.role, ())):
+            problems.append(f"{item.role} 的工作说明与目录不一致")
+        if item.permissions != tuple(catalog.PERMISSIONS.get(item.role, ())):
+            problems.append(f"{item.role} 的权限与目录不一致")
+        if item.role != "principal" and not item.duties:
+            problems.append(f"{item.role} 一项工作也没有：它做不了任何事")
         for field in item.report_requirements:
             if field not in REPORT_FIELDS:
                 problems.append(f"{item.role} 要求了不认识的报告字段：{field}")
-        # 每个会跑子会话的角色都要有时限：没有时限的失败会一直挂着，
-        # 父会话只能靠人发现（P-83）。
         if item.role != "principal" and not item.timeout_minutes:
             problems.append(f"{item.role} 没有执行时限")
+    missing = sorted(set(catalog.ROLES) - {item.role for item in profiles})
+    if missing:
+        problems.append(f"目录里的角色没有说明书：{'、'.join(missing)}")
     return problems

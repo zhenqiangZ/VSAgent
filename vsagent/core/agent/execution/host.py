@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from vsagent.core.file_refs import resolve_file_refs
 from vsagent.core.models import Message, Part, PartType, Session
@@ -74,6 +74,12 @@ class AgentHost:
         # 正在跑的多角色执行，按发起它的会话记。与 `_tasks` 分开：一场战役
         # 包含多个子会话，塞进 `_tasks` 会让"这个会话在跑吗"多算一次。
         self._campaigns: dict[str, asyncio.Task[None]] = {}
+        # 战役结束的交接点：派发工具在这里等，不直接 await 任务本身。
+        # 直接 await 分不清「父会话被中断」与「战役被单独取消」，而且战役在
+        # 第一次调度前就被取消时，那个任务一行都执行不到，等的人会永远醒不来。
+        self._campaign_waiters: dict[str, asyncio.Event] = {}
+        # （campaign, error, cancelled）。同一个会话只保留最近一次。
+        self._campaign_outcomes: dict[str, tuple[Any, str, bool]] = {}
 
     # ------------------------------------------------------------------
     # 循环层、登记表与工作区
@@ -190,6 +196,8 @@ class AgentHost:
         agent_role: str = "",
         task_id: str = "",
         campaign_id: str = "",
+        constraints: Iterable[str] | None = None,
+        goal: str = "",
     ) -> Session:
         """从父会话 fork 一个子 agent，可选立刻开跑。
 
@@ -199,6 +207,10 @@ class AgentHost:
         `agent_role` / `task_id` / `campaign_id` 只有结构化派发（`dispatcher.py`）
         才给：它们写在**创建时**而不是创建之后补，因为 `run=True` 时子会话可能
         在下一轮事件循环就开始跑，补写会与第一轮抢同一个会话。
+
+        `constraints` 与 `goal` 同样由结构化派发给出：约束写这个角色自己那几条，
+        目标写这次任务要做什么。`constraints` 留 `None` 时沿用旧行为，复制父会话
+        的约束，供自由文本派发的会话使用。
 
         深度上限在这里兜底。工具层与界面层都各自拦过一次，但真正决定
         「能不能创建」的是这一处：前两层只是让模型与用户早点看到原因。
@@ -234,7 +246,15 @@ class AgentHost:
             ContextAssembler(loop.context_window).available(loop.tool_specs(child))
             * SEED_RATIO
         )
-        copied, dropped = fork_messages(parent, child, start, end, max(1, budget))
+        copied, dropped = fork_messages(
+            parent,
+            child,
+            start,
+            end,
+            max(1, budget),
+            constraints=constraints,
+            goal=goal,
+        )
         child.seed_start = start
         child.seed_end = end
 
@@ -475,7 +495,13 @@ class AgentHost:
     # 中断与查询
     # ------------------------------------------------------------------
     def cancel(self, session_id: str) -> None:
-        """中断某个会话当前的生成。只影响它自己。"""
+        """中断某个会话当前的生成。只影响它自己。
+
+        如果它正在等一场多角色执行，连那场执行和它的子 agent 一起停：
+        用户按中断的意思是「这一轮别继续了」，不是「父会话停了、子 agent 接着烧」。
+        """
+        if self.campaign_running(session_id):
+            self.cancel_campaign(session_id)
         loop = self._loops.get(session_id)
         if loop is not None:
             loop.cancel()
@@ -513,12 +539,60 @@ class AgentHost:
         一次战役以"所有子会话跑完"结束，中间可能隔着几分钟。放进 `_tasks`
         会让"这个会话在跑吗"的判定把整场战役算成一轮回答。
         """
-        if session.id in self._campaigns:
+        # 判「还在跑」而不是「有条目」：条目可能属于一场已经结束的任务。
+        if self.campaign_running(session.id):
             return False
+        # 上一场留下的已完成条目先清掉。留着它会让这里判成「已经在跑」，
+        # 而 spawn 那边判的是 running，两边对不上时派发就一直启动失败。
+        self._campaigns.pop(session.id, None)
+        self._campaign_outcomes.pop(session.id, None)
+        self._campaign_waiters[session.id] = asyncio.Event()
         task = asyncio.create_task(self._campaign(session, coroutine, on_done))
         self._campaigns[session.id] = task
-        self._set_campaign_state(session, campaign_state.RESEARCH)
+        # Textual 的循环设了 eager task factory，任务可能就在上一行同步跑完。
+        # 那时收尾里的 pop 还没有条目可删，补在这里；否则这个已完成的任务
+        # 会一直留在字典里，下一次派发被当成「已经有一场在跑」。
+        if task.done():
+            self._campaigns.pop(session.id, None)
+        else:
+            self._set_campaign_state(session, campaign_state.RESEARCH)
         return True
+
+    def _finish_campaign(
+        self,
+        session_id: str,
+        campaign: Any,
+        error: str = "",
+        cancelled: bool = False,
+    ) -> None:
+        """把结果交给等在 `wait_campaign` 上的那一方。
+
+        必须由所有出口调用：战役可能在第一次调度前就被取消，那个任务一行都
+        执行不到；只靠 `_campaign` 收尾会让等待方永远醒不来。
+        """
+        self._campaign_outcomes[session_id] = (campaign, error, cancelled)
+        waiter = self._campaign_waiters.get(session_id)
+        if waiter is not None and not waiter.is_set():
+            waiter.set()
+
+    async def wait_campaign(
+        self, session_id: str
+    ) -> tuple[Any, str, bool]:
+        """等这一场战役结束，返回（战役结果, 错误, 是否被取消）。
+
+        父会话自己被中断时，先把整场停掉再原样抛：用户按一次中断，不该留下
+        一群还在后台跑的子 agent。
+        """
+        waiter = self._campaign_waiters.get(session_id)
+        if waiter is not None:
+            try:
+                await waiter.wait()
+            except asyncio.CancelledError:
+                self.cancel_campaign(session_id)
+                raise
+            finally:
+                self._campaign_waiters.pop(session_id, None)
+        return self._campaign_outcomes.get(session_id, (None, "", False))
 
     def _set_campaign_state(self, session: Session, target: str) -> None:
         """推进战役状态。
@@ -553,40 +627,66 @@ class AgentHost:
         coroutine: Any,
         on_done: Callable[[Any], None] | None,
     ) -> None:
+        outcome: tuple[Any, str, bool] = (None, "", False)
         try:
-            campaign = await coroutine
-        except asyncio.CancelledError:
-            self._set_campaign_state(session, campaign_state.CANCELLED)
-            self.bus.publish("campaign.cancelled", {"session_id": session.id})
-            raise
-        except Exception as error:  # noqa: BLE001 - 后台任务不能把异常吞进事件循环
-            self._set_campaign_state(session, campaign_state.FAILED)
+            try:
+                campaign = await coroutine
+            except asyncio.CancelledError:
+                self._stop_children(session.id)
+                self._set_campaign_state(session, campaign_state.CANCELLED)
+                self.bus.publish("campaign.cancelled", {"session_id": session.id})
+                outcome = (None, "", True)
+                raise
+            except Exception as error:  # noqa: BLE001 - 后台任务不能把异常吞进事件循环
+                message = f"{type(error).__name__}: {error}"
+                self._set_campaign_state(session, campaign_state.FAILED)
+                self.bus.publish(
+                    "campaign.error",
+                    {"session_id": session.id, "error": message},
+                )
+                outcome = (None, message, False)
+                return
+            # 子会话都跑完了，结果回到父会话手上：下一步是汇总与复核，不是交付。
+            self._set_campaign_state(session, campaign_state.INTEGRATION)
+            if on_done is not None:
+                on_done(campaign)
             self.bus.publish(
-                "campaign.error",
-                {"session_id": session.id, "error": f"{type(error).__name__}: {error}"},
+                "campaign.done",
+                {
+                    "session_id": session.id,
+                    "task_id": getattr(getattr(campaign, "plan", None), "task_id", ""),
+                    "done": list(campaign.done()) if hasattr(campaign, "done") else [],
+                    "partial": (
+                        list(campaign.partial()) if hasattr(campaign, "partial") else []
+                    ),
+                    "unfinished": (
+                        list(campaign.unfinished())
+                        if hasattr(campaign, "unfinished")
+                        else []
+                    ),
+                    # 这次按子集派发、计划里还剩谁。事件订阅方据此知道事情没完。
+                    "pending": list(getattr(campaign, "pending", ()) or ()),
+                },
             )
-            return
+            if self.save_state is not None:
+                self.save_state()
+            outcome = (campaign, "", False)
         finally:
-            self._campaigns.pop(session.id, None)
-        # 子会话都跑完了，结果回到父会话手上：下一步是汇总与复核，不是交付。
-        self._set_campaign_state(session, campaign_state.INTEGRATION)
-        if on_done is not None:
-            on_done(campaign)
-        self.bus.publish(
-            "campaign.done",
-            {
-                "session_id": session.id,
-                "task_id": getattr(getattr(campaign, "plan", None), "task_id", ""),
-                "done": list(campaign.done()) if hasattr(campaign, "done") else [],
-                "unfinished": (
-                    list(campaign.unfinished()) if hasattr(campaign, "unfinished") else []
-                ),
-                # 这次按子集派发、计划里还剩谁。事件订阅方据此知道事情没完。
-                "pending": list(getattr(campaign, "pending", ()) or ()),
-            },
-        )
-        if self.save_state is not None:
-            self.save_state()
+            # 只删自己那一条：收尾晚到的旧任务不能把后来那场的条目一起删掉。
+            if self._campaigns.get(session.id) is asyncio.current_task():
+                self._campaigns.pop(session.id, None)
+            self._finish_campaign(session.id, *outcome)
+
+    def _stop_children(self, session_id: str) -> int:
+        """停掉这一场派出的子会话。只认带任务号的那些。"""
+        stopped = 0
+        for child in self.children_of(session_id):
+            if not child.task_id:
+                continue
+            if self.is_running(child.id):
+                self.cancel(child.id)
+                stopped += 1
+        return stopped
 
     def cancel_campaign(self, session_id: str) -> int:
         """取消一次战役：它自己、它派出的子会话，返回停掉的会话数。
@@ -604,19 +704,16 @@ class AgentHost:
         owner = self.manager.get_session(session_id)
         if task is not None and owner is not None:
             self._set_campaign_state(owner, campaign_state.CANCELLED)
-        for child in self.children_of(session_id):
-            if not child.task_id:
-                continue
-            if self.is_running(child.id):
-                self.cancel(child.id)
-                stopped += 1
+        stopped += self._stop_children(session_id)
+        self._finish_campaign(session_id, None, cancelled=True)
         return stopped
 
     def shutdown(self) -> None:
         """退出时取消全部后台任务。"""
-        for task in list(self._campaigns.values()):
+        for session_id, task in list(self._campaigns.items()):
             if not task.done():
                 task.cancel()
+            self._finish_campaign(session_id, None, cancelled=True)
         self._campaigns.clear()
         for task in list(self._tasks.values()):
             if not task.done():

@@ -14,9 +14,11 @@ from vsagent.core.agent.planning.context import (
     ContextBundle,
     EvidenceStore,
 )
-from vsagent.core.agent.state.event_log import (TOPIC_SOFT_LIMIT, EventRuntime, event_boundary,
-                        open_tokens, record_step, seal_range, seal_topic)
+from vsagent.core.agent.state.event_log import (TOPIC_SOFT_LIMIT, EventRuntime, absorb_tail,
+                        event_boundary, open_tokens, record_step, seal_range,
+                        seal_topic)
 from vsagent.core.agent.planning import intent
+from vsagent.core.agent.planning.intent_summary import render_intent
 from vsagent.core.agent.roles.contracts import TaskSpec
 from vsagent.core.agent.planning.route_adapter import describe as describe_route
 from vsagent.core.agent.validators import check_tool
@@ -60,17 +62,91 @@ from vsagent.core.agent.search_reasoning.models import SearchEvidence
 
 # 一轮里最多问模型这么多次，防止模型在工具之间来回不收敛
 MAX_STEPS = 24
-# 剩这么多步时进入收束阶段：只放行收尾型的工具，不再展开新工作。
+# 剩这么多步时进入收束阶段：只放行交付动作，不再展开新工作。
 # 等走到 0 再停，这一轮什么交代都没有，用户只能看见一截被截断的过程。
 CLOSING_STEPS = 3
 # 一个主题走到这么多步还没收，内核自己封一次。
 # `close_topic` 是模型判断，实测一条主题能走到 21 步（`evt_0009`），
 # 全靠它收不住。封存不花请求，封完原文让位、结论留下。
+# 这只对根会话成立：子 agent 整个任务就是一个主题，中途封存会逼它
+# 用 `recall_event` 把刚封掉的细节捞回来（2026-11-18 实测 3–5 步）。
 TOPIC_STEP_LIMIT = 20
-# 收束阶段只放行这几个工具：写产物、收主题、记任务状态，外加回看原文与历史。
-CLOSING_TOOLS = frozenset(
-    {"write_run", "close_topic", "task", "read_turn", "recall_event", "search_history"}
+# 收束阶段放行的是「交付动作」：登记、写文件、核对、收主题、记状态。
+# 子 agent 与根会话要交的东西不同，名单分开。
+#
+# 2026-11-18 的四个会话里，子 agent 最后三步想做的依次是
+# `add_evidence`、`workspace`、`read`、`registry`，全部被旧名单拦下；
+# 而旧名单里的 `write_run` 是把受体与口袋写成运行目录的工具，三个角色
+# 一次都没用过。名单按层级与角色算，不再用一张表管所有会话。
+WORKER_CLOSING = frozenset(
+    {
+        "write",
+        "patch",
+        "read",
+        "grep",
+        "registry",
+        "workspace",
+        "add_evidence",
+        "close_topic",
+        "task",
+        "recall_event",
+    }
 )
+ROOT_CLOSING = frozenset(
+    {
+        "read",
+        "grep",
+        "write",
+        "patch",
+        "registry",
+        "read_turn",
+        "search_history",
+        "recall_event",
+        "close_topic",
+        "task",
+    }
+)
+# 只有产出运行目录的角色才需要它。
+RUN_CLOSING = frozenset({"write_run"})
+RUN_CLOSING_ROLES = frozenset({"prepare", "docking", "visualization"})
+
+# 收尾被拒时给模型的话。旧文案让所有角色都去调 `write_run`，而它只对
+# 产出运行目录的角色有意义；这里按层级说清「现在还能做哪几类事」。
+CLOSING_HINT_WORKER = (
+    "本轮步数快用完了，不再取新数据、不再开新计算。"
+    "把已经做出来的登记好（add_evidence、workspace），"
+    "把交付文件写完或核对一遍（write、patch、read、grep），"
+    "{runner}"
+    "然后收主题、记下一步（close_topic、task）。"
+    "最后按任务书给出结论、产物、证据出处、没做到的部分。"
+)
+CLOSING_HINT_ROOT = (
+    "本轮步数快用完了，不再派发新角色、不再开新计算。"
+    "子 agent 的结论已经随派发结果带回，核对交付文件（read、grep），"
+    "然后收主题、记下一步（close_topic、task），"
+    "最后给用户一份结论、产物与没做到的部分。"
+)
+
+
+def closing_tools(session: Session) -> frozenset[str]:
+    """这一步只放行哪些工具。子会话按角色算，根会话按编排算。"""
+    if int(getattr(session, "depth", 0) or 0) > 0:
+        role = str(getattr(session, "agent_role", "") or "").strip()
+        if role in RUN_CLOSING_ROLES:
+            return WORKER_CLOSING | RUN_CLOSING
+        return WORKER_CLOSING
+    return ROOT_CLOSING
+
+
+def closing_hint(session: Session) -> str:
+    """收尾阶段拒绝一次调用时，告诉模型现在该做什么。"""
+    if int(getattr(session, "depth", 0) or 0) > 0:
+        role = str(getattr(session, "agent_role", "") or "").strip()
+        runner = "需要运行目录的用 write_run，" if role in RUN_CLOSING_ROLES else ""
+        return CLOSING_HINT_WORKER.format(runner=runner)
+    return CLOSING_HINT_ROOT
+
+
 # Stop 钩子最多让一轮多走这么多次，单独计数，不吃 MAX_STEPS 的额度
 MAX_STOP_RETRIES = 2
 # 可以重试的错误最多重发这么多次
@@ -239,6 +315,14 @@ WRAPUP_INSTRUCTION = (
     "只写简报本身，不要寒暄，不要复述这段指令，不要再调用工具。"
 )
 
+# 最后一步的提示。步数用满之前还有一次请求，这一次不带工具定义：
+# 模型看到「还剩 1 步」仍会拿去调 close_topic 或再跑一个工具，真正想说的话
+# 只能挤进收尾总结里（2026-11-20 那一轮，第 24 步还在调 task 与 close_topic）。
+FINAL_STEP_INSTRUCTION = (
+    "这是本次允许的最后一步，工具已经收回。不要再调用工具，"
+    "把目前能确定的结论、产出与还差什么直接写给用户。"
+)
+
 
 @dataclass
 class _PendingPermission:
@@ -295,8 +379,8 @@ class AgentLoop:
         # 本地结构服务的状态。与记忆一样是**应用级**的：整个进程一个，
         # 不随会话切换而变，也不每轮重建。open_viewer 只从中读实际端口。
         self.viewer = viewer
-        # 子 agent 派发器。应用级对象，由 app 装配、按会话注入给 dispatch_campaign
-        # 与 agent_status。根会话的循环层拿得到它，子 agent 的注册表里没有这两个工具，
+        # 子 agent 派发器。应用级对象，由 app 装配、按会话注入给 dispatch_campaign。
+        # 根会话的循环层拿得到它，子 agent 的注册表里没有这个工具，
         # 所以「子 agent 不能再派发」在装配层就成立，不靠工具自己判断。
         self.spawner = spawner
         # 科研工作区：与登记表一样是**按根会话共享**的一份，由 host 持有。
@@ -526,6 +610,10 @@ class AgentLoop:
                 # 不存的话事后分不出「做完的」与「被停下的」。
                 exit_reason=exit_reason or "",
             )
+            # 轮末封存只切到消息边界；模型在最后一步调过 close_topic 时，
+            # 切点落在最后一条消息中间，收尾总结就成了切点之后的一小段。
+            # 并回上一条事件，界面上才不会多出一个只有一行答复的主题。
+            absorb_tail(session)
         finally:
             # 兜底：中途抛错时，已经生成但还没发布的正文也要让用户看见。
             # 正常情况下由 `_finalize_answer` 发过一次，这里再调是空操作。
@@ -732,6 +820,12 @@ class AgentLoop:
         任何异常都不往外抛：路由是新加的一层，不能成为新的故障点。
         """
         text = self._last_user_text(session)
+        # 这三个字段只在内存里，每轮重写。`route_note` 是给模型的短提示，
+        # `route_intent` 是解析结果的摘要，两者都进 TASK 层；
+        # `route_blocked_reason` 由派发工具用来拦一次。
+        session.route_note = ""
+        session.route_intent = ""
+        session.route_blocked_reason = ""
         if text.strip():
             # 关键词提示与路由无关：路由关掉、或者是子会话，上下文里那一行照样要给。
             self._turn_hint = intent.detect(text)
@@ -749,7 +843,13 @@ class AgentLoop:
                     {"session_id": session.id, "error": f"读不出当前任务规格：{error}"},
                 )
         try:
-            decision = await self.route_adapter.prepare(text, current=current)
+            decision = await self.route_adapter.prepare(
+                text,
+                current=current,
+                session=session,
+                ledger=self.ledger,
+                workspace=self.workspace,
+            )
         except Exception as error:
             self.bus.publish("route.error", {"session_id": session.id, "error": str(error)})
             return
@@ -770,23 +870,90 @@ class AgentLoop:
             {
                 "session_id": session.id,
                 "mode": decision.mode,
+                "relation": decision.relation,
+                "action": decision.action,
                 "task_id": decision.task.task_id if decision.task else "",
                 "revision": decision.task.revision if decision.task else 0,
-                "capabilities": list(plan.selected_capabilities) if plan else [],
+                "operations": list(decision.intent.operations) if decision.intent else [],
                 "agents": list(plan.selected_agents) if plan else [],
+                "verdict": decision.verdict.decision if decision.verdict else "",
                 "warnings": list(decision.warnings),
             },
         )
         if decision.error:
             # 出错就什么都不改：宁可这一轮退回原来的路径，也不要把一份半成品
             # 计划写进会话状态，下一轮再按它继续。
+            if (
+                getattr(self.route_adapter, "mode", "shadow") == "enforce"
+                and decision.verdict is not None
+                and decision.verdict.decision == "reject"
+            ):
+                session.route_blocked_reason = decision.error
+                session.route_note = (
+                    f"这一轮路由明确拒绝：{decision.error}。不要派发，先向用户说明原因。"
+                )
+            return
+        if decision.clarification:
+            if getattr(self.route_adapter, "mode", "shadow") == "enforce":
+                session.pending_intent = {
+                    "intent": decision.intent.to_dict() if decision.intent else {},
+                    "clarification": list(decision.clarification),
+                    "task_id": decision.task.task_id if decision.task else (current.task_id if current else ""),
+                    "goal": decision.intent.goal if decision.intent else "",
+                }
+                session.route_note = (
+                    "本轮先向用户澄清："
+                    + "；".join(decision.clarification)
+                    + "。不要派发。"
+                )
+            return
+        if decision.action == "status_query":
+            session.route_note = "本轮只回答当前进度，不要重新编译任务，也不要派发新的角色。"
+            return
+        if decision.action == "ask_result":
+            session.route_note = "本轮只解释已有结果与产物，不要重新计算，也不要派发新的角色。"
+            return
+        if decision.action == "cancel":
+            if getattr(self.route_adapter, "mode", "shadow") == "enforce":
+                if self.spawner is not None and hasattr(self.spawner, "cancel_campaign"):
+                    try:
+                        self.spawner.cancel_campaign(session.id)
+                    except Exception as error:  # noqa: BLE001 - 取消失败也要给模型一句说明
+                        session.route_note = f"取消战役时出错：{error}"
+                if current is not None:
+                    cancelled = current.with_updates(status="cancelled")
+                    session.task_spec = cancelled.to_dict()
+                session.pending_intent = None
+            session.route_note = (
+                session.route_note
+                or "本轮用户要求终止任务。说明已经停止的部分；不要再派发。"
+            )
+            return
+        if decision.action == "chat" or decision.relation == "none":
+            session.route_note = "本轮是闲聊或概念问答，不要建任务，也不要派发。"
             return
         if decision.task is not None:
             previous = session.task_spec or {}
             session.task_spec = decision.task.to_dict()
             self._note_task_change(session, previous, decision.task)
+            # 解析结果压成一页摘要，进 TASK 层。模型据此核对系统理解与用户原话；
+            # 派发工具仍然从 `task_spec` 读完整规格，不依赖这一段。
+            session.route_intent = render_intent(
+                decision.intent,
+                decision.task,
+                decision.plan,
+                mode=decision.mode,
+            )
+        session.pending_intent = None
         self._turn_plan = decision.plan
         self._turn_task = decision.task
+        session.route_note = {
+            "new": "本轮是新任务；按当前任务规格执行。",
+            "continue": "本轮延续当前任务；不要新建任务号。",
+            "modify": "本轮修改了任务目标；已有产物可以继续使用。",
+            "compare": "本轮是比较任务：只比较已有对象或结果，不要重跑上游。",
+            "resume": "本轮恢复旧任务；沿用原任务号与已有产物。",
+        }.get(decision.relation, "")
 
     def _note_task_change(self, session: Session, previous: dict, task: Any) -> None:
         """任务规格变了，把战役状态推到「定规格」。
@@ -1087,8 +1254,10 @@ class AgentLoop:
             if added:
                 self._suppress_retrieval(message, step)
             # 多 Agent：子会话报告带着证据对象，状态已经存在时并进同一场证据池。
+            # 认 `tool_meta["evidence"]`，不认具体工具名：派发结果与以后的
+            # 其它汇总工具都可能带证据，按名字白名单会让新工具悄悄漏掉。
             for part in calls:
-                if part.tool_name != "agent_status":
+                if not (part.tool_meta or {}).get("evidence"):
                     continue
                 for row in (part.tool_meta or {}).get("evidence") or []:
                     if not isinstance(row, dict):
@@ -1197,7 +1366,9 @@ class AgentLoop:
         if exit_reason:
             state.status = "failed"
             save_answer(state, self.state_dir, session.id)
-            self._flush_held()
+            # 交代已经由收尾总结给了。这里再把压着的草稿放出去，用户看到的
+            # 最后一段会是一句「本轮写入：…」的半截话，总结被挤到它前面。
+            self._drop_held()
             self._release_suppressed()
             return
 
@@ -1375,7 +1546,7 @@ class AgentLoop:
         findings = check_delivery(
             self._turn_task, ledger=self.ledger, workspace=self.workspace_root
         )
-        names = [row["name"] for row in self._turn_task.required_outputs]
+        names = list(self._turn_task.required_outputs)
         self.bus.publish(
             "validator.delivery",
             {
@@ -1505,7 +1676,7 @@ class AgentLoop:
 
         名单来自 `agents.toml`（见 `roles/agents.py`），会话建立时定稿、运行当中
         不变。名单外的工具连名字都不出现，模型不会去调它不存在的东西；真去调时
-        执行处还会按同一份名单拒绝（`capability_guard`）。
+        执行处还会按同一份名单拒绝（`tool_guard`）。
         """
         from vsagent.core.agent.roles.agents import allowed_tools
 
@@ -1578,10 +1749,23 @@ class AgentLoop:
             step += 1
             steps_left = self.max_steps - tool_steps
             self._closing = steps_left <= CLOSING_STEPS
+            # 最后一步不再发工具定义：发了它就会用掉，然后一步不剩地撞上限。
+            # 这一步要的是一段答复，收尾总结只是兜底。
+            final_step = steps_left <= 1
+            step_hint = (
+                f"{hint_text}\n\n{FINAL_STEP_INSTRUCTION}" if final_step else hint_text
+            )
+            tools = [] if final_step else self.tool_specs(session)
             self._publish(message, Part(type=PartType.STEP_START, text=f"{step} · {self.config.model}"))
             prefix = stable_prefix(workspace, session)
             try:
-                context = self._assemble(session, prefix, steps_left=steps_left, hint_text=hint_text)
+                context = self._assemble(
+                    session,
+                    prefix,
+                    with_tools=not final_step,
+                    steps_left=steps_left,
+                    hint_text=step_hint,
+                )
             except ContextAssemblyError as error:
                 # 装不下就明说，不静默截断：模型在缺了材料的情况下继续往下做，
                 # 比停下来让用户知道「要腾地方」糟得多。
@@ -1603,19 +1787,37 @@ class AgentLoop:
                 if self._seal_range(session, kind="auto", upto=covered, force=True):
                     # 装不下是必须解决的约束：这一段的原文必须让位。
                     session.compact_upto = max(session.compact_upto, covered)
-                    context = self._assemble(session, prefix, steps_left=steps_left, hint_text=hint_text)
+                    context = self._assemble(
+                        session,
+                        prefix,
+                        with_tools=not final_step,
+                        steps_left=steps_left,
+                        hint_text=step_hint,
+                    )
                 elif await self._summarize(session, message, context.dropped_upto):
-                    context = self._assemble(session, prefix, steps_left=steps_left, hint_text=hint_text)
+                    context = self._assemble(
+                        session,
+                        prefix,
+                        with_tools=not final_step,
+                        steps_left=steps_left,
+                        hint_text=step_hint,
+                    )
             elif context.dropped_upto > 0:
                 # 判据是「上下文里有没有已经不在的内容」，不是「这一步新丢了没有」：
                 # 用户手动 /compact 推的边界不在当步产生新移出，但那一段同样要摘要；
                 # 已经收进摘要的会由 `_summarize` 自己判掉，只留一条界面记录。
                 if await self._summarize(session, message, context.dropped_upto):
-                    context = self._assemble(session, prefix, steps_left=steps_left, hint_text=hint_text)
+                    context = self._assemble(
+                        session,
+                        prefix,
+                        with_tools=not final_step,
+                        steps_left=steps_left,
+                        hint_text=step_hint,
+                    )
             self._trace_context(session, context)
             before = dict(message.tokens)
             calls = await self._ask_model(
-                message, context.messages, self.tool_specs(session), session.effort
+                message, context.messages, tools, session.effort
             )
             self._record_step_metrics(
                 session,
@@ -1691,7 +1893,12 @@ class AgentLoop:
 
         只看步数会让正常推进的长主题也被切断；只看「没有新产物」会让刚起步
         还没产出的主题被误收。两个条件同时成立才算卡住。
+
+        子 agent 不适用：它的整个任务就是一个主题，封存会把还要接着用的
+        原文拿走。它装不下时由装配层按需封存（`context.dropped` 那条路）。
         """
+        if int(getattr(session, "depth", 0) or 0) > 0:
+            return False
         steps = session.pending_steps
         if len(steps) < TOPIC_STEP_LIMIT:
             return False
@@ -2211,16 +2418,10 @@ class AgentLoop:
                 missing_tool_reason(self.registry, part.tool_name, session),
             )
             return
-        if self._closing and not explicit and tool.spec.name not in CLOSING_TOOLS:
-            # 收束阶段：不再开新工作，只允许写产物、收主题、记状态与回看原文。
+        if self._closing and not explicit and tool.spec.name not in closing_tools(session):
+            # 收束阶段：不再开新工作，只允许登记、写交付物、核对、收主题与记状态。
             # 与走到 0 步直接断开相比，这一步把「还剩几步」交给模型自己安排。
-            self._fail_tool(
-                message,
-                part,
-                "本轮步数快用完了，不再展开新工作。"
-                "把已经做出来的写进 write_run，用 close_topic 收这一段，"
-                "再用 task 记下下一步。",
-            )
+            self._fail_tool(message, part, closing_hint(session))
             return
         error = argument_error(tool.spec, part.tool_input)
         if error:

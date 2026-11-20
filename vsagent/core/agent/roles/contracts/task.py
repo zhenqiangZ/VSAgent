@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from vsagent.core.agent.roles.catalog import AGENTS, STAGES
 from vsagent.core.agent.roles.contracts.base import (
     SCHEMA_VERSION,
     ContractError,
@@ -61,6 +62,25 @@ def _named_rows(rows: Any, field_name: str, keys: tuple[str, ...]) -> list[dict[
     return out
 
 
+def _unique_texts(value: Any, field_name: str) -> tuple[str, ...]:
+    """一组不重复的文本。重复项直接报错，不静默去重。
+
+    `texts()` 会去重；交付物与确认点是合同里的清单，重复说明写入方算错了，
+    静默合并会让「为什么只派了一份」变得难以追查。
+    """
+    raw = value
+    if raw is None:
+        raw = ()
+    elif isinstance(raw, str):
+        raw = (raw,)
+    if not isinstance(raw, (list, tuple)):
+        raise ContractError(f"{field_name} 应当是字符串数组，收到 {type(raw).__name__}")
+    out = texts(raw, field_name)
+    if len(out) != len(raw):
+        raise ContractError(f"{field_name} 里有重复项：{'、'.join(out)}")
+    return out
+
+
 @dataclass
 class TaskSpec:
     """一次科研任务的合同。"""
@@ -74,10 +94,10 @@ class TaskSpec:
     exclusions: tuple[str, ...] = ()
     required_inputs: list[dict[str, Any]] = field(default_factory=list)
     available_inputs: dict[str, Any] = field(default_factory=dict)
-    required_outputs: list[dict[str, Any]] = field(default_factory=list)
-    evidence_requirements: list[dict[str, Any]] = field(default_factory=list)
+    required_outputs: tuple[str, ...] = ()
+    evidence_requirements: tuple[str, ...] = ()
     acceptance_criteria: list[dict[str, Any]] = field(default_factory=list)
-    approval_points: list[dict[str, Any]] = field(default_factory=list)
+    approval_points: tuple[str, ...] = ()
     status: str = "draft"
     revision: int = 0
     schema_version: int = SCHEMA_VERSION
@@ -93,17 +113,39 @@ class TaskSpec:
         self.constraints = texts(self.constraints, "TaskSpec.constraints")
         self.exclusions = texts(self.exclusions, "TaskSpec.exclusions")
         self.subgoals = _named_rows(self.subgoals, "TaskSpec.subgoals", ("goal",))
+        for index, row in enumerate(self.subgoals):
+            agent = row.get("agent")
+            if not isinstance(agent, str) or not agent.strip():
+                raise ContractError(
+                    f"TaskSpec.subgoals[{index}].agent 不能为空：每个子目标都要有负责角色"
+                )
+            if agent.strip() not in AGENTS:
+                raise ContractError(
+                    f"TaskSpec.subgoals[{index}].agent 不认识：{agent!r}。"
+                    f"可用：{'、'.join(AGENTS)}"
+                )
+            row["agent"] = agent.strip()
+            stage = row.get("stage")
+            if stage is None or (isinstance(stage, str) and not stage.strip()):
+                row.pop("stage", None)
+                continue
+            if not isinstance(stage, str) or stage.strip() not in STAGES:
+                raise ContractError(
+                    f"TaskSpec.subgoals[{index}].stage 不认识：{stage!r}。"
+                    f"可用：{'、'.join(STAGES)}"
+                )
+            row["stage"] = stage.strip()
         self.required_inputs = _named_rows(
             self.required_inputs, "TaskSpec.required_inputs", ("name",)
         )
-        self.required_outputs = _named_rows(
-            self.required_outputs, "TaskSpec.required_outputs", ("name",)
+        self.required_outputs = _unique_texts(
+            self.required_outputs, "TaskSpec.required_outputs"
         )
-        self.evidence_requirements = _named_rows(
-            self.evidence_requirements, "TaskSpec.evidence_requirements", ("name",)
+        self.evidence_requirements = _unique_texts(
+            self.evidence_requirements, "TaskSpec.evidence_requirements"
         )
-        self.approval_points = _named_rows(
-            self.approval_points, "TaskSpec.approval_points", ("name",)
+        self.approval_points = _unique_texts(
+            self.approval_points, "TaskSpec.approval_points"
         )
         self.acceptance_criteria = _named_rows(
             self.acceptance_criteria, "TaskSpec.acceptance_criteria", ("kind", "target")
@@ -112,9 +154,6 @@ class TaskSpec:
             self.acceptance_criteria[index]["kind"] = choice(
                 row["kind"], ACCEPTANCE_KINDS, f"TaskSpec.acceptance_criteria[{index}].kind"
             )
-        names = [row["name"] for row in self.required_outputs]
-        if len(names) != len(set(names)):
-            raise ContractError("TaskSpec.required_outputs 里有重名的交付物")
 
     @property
     def machine_checks(self) -> list[dict[str, Any]]:
@@ -128,7 +167,7 @@ class TaskSpec:
     def uncovered_outputs(self) -> list[str]:
         """没有验收条件的交付物。空列表才说明每个交付物都有人管。"""
         covered = {row.get("output") or row.get("target") for row in self.acceptance_criteria}
-        return [row["name"] for row in self.required_outputs if row["name"] not in covered]
+        return [name for name in self.required_outputs if name not in covered]
 
     def with_updates(self, **changes: Any) -> "TaskSpec":
         """改一份副本并重新校验。改目标时 `revision` 由调用方显式加一。"""
@@ -148,10 +187,10 @@ class TaskSpec:
             "exclusions": list(self.exclusions),
             "required_inputs": [dict(row) for row in self.required_inputs],
             "available_inputs": dict(self.available_inputs),
-            "required_outputs": [dict(row) for row in self.required_outputs],
-            "evidence_requirements": [dict(row) for row in self.evidence_requirements],
+            "required_outputs": list(self.required_outputs),
+            "evidence_requirements": list(self.evidence_requirements),
             "acceptance_criteria": [dict(row) for row in self.acceptance_criteria],
-            "approval_points": [dict(row) for row in self.approval_points],
+            "approval_points": list(self.approval_points),
             "status": self.status,
             "revision": self.revision,
         }
@@ -190,10 +229,10 @@ class TaskSpec:
             exclusions=tuple(data.get("exclusions") or ()),
             required_inputs=data.get("required_inputs") or [],
             available_inputs=data.get("available_inputs") or {},
-            required_outputs=data.get("required_outputs") or [],
-            evidence_requirements=data.get("evidence_requirements") or [],
+            required_outputs=tuple(data.get("required_outputs") or ()),
+            evidence_requirements=tuple(data.get("evidence_requirements") or ()),
             acceptance_criteria=data.get("acceptance_criteria") or [],
-            approval_points=data.get("approval_points") or [],
+            approval_points=tuple(data.get("approval_points") or ()),
             status=data.get("status", "draft"),
             revision=data.get("revision", 0),
             schema_version=check_version(data.get("schema_version"), name="TaskSpec"),

@@ -36,6 +36,8 @@ class TaskTool(Tool):
             "所以**用户提的要求一律记进 `constraints` 参数**，别指望聊天记录还记得住。"
             "只填这次真正要改的字段，没填的字段不动。"
             "`constraints` 是累加的：这次没写出来的旧约束不会被删掉。"
+            "这里记的是本会话自己的要求。派发子 agent 时不要把整份清单抄过去；"
+            "按每个角色这一段的任务，在 dispatch_campaign 的 constraints 里写它该遵守的那几条。"
             "done / todo / blockers 是整段替换：要改就把这一类完整重写一遍，"
             "传空数组表示这一类清空。"
         ),
@@ -49,7 +51,9 @@ class TaskTool(Tool):
                 "constraints": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "用户新提出的要求，逐条追加；已有的约束不会被覆盖",
+                    "description": (
+                        "用户新提出的要求，逐条追加；已有的约束不会被覆盖。"
+                    ),
                 },
                 # 这个参数原来叫 `add_constraints`。名字与状态里那个字段
                 # （`constraints`）、与说明文字、与渲染出来的标题都对不上，

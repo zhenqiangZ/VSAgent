@@ -30,6 +30,7 @@ os.environ.setdefault("VSA_ROUTE", "off")
 os.environ.setdefault("VSA_VALIDATE", "off")
 os.environ.setdefault("VSA_SAR", "off")
 
+from textual import events  # noqa: E402
 from textual.widgets import Input, TextArea  # noqa: E402
 
 from vsagent.app import VSAgentApp  # noqa: E402
@@ -46,10 +47,15 @@ from vsagent.core.agent.execution.loop import (  # noqa: E402
     EXIT_TOPIC_FULL,
     MAX_RETRIES,
     MAX_STOP_RETRIES,
+    ROOT_CLOSING,
+    RUN_CLOSING,
     STOP_NOTICE,
     TOOL_HOOK_NOTICE,
     TOPIC_STEP_LIMIT,
+    WORKER_CLOSING,
     AgentLoop,
+    closing_hint,
+    closing_tools,
     missing_tool_reason,
 )
 from vsagent.core.agent.permission import (  # noqa: E402
@@ -115,6 +121,7 @@ from vsagent.core.agent.state.event_log import (  # noqa: E402
     CloseTopicTool,
     EventRuntime,
     RecallEventTool,
+    absorb_tail,
     event_boundary,
     open_tokens,
     record_step,
@@ -128,7 +135,6 @@ from vsagent.core.agent.state.topics import step_seconds, topic_views
 from vsagent.core.agent.state.hypothesis import HypothesisTool
 from vsagent.core.agent.execution.spawn import (  # noqa: E402
     REPORT_TOKENS,
-    AgentStatusTool,
     _cap_report,
     fork_messages,
     task_preamble,
@@ -160,7 +166,6 @@ from vsagent.core.agent.roles.prompt import (  # noqa: E402
     platform_note,
     project_rules,
     rules_directory,
-    select_rules,
     stable_prefix,
     summary_messages,
     translate_message,
@@ -248,17 +253,18 @@ from vsagent.core.agent.roles.contracts import (  # noqa: E402
     ACCEPTANCE_KINDS,
     AgentReport,
     AgentTask,
-    CapabilityPlan,
+    AgentPlan,
     ContractError,
     IntentSpec,
+    ObjectRef,
     SCHEMA_VERSION,
     TaskSpec,
 )
 from vsagent.core.agent.coretools import build_core_tools  # noqa: E402
 from vsagent.core.agent.planning.intent_parser import IntentParseError, IntentParser
 from vsagent.core.agent.planning.task_compiler import CompileError, TaskCompiler
-from vsagent.core.agent.planning.capability_router import (  # noqa: E402
-    CapabilityRouter,
+from vsagent.core.agent.planning.agent_router import (  # noqa: E402
+    AgentRouter,
     RouterError,
     missing_prerequisites,
 )
@@ -283,7 +289,7 @@ from vsagent.screens.connection_form import ConnectionFormScreen  # noqa: E402
 from vsagent.screens.home import HomeScreen  # noqa: E402
 from vsagent.screens.permission import PermissionDialog  # noqa: E402
 from vsagent.screens.session_picker import ConfirmDialog, SessionPickerScreen  # noqa: E402
-from vsagent.screens.subagent import StartBar, SubagentChatScreen  # noqa: E402
+from vsagent.screens.subagent import StartBar, SubagentBanner, SubagentChatScreen  # noqa: E402
 
 from fake_model_server import (  # noqa: E402
     FakeModelServer,
@@ -350,9 +356,8 @@ def _debug_tool_modules() -> list[tuple[str, list[Tool]]]:
 
 DOMAIN_TOOL_NAMES = [tool.spec.name for tool in all_domain_tools()]
 
-# `domain` 包里全部模块的工具，比上面多一个：`assess_campaign` 常驻、不登记族
-# （它决定这一轮装哪几族，自己先要装族就反了），所以不在按族装的清单里。
-# 调试脚本的覆盖判据用它——那个工具同样要端到端跑过一遍。
+# `domain` 包里全部模块的工具。调试脚本的覆盖判据用它：模块里的工具也要端到端
+# 跑过一遍，哪怕它没写进任何角色名单。
 DOMAIN_PACKAGE_TOOL_NAMES = [
     tool.spec.name for _name, tools in _debug_tool_modules() for tool in tools
 ]
@@ -382,6 +387,20 @@ class EchoTool(Tool):
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         return ToolResult(output=str(arguments["text"]))
+
+
+class NamedTool(Tool):
+    """按名字返回成功：验收尾放行名单时不必为每个名字写一个类。"""
+
+    def __init__(self, name: str) -> None:
+        self.spec = ToolSpec(
+            name=name,
+            description="测试用工具",
+            parameters={"type": "object", "properties": {}, "required": []},
+        )
+
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
+        return ToolResult(output=f"{self.spec.name} 完成")
 
 
 class SlowTool(Tool):
@@ -1052,7 +1071,10 @@ def check_rules() -> None:
     try:
         check(rules_directory(WORKSPACE_FIXTURE) == RULES_FIXTURE, "VSA_RULES_DIR 能顶掉规则目录")
         with_rules = stable_prefix(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
-        check("只许读，不许写" in with_rules, "系统提示里带上规则文件的内容")
+        check(
+            "只许读，不许写" not in with_rules,
+            "项目规则不再进前缀",
+        )
     finally:
         os.environ.pop(RULES_DIR_ENV, None)
 
@@ -1060,7 +1082,7 @@ def check_rules() -> None:
 
 
 def check_prefix() -> None:
-    """稳定前缀：规则排最后、平台是真的、日期与状态目录不进前缀、不点名看不见的工具。
+    """稳定前缀：项目规则不注入、平台是真的、日期与状态目录不进前缀、不点名看不见的工具。
 
     预算、Plan 类别覆盖、越界参数表那三条在 `tools/check_prefix.py`：它们要装全部
     工具、还要读真实的规则文件，跑一次比这一组贵，分开放着更容易查。
@@ -1077,7 +1099,10 @@ def check_prefix() -> None:
 
         rules_path.write_text("# 前缀判据规则\n", encoding="utf-8")
         with_rules = stable_prefix(Workspace(session.id, root=WORKSPACE_FIXTURE), session)
-        check(with_rules.rstrip().endswith("# 前缀判据规则"), "规则排在前缀最后")
+        check(
+            "# 前缀判据规则" not in with_rules,
+            "规则文件存在也不进前缀，只留给 /init 与人工查阅",
+        )
     finally:
         os.environ.pop(RULES_DIR_ENV, None)
         rules_path.unlink(missing_ok=True)
@@ -1088,7 +1113,7 @@ def check_prefix() -> None:
     check("状态目录" not in bare, "状态目录不进前缀")
 
     # 内置纪律里不点任何领域工具名：它们首步看不见，点名等于教模型去撞墙。
-    # 核心工具可以点名（load_tools、recall_event 这些一直在清单里）；项目规则也
+    # 核心工具可以点名（remember、recall_event 这些一直在清单里）；项目规则也
     # 可以——门禁写在具体动作上，那里点出工具名是为了说清「这一步调用它之前先做什么」。
     domain = set(all_names())
     named = sorted(name for name in domain if re.search(rf"\b{re.escape(name)}\b", bare))
@@ -1105,18 +1130,25 @@ def check_prefix() -> None:
         all(name in visible for name in core_named),
         f"前缀点名的核心工具首步可见：{core_named}",
     )
-    check("不必也不能自己装载" in bare, "前缀说明工具清单由角色决定、不用自己装")
     check(
-        "没有地址就不要发这段描述" in bare,
-        "呈现纪律写明：具体的结构描述必须带页面地址",
+        "不得假定自己拥有未提供的工具" in bare,
+        "前缀说明工具清单由角色决定、不能自己扩权",
     )
     check(
-        "write_run" in bare and "open_viewer" in bare,
-        "呈现纪律点名两个基础档工具",
+        "页面地址必须来自工具返回" in bare,
+        "呈现纪律写明：页面地址必须来自工具",
     )
     check(
-        "打分是两路" in bare and "微调" in bare,
-        "打分纪律写明两路与 DTA 的微调后推理",
+        "visualization" in bare and "视图生成" in bare,
+        "呈现纪律写明视图由 visualization 角色负责",
+    )
+    docking = Session(id="ses_prefix_docking", title="打分", agent_role="docking")
+    docking_prefix = stable_prefix(
+        Workspace(docking.id, root=WORKSPACE_FIXTURE), docking
+    )
+    check(
+        "评分模型" in docking_prefix and "亲和力模型训练" in docking_prefix,
+        "打分纪律写明评分职责与亲和力通道",
     )
 
 
@@ -1129,14 +1161,9 @@ def check_rules_tier() -> None:
     整本手册塞进前缀。
     """
     from vsagent.core.agent.roles import prompt as prompt_module
-    from vsagent.core.agent.roles.capabilities import CAPABILITIES, ROLES
+    from vsagent.core.agent.roles.catalog import ROLES
     from vsagent.core.agent.roles.profiles import TITLES
-    from vsagent.core.agent.planning.stages import (
-        CAPABILITY_STAGE,
-        STAGES,
-        stage_for,
-        stage_label,
-    )
+    from vsagent.core.agent.planning.stages import STAGES, stage_for, stage_label
 
     inventory = prompt_module.rule_inventory(ROOT)
     check(
@@ -1163,17 +1190,20 @@ def check_rules_tier() -> None:
             head.startswith("# ") and TITLES[role].startswith(head[2:]),
             f"{role} 的规则标题与说明书一致：{head} / {TITLES[role]}",
         )
+        # 主控承接了原 AGENTS.md 的交付、禁止与检查清单，额度单独放宽；
+        # 其余角色仍然按 400 卡，避免角色规则长成第二本手册。
+        limit = 1_200 if role == "principal" else 400
         check(
-            estimate_tokens(text) <= 400,
-            f"{role} 的规则不超过 400 token：{estimate_tokens(text)}",
+            estimate_tokens(text) <= limit,
+            f"{role} 的规则不超过 {limit} token：{estimate_tokens(text)}",
         )
 
-    # 取证顺序与停止条件在 target 角色规则里（主 Agent 只知道该找谁）。
+    # 取证顺序与停止条件在 research 角色规则里（主 Agent 只知道该找谁）。
     # 这一条原来查的是主前缀：领域约束按角色归位之后，判据跟着内容走。
-    target_rules = prompt_module.agent_rules(ROOT, "target")
+    target_rules = prompt_module.agent_rules(ROOT, "research")
     check(
         "本地语料" in target_rules and "命中就停" in target_rules,
-        "取证顺序写在 target 规则里：本地语料优先，命中即止",
+        "取证顺序写在 research 规则里：本地语料优先，命中即止",
     )
     check("两轮" in target_rules, "检索有轮次上限，不无限扩大")
     check("没有记录" in target_rules, "查不到时写「没有记录」")
@@ -1183,17 +1213,14 @@ def check_rules_tier() -> None:
     check("只有前两类能让假设变成" in invariants, "七级证据与封顶规则进了全局规则")
     check("子 Agent 不能改共享状态" in invariants, "确认与边界进了全局规则")
 
-    # 阶段表写错名字不会报错，只会永远匹配不上：能力名要真实存在，
-    # 指向的阶段要在五步里。
-    known = {item.name for item in CAPABILITIES}
-    unknown = sorted(set(CAPABILITY_STAGE) - known)
-    check(not unknown, f"阶段表里的能力都真实存在：{unknown}")
-    bad_stage = sorted(set(CAPABILITY_STAGE.values()) - set(STAGES))
-    check(not bad_stage, f"阶段表指向的阶段都在五步里：{bad_stage}")
+    # 阶段直接写在子目标上；写错的阶段不会被当成某一步。
     check(
-        "target_intelligence" not in CAPABILITY_STAGE
-        and "literature_evidence" not in CAPABILITY_STAGE,
-        "跨阶段的能力不硬塞进某一步",
+        stage_for(Session(
+            id="ses_bad_stage",
+            title="坏阶段",
+            task_spec={"subgoals": [{"goal": "x", "agent": "pocket", "stage": "nope"}]},
+        )) == "",
+        "不认识的阶段不硬塞",
     )
 
     # 前缀：全局不变式 + 这一个角色的规则，且只有这一个角色的规则。
@@ -1202,25 +1229,28 @@ def check_rules_tier() -> None:
     os.environ[RULES_DIR_ENV] = str(RULES_ROOT)
     try:
         principal = stable_prefix(workspace, session)
-        check("这些规则不分角色，每一轮都必须遵守" in principal, "全局规则进稳定前缀")
+        check(
+            "以下全局规则适用于所有角色，必须遵守" in principal,
+            "全局规则进稳定前缀",
+        )
         check(
             prompt_module.agent_rules(ROOT, "principal") in principal,
             "没有角色的会话按 principal 加载",
         )
         check("派发前写清四件事" in principal, "主 Agent 的规则确实在前缀里")
 
-        session.agent_role = "screening"
-        screening = stable_prefix(workspace, session)
+        session.agent_role = "prepare"
+        prepared = stable_prefix(workspace, session)
         check(
-            prompt_module.agent_rules(ROOT, "screening") in screening,
+            prompt_module.agent_rules(ROOT, "prepare") in prepared,
             "带角色的会话加载的是自己那一份",
         )
         check(
-            prompt_module.agent_rules(ROOT, "principal") not in screening,
+            prompt_module.agent_rules(ROOT, "principal") not in prepared,
             "不再捎带别的角色的规则",
         )
         check(
-            prompt_module.stage_rules("pocket_analysis", ROOT) not in screening,
+            prompt_module.stage_rules("pocket_analysis", ROOT) not in prepared,
             "阶段规则不进稳定前缀（每推进一步就变，会把缓存打掉）",
         )
         for name in prompt_module.reference_files(ROOT):
@@ -1229,7 +1259,7 @@ def check_rules_tier() -> None:
                 / prompt_module.REFERENCE_RULE_DIR
                 / name
             )
-            check(body not in screening, f"参考材料 {name} 不默认注入")
+            check(body not in prepared, f"参考材料 {name} 不默认注入")
     finally:
         os.environ.pop(RULES_DIR_ENV, None)
 
@@ -1237,8 +1267,8 @@ def check_rules_tier() -> None:
     staged = Session(id="ses_stage", title="阶段")
     staged.task_spec = {
         "subgoals": [
-            {"capability": "target_intelligence"},
-            {"capability": "pocket_discovery"},
+            {"goal": "查靶点", "agent": "research"},
+            {"goal": "找口袋", "agent": "pocket", "stage": "pocket_analysis"},
         ]
     }
     check(stage_for(staged) == "pocket_analysis", "跳过跨阶段的子目标，取第一个认得出的")
@@ -1246,7 +1276,7 @@ def check_rules_tier() -> None:
     check(stage_for(Session(id="ses_none", title="无")) == "", "没有任务规格时没有阶段")
 
     unknown_spec = Session(id="ses_unknown", title="认不出")
-    unknown_spec.task_spec = {"subgoals": [{"capability": "target_intelligence"}]}
+    unknown_spec.task_spec = {"subgoals": [{"goal": "查靶点", "agent": "research"}]}
     check(stage_for(unknown_spec) == "", "只有跨阶段子目标时不硬塞一个阶段")
 
     prefix = stable_prefix(Workspace(staged.id, root=WORKSPACE_FIXTURE), staged)
@@ -1429,17 +1459,12 @@ def check_docs() -> None:
     只查**名字**，不查句子：名字是最稳定的那一部分，改了名字而文档没跟上，是
     读者一定会踩到的坑；句子怎么写，交给写文档的人。
     """
-    from vsagent.core.agent.roles.capabilities import CAPABILITIES, ROLES
+    from vsagent.core.agent.roles.catalog import ROLES
 
     text = (ROOT / "docs" / "design.md").read_text(encoding="utf-8")
 
     missing_roles = [role for role in ROLES if f"`{role}`" not in text]
     check(not missing_roles, f"每个角色都在总文档里：{missing_roles}")
-
-    missing_caps = [
-        item.name for item in CAPABILITIES if f"`{item.name}`" not in text
-    ]
-    check(not missing_caps, f"每个能力都在总文档里：{missing_caps}")
 
     missing_tiers = [
         name
@@ -2740,34 +2765,29 @@ def check_prompt() -> None:
     system_prompt = stable_prefix(workspace, session)
     prefix = stable_prefix(workspace, session)
     check(
-        "引用一律用 handle，不要写文件路径" in system_prompt,
-        "系统提示里写着「收 handle 不收路径」那条纪律",
+        "通过系统提供的引用或 handle 追踪" in system_prompt,
+        "系统提示里写着共享对象用引用或 handle 追踪",
     )
     check(
-        "以各自工具的描述为准" in system_prompt,
-        "收路径的动作不枚举，改为指向各工具描述（枚举过三份写法，全都漂了）",
+        "引用已有对象时优先使用其稳定标识" in system_prompt,
+        "系统提示里写着引用已有对象要用稳定标识",
     )
-    # handle 的出处改指「任务状态里的工作区索引」：那是每步都在的 TASK 层。
-    # 原先前缀写「从 list_workspace 里取」，而它属于 listing 族、首步不可见——
-    # 模型照着做会先撞一次墙。
     check(
-        "工作区索引" in system_prompt,
-        "handle 从任务状态的工作区索引里取",
+        "共享读取不代表拥有写入权限" in system_prompt,
+        "系统提示里写着共享读取不等于写入权限",
     )
     check(
         "list_workspace" not in system_prompt and "describe_entry" not in system_prompt,
         "前缀不点名首步看不见的工具（撞墙一次就是白花一步）",
     )
-    # 复核癖：工具已经把结果写进返回，模型还要 ls → stat → md5sum 再核一遍。
-    # 实测五次运行里复核占工具调用的 25–81%，钱不多（多 35 步只多 $0.014），
-    # 但会撞满步数上限、还会把要核的那段上下文挤出窗口。
+    # 复核癖：工具已经把结果写进返回，模型还要再读一遍或再算一次。
     check(
-        "不要再用 bash 复核" in system_prompt,
-        "提示里写着：工具已经给出的事实不要再复核一遍",
+        "工具已返回并登记结果时，不要无目的重复执行" in system_prompt,
+        "提示里写着：工具已经给出的事实不要重复执行",
     )
     check(
-        "md5sum" in system_prompt and "read" in system_prompt,
-        "点明了不该做的（ls/stat/md5sum 逐项）与该用的（read 一次看完）",
+        "避免重复读取、重复计算或无意义的文件检查" in system_prompt,
+        "点明了不该做的（重复读取与计算）",
     )
     # 现场来的三条：模型写 pwd、写 cp、把上一条命令的 cd 当基准。它只能从系统提示里知道
     # 「每次调用是一个新解释器」「这里是哪个平台」，否则只能靠一次次失败去猜。
@@ -2789,35 +2809,37 @@ def check_prompt() -> None:
         ("这套环境是 Windows" in system_prompt) == sys.platform.lower().startswith("win"),
         f"平台那句与真实平台一致（sys.platform={sys.platform}）",
     )
-    # 子 agent 在 37 步里一次都没被派过：前缀全文不含派发工具名，模型只在
-    # 工具清单的一行 description 里见过它——那句话只在「已经想到要用」时才有用。
-    # 触发条件与盘点写在同一段：什么时候该派取决于口袋是否唯一、候选结构有几个。
-    # 派发只剩 `dispatch_campaign` 一条路（P-73），所以这里查的就是它。
     check(
-        "候选结构 ≥3" in system_prompt and "dispatch_campaign" in system_prompt,
-        "前缀里有父会话视角的派发规则，且点到具体工具名",
+        "Principal（主控 Agent）" in system_prompt
+        and "dispatch_campaign" in system_prompt,
+        "前缀里有主控职责，且点到派发工具",
     )
     check(
-        "子 agent 看不到你的推理" in system_prompt,
-        "写清了「什么时候不该派」：子任务依赖当前推理时不该派",
+        "派发前构造完整 AgentTask" in system_prompt,
+        "派发前要写清任务合同",
     )
-    # 检索按角色拆开了：主 Agent 只负责「先查证、再问目标、需要时派 target」，
-    # 取证顺序与停止条件写在 target 角色规则里（P-72）。这里守前半截——主 Agent
-    # 得知道取证该找谁；后半截由 `rules-tier` 组核 target 文件本身。
-    # 背景仍是 α7 那次 0 次调用：规则里只有「不要检索」这一侧的限制，
-    # 没有任何一句说「什么时候该查」。
     check(
-        "`target`" in system_prompt and "靶点身份" in system_prompt,
-        "主 Agent 知道取证要找哪个角色",
+        "partial 或 failed 不得包装成 completed" in system_prompt,
+        "报告验收口径写在主控段里",
     )
-    check("证据检索" in system_prompt, "任务入口写着先做证据检索，再问目标")
+    check(
+        "用户确认" in system_prompt,
+        "主控不得绕过用户确认",
+    )
     child = Session(id="ses_child", title="子任务", depth=1)
     child_prefix = stable_prefix(workspace, child)
     check(
         "该派子 agent" not in child_prefix,
         "子 agent 的前缀里没有派发规则（它不能再派，写了只是白占额度）",
     )
-    check("你是从父会话分出的子 agent" in child_prefix, "子 agent 有它自己的身份段")
+    check(
+        "你是由 Principal 派发的专业 Worker Agent" in child_prefix,
+        "子 agent 有它自己的身份段",
+    )
+    check(
+        "以下是项目级规则" not in child_prefix,
+        "子 agent 不加载 AGENTS.md",
+    )
     built = ContextAssembler(context_window=200_000).build(session, prefix)
     roles = [item["role"] for item in built.messages]
     check(roles == ["system", "user", "assistant", "tool", "assistant"], f"按角色翻译成消息序列：{roles}")
@@ -2984,6 +3006,53 @@ def check_prompt() -> None:
             forced = True
     check(monotone, "记忆只让移出变多，不会变少")
     check(forced, "把记忆塞进小窗口会真的多移出几组（证明记忆计入预算）")
+
+
+def check_route_config() -> None:
+    """路由模式由 `.vsagent/route.toml` 控制，环境变量只做覆盖。"""
+    from vsagent.core import route_config
+    from vsagent.core.agent.roles import agents
+
+    base = PROBE / "route-config"
+    shutil.rmtree(base, ignore_errors=True)
+    root = base / "project"
+    home = base / "home"
+    (root / ".vsagent").mkdir(parents=True)
+    (home / ".vsagent").mkdir(parents=True)
+    saved = os.environ.pop("VSA_ROUTE", None)
+    try:
+        check(route_config.mode(root, home) == "shadow", "没有配置时默认 shadow")
+
+        (root / ".vsagent" / "route.toml").write_text(
+            '[route]\nmode = "off"\n', encoding="utf-8"
+        )
+        check(route_config.mode(root, home) == "off", "项目配置生效")
+        session = Session(id="ses_route_cfg", title="路由配置")
+        check(
+            agents.allowed_tools(session, root) is None,
+            "路由关掉时根会话不过滤工具",
+        )
+
+        (home / ".vsagent" / "route.toml").write_text(
+            '[route]\nmode = "enforce"\n', encoding="utf-8"
+        )
+        check(route_config.mode(root, home) == "enforce", "用户配置覆盖项目配置")
+
+        os.environ["VSA_ROUTE"] = "shadow"
+        check(route_config.mode(root, home) == "shadow", "环境变量覆盖配置文件")
+        os.environ.pop("VSA_ROUTE", None)
+
+        (home / ".vsagent" / "route.toml").write_text(
+            '[route]\nmode = "invalid"\n', encoding="utf-8"
+        )
+        check(route_config.mode(root, home) == "off", "不认识的值被忽略，保留上一层")
+
+        (root / ".vsagent" / "route.toml").write_text("坏 TOML", encoding="utf-8")
+        check(route_config.mode(root, home) == "shadow", "写坏的文件不拦启动")
+    finally:
+        if saved is not None:
+            os.environ["VSA_ROUTE"] = saved
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def check_output_limit() -> None:
@@ -3863,6 +3932,7 @@ async def check_loop(server: FakeModelServer) -> None:
     await check_effort(server, loop, recorder)
     await check_identity(server, loop, recorder)
     await check_step_limit(server)
+    await check_closing_gate(server)
     await check_wrap_up_fallbacks(server)
     await check_run_bash(server, loop, recorder)
     await check_sampling(server)
@@ -4309,6 +4379,15 @@ async def check_step_limit(server: FakeModelServer) -> None:
         not [part for part in message.parts if part.type is PartType.TEXT],
         "步数用满时不再往正文里插一句「先停在这里」，交代由 SUMMARY 承担",
     )
+    final_request = server.requests[-2]
+    check(
+        not final_request.get("tools"),
+        "最后一步的发问不带工具定义：模型只能用文字交答复",
+    )
+    check(
+        "最后一步" in json.dumps(final_request, ensure_ascii=False),
+        "最后一步的提示写进上下文",
+    )
 
     # 主题预算：步数没到轮上限，但当前主题已经 20 步且没有新产物，内核自己收。
     server.clear()
@@ -4347,6 +4426,141 @@ async def check_step_limit(server: FakeModelServer) -> None:
     check(
         session_topic.last_exit_reason == EXIT_TOPIC_FULL,
         "整轮停因记在会话上，下一轮复述要用",
+    )
+
+
+async def check_closing_gate(server: FakeModelServer) -> None:
+    """最后三步按层级与角色放行：能登记、能核对，不再开新计算。"""
+    from vsagent.core.agent.validators.task_precondition import _EXECUTE_TOOLS
+
+    worker = Session(
+        id="ses_closing_worker", title="收尾", depth=1, agent_role="research"
+    )
+    allowed = closing_tools(worker)
+    for name in (
+        "add_evidence",
+        "workspace",
+        "write",
+        "patch",
+        "read",
+        "grep",
+        "close_topic",
+        "task",
+    ):
+        check(name in allowed, f"子 agent 收尾放行 {name}：{sorted(allowed)}")
+    for name in (
+        "dock",
+        "search_pdb",
+        "fetch_structure",
+        "bash",
+        "dispatch_campaign",
+    ):
+        check(name not in allowed, f"子 agent 收尾拦下 {name}")
+    check("write_run" not in allowed, "调研不需要运行目录，收尾不装 write_run")
+
+    runner = closing_tools(
+        Session(id="ses_closing_prepare", title="准备", depth=1, agent_role="prepare")
+    )
+    check("write_run" in runner, "准备角色收尾可以写运行目录")
+
+    root = closing_tools(Session(id="ses_closing_root", title="根"))
+    for name in ("read", "write", "close_topic", "task"):
+        check(name in root, f"根会话收尾放行 {name}")
+    for name in ("dispatch_campaign", "bash", "dock"):
+        check(name not in root, f"根会话收尾拦下 {name}")
+
+    # 与「会产出新东西的工具」不重叠：以后有人往名单里塞新计算，这条会红。
+    check(
+        WORKER_CLOSING & _EXECUTE_TOOLS == frozenset()
+        and ROOT_CLOSING & _EXECUTE_TOOLS == frozenset()
+        and RUN_CLOSING & _EXECUTE_TOOLS == frozenset({"write_run"}),
+        "收尾名单只留交付动作（write_run 只给运行目录角色）",
+    )
+    check(
+        "派发结果带回" in closing_hint(Session(id="r", title="根"))
+        and "add_evidence" in closing_hint(worker),
+        "收尾拒绝时按层级说清还能做什么",
+    )
+    check(
+        "write_run" not in closing_hint(worker)
+        and "write_run" in closing_hint(
+            Session(id="p", title="准备", depth=1, agent_role="prepare")
+        ),
+        "只有产出运行目录的角色在收尾提示里看到 write_run",
+    )
+
+    # 子 agent 整个任务就是一个主题：不催封存，也不由内核主动收。
+    steps = [Step(seq=index + 1) for index in range(TOPIC_STEP_LIMIT)]
+    worker.pending_steps = steps
+    root_session = Session(id="ses_topic_root", title="根")
+    root_session.pending_steps = steps
+    check(not AgentLoop._topic_over_budget(worker), "子 agent 不按主题预算主动封存")
+    check(AgentLoop._topic_over_budget(root_session), "根会话仍按主题预算收")
+    assembler = ContextAssembler(context_window=200_000)
+    worker_line = assembler._progress_block(worker, steps_left=3)
+    check("close_topic" not in worker_line, f"子 agent 的进度行不催封存：{worker_line}")
+    check("最多还能做 3 步" in worker_line, "子 agent 仍看得见剩余步数")
+    check("不是必须用完" in worker_line, "剩余步数写明是上限，不是必须消耗的额度")
+
+    # 实跑：第 2 步起进入收尾，新计算被拒、登记照常。
+    server.clear()
+    bus = EventBus()
+    registry = ToolRegistry()
+    for name in ("echo", "dock", "add_evidence", "close_topic"):
+        registry.register(NamedTool(name))
+    loop = build_loop(server, bus, registry)
+    loop.max_steps = 4
+    session = Session(
+        id="ses_closing_run", title="收尾实跑", depth=1, agent_role="research"
+    )
+    ask(session, "收尾")
+    server.clear()
+    server.script(_tool_reply(("c1", "echo")))
+    server.script(_tool_reply(("c1", "dock"), ("c2", "add_evidence")))
+    server.script(_tool_reply(("c1", "close_topic")))
+    server.script(Reply(chunks=[*text_chunks("收尾完成。", size=4), usage_chunk(1, 1)]))
+    message = await loop.stream_reply(session, "")
+    assert message is not None
+    status = {
+        part.tool_name: part.tool_status
+        for part in message.parts
+        if part.type is PartType.TOOL
+    }
+    check(status.get("echo") is ToolStatus.COMPLETED, f"第 1 步照常执行：{status}")
+    check(status.get("dock") is ToolStatus.FAILED, f"收尾阶段拦下新计算：{status}")
+    check(
+        status.get("add_evidence") is ToolStatus.COMPLETED,
+        f"收尾阶段放行证据登记：{status}",
+    )
+    check(
+        status.get("close_topic") is ToolStatus.COMPLETED,
+        f"收尾阶段放行收主题：{status}",
+    )
+    denied = [
+        part
+        for part in message.parts
+        if part.type is PartType.TOOL and part.tool_name == "dock"
+    ]
+    check(
+        "不再取新数据" in (denied[0].tool_output or ""),
+        f"拒绝时说明还能做什么：{denied[0].tool_output}",
+    )
+
+
+def _tool_reply(*calls: tuple[str, str]) -> Reply:
+    """一条带多个工具调用的模型回复。参数都留空，供测试里的无参工具用。"""
+    return Reply(
+        chunks=[
+            delta_chunk(
+                tool_calls=[
+                    tool_call_delta(
+                        index, call_id=call_id, name=name, arguments="{}"
+                    )
+                    for index, (call_id, name) in enumerate(calls)
+                ]
+            ),
+            usage_chunk(1, 1),
+        ]
     )
 
 
@@ -5062,7 +5276,7 @@ async def check_live_app(server: FakeModelServer) -> None:
         check(
             app.agent.registry.get("write_run") is not None
             and app.agent.registry.get("open_viewer") is not None,
-            "呈现工具常驻核心，不靠 load_tools 装族",
+            "呈现工具常驻核心，不靠额外装载",
         )
         check(
             [spec["function"]["name"] for spec in app.agent.registry.specs()][:3]
@@ -5451,7 +5665,29 @@ def check_ledger_digest() -> None:
         tick.pending_steps.append(Step(seq=count, intent="bash", tools=["bash"]))
     long_run = ContextAssembler(200_000).build(tick, prefix)
     check("本主题已 8 步" in long_run.messages[-1]["content"], "第 8 步仍报步数")
-    check("先调 close_topic" in long_run.messages[-1]["content"], "第 8 步改成先收一次")
+    check(
+        "最近 4 步没有新产物" in long_run.messages[-1]["content"],
+        "第 8 步没有新产物时提示检查是否完成",
+    )
+    check(
+        "步数多不是收的理由" in long_run.messages[-1]["content"],
+        "第 8 步只做条件提示，不命令立即封存",
+    )
+    check(
+        "先调 close_topic" not in long_run.messages[-1]["content"],
+        "第 8 步不再要求先收一次",
+    )
+    active = Session(id="ses_topic_active", title="还在产出")
+    for index in range(8):
+        active.pending_steps.append(
+            Step(seq=index + 1, intent="bash", tools=["bash"], artifacts=[f"artifact#{index}"])
+        )
+    active_line = ContextAssembler(200_000)._progress_block(active, steps_left=12)
+    check(
+        "最近 4 步没有新产物" not in active_line,
+        f"还在产出时不提示收口：{active_line}",
+    )
+    check("步数多不是收的理由" in active_line, "普通提示也说明步数不是收的理由")
     check(
         long_run.messages[1]["content"] == single.messages[1]["content"],
         "提示不进 user 头：前缀一个字节都没动",
@@ -5625,6 +5861,16 @@ def check_focus() -> None:
     )
     check(filled.messages[0]["content"] == prefix, "system 那条一个字节都没变")
 
+    # 本轮路由提示：模型要能看到这一轮是查进度、取消还是执行。
+    noted = Session(title="路由提示")
+    noted.route_note = "本轮只回答进度，不要重新派发"
+    noted_user = noted.add_message(Message(role="user"))
+    noted_user.add_part(Part(type=PartType.TEXT, text="到哪一步了"))
+    noted_body = "\n".join(
+        str(item.get("content") or "") for item in build(noted).messages
+    )
+    check("本轮路由：本轮只回答进度" in noted_body, "路由提示进了 TASK 层")
+
     # 多轮：只插一次，而且插在**最后**那条用户消息前。
     many = build(session_with(True, rounds=3))
     bodies = [str(item.get("content") or "") for item in many.messages]
@@ -5678,6 +5924,118 @@ def check_focus() -> None:
     check(
         long_built.usage[Layer.HISTORY] >= 0,
         f"长复述短摘要时 HISTORY 不为负：{long_built.usage[Layer.HISTORY]}",
+    )
+
+
+def check_intent_block() -> None:
+    """意图摘要：字段齐全、模式标签、超长丢弃、进入 TASK 层。"""
+    from vsagent.core.agent.planning.intent_summary import render_intent
+    from vsagent.core.agent.roles.contracts import (
+        AgentPlan,
+        IntentSpec,
+        ObjectRef,
+        TaskSpec,
+    )
+
+    intent = IntentSpec(
+        goal="为靶点 HA2 制定一套可行的配体筛选计划",
+        task_relation="new",
+        conversation_action="execute",
+        objects=(ObjectRef(type="target", label="HA2"),),
+        operations=("research", "pocket", "ligand"),
+        constraints=("针对 HA2 进行配体筛选",),
+        confidence=0.8,
+    )
+    task = TaskSpec(
+        task_id="task_x",
+        objective=intent.goal,
+        subgoals=[
+            {"goal": "查清靶点身份、可成药性与临床证据", "agent": "research"},
+            {
+                "goal": "获取实验结构并建立结构目录",
+                "agent": "pocket",
+                "stage": "structure_discovery",
+            },
+            {
+                "goal": "汇总已知配体、活性与化学空间",
+                "agent": "ligand",
+                "stage": "ligand_analysis",
+            },
+        ],
+        constraints=("针对 HA2 进行配体筛选", "需要给出可行的计划"),
+        required_outputs=("ResearchDossier", "PocketAtlas", "LigandDossier"),
+        acceptance_criteria=[
+            {
+                "kind": "evidence_ref",
+                "target": "靶点身份的证据来源",
+                "output": "ResearchDossier",
+            },
+        ],
+        approval_points=("受体结构确认",),
+    )
+    plan = AgentPlan(task_id="task_x", selected_agents=("research", "pocket", "ligand"))
+    block = render_intent(intent, task, plan, mode="enforce")
+    for text in (
+        "本轮任务规格",
+        "目标：",
+        "对象：HA2",
+        "操作：research、pocket、ligand",
+        "子目标：",
+        "约束：",
+        "交付：ResearchDossier",
+        "验收：evidence_ref",
+        "确认：受体结构确认",
+    ):
+        check(text in block, f"意图块里有「{text}」")
+    check(
+        estimate_tokens(block) <= 500,
+        f"意图块不超过 500 个文字单位：{estimate_tokens(block)}",
+    )
+
+    shadow = render_intent(intent, task, plan, mode="shadow")
+    check("仅参考" in shadow and "本轮任务规格" not in shadow, "shadow 标成仅参考")
+
+    # 超长时先丢不确定、确认、验收；目标、操作、约束保留。
+    long_intent = IntentSpec(
+        goal="目标" * 200,
+        operations=("research",),
+        constraints=("约束" * 200,),
+        uncertainties=("不确定" * 100,),
+    )
+    long_task = TaskSpec(
+        task_id="task_long",
+        objective="o",
+        subgoals=[{"goal": "目标" * 100, "agent": "research"}],
+        constraints=("约束" * 200,),
+        required_outputs=("A" * 80,),
+        acceptance_criteria=[
+            {"kind": "evidence_ref", "target": "T" * 200, "output": "A"}
+        ],
+        approval_points=("确认" * 40,),
+    )
+    long_plan = AgentPlan(task_id="task_long", selected_agents=("research",))
+    capped = render_intent(long_intent, long_task, long_plan, mode="enforce")
+    check(
+        estimate_tokens(capped) <= 500,
+        f"超长时仍不超过 500：{estimate_tokens(capped)}",
+    )
+    check(
+        "目标：" in capped and "操作：" in capped and "约束：" in capped,
+        "必要的三行保留",
+    )
+    check("不确定：" not in capped, f"放不下时先丢不确定：{capped[-80:]}")
+
+    # 进入 TASK 层：同一段文字出现在任务头，并算进 TASK 用量。
+    session = Session(title="意图块")
+    user = session.add_message(Message(role="user"))
+    user.add_part(Part(type=PartType.TEXT, text="给 HA2 做筛选"))
+    session.route_intent = block
+    built = ContextAssembler(200_000).build(session, "前缀")
+    body = "\n".join(str(item.get("content") or "") for item in built.messages)
+    check("本轮任务规格" in body and "操作：research" in body, "意图块进了上下文")
+    check(
+        built.usage[Layer.TASK] >= estimate_tokens(block),
+        "意图块算进 TASK 用量",
     )
 
 
@@ -18869,7 +19227,7 @@ async def check_listing_tools() -> None:
         check(expected in names, f"新工具 {expected} 装上了（写了却没装，界面上完全看不出来）")
     check(
         "write_run" not in names and "open_viewer" not in names,
-        "呈现工具常驻核心，不占领域族的条目",
+        "呈现工具常驻核心，不占领域工具的位置",
     )
     # 搜索类工具是只读的：Plan 方式下必须放行（放进去就等于「查文献都做不到」）。
     from vsagent.core.agent.permission import PLAN_DENY
@@ -21014,10 +21372,14 @@ class FlakyTool(Tool):
 async def check_contracts() -> None:
     """协议层：五个对象能往返、该拦的都拦住、不依赖运行期。"""
     intent = IntentSpec(
-        primary_goal="调查 EGFR 的候选口袋并分析适配配体",
-        intent_types=("structure_discovery", "pocket_discovery"),
-        research_objects={"target": "EGFR"},
-        explicit_constraints=("覆盖候选口袋",),
+        goal="调查 EGFR 的候选口袋并分析适配配体",
+        task_relation="new",
+        conversation_action="execute",
+        objects=(
+            ObjectRef(type="target", label="EGFR", origin="new"),
+        ),
+        operations=("pocket", "ligand"),
+        constraints=("覆盖候选口袋",),
         exclusions=("不得直接执行分子对接",),
         confidence=0.8,
     )
@@ -21031,10 +21393,10 @@ async def check_contracts() -> None:
     task = TaskSpec(
         task_id="task_001",
         objective="口袋调查",
-        subgoals=[{"goal": "取结构"}],
-        required_outputs=[{"name": "PocketCatalog"}],
+        subgoals=[{"goal": "取结构", "agent": "pocket"}],
+        required_outputs=("PocketAtlas",),
         acceptance_criteria=[
-            {"kind": "artifact_exists", "target": "PocketCatalog", "output": "PocketCatalog"},
+            {"kind": "artifact_exists", "target": "PocketAtlas", "output": "PocketAtlas"},
             {"kind": "review_required", "target": "口袋画像是否合理"},
         ],
     )
@@ -21051,17 +21413,17 @@ async def check_contracts() -> None:
     bumped = task.with_updates(status="ready", revision=1)
     check(bumped.status == "ready" and bumped.revision == 1, "改副本不影响原件")
 
-    plan = CapabilityPlan(
+    plan = AgentPlan(
         task_id="task_001",
-        selected_capabilities=("structure_discovery",),
-        selected_agents=("structure_pocket", "ligand"),
-        dependencies=[{"from": "structure_pocket", "to": "ligand"}],
-        parallel_groups=[["structure_pocket", "ligand"]],
+        selected_agents=("pocket", "ligand"),
+        dependencies=[{"from": "pocket", "to": "ligand"}],
+        parallel_groups=[["pocket", "ligand"]],
     )
-    check(CapabilityPlan.from_dict(plan.to_dict()) == plan, "CapabilityPlan 往返一致")
+    check(AgentPlan.from_dict(plan.to_dict()) == plan, "AgentPlan 往返一致")
 
     agent_task = AgentTask(
         task_id="task_001.s1", role="pocket", objective="铺开结构",
+        background="给 4HJO 找一批新骨架",
         acceptance_criteria=[{"kind": "handle_registered", "target": "receptor#1"}],
     )
     report = AgentReport(
@@ -21069,6 +21431,11 @@ async def check_contracts() -> None:
         findings=[{"text": "找到 3 个候选口袋"}],
     )
     check(AgentTask.from_dict(agent_task.to_dict()) == agent_task, "AgentTask 往返一致")
+    check(
+        AgentTask.from_dict(agent_task.to_dict()).background == "给 4HJO 找一批新骨架",
+        "父任务背景随合同往返",
+    )
+    check(AgentTask(task_id="t", role="pocket", objective="x").background == "", "背景可以为空")
     check(AgentReport.from_dict(report.to_dict()) == report, "AgentReport 往返一致")
 
     def rejected(make, label: str) -> None:
@@ -21078,212 +21445,160 @@ async def check_contracts() -> None:
             return
         raise AssertionError(f"应当拒绝：{label}")
 
-    rejected(lambda: IntentSpec(primary_goal="x"), "没有意图类型")
+    rejected(lambda: IntentSpec(goal=""), "空目标")
+    rejected(
+        lambda: IntentSpec(goal="x", operations=("nope",)),
+        "操作不在九个角色里",
+    )
+    rejected(
+        lambda: IntentSpec(goal="x", task_relation="none", operations=("pocket",)),
+        "没有任务关系却要执行",
+    )
     rejected(
         lambda: IntentSpec(
-            primary_goal="x", intent_types=("needs_clarification",)
+            goal="x", conversation_action="status_query", operations=("pocket",)
         ),
-        "标了要澄清却没写问题",
-    )
-    rejected(lambda: IntentSpec(primary_goal="x", intent_types=("nope",)), "意图类型不在枚举里")
-    rejected(
-        lambda: IntentSpec(primary_goal="x", intent_types=("general_conversation",), confidence=2),
-        "置信度越界",
+        "查进度不该选操作",
     )
     rejected(
-        lambda: IntentSpec.from_dict(
-            {"primary_goal": "x", "intent_types": ["general_conversation"], "whatever": 1}
-        ),
+        lambda: ObjectRef(type="pocket", label="第二个口袋", origin="existing"),
+        "已有对象没有引用",
+    )
+    rejected(
+        lambda: IntentSpec.from_dict({"goal": "x", "whatever": 1}),
         "不认识的字段",
     )
     rejected(lambda: TaskSpec(task_id="", objective="x"), "空任务号")
     rejected(
+        lambda: TaskSpec(task_id="t", objective="x", subgoals=[{"goal": "没有角色"}]),
+        "子目标没有负责角色",
+    )
+    rejected(
         lambda: TaskSpec(
             task_id="t", objective="x",
-            acceptance_criteria=[{"kind": "感觉不错", "target": "x"}],
+            subgoals=[{"goal": "x", "agent": "nope"}],
         ),
-        "验收条件 kind 不在枚举里",
+        "子目标的角色不认识",
     )
     rejected(
-        lambda: TaskSpec.from_dict({"task_id": "t", "objective": "x", "schema_version": SCHEMA_VERSION + 1}),
-        "协议版本更新",
+        lambda: TaskSpec(
+            task_id="t", objective="x",
+            subgoals=[{"goal": "x", "agent": "pocket", "stage": "nope"}],
+        ),
+        "子目标的阶段不认识",
     )
     rejected(
-        lambda: CapabilityPlan(
-            task_id="t", selected_agents=("a",), dependencies=[{"from": "a", "to": "b"}]
+        lambda: AgentPlan(
+            task_id="t", selected_agents=("pocket",), dependencies=[{"from": "pocket", "to": "ligand"}]
         ),
         "依赖指向没选中的角色",
     )
     rejected(
-        lambda: CapabilityPlan(
-            task_id="t", selected_agents=("a", "b"), dependencies=[{"from": "a", "to": "a"}]
+        lambda: AgentPlan(
+            task_id="t", selected_agents=("pocket", "ligand"),
+            dependencies=[{"from": "pocket", "to": "pocket"}],
         ),
         "依赖指向自己",
     )
     rejected(
-        lambda: CapabilityPlan(
-            task_id="t", selected_agents=("a", "b"),
-            parallel_groups=[["a", "b"], ["a"]],
+        lambda: AgentPlan(
+            task_id="t", selected_agents=("pocket", "ligand"),
+            parallel_groups=[["pocket", "ligand"], ["pocket"]],
         ),
         "角色出现在两个并行组",
     )
     rejected(
-        lambda: CapabilityPlan(
-            task_id="t", selected_agents=("a",),
-            selected_capabilities=("x",), denied_capabilities=("x",),
+        lambda: AgentPlan(
+            task_id="t", selected_agents=("pocket",), denied_agents=("pocket",)
         ),
-        "同一能力既选中又拒绝",
+        "同一个角色既选中又拒绝",
     )
     rejected(lambda: AgentReport(task_id="t", agent_role="r"), "空报告标 completed")
     allowed = AgentReport(task_id="t", agent_role="r", status="partial")
     check(allowed.status == "partial", "空报告可以标 partial")
 
-    # 协议层不许依赖运行期：包里只允许单点相对导入（`from .base import ...`）。
-    package = ROOT / "vsagent" / "core" / "agent" / "contracts"
+    # 协议层不许依赖运行期：只允许角色目录这一份纯数据。
+    package = ROOT / "vsagent" / "core" / "agent" / "roles" / "contracts"
+    banned = (
+        "vsagent.core.agent.execution",
+        "vsagent.core.agent.planning",
+        "vsagent.core.agent.provider",
+    )
     offenders = []
     for path in sorted(package.glob("*.py")):
         source = path.read_text(encoding="utf-8")
-        if "from .." in source or "import vsagent" in source:
+        if any(word in source for word in banned):
             offenders.append(path.name)
     check(not offenders, f"协议层不依赖运行期模块：{offenders}")
 
 
-async def check_capabilities() -> None:
-    """能力注册表：能力挂到角色上，角色名单与额度由 agents.toml 决定。"""
-    from vsagent.core.agent.roles.capabilities import (
-        CAPABILITIES,
-        ROLES,
-        Capability,
-        capability,
-        capabilities_for,
-        roles_with_capabilities,
-        validate,
-    )
+async def check_catalog() -> None:
+    """角色目录：九个角色、九项操作、工作与权限都写在一处。"""
+    from vsagent.core.agent.roles import catalog
+    from vsagent.core.agent.roles.profiles import PROFILES, profile, validate
 
-    problems = validate()
-    check(not problems, f"能力表自身一致：{problems}")
-
-    names = [item.name for item in CAPABILITIES]
-    check(len(names) == len(set(names)), "能力名不重复")
-    check(
-        all(item.permissions for item in CAPABILITIES),
-        "每项能力都声明了权限（读还是写）",
-    )
-    check(len(ROLES) == 10 and ROLES[0] == "principal", f"十个角色：{ROLES}")
-    check("principal" not in roles_with_capabilities(), "principal 不承担具体能力")
-    check(len(roles_with_capabilities()) == 9, f"九个角色承担能力：{roles_with_capabilities()}")
-    check(capability("pocket_discovery").role == "pocket", "按名字取能力")
-    check(
-        len(capabilities_for("pocket")) == 3,
-        "口袋角色承担三项能力",
-    )
-    check(
-        [item.name for item in capabilities_for("target")]
-        == ["target_intelligence", "literature_evidence"],
-        "旧角色名按新角色查",
-    )
+    check(catalog.validate() == [], f"角色目录自身一致：{catalog.validate()}")
+    check(validate() == [], f"说明书与目录一致：{validate()}")
+    check(len(catalog.AGENTS) == 9, f"九个专业角色：{catalog.AGENTS}")
+    check(len(catalog.ROLES) == 10 and catalog.ROLES[0] == "principal", "主控加九个角色")
+    check(tuple(catalog.OPERATIONS) == catalog.AGENTS, "操作就是九个角色")
+    check("principal" not in catalog.OPERATIONS, "主控不进入操作")
+    for role in catalog.AGENTS:
+        check(catalog.DUTIES.get(role), f"{role} 有工作说明")
+        check(catalog.PERMISSIONS.get(role), f"{role} 有权限")
+        check(profile(role).duties == catalog.DUTIES[role], f"{role} 的说明书读的是同一份工作")
+    check(len(PROFILES) == 10, "一个主控加九个专业角色")
 
     research = set(agents.role_tools("research", ROOT))
     docking = set(agents.role_tools("docking", ROOT))
     check("search_literature" in research and "dock" not in research, "调研角色只拿情报工具")
     check("dock" in docking and "search_pdb" not in docking, "对接角色只拿对接工具")
 
-    def bad(problems: list[str], keyword: str, label: str) -> None:
-        check(
-            any(keyword in item for item in problems),
-            f"应当拦住{label}：{problems}",
-        )
-
-    bad(
-        validate(
-            (Capability(name="x", role="nope", permissions=("read",)),),
-        ),
-        "角色不存在",
-        "角色名不在名单里",
-    )
-    bad(
-        validate(
-            (
-                Capability(name="x", role="research", permissions=("read",)),
-                Capability(name="x", role="research", permissions=("read",)),
-            ),
-        ),
-        "能力重名",
-        "同一能力登记两次",
-    )
-    bad(
-        validate((Capability(name="x", role="research", permissions=("delete",)),)),
-        "权限取值不认识",
-        "权限取值不在四种里",
-    )
-    bad(
-        validate((Capability(name="x", role="research"),)),
-        "没有声明权限",
-        "能力没有权限",
-    )
-
 
 async def check_router() -> None:
-    """路由：按子目标取族、依赖成环会被拒、缺前置进未决、结果稳定。"""
-    from vsagent.core.agent.roles.capabilities import capability as lookup_capability
-    from vsagent.core.agent.planning.task_compiler import TEMPLATES
+    """路由：按子目标的 agent 取角色、自动补前置、拒绝项、依赖与并行组。"""
+    from vsagent.core.agent.planning.agent_router import validate_prerequisites
+    from vsagent.core.agent.roles.templates import TEMPLATES
+    from vsagent.core.agent.roles import catalog
 
-    compiler, router = TaskCompiler(), CapabilityRouter()
+    compiler, router = TaskCompiler(), AgentRouter()
 
-    # 模板与能力表必须对得上：意图类型名与能力名不是同一套，映射写在模板里。
-    for kind, template in TEMPLATES.items():
-        names = [str(template.get("capability") or "")]
-        names.extend(str(step[0]) for step in (template.get("steps") or ()))
-        names = [name for name in names if name]
-        check(names, f"{kind} 的模板写了能力名")
-        for name in names:
-            check(lookup_capability(name).name == name, f"{kind} 的能力名 {name} 在注册表里存在")
+    check(validate_prerequisites() == [], f"前置表自洽：{validate_prerequisites()}")
+    check(set(TEMPLATES) == set(catalog.AGENTS), "每个角色一份模板")
 
     task = compiler.compile(
         IntentSpec(
-            primary_goal="获取 EGFR 的所有候选结合口袋，分析口袋特征和适配分子",
-            intent_types=("pocket_discovery", "pocket_profiling", "ligand_discovery"),
+            goal="获取 EGFR 的所有候选结合口袋，分析口袋特征和适配分子",
+            operations=("pocket", "ligand"),
+            objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
             exclusions=("不要直接进行分子对接",),
         )
     ).task
     routed = router.route(task)
     plan = routed.plan
-    check(
-        plan.selected_capabilities == ("pocket_discovery", "pocket_profiling", "ligand_intelligence"),
-        f"能力按子目标顺序：{plan.selected_capabilities}",
-    )
-    check(
-        plan.selected_agents == ("pocket", "ligand"),
-        f"同一角色的两项能力合成一个：{plan.selected_agents}",
-    )
-    check(not plan.dependencies, f"同一个角色内部不连依赖边：{plan.dependencies}")
+    check(plan.selected_agents == ("pocket", "ligand"), f"按角色去重：{plan.selected_agents}")
+    check(not plan.dependencies, f"互不依赖：{plan.dependencies}")
     check(
         plan.parallel_groups == [["pocket", "ligand"]],
         f"互不依赖的两个角色可以并行：{plan.parallel_groups}",
     )
     check(not plan.unresolved_inputs, f"前置齐全时没有未决：{plan.unresolved_inputs}")
-    check("docking_run" in plan.denied_capabilities, "用户禁止对接，计划里标明它被排除")
+    check("docking" in plan.denied_agents, "用户禁止对接，计划里标明它被排除")
     check(plan.task_id == task.task_id and plan.revision == task.revision, "计划挂着任务号与版本")
 
     twice = router.route(task).plan.to_dict()
     check(twice == plan.to_dict(), "同一份任务两次路由字节一致")
 
-    # 筛选缺口袋：计划自己把上游补成节点，不能留到派发时才发现（P-81）。
-    # 这一条来自 2026-11-13 的 HA2 会话：计划只有 ligand、screening，主 agent
-    # 想派 structure_pocket 被拒两次，最后一步结构盘点谁也做不了。
+    # 筛选缺口袋：计划自己把上游补成节点。
     screening_task = compiler.compile(
         IntentSpec(
-            primary_goal="针对 HA2 做配体筛选",
-            intent_types=("ligand_discovery", "virtual_screening"),
+            goal="针对 HA2 做配体筛选",
+            operations=("ligand", "docking"),
+            objects=(ObjectRef(type="target", label="HA2", origin="new"),),
         )
     ).task
     screening_route = router.route(screening_task)
     screening_plan = screening_route.plan
-    check(
-        screening_plan.selected_capabilities
-        == ("ligand_intelligence", "pocket_discovery", "receptor_preparation", "docking_run"),
-        f"准备与对接各占一个节点：{screening_plan.selected_capabilities}",
-    )
     check(
         screening_plan.selected_agents == ("ligand", "pocket", "prepare", "docking"),
         f"补出来的角色一起进计划：{screening_plan.selected_agents}",
@@ -21298,7 +21613,7 @@ async def check_router() -> None:
         f"补完没有未决：{screening_plan.unresolved_inputs}",
     )
     check(
-        any("补上了缺的前置步骤" in item for item in screening_route.warnings),
+        any("补上了缺的前置角色" in item for item in screening_route.warnings),
         f"补了什么要说明：{screening_route.warnings}",
     )
     check(
@@ -21307,40 +21622,28 @@ async def check_router() -> None:
     )
     check(
         missing_prerequisites(screening_plan) == [],
-        "补完的计划能过派发前的硬闸门（P-80）",
+        "补完的计划能过派发前的硬闸门",
     )
 
     solo = compiler.compile(
-        IntentSpec(primary_goal="比较这批结果的可靠性", intent_types=("scoring_evaluation",))
+        IntentSpec(goal="比较这批结果的可靠性", operations=("analysis",))
     ).task
     solo_plan = router.route(solo).plan
     check(solo_plan.selected_agents == ("analysis",), "孤立评分只选分析角色")
-    check(
-        "docking_run" not in solo_plan.selected_capabilities,
-        "评分的前置可以吃已有产物，不自动补（只补没有输入就开不了跑的，P-81）",
-    )
-    check(
-        solo_plan.unresolved_inputs and "docking_run" in solo_plan.unresolved_inputs[0],
-        f"缺上游产物时记进未决，而不是硬连一条依赖：{solo_plan.unresolved_inputs}",
-    )
-    check(not solo_plan.dependencies, "未决的前置不产生依赖边")
+    check(not solo_plan.dependencies, "分析没有硬前置，不连依赖边")
 
-    # 用户自带口袋与配体：不再补那两个角色，也不算缺前置（P-83）。
+    # 用户自带口袋与配体：不再补那两个角色。
     supplied = compiler.compile(
         IntentSpec(
-            primary_goal="用我给的受体、口袋与配体跑筛选",
-            intent_types=("virtual_screening",),
-            provided_inputs={"pocket": "pocketset#9", "ligand_set": "ligandset#3"},
+            goal="用我给的受体、口袋与配体跑筛选",
+            operations=("docking",),
+            inputs={"pocket": "pocketset#9", "ligand_set": "ligandset#3"},
         )
     ).task
     supplied_plan = router.route(supplied).plan
     check(
-        supplied_plan.selected_capabilities == ("receptor_preparation", "docking_run"),
-        f"自带口袋与配体就不再补，但准备与对接仍是两步：{supplied_plan.selected_capabilities}",
-    )
-    check(
         supplied_plan.selected_agents == ("prepare", "docking"),
-        f"只派准备与对接：{supplied_plan.selected_agents}",
+        f"自带口袋与配体就不再补：{supplied_plan.selected_agents}",
     )
     check(
         not supplied_plan.unresolved_inputs,
@@ -21351,25 +21654,39 @@ async def check_router() -> None:
         "自带输入的计划能过派发前的硬闸门",
     )
     check(
-        set(supplied_plan.provided_capabilities)
-        == {"pocket_discovery", "ligand_intelligence"},
-        f"计划里记下哪些是用户给的：{supplied_plan.provided_capabilities}",
+        set(supplied_plan.provided_agents) == {"pocket", "ligand"},
+        f"计划里记下哪些是用户给的：{supplied_plan.provided_agents}",
     )
 
-    tagged = TaskSpec(
-        task_id="task_tag",
-        objective="带一个不认识的能力标签",
-        subgoals=[{"goal": "随便做点", "capability": "no_such_capability"}],
+    # 只给受体：准备角色仍要补。
+    partial = TaskSpec(
+        task_id="task_partial",
+        objective="用已经准备好的受体跑一轮对接",
+        subgoals=[{"goal": "跑一轮对接", "agent": "docking"}],
+        available_inputs={"receptor": "receptor#1"},
     )
-    unknown = router.route(tagged)
-    check(unknown.warnings and "no_such_capability" in unknown.warnings[0], "不认识的能力标签要报警")
-    check(unknown.plan.selected_agents == (), "认不出能力时计划为空")
+    partial_plan = router.route(partial).plan
+    check("prepare" in partial_plan.selected_agents, "准备角色仍然进计划")
+    check(
+        missing_prerequisites(partial_plan) == [],
+        f"准备补上之后不缺前置：{partial_plan.unresolved_inputs}",
+    )
 
-    bare = router.route(TaskSpec(task_id="task_bare", objective="没有标签"))
-    check(bare.warnings and bare.plan.selected_agents == (), "没有能力标签时计划为空并报警")
+    # 展示是汇点：同计划里其他角色都跑完才轮到它。
+    shown = compiler.compile(
+        IntentSpec(goal="把口袋结果打开给我看", operations=("pocket", "visualization"))
+    ).task
+    shown_plan = router.route(shown).plan
+    check(
+        {"from": "pocket", "to": "visualization"} in shown_plan.dependencies,
+        f"展示排在产出之后：{shown_plan.dependencies}",
+    )
+
+    bare = router.route(TaskSpec(task_id="task_bare", objective="没有子目标"))
+    check(bare.warnings and bare.plan.selected_agents == (), "没有子目标时计划为空并报警")
 
     try:
-        router._check_cycle(["a", "b"], [{"from": "a", "to": "b"}, {"from": "b", "to": "a"}])
+        router._check_cycle(["pocket", "ligand"], [{"from": "pocket", "to": "ligand"}, {"from": "ligand", "to": "pocket"}])
     except RouterError as error:
         check("环" in str(error), f"环要被指出来：{error}")
     else:
@@ -21377,128 +21694,250 @@ async def check_router() -> None:
 
 
 async def check_task_compiler() -> None:
-    """规则编译：同一意图两次一致、每条交付物有验收条件、禁止项能删掉冲突模板。"""
-    from vsagent.core.agent.planning.task_compiler import GENERIC_TEMPLATE, TEMPLATES
+    """规则编译：同一意图两次一致、每条交付物有验收条件、禁止项能删掉冲突角色。"""
+    from vsagent.core.agent.planning.task_compiler import default_task_id
+    from vsagent.core.agent.roles.templates import TEMPLATES
+    from vsagent.core.agent.roles import catalog
 
     compiler = TaskCompiler()
+    check(set(TEMPLATES) == set(catalog.AGENTS), "每个角色一份模板")
+
     intent = IntentSpec(
-        primary_goal="获取 EGFR 的所有候选结合口袋，分析口袋特征和适配分子",
-        intent_types=("pocket_discovery", "pocket_profiling", "ligand_discovery"),
+        goal="获取 EGFR 的所有候选结合口袋，分析口袋特征和适配分子",
+        operations=("pocket", "ligand"),
+        objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
         exclusions=("不要直接进行分子对接",),
-        explicit_constraints=("只看人类",),
-        provided_inputs={"target": "EGFR"},
+        constraints=("只看人类",),
+        inputs={"target": "EGFR"},
     )
     compiled = compiler.compile(intent)
     task = compiled.task
-    check(len(task.required_outputs) == 3, f"三个意图三个交付物：{[r['name'] for r in task.required_outputs]}")
+    check(
+        set(task.required_outputs) == {"PocketAtlas", "LigandDossier"},
+        f"两个角色两份交付物：{task.required_outputs}",
+    )
     check(task.uncovered_outputs() == [], "每个交付物都有验收条件")
     check(
-        {r["name"] for r in task.approval_points} == {"受体结构确认", "结合口袋确认"},
-        f"确认点按任务裁剪：{[r['name'] for r in task.approval_points]}",
+        set(task.approval_points) == {"受体结构确认", "结合口袋确认"},
+        f"确认点按角色裁剪：{task.approval_points}",
     )
     check(task.exclusions == ("不要直接进行分子对接",), "禁止项原样继承")
     check(task.constraints == ("只看人类",), "约束原样继承")
-    check(not compiled.uncovered, f"覆盖到的类型不报未覆盖：{compiled.uncovered}")
+    check({row["agent"] for row in task.subgoals} == {"pocket", "ligand"}, "子目标带角色")
+    check(not compiled.uncovered, f"覆盖到的角色不报未覆盖：{compiled.uncovered}")
 
     twice = compiler.compile(intent).task.to_dict()
     check(twice == task.to_dict(), "同一意图两次编译字节一致")
+    check(default_task_id(intent) == task.task_id, "任务号由意图派生")
 
     changed = IntentSpec(
-        primary_goal="研究 EGFR 并寻找新型抑制剂",
-        intent_types=("structure_discovery", "virtual_screening", "multi_objective"),
+        goal="研究 EGFR 并寻找新型抑制剂",
+        operations=("pocket", "docking"),
+        objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
         exclusions=("不要对接",),
     )
     dropped = compiler.compile(changed)
-    goals = [row["goal"] for row in dropped.task.subgoals]
-    check(
-        all("筛选" not in goal for goal in goals),
-        f"说了不要对接，筛选那一段就不在计划里：{goals}",
-    )
-    check(dropped.warnings and "virtual_screening" in dropped.warnings[0], "删掉模板要记警告")
-    check(
-        any("复合目标" in goal for goal in goals),
-        "多目标仍然留下拆解子目标",
-    )
+    agents_now = {row["agent"] for row in dropped.task.subgoals}
+    check("docking" not in agents_now, f"说了不要对接，对接角色就不在计划里：{agents_now}")
+    check(dropped.warnings and "docking" in dropped.warnings[0], "删掉角色要记警告")
 
-    running = task.with_updates(status="running", revision=3)
+    pocket_only = compiler.compile(
+        IntentSpec(
+            goal="获取 EGFR 的结构与口袋",
+            operations=("pocket",),
+            objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
+        )
+    ).task
+    running = pocket_only.with_updates(status="running", revision=3)
     revised = compiler.compile(
         IntentSpec(
-            primary_goal="只看 T790M 突变体的口袋",
-            intent_types=("pocket_discovery",),
-            turn_mode="modify_task",
-            exclusions=("不要联网",),
+            goal="只看 T790M 突变体的口袋",
+            task_relation="modify",
+            operations=("pocket",),
+            constraints=("只看 T790M",),
         ),
         current=running,
     ).task
-    check(revised.task_id == running.task_id, "改目标不换任务号")
-    check(revised.revision == running.revision + 1, "改目标版本号加一")
-    check(revised.status == "running", "正在跑的任务改目标后仍是运行中")
-    check("只看人类" in revised.constraints, "改目标不清掉旧约束")
-    check("不要联网" in revised.exclusions, "改目标累加新禁止项")
+    check(revised.task_id == running.task_id, "修改任务沿用任务号")
+    check(revised.revision == 4, f"修改任务版本加一：{revised.revision}")
+    check(revised.status == "running", "正在跑的任务保留状态")
+    check(revised.objective == "只看 T790M 突变体的口袋", "修改任务换目标")
+    check("只看 T790M" in revised.constraints, "新约束并进去")
 
-    for label, bad in (
-        ("还没解析完", IntentSpec(primary_goal="x", intent_types=("needs_clarification",), clarification_required=("想做什么？",))),
-        ("闲聊", IntentSpec(primary_goal="x", intent_types=("general_conversation",), turn_mode="general_chat")),
-        ("任务延续", IntentSpec(primary_goal="x", intent_types=("task_continuation",), turn_mode="continue_task")),
-    ):
-        try:
-            compiler.compile(bad)
-        except CompileError:
-            continue
-        raise AssertionError(f"应当拒绝编译：{label}")
+    compare = compiler.compile(
+        IntentSpec(
+            goal="比较两个口袋",
+            task_relation="compare",
+            operations=("analysis",),
+            objects=(
+                ObjectRef(type="pocket", label="第一个", ref="pocket#1", origin="existing"),
+                ObjectRef(type="pocket", label="第二个", ref="pocket#2", origin="existing"),
+            ),
+        ),
+        current=running,
+    ).task
+    check(compare.task_id == running.task_id, "比较任务沿用任务号")
+    check(compare.revision == 4, "比较任务版本加一")
+    check("analysis" in {row["agent"] for row in compare.subgoals}, "比较任务补上分析角色")
 
-    generic = compiler.compile(
-        IntentSpec(primary_goal="随便看看", intent_types=("general_conversation",), turn_mode="new_task")
-    )
+    continued = compiler.compile(
+        IntentSpec(
+            goal="继续",
+            task_relation="continue",
+            operations=("pocket", "ligand"),
+        ),
+        current=running,
+    ).task
     check(
-        generic.warnings and generic.task.required_outputs[0]["name"] == "TaskReport",
-        f"没有专用模板时用通用模板并记警告：{generic.warnings}",
+        {"pocket", "ligand"} <= {row["agent"] for row in continued.subgoals},
+        "延续任务把新角色并进来",
     )
 
-    # 模板自身的完整性：每种类型的每个交付物都要有验收条件，否则 Phase 8 判不了。
-    for kind, template in TEMPLATES.items():
-        covered = {row[2] for row in template["checks"]}
-        missing = [name for name in template["outputs"] if name not in covered]
-        check(not missing, f"{kind} 的交付物都有验收条件：缺 {missing}")
-    covered = {row[2] for row in GENERIC_TEMPLATE["checks"]}
-    check(
-        all(name in covered for name in GENERIC_TEMPLATE["outputs"]),
-        "通用模板的交付物也有验收条件",
+    try:
+        compiler.compile(
+            IntentSpec(goal="继续", task_relation="continue"),
+            current=running,
+        )
+    except CompileError as error:
+        check("重新编译" in str(error), f"只补约束不该重新编译：{error}")
+    else:
+        raise AssertionError("只补约束时应当提示沿用当前任务")
+
+    try:
+        compiler.compile(
+            IntentSpec(
+                goal="x",
+                clarification_required=("想做什么？",),
+            )
+        )
+    except CompileError as error:
+        check("澄清" in str(error), f"要澄清时不该编译：{error}")
+    else:
+        raise AssertionError("需要澄清时应当拒绝编译")
+
+
+def check_templates_typed() -> None:
+    """模板是冻结数据类，字段名与合同对齐，验收条件管得住交付物。"""
+    from vsagent.core.agent.roles import catalog
+    from vsagent.core.agent.roles.contracts.task import ACCEPTANCE_KINDS
+    from vsagent.core.agent.roles.templates import (
+        GENERIC_TEMPLATE,
+        TEMPLATES,
+        RoleTemplate,
+        template_for,
     )
+
+    check(set(TEMPLATES) == set(catalog.AGENTS), "每个角色一份模板")
+    check(
+        template_for("no-such-role") is GENERIC_TEMPLATE,
+        "不认识的角色回退到通用模板",
+    )
+    for role, template in TEMPLATES.items():
+        check(isinstance(template, RoleTemplate), f"{role} 的模板是 RoleTemplate")
+        outputs = set(template.required_outputs)
+        for criterion in template.acceptance_criteria:
+            check(
+                criterion.kind in ACCEPTANCE_KINDS,
+                f"{role} 的验收条件 kind 合法：{criterion.kind}",
+            )
+            check(
+                criterion.output in outputs,
+                f"{role} 的验收条件指向自己的交付物：{criterion.output}",
+            )
+        covered = {item.output for item in template.acceptance_criteria}
+        check(
+            outputs <= covered,
+            f"{role} 的每个交付物都有验收条件：{sorted(outputs - covered)}",
+        )
+        for step in template.subgoals:
+            check(
+                not step.stage or step.stage in catalog.STAGES,
+                f"{role} 的模板阶段认识：{step.stage}",
+            )
+        check(
+            template.constraints == (),
+            f"{role} 的固定约束目前为空：{template.constraints}",
+        )
+
+
+def check_projection_single_source() -> None:
+    """投影只有一个入口：AgentTask 只在 projection.py 构造，旧对象已删。"""
+    import vsagent.core.agent.execution.projection as projection_module
+    from vsagent.core.agent.execution import coordinator
+
+    check(
+        "AgentTask(" in _source_of(projection_module),
+        "投影模块自己构造 AgentTask",
+    )
+    coordinator_text = _source_of(coordinator)
+    check(
+        "AgentTask(" not in coordinator_text,
+        "协调器不再直接构造 AgentTask",
+    )
+    for key in ('["outputs"]', '["checks"]', '["approvals"]', '["steps"]'):
+        check(
+            key not in coordinator_text,
+            f"协调器不再按模板键读：{key}",
+        )
+
+    offenders: list[str] = []
+    stale: list[str] = []
+    for path in (ROOT / "vsagent").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        relative = str(path.relative_to(ROOT))
+        if "AgentTask(" in text and path.name != "projection.py":
+            offenders.append(relative)
+        if "TurnContext(" in text or "class TurnContext" in text:
+            stale.append(relative)
+    check(not offenders, f"AgentTask 只在投影模块构造：{offenders}")
+    check(not stale, f"TurnContext 已经并入 RouteDecision：{stale}")
+
+
+def _source_of(module: Any) -> str:
+    import inspect
+
+    return inspect.getsource(module)
 
 
 async def check_task_context() -> None:
-    """轮次类型接线：继续、改目标、看结果、恢复，以及没有任务时的降级。"""
+    """两轴接线：新建、延续、修改、比较、恢复、查进度、取消、闲聊。"""
     from vsagent.core.agent.planning.task_context import TaskContextResolver, context_line
 
-    def intent(mode: str, **kwargs) -> IntentSpec:
-        base = {"primary_goal": "获取 EGFR 的结构", "intent_types": ("structure_discovery",)}
+    def intent(relation: str, action: str = "execute", **kwargs) -> IntentSpec:
+        base = {"goal": "获取 EGFR 的结构", "task_relation": relation, "conversation_action": action}
+        if relation in ("new", "modify", "compare") and action == "execute":
+            base["operations"] = ("pocket",)
         base.update(kwargs)
-        if "intent_types" not in kwargs:
-            base["intent_types"] = ("structure_discovery",)
-        return IntentSpec(turn_mode=mode, **base)
+        return IntentSpec(**base)
 
     task = TaskSpec(
         task_id="task_001",
         objective="获取 EGFR 的全部实验结构",
         constraints=("只看人类",),
         exclusions=("不得联网取预测结构",),
+        subgoals=[{"goal": "取结构", "agent": "pocket"}],
         status="running",
     )
     resolver = TaskContextResolver()
 
-    fresh = resolver.resolve(intent("new_task"))
+    fresh = resolver.resolve(intent("new"))
     check(fresh.task is None and fresh.recompile, "新任务不接旧任务、要重新编译")
 
-    chat = resolver.resolve(intent("general_chat"))
+    chat = resolver.resolve(intent("none", "chat"))
     check(chat.task is None and not chat.recompile, "闲聊不建任务")
 
-    kept = resolver.resolve(intent("continue_task"), task)
+    status = resolver.resolve(intent("continue", "status_query"), task)
+    check(status.task is task and not status.recompile, "查进度不编译任务")
+
+    cancel = resolver.resolve(intent("continue", "cancel"), task)
+    check(cancel.task is task and not cancel.recompile, "取消不编译任务")
+
+    kept = resolver.resolve(intent("continue"), task)
     check(kept.task is task and not kept.recompile, "继续用同一份任务、不重新编译")
     check(not kept.warnings, "有任务时继续不报警")
 
     added = resolver.resolve(
-        intent("continue_task", exclusions=("不要用 AD4",), explicit_constraints=("只看链 A",)),
+        intent("continue", exclusions=("不要用 AD4",), constraints=("只看链 A",)),
         task,
     )
     check(
@@ -21509,37 +21948,190 @@ async def check_task_context() -> None:
     check(added.task.revision == task.revision + 1, "真的改了才加版本号")
     check(added.task.objective == task.objective, "继续不改目标")
 
-    same = resolver.resolve(intent("continue_task"), task)
+    same = resolver.resolve(intent("continue"), task)
     check(same.task.revision == task.revision, "没有变化就不加版本号")
 
+    new_role = resolver.resolve(intent("continue", operations=("ligand",)), task)
+    check(new_role.recompile, "延续任务出现新角色时要重新编译")
+    check("pocket" in new_role.intent.operations and "ligand" in new_role.intent.operations, "新角色与旧角色都在")
+
     changed = resolver.resolve(
-        intent("modify_task", primary_goal="获取 EGFR T790M 的结构", research_objects={"mutant": "T790M"}),
+        intent("modify", operations=("pocket",), goal="获取 EGFR T790M 的结构"),
         task,
     )
     check(changed.recompile, "改目标要重新编译")
-    check(changed.task.objective == "获取 EGFR T790M 的结构", "目标被替换")
-    check("只看人类" in changed.task.constraints, "改目标不清掉旧约束")
-    check(changed.task.research_scope.get("mutant") == "T790M", "研究对象并进范围")
+    check(changed.task is task, "改目标交给编译器合并")
+    check(changed.intent.objects == (), "修改任务可以不写对象")
 
-    missing = resolver.resolve(intent("continue_task"))
+    compare = resolver.resolve(
+        intent(
+            "compare",
+            operations=("analysis",),
+            objects=(
+                ObjectRef(type="pocket", label="第一个", ref="pocket#1", origin="existing"),
+                ObjectRef(type="pocket", label="第二个", ref="pocket#2", origin="existing"),
+            ),
+        ),
+        task,
+    )
+    check(compare.recompile, "比较任务要重新编译")
+    check("analysis" in compare.intent.operations and "pocket" in compare.intent.operations, "比较任务补上分析角色")
+
+    missing = resolver.resolve(intent("continue"))
     check(
-        missing.mode == "new_task" and missing.warnings,
+        missing.task is None and missing.warnings,
         f"没有任务却要继续：降级成新任务并记警告 {missing.warnings}",
     )
-    missing_modify = resolver.resolve(intent("modify_task"))
-    check(missing_modify.mode == "new_task" and missing_modify.warnings, "没有任务却要改目标，同样降级")
+    missing_modify = resolver.resolve(intent("modify", operations=("pocket",)))
+    check(missing_modify.task is None and missing_modify.warnings, "没有任务却要改目标，同样降级")
 
     resumed = resolver.resolve(
-        intent("resume_historical_task"), task, source_refs=("ses_0007/evt_3",)
+        intent("resume"), task, source_refs=("ses_0007/evt_3",)
     )
     check(resumed.task is task, "恢复旧任务时接上当前任务")
     check(resumed.source_refs == ("ses_0007/evt_3",), "恢复要留出处")
-    bare_resume = resolver.resolve(intent("resume_historical_task"), task)
-    check(bare_resume.warnings, "恢复但没给出处时记一条警告")
 
     line = context_line(task)
     check("目标：" in line and "禁止：" in line and len(line) <= 400, f"摘要够短：{len(line)} 字符")
     check(context_line(None) == "", "没有任务时摘要为空")
+
+
+async def check_context_resolver() -> None:
+    """上下文解析：任务、对象、产物、待澄清四段都在预算内。"""
+    from vsagent.core.agent.planning.context_resolver import ContextResolver
+
+    class _Handle:
+        def __init__(self, kind: str, seq: int) -> None:
+            self.kind = kind
+            self.seq = seq
+
+        def __str__(self) -> str:
+            return f"{self.kind}#{self.seq}"
+
+    class _Entry:
+        def __init__(self, kind: str, seq: int, summary: str, path: str = "") -> None:
+            self.handle = _Handle(kind, seq)
+            self.summary = summary
+            self.path = path
+
+    class _Ledger:
+        def entries(self) -> list[Any]:
+            return [
+                _Entry("pocket", 1, "候选口袋 A"),
+                _Entry("pocket", 2, "候选口袋 B"),
+                _Entry("artifact", 7, "对接结果", path="/tmp/poses"),
+            ]
+
+    task = TaskSpec(
+        task_id="task_ctx",
+        objective="比较两个口袋",
+        subgoals=[{"goal": "比较口袋", "agent": "analysis"}],
+        research_scope={"target": "target#1"},
+    )
+    session = Session(id="ses_ctx", task_spec=task.to_dict())
+    recent_message = session.add_message(Message(role="user", session_id=session.id))
+    recent_message.add_part(Part(type=PartType.TEXT, text="看看 pocket#1 和 artifact#7"))
+    session.pending_intent = {
+        "goal": "比较口袋",
+        "clarification": ["要比较哪两个口袋？"],
+    }
+    bundle = ContextResolver().resolve(session=session, current=task, ledger=_Ledger())
+    check("当前任务" in bundle.text and "task_ctx" in bundle.text, "任务摘要进了现场")
+    check("pocket#1" in bundle.text and "第1个" in bundle.text, "对象表带顺序")
+    check("artifact#7" in bundle.text and "对接结果" in bundle.text, "产物表带摘要")
+    check("上一轮待回答" in bundle.text and "哪两个口袋" in bundle.text, "待澄清问题进了现场")
+    check("最近提到的对象" in bundle.text and "pocket#1" in bundle.text, "最近提到的对象单独一段")
+    check("pocket#1" in bundle.refs and "artifact#7" in bundle.refs, "引用集合包含对象与产物")
+    check(len(bundle.text) <= 1_500, f"现场不超过 1500 字：{len(bundle.text)}")
+
+    empty = ContextResolver().resolve()
+    check(not empty.refs and "没有任务" in empty.text, "没有现场时给一句空说明")
+
+
+async def check_intent_validator() -> None:
+    """意图验证：四种决策各有覆盖，引用与完整性都能拦住。"""
+    from vsagent.core.agent.planning.context_resolver import ContextBundle
+    from vsagent.core.agent.planning.intent_validator import IntentValidator
+
+    validator = IntentValidator()
+    target = ObjectRef(type="target", label="EGFR", origin="new")
+    bundle = ContextBundle(
+        text="",
+        refs=frozenset({"pocket#1", "pocket#2"}),
+        objects="",
+        artifacts="",
+        pending="",
+    )
+
+    accepted = validator.validate(
+        IntentSpec(goal="取结构", operations=("pocket",), objects=(target,)), bundle
+    )
+    check(accepted.decision == "accept", f"正常意图通过：{accepted.decision}")
+
+    missing_ref = validator.validate(
+        IntentSpec(
+            goal="比较",
+            task_relation="compare",
+            operations=("analysis",),
+            objects=(
+                ObjectRef(type="pocket", label="第一个", ref="pocket#9", origin="existing"),
+                ObjectRef(type="pocket", label="第二个", ref="pocket#2", origin="existing"),
+            ),
+        ),
+        bundle,
+    )
+    check(missing_ref.decision == "clarify" and missing_ref.clarification, "失效引用要求澄清")
+
+    one_object = validator.validate(
+        IntentSpec(
+            goal="比较",
+            task_relation="compare",
+            operations=("analysis",),
+            objects=(ObjectRef(type="pocket", label="第一个", ref="pocket#1", origin="existing"),),
+        ),
+        bundle,
+    )
+    check(one_object.decision == "clarify" and "两组" in "".join(one_object.clarification), "比较至少两组对象")
+
+    current = TaskSpec(
+        task_id="task_v",
+        objective="先做对接",
+        subgoals=[{"goal": "跑对接", "agent": "docking"}],
+    )
+    changed = validator.validate(
+        IntentSpec(goal="改看另一个口袋", task_relation="modify", operations=("pocket",)),
+        bundle,
+        current=current,
+    )
+    check(changed.decision == "update", f"修改任务要先更新规格：{changed.decision}")
+
+    empty_bundle = ContextBundle(text="", refs=frozenset())
+    empty_result = validator.validate(
+        IntentSpec(goal="评价这批结果", operations=("analysis",)), empty_bundle
+    )
+    check(empty_result.decision == "clarify", "没有已有结果时要求澄清")
+
+    with_result = validator.validate(
+        IntentSpec(goal="评价这批结果", operations=("analysis",)),
+        bundle,
+        current=current,
+    )
+    check(with_result.decision == "accept", f"有上游结果时可以分析：{with_result.decision}")
+
+    conflict = validator.validate(
+        IntentSpec(
+            goal="筛选但不要对接",
+            operations=("docking",),
+            objects=(target,),
+            exclusions=("不要对接",),
+        ),
+        bundle,
+    )
+    check(
+        conflict.decision == "accept"
+        and any(item.code == "excluded_operation" for item in conflict.reasons),
+        f"禁止项与操作冲突时记一条提示：{conflict.reasons}",
+    )
 
 
 class _StubParser:
@@ -21559,7 +22151,7 @@ class _StubParser:
 
 async def check_profiles() -> None:
     """角色说明书：能力从注册表来、报告要求能判、坏说明书会被拦住。"""
-    from vsagent.core.agent.roles.capabilities import CAPABILITIES
+    from vsagent.core.agent.roles import catalog
     from vsagent.core.agent.roles.profiles import (
         PROFILES,
         REPORT_FIELDS,
@@ -21573,7 +22165,7 @@ async def check_profiles() -> None:
     check(len(PROFILES) == 10, f"一个主 Agent 加九个角色：{len(PROFILES)}")
 
     principal = profile("principal")
-    check(not principal.capabilities, "主 Agent 不承担具体能力")
+    check(not principal.duties, "主 Agent 不承担具体工作")
     check(not principal.report_requirements, "主 Agent 不交专业报告")
     check(principal.timeout_minutes is None, "主 Agent 不跑子会话，没有执行时限")
 
@@ -21593,10 +22185,8 @@ async def check_profiles() -> None:
     for item in PROFILES:
         if item.role == "principal":
             continue
-        check(bool(item.capabilities), f"{item.role} 至少有一项能力")
-        for name in item.capabilities:
-            capability = next(c for c in CAPABILITIES if c.name == name)
-            check(capability.role == item.role, f"{name} 属于 {item.role}")
+        check(bool(item.duties), f"{item.role} 至少有一项工作")
+        check(item.duties == catalog.DUTIES[item.role], f"{item.role} 的工作来自目录")
         check(set(item.report_requirements) <= set(REPORT_FIELDS), f"{item.role} 的报告要求合法")
 
     check(
@@ -21610,8 +22200,35 @@ async def check_profiles() -> None:
         findings=[{"text": "找到 3 个候选口袋"}],
         evidence_refs=("PDB 1IEP",),
         artifact_refs=("receptor#1",),
+        conclusions=[{"text": "6 套结构里 3 套有共晶小分子，推荐 3EYM 作为后续定案的参照。"}],
     )
     check(not profile("pocket").check_report(good), "要求都满足时报告合格")
+
+    # 非正常结束、结论只有一句「东西在哪」时判不合格：引用回答位置，
+    # 结论要回答做到哪一步（2026-11-18 的 ses_0060 只交了文件路径）。
+    terse = AgentReport(
+        task_id="t1",
+        agent_role="pocket",
+        evidence_refs=("PDB 1IEP",),
+        artifact_refs=("receptor#1",),
+        conclusions=[{"text": "本轮写入：runs/ha2_structure_catalog.md"}],
+        status="partial",
+    )
+    check(
+        any("结论" in item for item in profile("pocket").check_report(terse)),
+        "非正常结束只有一句路径时要指出来",
+    )
+
+    # 正常完成的短结论不拦：对接这类角色本来就可能只是一行数字。
+    brief = AgentReport(
+        task_id="t1",
+        agent_role="pocket",
+        evidence_refs=("PDB 1IEP",),
+        artifact_refs=("receptor#1",),
+        conclusions=[{"text": "最好 -8.2 kcal/mol。"}],
+        status="completed",
+    )
+    check(not profile("pocket").check_report(brief), "正常完成的短结论不判不合格")
 
     bare = AgentReport(task_id="t1", agent_role="pocket", findings=[{"text": "做完了"}])
     issues = profile("pocket").check_report(bare)
@@ -21628,12 +22245,10 @@ async def check_profiles() -> None:
     )
 
     bad = (
-        AgentProfile(role="nope", title="x", capabilities=()),
+        AgentProfile(role="nope", title="x"),
+        AgentProfile(role="research", title="x", duties=("别的角色的事",)),
         AgentProfile(
-            role="research", title="x", capabilities=("pocket_discovery",)
-        ),
-        AgentProfile(
-            role="ligand", title="x", capabilities=("ligand_intelligence",),
+            role="ligand", title="x", duties=("已知配体",),
             report_requirements=("whatever",),
         ),
     )
@@ -21669,7 +22284,7 @@ async def check_profiles() -> None:
 
 async def check_delivery() -> None:
     """输出合同与交付验收：能验的验，验不了的标 manual，不假装通过。"""
-    from vsagent.core.agent.planning.task_compiler import GENERIC_TEMPLATE, TEMPLATES
+    from vsagent.core.agent.roles.templates import GENERIC_TEMPLATE, TEMPLATES
     from vsagent.core.agent.validators import check_delivery
     from vsagent.core.agent.validators.output_contract import (
         CONTRACTS,
@@ -21678,8 +22293,8 @@ async def check_delivery() -> None:
         verify,
     )
 
-    outputs = [str(name) for template in TEMPLATES.values() for name in template["outputs"]]
-    outputs += [str(name) for name in GENERIC_TEMPLATE["outputs"]]
+    outputs = [name for template in TEMPLATES.values() for name in template.required_outputs]
+    outputs += list(GENERIC_TEMPLATE.required_outputs)
     missing = sorted({name for name in outputs if name not in CONTRACTS})
     check(not missing, f"每个交付物都有合同：缺 {missing}")
 
@@ -21690,16 +22305,8 @@ async def check_delivery() -> None:
     # 结构全景、口袋集、配体集都能按登记条目机械验了（P-83）。
     remaining = sorted(set(unverifiable(outputs)))
     check(
-        remaining
-        == [
-            "EvidenceReport",
-            "HypothesisReview",
-            "MechanismReport",
-            "PocketProfile",
-            "TargetBrief",
-            "TaskReport",
-        ],
-        f"只剩这六个确实只能评审：{remaining}",
+        remaining == ["MechanismReport", "ResearchDossier", "TaskReport"],
+        f"只剩这三个确实只能评审：{remaining}",
     )
 
     class _Entry:
@@ -21752,10 +22359,10 @@ async def check_delivery() -> None:
         check(verify("ScoringReport", workspace=workspace) is None, "有运行目录时验过")
 
         task = TaskCompiler().compile(
-            IntentSpec(primary_goal="筛选候选", intent_types=("virtual_screening",))
+            IntentSpec(goal="筛选候选", operations=("prepare", "docking"))
         ).task
         check(
-            [row["name"] for row in task.required_outputs]
+            list(task.required_outputs)
             == ["PreparedReceptor", "PreparedLigandSet", "CandidateSet"],
             f"筛选任务的交付物（准备两件加候选集）：{task.required_outputs}",
         )
@@ -21788,7 +22395,7 @@ async def check_delivery() -> None:
         workspace_root=WORKSPACE_FIXTURE, validator_mode="shadow",
     )
     loop._turn_task = TaskCompiler().compile(
-        IntentSpec(primary_goal="写一份机制说明", intent_types=("mechanism_analysis",))
+        IntentSpec(goal="写一份机制说明", operations=("mechanism",))
     ).task
     loop._check_delivery(Session(id="ses_delivery"))
     check(len(seen) == 1, "轮末写一条交付验收事件")
@@ -21892,6 +22499,32 @@ async def check_reports() -> None:
         f"退回时指出缺哪几项：{bare.problems}",
     )
 
+    # 非正常结束时，搜索增强会把正文压到总结之后才发布。按“最后一个部件”
+    # 取会拿到一句「本轮写入：…」，报告结论也跟着变成一行路径
+    # （2026-11-18 的 ses_0060）。这里要求优先取收尾总结。
+    from vsagent.core.agent.execution.reports import answer_text
+
+    summary = (
+        "结构清单已经写成 113 行，含分辨率、共晶配体与缺失残基；"
+        "目前还差 4KOL 的配体证据没有登记，下一轮补。"
+    )
+    late = _report_session("本轮写入：runs/ha2_structure_catalog.md", exit_reason="exhausted")
+    late.messages[-1].parts = [
+        part for part in late.messages[-1].parts if part.type is not PartType.TEXT
+    ]
+    late.messages[-1].add_part(Part(type=PartType.SUMMARY, text=summary))
+    late.messages[-1].add_part(
+        Part(type=PartType.TEXT, text="本轮写入：runs/ha2_structure_catalog.md")
+    )
+    check(answer_text(late).startswith("结构清单"), "非正常结束优先取收尾总结")
+    late_built = build(late, profile("pocket"))
+    check(
+        late_built.report.conclusions
+        and "113 行" in late_built.report.conclusions[0]["text"],
+        f"报告结论也取总结：{late_built.report.conclusions}",
+    )
+    check(late_built.acceptable, f"总结写得清楚时报告照常收下：{late_built.problems}")
+
     # 上限：结论与引用都不能无限长，父会话只拿一段摘要。
     long_session = _report_session("\n".join(f"结论 {i}" for i in range(MAX_CONCLUSIONS + 5)))
     long_built = build(long_session, profile("pocket")).report
@@ -21910,7 +22543,7 @@ async def check_validators() -> None:
     """校验器：计划外的族被拦、任务状态与缺输入、shadow 只记录不阻止。"""
     from vsagent.core.agent.planning.task_compiler import TaskCompiler
     from vsagent.core.agent.validators import check_tool
-    from vsagent.core.agent.validators import capability_guard, task_precondition
+    from vsagent.core.agent.validators import task_precondition, tool_guard
 
     # 这个会话只装了两个名字：清单外的工具要被判 deny。
     allowed_names = ("fetch_structure", "bash")
@@ -21926,9 +22559,9 @@ async def check_validators() -> None:
     check(not check_tool("detect_pockets").blocked, "没有清单时不拦")
 
     task = TaskCompiler().compile(
-        IntentSpec(primary_goal="取结构", intent_types=("structure_discovery",))
+        IntentSpec(goal="取结构", operations=("pocket",))
     ).task
-    check(not capability_guard.check("fetch_structure", None), "没有清单不产生发现")
+    check(not tool_guard.check("fetch_structure", None), "没有清单不产生发现")
 
     cancelled = task.with_updates(status="cancelled")
     findings = task_precondition.check("fetch_structure", cancelled)
@@ -22008,8 +22641,9 @@ async def check_route() -> None:
 
     # 2. shadow：解析、编译、路由都跑，结果只回给调用方。
     intent = IntentSpec(
-        primary_goal="取 EGFR 的全部实验结构",
-        intent_types=("structure_discovery",),
+        goal="取 EGFR 的全部实验结构",
+        operations=("pocket",),
+        objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
     )
     shadow = RouteAdapter(None, mode="shadow", parser=_StubParser(intent))
     decision = await shadow.prepare("取 EGFR 的全部实验结构")
@@ -22027,17 +22661,43 @@ async def check_route() -> None:
 
     # 4. 还没解析完就编译：拒绝，但不抛。
     unclear = IntentSpec(
-        primary_goal="EGFR", intent_types=("needs_clarification",), clarification_required=("想做什么？",)
+        goal="EGFR", clarification_required=("想做什么？",)
     )
     rejected = await RouteAdapter(None, mode="shadow", parser=_StubParser(unclear)).prepare("EGFR")
-    check(rejected.error and rejected.task is None, f"未解析完时不编译：{rejected.error}")
+    check(rejected.clarification and rejected.task is None, f"未解析完时先问：{rejected.clarification}")
 
-    # 5. 循环层：enforce 装族、shadow 不装、出错不动。
+    # 4.1 回答上一轮澄清：把待澄清意图补回来，再按执行处理。
+    pending_intent = IntentSpec(
+        goal="比较两个口袋",
+        task_relation="compare",
+        operations=("analysis",),
+        objects=(
+            ObjectRef(type="pocket", label="第一个", ref="pocket#1", origin="existing"),
+            ObjectRef(type="pocket", label="第二个", ref="pocket#2", origin="existing"),
+        ),
+    )
+    pending_session = Session(id="ses_pending", task_spec=None)
+    pending_session.pending_intent = {"intent": pending_intent.to_dict()}
+    answer = IntentSpec(
+        goal="就用第一个和第二个",
+        task_relation="continue",
+        conversation_action="clarify",
+    )
+    merged = RouteAdapter._merge_pending(answer, pending_session)
+    check(
+        merged.conversation_action == "execute"
+        and merged.task_relation == "compare"
+        and "analysis" in merged.operations
+        and len(merged.objects) == 2,
+        f"回答澄清后补回上一轮意图：{merged.to_dict()}",
+    )
+
+    # 5. 循环层：enforce 记规格、shadow 只记录、出错不动。
     from vsagent.core.agent.roles.contracts import IntentSpec as _Intent
     from vsagent.core.agent.planning.task_compiler import TaskCompiler
 
     built = TaskCompiler().compile(
-        _Intent(primary_goal="取 EGFR 的全部实验结构", intent_types=("structure_discovery",))
+        _Intent(goal="取 EGFR 的全部实验结构", operations=("pocket",))
     ).task
     plan = shadow.router.route(built).plan
 
@@ -22045,7 +22705,7 @@ async def check_route() -> None:
         def __init__(self, decision: Any) -> None:
             self.decision = decision
 
-        async def prepare(self, text: str, *, current: Any = None) -> Any:
+        async def prepare(self, text: str, *, current: Any = None, **kwargs: Any) -> Any:
             return self.decision
 
     class _NoProvider:
@@ -22070,7 +22730,8 @@ async def check_route() -> None:
     loop = make_loop(
         _Adapter(
             RouteDecision(
-                mode="enforce", intent=intent, task=built, plan=plan
+                mode="enforce", relation="new", action="execute",
+                intent=intent, task=built, plan=plan
             )
         )
     )
@@ -22090,10 +22751,10 @@ async def check_route() -> None:
     check(len(routes) == 1, f"一轮只留一块过程记录：{len(routes)}")
     route_text = routes[0].text if routes else ""
     check(
-        route_text.startswith("意图与任务 · 新任务 · 1 个角色 · enforce"),
+        route_text.startswith("意图与任务 · 新建 · 执行 · 1 个角色 · enforce"),
         f"标题写清轮次、角色数与模式：{route_text.splitlines()[:1]}",
     )
-    check("[意图]" in route_text and "structure_discovery" in route_text, "意图那一段有类型")
+    check("[意图]" in route_text and "pocket" in route_text, "意图那一段有类型")
     check(
         "[任务]" in route_text and built.task_id in route_text, "任务那一段有任务号"
     )
@@ -22105,8 +22766,8 @@ async def check_route() -> None:
         "[计划]" in route_text and "pocket" in route_text, "计划那一段有角色"
     )
     check(
-        "主 agent：只编排，不装领域族" in route_text,
-        f"计划里写明主 agent 不装族：{route_text}",
+        "主 agent：只编排，不直接调用领域工具" in route_text,
+        f"计划里写明主 agent 不直接执行：{route_text}",
     )
     check(
         "工具：" in route_text and "来自 agents.toml" in route_text,
@@ -22134,7 +22795,7 @@ async def check_route() -> None:
     question = stepped.add_message(Message(role="user"))
     question.add_part(Part(type=PartType.TEXT, text="取结构"))
     answer = stepped.add_message(Message(role="assistant"))
-    answer.add_part(Part(type=PartType.ROUTE, text="意图与任务 · 新任务"))
+    answer.add_part(Part(type=PartType.ROUTE, text="意图与任务 · 新建"))
     answer.add_part(Part(type=PartType.STEP_START, text="1 · m"))
     answer.add_part(Part(type=PartType.TEXT, text="好的"))
     numbers = [(turn.step_no, turn.messages[0].get("content")) for turn in split_turns(stepped.messages)]
@@ -22145,7 +22806,7 @@ async def check_route() -> None:
 
     exported = render_session_markdown(stepped)
     check(
-        "<summary>意图与任务 · 新任务</summary>" in exported,
+        "<summary>意图与任务 · 新建</summary>" in exported,
         "导出的 Markdown 把过程记录折叠起来",
     )
 
@@ -22155,7 +22816,7 @@ async def check_route() -> None:
     ask(hint_session, "上次那个 EGFR 的口袋查到哪了")
     hint_message = reply_message(hint_session)
     hint_loop = make_loop(
-        _Adapter(RouteDecision(mode="shadow", intent=intent, task=built, plan=plan))
+        _Adapter(RouteDecision(mode="shadow", relation="new", action="execute", intent=intent, task=built, plan=plan))
     )
     await hint_loop._prepare_route(hint_session, hint_message)
     hint_block = next(
@@ -22199,7 +22860,7 @@ async def check_route() -> None:
     enforce_session.campaign_state = "research"
     other = TaskSpec(task_id="task_other", objective="另一件事")
     await make_loop(
-        _Adapter(RouteDecision(mode="shadow", intent=intent, task=other))
+        _Adapter(RouteDecision(mode="shadow", relation="new", action="execute", intent=intent, task=other))
     )._prepare_route(enforce_session, other_message)
     check(
         enforce_session.campaign_state == "specification",
@@ -22223,18 +22884,24 @@ async def check_route() -> None:
     await make_loop(
         _Adapter(
             RouteDecision(
-                mode="shadow", intent=intent, task=built, plan=plan
+                mode="shadow", relation="new", action="execute",
+                intent=intent, task=built, plan=plan
             )
         )
     )._prepare_route(shadow_session, shadow_message)
     check(shadow_session.task_spec is not None, "shadow 也记任务规格（否则下一轮没有上下文）")
+    check(
+        shadow_session.route_intent.startswith("（本轮理解，仅参考"),
+        f"shadow 的意图块标成仅参考：{shadow_session.route_intent[:24]}",
+    )
+    check("操作：" in shadow_session.route_intent, "意图块列出角色")
     shadow_routes = [part.text for part in shadow_message.parts if part.type is PartType.ROUTE]
     check(
         shadow_routes
         and "计划按角色派发" in shadow_routes[0]
-        and "主 agent 不装族" in shadow_routes[0]
+        and "主 agent 不直接执行" in shadow_routes[0]
         and "shadow" in shadow_routes[0],
-        f"shadow 在块里写明族由角色拿：{shadow_routes[:1]}",
+        f"shadow 在块里写明工具由角色拿：{shadow_routes[:1]}",
     )
 
     error_session = Session(id="ses_route_error")
@@ -22279,16 +22946,19 @@ async def check_intent_parser(server: FakeModelServer) -> None:
     config = ProviderConfig(base_url=server.base_url, api_key="secret", model="fake-model")
     parser = IntentParser(OpenAICompatProvider(config))
     payload = {
-        "primary_goal": "调查 EGFR 的候选口袋并分析适配配体",
-        "turn_mode": "modify_task",
-        "intent_types": ["structure_discovery", "pocket_discovery"],
-        "research_objects": {"target": "EGFR"},
-        "explicit_constraints": ["覆盖候选口袋"],
+        "task_relation": "modify",
+        "conversation_action": "execute",
+        "goal": "调查 EGFR 的候选口袋并分析适配配体",
+        "objects": [
+            {"type": "target", "label": "EGFR", "ref": "", "origin": "new"}
+        ],
+        "operations": ["pocket", "ligand"],
+        "constraints": ["覆盖候选口袋"],
         "exclusions": ["不得直接执行分子对接"],
-        "provided_inputs": {},
+        "inputs": {},
+        "expected_outputs": ["PocketAtlas"],
         "missing_information": ["具体结构与口袋尚未指定"],
         "clarification_required": [],
-        "expected_deliverables": ["PocketCatalog"],
         "confidence": 0.8,
         "uncertainties": [],
         "source_message_ids": [],
@@ -22299,26 +22969,27 @@ async def check_intent_parser(server: FakeModelServer) -> None:
     spec = await parser.parse("获取 EGFR 的所有候选结合口袋，分析口袋特征，不要对接")
     check(len(server.requests) == before + 1, "一次合法输出只要一次调用")
     check(
-        spec.intent_types == ("structure_discovery", "pocket_discovery"),
-        f"多意图都保留：{spec.intent_types}",
+        spec.operations == ("pocket", "ligand"),
+        f"多个操作都保留：{spec.operations}",
     )
     check(
         spec.exclusions == ("不得直接执行分子对接",),
         f"排除项原样保留：{spec.exclusions}",
     )
-    check(spec.turn_mode == "modify_task", f"轮次类型跟着一起解析：{spec.turn_mode}")
+    check(spec.task_relation == "modify", f"任务关系跟着一起解析：{spec.task_relation}")
+    check(spec.conversation_action == "execute", f"对话行为跟着一起解析：{spec.conversation_action}")
     body = server.requests[-1]
     check(not body.get("tools"), "解析请求不带工具定义")
     system = body["messages"][0]["content"]
     check("AGENTS.md" not in system, "解析提示不加载项目规则")
-    check(len(system) < 4000, f"解析提示够短：{len(system)} 字符")
+    check(len(system) < 5000, f"解析提示够短：{len(system)} 字符")
 
     # 围栏包着的 JSON 也认。
     server.script(
         Reply(chunks=text_chunks("```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"))
     )
     fenced = await parser.parse("再来一句")
-    check(fenced.primary_goal == payload["primary_goal"], "解析 ```json 围栏")
+    check(fenced.goal == payload["goal"], "解析 ```json 围栏")
 
     # 第一次坏、第二次好：只让它改格式。
     before = len(server.requests)
@@ -22327,7 +22998,7 @@ async def check_intent_parser(server: FakeModelServer) -> None:
         Reply(chunks=text_chunks(json.dumps(payload, ensure_ascii=False))),
     )
     retried = await parser.parse("再试一次")
-    check(retried.primary_goal == payload["primary_goal"], "坏输出之后重试成功")
+    check(retried.goal == payload["goal"], "坏输出之后重试成功")
     check(len(server.requests) == before + 2, "重试只多问一次")
     correction = server.requests[-1]["messages"][-1]["content"]
     check("不合法" in correction and "不要改变" in correction, "第二次只要求改格式")
@@ -22385,31 +23056,25 @@ async def check_worker_guard() -> None:
 
 
 async def check_rules_split() -> None:
-    """项目规则按「会不会和用户说话」切两段：子 agent 拿不到交互那四节。"""
-    text = project_rules(rules_directory(ROOT))
-    check(bool(text), "规则文件读得到")
-    main_rules = select_rules(text, user_facing=True)
-    sub_rules = select_rules(text, user_facing=False)
-
-    for marker in ("### 2.1", "### 2.2", "### 2.3", "### 2.4", "## 3.", "## 4.", "## 5."):
-        check(marker in main_rules, f"主 agent 保留 {marker}")
-    for marker in ("### 2.2", "## 3.", "## 4.", "## 5."):
-        check(marker not in sub_rules, f"子 agent 不加载 {marker}")
-    for marker in ("### 2.1", "### 2.3", "### 2.4", "## 6.", "## 7.", "## 8."):
-        check(marker in sub_rules, f"子 agent 保留 {marker}")
-    check("## 9." not in main_rules, "流程索引（第 9 节）两档都不加载")
-    check("## 1." in main_rules, "主 agent 保留入口与优先级那一段")
-    check("## 1." not in sub_rules, "子 agent 不加载文档导航")
-    check(
-        estimate_tokens(sub_rules) < estimate_tokens(main_rules),
-        f"子 agent 的规则更短：主 {estimate_tokens(main_rules)} / "
-        f"子 {estimate_tokens(sub_rules)}",
+    """项目规则不再进任何前缀：AGENTS.md 只留给 /init 与人工查阅。"""
+    root = Session(id="ses_rules_root", title="主控")
+    child = Session(
+        id="ses_rules_child", title="子", parent_id=root.id, root_id=root.id, depth=1
     )
-
-    # 认不出结构就整份返回：规则是许可的来源，宁可多给也不给半份。
-    broken = "## 随便一节\n正文\n### 2.1 没有必需的其它节\n"
-    check(select_rules(broken, user_facing=False) == broken, "缺节时整份返回")
-    check(select_rules("", user_facing=False) == "", "空规则仍是空")
+    for session, name in ((root, "主控"), (child, "子 agent")):
+        text = stable_prefix(Workspace(session.id, ROOT), session)
+        check(
+            "Multi-Agent Operating Specification" not in text,
+            f"{name} 的前缀里没有 AGENTS.md",
+        )
+        check(
+            "以下是项目级规则" not in text,
+            f"{name} 的前缀里没有项目规则段",
+        )
+    check(
+        bool(project_rules(rules_directory(ROOT))),
+        "规则文件仍在磁盘上，供 /init 与人工查阅",
+    )
 
 
 async def check_core_tools_profile() -> None:
@@ -22423,7 +23088,7 @@ async def check_core_tools_profile() -> None:
         for tool in tools
     }
     check(len(names) == len(set(names)), "常驻工具没有重名")
-    check(len(names) == 18, f"常驻工具按清单装配：{len(names)} 个")
+    check(len(names) == 17, f"常驻工具按清单装配：{len(names)} 个")
     check(names[0] == "bash", "装配顺序从 bash 开始（顺序就是请求体里的顺序）")
     check(names[-1] == "dispatch_campaign", "派发那一组排在最后")
 
@@ -22431,8 +23096,52 @@ async def check_core_tools_profile() -> None:
     worker = set(agents.core_tools("worker", ROOT))
     check("dispatch_campaign" in orchestrator, "主会话有派发工具")
     check("dispatch_campaign" not in worker, "子会话没有派发工具")
-    check("agent_status" not in worker, "子会话不能查别的 agent")
     check({"registry", "add_evidence", "workspace"} <= worker, "共享设施在子会话基础档里")
+    worker_ro = set(agents.core_tools("worker_ro", ROOT))
+    check(worker_ro <= worker, "只读子会话档是子会话基础档的子集")
+    check(
+        not ({"bash", "read", "write", "patch", "grep"} & worker_ro),
+        "只读子会话档不含会读写文件或跑命令的工具",
+    )
+    check("worker_ro" in agents.tier_names(ROOT), "自定义档出现在档位名单里")
+
+    # 自定义档只写在项目配置里，包内默认不用动；`core` 的名字按实际有的档判。
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / ".vsagent").mkdir()
+        config = root / ".vsagent" / "agents.toml"
+        config.write_text(
+            '[core.probe]\ntools = ["read", "registry"]\n\n'
+            '[agents.ligand]\ncore = "probe"\ntools = ["search_actives"]\n',
+            encoding="utf-8",
+        )
+        agents.reset()
+        try:
+            check(
+                agents.core_tools("probe", root) == ("read", "registry"),
+                "项目配置加的档读得到",
+            )
+            check(
+                agents.role_tools("ligand", root)
+                == ("read", "registry", "search_actives"),
+                "角色可以指向自定义档",
+            )
+            config.write_text(
+                '[agents.ligand]\ncore = "probe_typo"\ntools = ["search_actives"]\n',
+                encoding="utf-8",
+            )
+            agents.reset()
+            try:
+                agents.role_tools("ligand", root)
+            except agents.ConfigError as error:
+                check(
+                    "probe_typo" in str(error) and "worker_ro" in str(error),
+                    f"拼错档名时列出可用档：{error}",
+                )
+            else:
+                check(False, "拼错档名要报错")
+        finally:
+            agents.reset()
 
     main_total = sum(costs[name] for name in orchestrator if name in costs)
     worker_total = sum(costs[name] for name in worker if name in costs)
@@ -22704,6 +23413,28 @@ def check_topic_views() -> None:
     chat_view = topic_views(chat, running=False)[-1]
     check(chat_view.status == "completed", f"纯聊天的一轮已经说完：{chat_view.status}")
 
+    # 轮末的总结并进上一条事件：模型在最后一步调过 close_topic 时，
+    # 切点落在消息中间，总结会变成一个只有一行答复的第四条主题。
+    tail = _event_fixture(1)
+    check(seal_range(tail, upto=2) is not None, "先封一条主题")
+    closing = tail.add_message(Message(role="assistant"))
+    closing.add_part(Part(type=PartType.SUMMARY, text="给你的答复：做完了。"))
+    check(len(topic_views(tail, running=False)) == 2, "封存之后还剩一段未封存的尾巴")
+    absorbed = absorb_tail(tail)
+    check(absorbed is not None and absorbed.cut == (3, 0), f"尾巴并进了上一条：{absorbed}")
+    check(len(topic_views(tail, running=False)) == 1, "并完之后不再多出一个主题")
+
+    later = _event_fixture(1)
+    seal_range(later, upto=2)
+    later.add_message(Message(role="user")).add_part(Part(type=PartType.TEXT, text="再来"))
+    check(absorb_tail(later) is None, "切点之后有新用户消息，属于下一段")
+
+    pending = _event_fixture(1)
+    seal_range(pending, upto=2)
+    more = pending.add_message(Message(role="assistant"))
+    more.add_part(Part(type=PartType.TOOL, tool_name="dock", tool_status=ToolStatus.RUNNING))
+    check(absorb_tail(pending) is None, "切点之后还有工具调用，属于下一步")
+
     # 重启回来：pending_steps 空了，步按原文回填，工具数不能写成 0。
     restored = _event_fixture(1)
     restored_view = topic_views(restored, running=False)[-1]
@@ -22808,15 +23539,15 @@ async def check_event_log() -> None:
     )
 
     # 一条 assistant 消息里装着**一整轮**的多步（`STEP_START` 切开）：封存时不能压成一步。
-    # 实测一次四轮会话，第二轮「先 load_tools 再 fetch_target」两步只留下了一步，
+    # 实测一次四轮会话，第二轮「先查靶点再取结构」两步只留下了一步，
     # 判据「每个 Step 恰好被一个 Phase 收走一次」当场不成立。
     def _multi_step() -> Session:
         built = Session(id="ses_multi")
         built.add_message(Message(role="user")).add_part(
-            Part(type=PartType.TEXT, text="装族再用")
+            Part(type=PartType.TEXT, text="先查靶点再取结构")
         )
         message = built.add_message(Message(role="assistant"))
-        for name in ("load_tools", "fetch_target"):
+        for name in ("target_lookup", "fetch_structure"):
             message.add_part(Part(type=PartType.STEP_START))
             message.add_part(
                 Part(
@@ -22833,12 +23564,12 @@ async def check_event_log() -> None:
     folded_event = seal_range(folded, upto=2)
     check(
         folded_event is not None and [step.tools for step in folded_event.steps]
-        == [["load_tools"], ["fetch_target"]],
+        == [["target_lookup"], ["fetch_structure"]],
         f"回填按 STEP_START 分段，一步不丢：{[s.tools for s in folded_event.steps] if folded_event else None}",
     )
 
     recorded = _multi_step()
-    for order, name in enumerate(("load_tools", "fetch_target"), 1):
+    for order, name in enumerate(("target_lookup", "fetch_structure"), 1):
         parts = recorded.messages[1].parts
         positions = [
             position
@@ -22857,7 +23588,7 @@ async def check_event_log() -> None:
     check(
         recorded_event is not None
         and [step.tools for step in recorded_event.steps]
-        == [["load_tools"], ["fetch_target"]],
+        == [["target_lookup"], ["fetch_structure"]],
         f"当场记的那份与回填不重复也不丢：{[s.tools for s in recorded_event.steps] if recorded_event else None}",
     )
 
@@ -22977,7 +23708,7 @@ async def check_event_log() -> None:
     )
     check(
         manual_session.topic_title == "再来一次",
-        "预装族写错时不留下半个标题，下一步不会被它触发封存",
+        "标题写错时不留下半个标题，下一步不会被它触发封存",
     )
     await CloseTopicTool().execute(
         {
@@ -23004,7 +23735,7 @@ async def check_event_log() -> None:
         f"封完之后没有新步，再调就拒绝：{closed_again.output}",
     )
 
-    # 主 agent 这一轮只编排：不预装族，说清族由计划按角色给（P-83）。
+    # 主 agent 这一轮只编排：不直接调领域工具，工具由计划里的角色拿（P-83）。
     # 一步都没有时拒绝：空主题封出来只是一条占位，还会把下一个主题的起点往前挪。
     empty = _event_fixture(1)
     refused = await CloseTopicTool().execute(
@@ -23964,7 +24695,6 @@ async def check_dispatch() -> None:
     """结构化派发：一个任务号只派一次、越权的不派、报告按角色判。"""
     from vsagent.core.agent.roles.contracts import AgentTask
     from vsagent.core.agent.execution.dispatcher import AgentDispatcher, DispatcherError
-    from vsagent.core.agent.execution.spawn import AgentStatusTool
 
     class _Host:
         """只实现派发器用到的两件事：spawn 与 children_of。"""
@@ -24023,17 +24753,31 @@ async def check_dispatch() -> None:
     book = str(host.calls[0]["task"])
     for wanted in ("4HJO", "receptor#1", "PocketCatalog", "只报体积最大的三个", "证据出处"):
         check(wanted in book, f"任务书里有 {wanted}：{book[:80]}…")
-    check("工具：27 件" in book, f"任务书写明工具按角色配置装配：{book[:120]}")
+    check(
+        f"工具：{len(agents.role_tools('pocket'))} 件" in book,
+        f"任务书写明工具按角色配置装配：{book[:120]}",
+    )
     check(
         host.calls[0]["start"] == host.calls[0]["end"] == len(parent.messages),
         "结构化派发不复制父会话历史",
     )
 
-    # 同一个任务号再派一次：返回已有会话，不建第二个。
+    # 同一个任务号再派一次：还在待发，返回已有会话，不建第二个。
     again = dispatcher.dispatch(parent, task)
     check(not again.created, "第二次派发不新建")
     check(again.session.id == first.session.id, "第二次派发返回同一个子会话")
     check(len(host.calls) == 1, f"同一个任务号只调一次 spawn：{len(host.calls)}")
+
+    # 已经跑完的子会话不复用：同一任务号再派一次要开新的子会话。
+    first.session.status = "done"
+    rerun = dispatcher.dispatch(parent, task)
+    check(rerun.created, "跑完后再次派发要新建")
+    check(rerun.session.id != first.session.id, "不再返回跑完的那个子会话")
+    check(
+        rerun.session.task_id == "task_pocket#2",
+        f"新一代任务号：{rerun.session.task_id}",
+    )
+    check(len(host.calls) == 2, f"再派一次就再调一次 spawn：{len(host.calls)}")
 
     def refusal(call: Any, label: str) -> str:
         try:
@@ -24114,31 +24858,24 @@ async def check_dispatch() -> None:
     plain = Session(id="ses_plain", parent_id=parent.id, depth=1)
     check(dispatcher.collect(plain) is None, "没有角色的子会话不做角色判定")
 
-    # --- agent_status 把这份判定带给父会话 ---
-    host.children.append(thin)
-    host.children.append(plain)
-    plain.status = "done"
-    plain_answer = Message(role="assistant", session_id=plain.id)
-    plain_answer.add_part(Part(type=PartType.TEXT, text="自由文本派发的结论"))
-    plain.add_message(plain_answer)
+    # 报告判定写成「一段一行」，派发结果直接原样带回父会话。
+    from vsagent.core.agent.execution.spawn import _report_lines
 
-    status_tool = AgentStatusTool()
-    seen = await status_tool.execute(
-        {"session_id": child.id}, session=parent, spawner=host
+    good_lines = _report_lines(child)
+    check(
+        any("报告：合格" in item for item in good_lines),
+        f"合格的报告要标合格：{good_lines}",
     )
-    check("报告：合格" in seen.output, f"合格的报告在 agent_status 里标合格：{seen.output}")
-    check("产物句柄：artifact#7" in seen.output, "报告里的句柄一起列出来")
-
-    seen_thin = await status_tool.execute(
-        {"session_id": thin.id}, session=parent, spawner=host
+    check(
+        any("产物句柄：artifact#7" in item for item in good_lines),
+        "报告里的句柄一起列出来",
     )
-    check("报告：不合格" in seen_thin.output, f"不合格的报告明说：{seen_thin.output}")
-    check("artifact_refs" in seen_thin.output, "不合格时指出缺哪一项")
-
-    seen_plain = await status_tool.execute(
-        {"session_id": plain.id}, session=parent, spawner=host
+    thin_lines = _report_lines(thin)
+    check(
+        any("报告：不合格" in item for item in thin_lines),
+        f"不合格的报告明说：{thin_lines}",
     )
-    check("报告：" not in seen_plain.output, "没有角色的子会话不加报告段")
+    check("artifact_refs" in "".join(thin_lines), "不合格时指出缺哪一项")
 
     # 角色与任务号要能跟着状态文件活过重启。
     restored = Session.from_dict(child.to_dict())
@@ -24285,10 +25022,10 @@ async def check_scheduler() -> None:
     host = _Host()
     scheduler = AgentScheduler(AgentDispatcher(host), max_parallel=2, poll=0.01)
     tasks = [
-        task("t_struct", "structure_pocket"),
+        task("t_struct", "pocket"),
         task("t_ligand", "ligand"),
-        task("t_lit", "literature"),
-        task("t_screen", "screening", "t_struct", "t_ligand"),
+        task("t_lit", "research"),
+        task("t_screen", "prepare", "t_struct", "t_ligand"),
     ]
     result = await scheduler.run(parent, tasks)
     check(
@@ -24296,7 +25033,7 @@ async def check_scheduler() -> None:
         == ["done", "done", "done"],
         f"三个并行任务都完成：{[(k, v.status) for k, v in result.outcomes.items()]}",
     )
-    # screening 的说明书要求报告里写局限，而这次没有失败的工具——按角色判就是 partial。
+    # 准备角色的说明书要求报告里写局限，而这次没有失败的工具——按角色判就是 partial。
     check(
         result.outcomes["t_screen"].status == "partial"
         and any("limitations" in item for item in result.outcomes["t_screen"].problems),
@@ -24322,7 +25059,7 @@ async def check_scheduler() -> None:
     scheduler = AgentScheduler(AgentDispatcher(host), max_parallel=2, poll=0.01)
     result = await scheduler.run(
         parent,
-        [task("t_a", "target"), task("t_b", "target", "t_a"), task("t_c", "target")],
+        [task("t_a", "research"), task("t_b", "research", "t_a"), task("t_c", "research")],
     )
     check(result.outcomes["t_a"].status == "failed", "失败的那个标 failed")
     check(result.outcomes["t_b"].status == "blocked", "依赖它的标 blocked，不是 failed")
@@ -24361,12 +25098,26 @@ async def check_scheduler() -> None:
     )
     check(stuck.cancelled == ["ses_t_slow"], f"子会话被中断：{stuck.cancelled}")
 
+    # --- 整场超时：不再等，也要把还在跑的子会话停掉 ---
+    stuck = _StuckHost()
+    stuck_scheduler = AgentScheduler(AgentDispatcher(stuck), max_parallel=1, poll=0.01)
+    expired = await stuck_scheduler.run(parent, [task("t_slow", "ligand")], timeout=0.01)
+    check(
+        expired.outcomes["t_slow"].status == "failed",
+        f"整场超时记失败：{expired.outcomes['t_slow']}",
+    )
+    check(
+        any("调度超时" in item for item in expired.outcomes["t_slow"].problems),
+        f"说明是整场超时：{expired.outcomes['t_slow'].problems}",
+    )
+    check(stuck.cancelled == ["ses_t_slow"], f"整场超时也要停子会话：{stuck.cancelled}")
+
     # --- 报告不合格：算 partial，下游仍然可以跑 ---
     host = _Host(thin=("t_struct",))
     scheduler = AgentScheduler(AgentDispatcher(host), max_parallel=2, poll=0.01)
     result = await scheduler.run(
         parent,
-        [task("t_struct", "structure_pocket"), task("t_next", "ligand", "t_struct")],
+        [task("t_struct", "pocket"), task("t_next", "ligand", "t_struct")],
     )
     check(result.outcomes["t_struct"].status == "partial", "缺产物与证据的报告算 partial")
     check(
@@ -24374,12 +25125,15 @@ async def check_scheduler() -> None:
         f"partial 要说清缺什么：{result.outcomes['t_struct'].problems}",
     )
     check(result.outcomes["t_next"].status == "done", "上游 partial 不拦下游")
+    check("t_struct" in result.done(), "partial 也算结束，同时进 done")
+    check("t_struct" not in result.unfinished(), "partial 不算没来得及跑")
+    check(result.partial() == ["t_struct"], f"partial 单列：{result.partial()}")
 
     # --- 图不成立时一个都不派 ---
     host = _Host()
     scheduler = AgentScheduler(AgentDispatcher(host), max_parallel=2, poll=0.01)
     try:
-        await scheduler.run(parent, [task("x", "target", "y"), task("y", "target", "x")])
+        await scheduler.run(parent, [task("x", "research", "y"), task("y", "research", "x")])
     except SchedulerError as error:
         check("成环" in str(error), f"有环时拒绝调度：{error}")
     else:
@@ -24449,10 +25203,11 @@ async def check_scheduler() -> None:
 
 
 async def check_coordinator() -> None:
-    """协调器：计划翻成任务、依赖换号、交付物给汇点、重跑不重复派发。"""
-    from vsagent.core.agent.planning.capability_router import CapabilityRouter
-    from vsagent.core.agent.roles.contracts import AgentTask, CapabilityPlan, TaskSpec
-    from vsagent.core.agent.execution.coordinator import Coordinator, build_tasks, task_id_for
+    """协调器：计划翻成任务、依赖换号、交付物给汇点、跑完后再派发开新会话。"""
+    from vsagent.core.agent.planning.agent_router import AgentRouter
+    from vsagent.core.agent.roles.contracts import AgentTask, AgentPlan, TaskSpec
+    from vsagent.core.agent.execution.coordinator import Coordinator, build_tasks
+    from vsagent.core.agent.execution.projection import task_id_for
     from vsagent.core.agent.execution.dispatcher import AgentDispatcher
     from vsagent.core.agent.execution.scheduler import AgentScheduler
 
@@ -24460,17 +25215,17 @@ async def check_coordinator() -> None:
         task_id="task_c",
         objective="给 4HJO 找一批新骨架",
         subgoals=[
-            {"goal": "找出可用的口袋", "capability": "pocket_discovery"},
-            {"goal": "汇总已知配体与活性", "capability": "ligand_intelligence"},
-            {"goal": "对接并给出候选集", "capability": "docking_run"},
+            {"goal": "找出可用的口袋", "agent": "pocket"},
+            {"goal": "汇总已知配体与活性", "agent": "ligand"},
+            {"goal": "对接并给出候选集", "agent": "docking"},
         ],
         constraints=("只用已上市药物",),
-        required_outputs=[{"name": "CandidateSet"}],
+        required_outputs=("CandidateSet",),
         acceptance_criteria=[
             {"kind": "handle_registered", "target": "CandidateSet", "output": "CandidateSet"},
         ],
     )
-    plan = CapabilityRouter().route(spec).plan
+    plan = AgentRouter().route(spec).plan
     check(
         plan.selected_agents == ("pocket", "ligand", "prepare", "docking"),
         f"路由出四个角色（准备与对接各一个）：{plan.selected_agents}",
@@ -24486,7 +25241,15 @@ async def check_coordinator() -> None:
     by_role = {item.role: item for item in tasks}
     check(
         by_role["pocket"].objective == "找出可用的口袋",
-        f"目标取这个角色负责的子目标：{by_role['pocket'].objective}",
+        f"本角色的目标只写它这一段：{by_role['pocket'].objective}",
+    )
+    check(
+        by_role["pocket"].background == "给 4HJO 找一批新骨架",
+        f"父目标放进背景：{by_role['pocket'].background}",
+    )
+    check(
+        "总目标" not in by_role["pocket"].input_refs,
+        f"父目标不再冒充输入引用：{by_role['pocket'].input_refs}",
     )
     check(
         by_role["docking"].dependencies == (task_id_for(plan, "prepare"),),
@@ -24500,9 +25263,80 @@ async def check_coordinator() -> None:
         not by_role["pocket"].required_outputs,
         "中间环节不领整份交付物",
     )
+    # 任务规格里的要求不再自动下发；限制由父 agent 在派发时按角色写。
     check(
-        by_role["docking"].constraints == ("只用已上市药物",),
-        "用户约束传给每个角色",
+        all("只用已上市药物" not in item.constraints for item in tasks),
+        f"任务规格里的原话不自动进任务书：{[(t.role, t.constraints) for t in tasks]}",
+    )
+
+    routed = TaskSpec(
+        task_id="task_routed",
+        objective="摸清结构与配体",
+        subgoals=[
+            {"goal": "找口袋", "agent": "pocket"},
+            {"goal": "查配体", "agent": "ligand"},
+        ],
+        constraints=(
+            "全局都要看",
+            "pocket：结构清单七项",
+            "ligand: 不生成新分子",
+        ),
+    )
+    routed_plan = AgentRouter().route(routed).plan
+    routed_tasks, routed_warnings = build_tasks(
+        routed_plan,
+        routed,
+        constraints={
+            "global": ["所有角色共用"],
+            "pocket": ["只要实验结构"],
+            "ligand": ["不生成新分子"],
+        },
+    )
+    routed_by_role = {item.role: item for item in routed_tasks}
+    check(
+        "只要实验结构" in routed_by_role["pocket"].constraints
+        and "只要实验结构" not in routed_by_role["ligand"].constraints,
+        f"角色专属限制只进那个角色：{[(t.role, t.constraints) for t in routed_tasks]}",
+    )
+    check(
+        "所有角色共用" in routed_by_role["pocket"].constraints
+        and "所有角色共用" in routed_by_role["ligand"].constraints,
+        f"global 进每一份：{[(t.role, t.constraints) for t in routed_tasks]}",
+    )
+    check(
+        not any("结构清单七项" in item.constraints for item in routed_tasks),
+        "任务规格里的带前缀条目也不再自动切",
+    )
+    check(not routed_warnings, f"规矩的限制没有告警：{routed_warnings}")
+
+    # 写给这次不派的角色：提示但不下发。
+    stray_tasks, stray_warnings = build_tasks(
+        routed_plan,
+        routed,
+        constraints={"docking": ["每个位姿都给 RMSD"]},
+    )
+    check(
+        all("每个位姿都给 RMSD" not in item.constraints for item in stray_tasks),
+        f"不派的角色收到限制也没有去处：{[(t.role, t.constraints) for t in stray_tasks]}",
+    )
+    check(
+        any("这次不派的角色" in item for item in stray_warnings),
+        f"写给不派的角色要提示：{stray_warnings}",
+    )
+
+    # 同一句话在 global 与角色里都写了，只留一份。
+    duplicate = TaskSpec(
+        task_id="task_dup",
+        objective="摸清结构与配体",
+        subgoals=[{"goal": "找口袋", "agent": "pocket"}],
+    )
+    dup_plan = AgentRouter().route(duplicate).plan
+    dup_tasks, _ = build_tasks(
+        dup_plan, duplicate, constraints={"global": ["同一句"], "pocket": ["同一句"]}
+    )
+    check(
+        dup_tasks[0].constraints.count("同一句") == 1,
+        f"重复的限制只留一份：{dup_tasks[0].constraints}",
     )
     # 权限从角色说明书来：以前这个字段没填，`check_task()` 的权限校验是空转。
     from vsagent.core.agent.roles.profiles import profile as _profile
@@ -24517,29 +25351,53 @@ async def check_coordinator() -> None:
         f"对接任务只授权执行与写入：{by_role['docking'].permissions}",
     )
     check(
-        by_role["docking"].input_refs.get("总目标") == "给 4HJO 找一批新骨架",
-        "任务书带上总目标",
+        by_role["docking"].background == "给 4HJO 找一批新骨架",
+        "任务书带上父任务背景",
     )
 
-    # 两个终点时不硬分交付物，只告警。
+    # 两个终点各领自己的交付物，不再整份丢掉。
     two_ends = TaskSpec(
         task_id="task_two",
         objective="摸清结构与配体",
         subgoals=[
-            {"goal": "找口袋", "capability": "pocket_discovery"},
-            {"goal": "查配体", "capability": "ligand_intelligence"},
+            {"goal": "找口袋", "agent": "pocket"},
+            {"goal": "查配体", "agent": "ligand"},
         ],
-        required_outputs=[{"name": "CandidateSet"}],
+        required_outputs=("PocketAtlas", "LigandDossier"),
     )
-    two_plan = CapabilityRouter().route(two_ends).plan
+    two_plan = AgentRouter().route(two_ends).plan
     two_tasks, two_warnings = build_tasks(two_plan, two_ends)
+    two_by_role = {item.role: item for item in two_tasks}
     check(
-        all(not item.required_outputs for item in two_tasks),
-        "多个终点时不给任何任务挂整份交付物",
+        two_by_role["pocket"].required_outputs == ("PocketAtlas",)
+        and two_by_role["ligand"].required_outputs == ("LigandDossier",),
+        f"两个终点各领自己的交付物："
+        f"{[(t.role, t.required_outputs) for t in two_tasks]}",
     )
-    check(any("终点" in item for item in two_warnings), f"这种情况要告警：{two_warnings}")
+    check(not two_warnings, f"认领得到时没有告警：{two_warnings}")
 
-    empty_tasks, empty_warnings = build_tasks(CapabilityPlan(task_id="task_empty"), spec)
+    # 没有角色声明这个名字时，多个终点只告警，不硬挂。
+    orphan = TaskSpec(
+        task_id="task_orphan",
+        objective="摸清结构与配体",
+        subgoals=[
+            {"goal": "找口袋", "agent": "pocket"},
+            {"goal": "查配体", "agent": "ligand"},
+        ],
+        required_outputs=("CandidateSet",),
+    )
+    orphan_plan = AgentRouter().route(orphan).plan
+    orphan_tasks, orphan_warnings = build_tasks(orphan_plan, orphan)
+    check(
+        all(not item.required_outputs for item in orphan_tasks),
+        "没人认领的交付物不硬挂",
+    )
+    check(
+        any("终点" in item for item in orphan_warnings),
+        f"这种情况要告警：{orphan_warnings}",
+    )
+
+    empty_tasks, empty_warnings = build_tasks(AgentPlan(task_id="task_empty"), spec)
     check(not empty_tasks and empty_warnings, f"空计划不产生任务：{empty_warnings}")
 
     # --- 跑一遍：派发、收报告、重跑不重复建会话 ---
@@ -24549,10 +25407,15 @@ async def check_coordinator() -> None:
             self.spawned = 0
             self.handles = 0
             self.books: dict[str, str] = {}
+            self.sent: dict[str, dict[str, Any]] = {}
 
         def spawn(self, session: Session, **kwargs: Any) -> Session:
             self.spawned += 1
             self.books[str(kwargs["task_id"])] = str(kwargs["task"])
+            self.sent[str(kwargs["task_id"])] = {
+                "constraints": kwargs.get("constraints"),
+                "goal": kwargs.get("goal"),
+            }
             child = Session(
                 id=f"ses_{kwargs['task_id'].replace(':', '_')}",
                 title=str(kwargs["title"]),
@@ -24614,7 +25477,9 @@ async def check_coordinator() -> None:
     parent = Session(id="ses_coord", title="父")
     host = _Host()
     coordinator = Coordinator(AgentScheduler(AgentDispatcher(host), max_parallel=2, poll=0.01))
-    campaign = await coordinator.run(parent, plan, spec)
+    campaign = await coordinator.run(
+        parent, plan, spec, constraints={"global": ["只用已上市药物"]}
+    )
     check(campaign.dispatched() == 4, f"四个任务都派了：{campaign.dispatched()}")
     check(
         len(campaign.done()) == 4,
@@ -24629,25 +25494,51 @@ async def check_coordinator() -> None:
     screen_book = host.books["task_c:docking"]
     check("上游产物" in screen_book, f"筛选的任务书里有上游引用：{screen_book[:60]}…")
     check("对接并给出候选集" in screen_book, "任务书里有它负责的那一段")
+    check(
+        "背景（父任务，只作上下文，不要重复完成）：给 4HJO 找一批新骨架"
+        in screen_book,
+        f"父目标写成背景，不当任务：{screen_book}",
+    )
+    check("总目标" not in screen_book, "父目标不再冒充输入引用")
+    check(
+        host.sent["task_c:docking"]["constraints"] == ("只用已上市药物",),
+        f"派发时把本角色的约束交给子会话：{host.sent['task_c:docking']}",
+    )
+    check(
+        host.sent["task_c:docking"]["goal"] == by_role["docking"].objective,
+        "子会话的目标用任务书的目标，不用标题",
+    )
     check(screen.messages, "筛选子会话跑过了")
 
-    # 同一份计划再跑一次：任务号一样，不建新会话。
+    # 同一份计划再跑一次：上一场的子会话都跑完了，这一轮要重新派发。
     again = await coordinator.run(parent, plan, spec)
-    check(host.spawned == 4, f"重跑不重复建会话：{host.spawned}")
+    check(host.spawned == 8, f"跑完后再跑要开新的子会话：{host.spawned}")
     check(again.dispatched() == 4, "重跑仍然给出四个结果")
     check(
         len(again.done()) == 4,
-        f"重跑直接收已有会话的报告：{[(k, v.status) for k, v in again.schedule.outcomes.items()]}",
+        f"重跑的四份报告来自新的会话：{[(k, v.status) for k, v in again.schedule.outcomes.items()]}",
+    )
+    rerun_ids = sorted(child.task_id for child in host.children if child.task_id.endswith("#2"))
+    check(
+        len(rerun_ids) == 4,
+        f"新一轮的任务号带代号：{[child.task_id for child in host.children]}",
     )
 
 
 async def check_campaign_dispatch() -> None:
     """多角色执行的入口：预演、启动、结果写回任务状态、取消。"""
-    from vsagent.core.agent.planning.capability_router import CapabilityRouter
+    from vsagent.core.agent.planning.agent_router import AgentRouter
     from vsagent.core.agent.roles.contracts import TaskSpec
     from vsagent.core.agent.execution.host import AgentHost
     from vsagent.core.agent.execution.spawn import DispatchCampaignTool
     from vsagent.core.session_manager import SessionManager
+    from vsagent.core.agent.execution import reports as reports_module
+
+    # 报告写到 .probe：判据不往仓根的 runs/ 里留文件。每轮先清掉上一轮留下的
+    # 报告：临时状态文件的会话号每次都从 ses_0001 起，旧文件会与这一轮撞号。
+    report_root = ROOT / ".probe" / "reports"
+    shutil.rmtree(report_root, ignore_errors=True)
+    reports_module.report_root = lambda: report_root
 
     class _Loop:
         """等到门开就写一条回答；配体角色故意失败，用来验"卡住"的写法。"""
@@ -24689,10 +25580,10 @@ async def check_campaign_dispatch() -> None:
             task_id=task_id,
             objective="摸清 4HJO 的口袋与已知配体",
             subgoals=[
-                {"goal": "找口袋", "capability": "pocket_discovery"},
-                {"goal": "查配体", "capability": "ligand_intelligence"},
+                {"goal": "找口袋", "agent": "pocket"},
+                {"goal": "查配体", "agent": "ligand"},
             ],
-            required_outputs=[{"name": "PocketCatalog"}],
+            required_outputs=("PocketCatalog",),
         )
 
     def spec_chain(task_id: str) -> TaskSpec:
@@ -24701,11 +25592,11 @@ async def check_campaign_dispatch() -> None:
             task_id=task_id,
             objective="从口袋走到候选集",
             subgoals=[
-                {"goal": "找口袋", "capability": "pocket_discovery"},
-                {"goal": "查配体", "capability": "ligand_intelligence"},
-                {"goal": "跑筛选", "capability": "docking_run"},
+                {"goal": "找口袋", "agent": "pocket"},
+                {"goal": "查配体", "agent": "ligand"},
+                {"goal": "跑筛选", "agent": "docking"},
             ],
-            required_outputs=[{"name": "CandidateSet"}],
+            required_outputs=("CandidateSet",),
         )
 
     async def settle(host: Any, session_id: str) -> bool:
@@ -24741,7 +25632,9 @@ async def check_campaign_dispatch() -> None:
         )
         child.task_spec = spec_for("task_camp").to_dict()
         try:
-            await tool.execute({"confirm": True}, session=child, spawner=host)
+            await tool.execute(
+                {"confirm": True, "constraints": {}}, session=child, spawner=host
+            )
         except ToolError as error:
             check("子 agent" in str(error), f"子 agent 发起被拦：{error}")
         else:
@@ -24767,6 +25660,31 @@ async def check_campaign_dispatch() -> None:
         check(
             root.campaign_state == "planning",
             f"预演也算排了一遍计划：{root.campaign_state}",
+        )
+
+        # 派发前必须按角色写限制：不给就拒绝，不能凭空从父会话抄一份。
+        no_limits = manager.new_session("没写限制")
+        no_limits.task_spec = spec_for("task_camp").to_dict()
+        try:
+            await tool.execute({"confirm": True}, session=no_limits, spawner=host)
+        except ToolError as error:
+            check("限制" in str(error) and "{}" in str(error), f"没写限制时拒绝：{error}")
+        else:
+            raise AssertionError("confirm=true 不带 constraints 时应当被拒")
+        check(not host.children_of(no_limits.id), "拒绝之后不建子会话")
+
+        # 规格里的原话只在预览里提醒，不自动下发。
+        nudged = manager.new_session("有原话")
+        nudged.task_spec = TaskSpec(
+            task_id="task_nudge",
+            objective="摸清 4HJO 的口袋",
+            subgoals=[{"goal": "找口袋", "agent": "pocket"}],
+            constraints=("只用实验结构",),
+        ).to_dict()
+        nudge = await tool.execute({"confirm": False}, session=nudged, spawner=host)
+        check(
+            "确认时按角色写进 constraints" in nudge.output,
+            f"预览提醒按角色写限制：{nudge.output}",
         )
 
         # --- 子集：roles 只能从计划里减；只选一个角色时可以换任务书 ---
@@ -24834,22 +25752,53 @@ async def check_campaign_dispatch() -> None:
         else:
             raise AssertionError("多个角色时不该接受自定义任务书")
 
-        # 计划外的角色按能力表补进来（P-83）：只有口袋+配体的计划也能点筛查。
+        # 计划是边界：roles 只能减，不能把计划外的角色塞进来。
         grown = manager.new_session("计划外角色")
         grown.task_spec = TaskSpec(
             task_id="task_grow",
             objective="先做配体与口袋",
             subgoals=[
-                {"goal": "找口袋", "capability": "pocket_discovery"},
-                {"goal": "查配体", "capability": "ligand_intelligence"},
+                {"goal": "找口袋", "agent": "pocket"},
+                {"goal": "查配体", "agent": "ligand"},
             ],
         ).to_dict()
-        extended = await tool.execute(
-            {"confirm": False, "roles": ["docking"]}, session=grown, spawner=host
-        )
-        check("4 个角色" in extended.output, f"补出来的上游一起派：{extended.output}")
-        check("补派计划外的角色" in extended.output, f"补了什么要说：{extended.output}")
-        check("对接（docking）" in extended.output, "补进来的角色在预览里")
+        try:
+            await tool.execute(
+                {"confirm": False, "roles": ["docking"]}, session=grown, spawner=host
+            )
+        except ToolError as error:
+            check("不在这份计划里" in str(error), f"计划外角色被拒：{error}")
+            check("pocket、ligand" in str(error), f"说清计划里有什么：{error}")
+        else:
+            raise AssertionError("计划外的角色不应当被接受")
+        check(not host.children_of(grown.id), "被拒之后不建子会话")
+
+        # 限制也只能写给这一场要派的角色。
+        try:
+            await tool.execute(
+                {
+                    "confirm": False,
+                    "roles": ["pocket"],
+                    "constraints": {"ligand": ["不生成新分子"]},
+                },
+                session=grown,
+                spawner=host,
+            )
+        except ToolError as error:
+            check("这次不派" in str(error), f"写给不派的角色被拒：{error}")
+        else:
+            raise AssertionError("写给这次不派的角色应当被拒")
+        try:
+            await tool.execute(
+                {"confirm": False, "constraints": {"nope": ["随便写"]}},
+                session=grown,
+                spawner=host,
+            )
+        except ToolError as error:
+            check("没有这个角色" in str(error), f"写给不存在的角色被拒：{error}")
+        else:
+            raise AssertionError("写给不存在的角色应当被拒")
+        check(not host.children_of(grown.id), "限制写错时也不建子会话")
 
         # 只派一个角色时，计划里剩下的要点名（P-83）。
         partial = await tool.execute(
@@ -24862,24 +25811,25 @@ async def check_campaign_dispatch() -> None:
         check("口袋" in partial.output, "点名剩下的是谁")
 
         # 缺前置不能派：预览标出来，confirm=true 直接拒。
-        # 用评分做样本：它的前置（筛选产物）是"可以吃已有产物"的那一类，路由不会
-        # 自动补（P-81 只补没有输入就开不了跑的阶段），所以这里一定缺。
+        # 用机制做样本：它要读口袋、配体与位姿，路由不会自动补这一串上游。
         broken = manager.new_session("缺前置")
         broken.task_spec = TaskSpec(
             task_id="task_missing",
-            objective="直接做评分",
-            subgoals=[{"goal": "做评分", "capability": "scoring_evaluation"}],
-            required_outputs=[{"name": "ScoringReport"}],
+            objective="直接解释机制",
+            subgoals=[{"goal": "解释机制", "agent": "mechanism"}],
+            required_outputs=("MechanismReport",),
         ).to_dict()
         blocked = await tool.execute({"confirm": False}, session=broken, spawner=host)
         check("不可派发" in blocked.output, f"预览标出不可派发：{blocked.output}")
         check(
-            "docking_run" in blocked.output,
+            "docking" in blocked.output,
             f"说清缺哪一步：{blocked.output}",
         )
         check(not host.children_of(broken.id), "缺前置时不建子会话")
         try:
-            await tool.execute({"confirm": True}, session=broken, spawner=host)
+            await tool.execute(
+                {"confirm": True, "constraints": {}}, session=broken, spawner=host
+            )
         except ToolError as error:
             check("缺前置" in str(error), f"确认时直接拒绝：{error}")
         else:
@@ -24892,8 +25842,8 @@ async def check_campaign_dispatch() -> None:
             task_id="task_upstream",
             objective="只做配体盘点",
             subgoals=[
-                {"goal": "查配体", "capability": "ligand_intelligence"},
-                {"goal": "跑筛选", "capability": "docking_run"},
+                {"goal": "查配体", "agent": "ligand"},
+                {"goal": "跑筛选", "agent": "docking"},
             ],
         ).to_dict()
         only = await tool.execute(
@@ -24903,11 +25853,38 @@ async def check_campaign_dispatch() -> None:
         )
         check("不可派发" not in only.output, f"只派上游不受影响：{only.output}")
 
-        started = await tool.execute({"confirm": True}, session=root, spawner=host)
-        check("已启动" in started.output, f"确认之后启动：{started.output}")
+        started = await tool.execute(
+            {
+                "confirm": True,
+                "constraints": {
+                    "global": ["只用实验结构"],
+                    "pocket": ["先看 4HJO 的 A 链"],
+                },
+            },
+            session=root,
+            spawner=host,
+        )
+        check("已全部结束" in started.output, f"确认之后要等到全部结束：{started.output}")
+        check("结论：" in started.output, f"派发结果直接带回结论：{started.output}")
         check(
-            root.campaign_state == "research",
-            f"启动之后是研究进行中：{root.campaign_state}",
+            "报告：合格（pocket）" in started.output,
+            f"派发结果带上报告判定：{started.output}",
+        )
+        index_file = report_root / root.id / "index-task_camp.md"
+        check(
+            str(index_file) in started.output,
+            f"派发结果给出报告索引的绝对路径：{started.output}",
+        )
+        check(index_file.exists(), f"索引写出来了：{index_file}")
+        full_files = sorted((report_root / root.id).glob("ses_*.md"))
+        check(len(full_files) == 2, f"每个子 agent 都有一份全文：{full_files}")
+        check(
+            "## 结论" in full_files[0].read_text(encoding="utf-8"),
+            "全文里有结论文段",
+        )
+        check(
+            root.campaign_state == "integration",
+            f"返回时已经进汇总结果：{root.campaign_state}",
         )
         check(root.campaign_task_id, "记下了这份计划的编号")
         check(root.campaign_revision == 0, f"记下了规格版本：{root.campaign_revision}")
@@ -24921,6 +25898,25 @@ async def check_campaign_dispatch() -> None:
             "两个角色各建一个子会话",
         )
 
+        # 父 agent 写的限制进了各自的任务书，没有串到兄弟角色。
+        books = {
+            child.agent_role: child.messages[0].parts[0].text
+            for child in host.children_of(root.id)
+            if child.task_id
+        }
+        check(
+            "先看 4HJO 的 A 链" in books["pocket"],
+            f"口袋的任务书带上给它的限制：{books['pocket']}",
+        )
+        check(
+            "先看 4HJO 的 A 链" not in books["ligand"],
+            f"限制没有串到配体：{books['ligand']}",
+        )
+        check(
+            "只用实验结构" in books["ligand"],
+            f"global 限制进了配体：{books['ligand']}",
+        )
+
         # 结果写回任务状态：完成的一行、失败的一行进"卡住"。
         check(
             any("口袋：完成" in item for item in root.task_state.done),
@@ -24932,13 +25928,27 @@ async def check_campaign_dispatch() -> None:
         )
         check(root.task_state.version > 0, "任务状态版本号涨了")
 
-        # 同一份计划再发起一次：子会话已存在，不重复建。
-        await tool.execute({"confirm": True}, session=root, spawner=host)
+        # 同一份计划再发起一次：上一场两个角色都结束了，这一轮重新派发。
+        before = [c.id for c in host.children_of(root.id) if c.task_id]
+        second = await tool.execute(
+            {"confirm": True, "constraints": {}}, session=root, spawner=host
+        )
         check(await settle(host, root.id), "第二次战役也收尾了")
         check(
-            len([c for c in host.children_of(root.id) if c.task_id]) == 2,
-            "重跑不新建子会话",
+            not any(cid in second.output for cid in before),
+            f"第二轮结果只带这一轮的子会话：{second.output}",
         )
+        children_after = [c for c in host.children_of(root.id) if c.task_id]
+        check(
+            len(children_after) == 4,
+            f"跑完后再派要开新的子会话：{[c.task_id for c in children_after]}",
+        )
+        check(
+            sorted(c.task_id for c in children_after if c.task_id.endswith("#2"))
+            == ["task_camp:ligand#2", "task_camp:pocket#2"],
+            f"新一轮的任务号带代号：{[c.task_id for c in children_after]}",
+        )
+        check("已全部结束" in second.output, "第二轮也带回了结果")
 
     # --- 取消战役：连它派出的子会话一起停 ---
     with tempfile.TemporaryDirectory() as raw:
@@ -24949,19 +25959,28 @@ async def check_campaign_dispatch() -> None:
         )
         root = manager.new_session("根")
         root.task_spec = spec_for("task_stop").to_dict()
-        await DispatchCampaignTool().execute({"confirm": True}, session=root, spawner=host)
-        for _ in range(100):
+        running = asyncio.create_task(
+            DispatchCampaignTool().execute(
+                {"confirm": True, "constraints": {}}, session=root, spawner=host
+            )
+        )
+        for _ in range(200):
             if len(host.children_of(root.id)) >= 2:
                 break
             await asyncio.sleep(0.01)
         check(host.campaign_running(root.id), "战役在跑")
         stopped = host.cancel_campaign(root.id)
         check(stopped >= 3, f"取消战役连子会话一起停：{stopped}")
-        for _ in range(100):
-            if not host.campaign_running(root.id):
-                break
-            await asyncio.sleep(0.01)
-        check(not host.campaign_running(root.id), "取消之后战役不再运行")
+        result = await asyncio.wait_for(running, 5)
+        check("已中断" in result.output, f"阻塞中的派发要返回中断：{result.output}")
+        stop_index = report_root / root.id / "index-task_stop.md"
+        check(stop_index.exists(), f"中断也要把报告写下来：{stop_index}")
+        check(
+            str(stop_index) in result.output,
+            f"中断结果给出报告索引：{result.output}",
+        )
+        stop_reports = sorted((report_root / root.id).glob("ses_*.md"))
+        check(len(stop_reports) == 2, f"中断时每个子 agent 也有全文：{stop_reports}")
         check(
             all(child.status == "cancelled" for child in host.children_of(root.id)),
             f"子会话都落 cancelled：{[c.status for c in host.children_of(root.id)]}",
@@ -24969,6 +25988,43 @@ async def check_campaign_dispatch() -> None:
         check(
             root.campaign_state == "cancelled",
             f"取消之后战役状态是已取消：{root.campaign_state}",
+        )
+        host.shutdown()
+
+    # --- 父会话被中断：这一场也一起停，不留后台子 agent ---
+    with tempfile.TemporaryDirectory() as raw:
+        manager = SessionManager(Path(raw) / "state.toml")
+        gate = asyncio.Event()
+        host = AgentHost(
+            manager, lambda session, ledger: _Loop(ledger, gate), EventBus(), Path(raw)
+        )
+        root = manager.new_session("根")
+        root.task_spec = spec_for("task_interrupt").to_dict()
+        running = asyncio.create_task(
+            DispatchCampaignTool().execute(
+                {"confirm": True, "constraints": {}}, session=root, spawner=host
+            )
+        )
+        for _ in range(200):
+            if len(host.children_of(root.id)) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        host.cancel(root.id)
+        try:
+            await asyncio.wait_for(running, 5)
+        except (asyncio.CancelledError, TimeoutError):
+            pass
+        for _ in range(100):
+            if not host.campaign_running(root.id):
+                break
+            await asyncio.sleep(0.01)
+        check(
+            all(child.status == "cancelled" for child in host.children_of(root.id)),
+            f"父会话中断连子会话一起停：{[c.status for c in host.children_of(root.id)]}",
+        )
+        check(
+            root.campaign_state == "cancelled",
+            f"父会话中断后战役是已取消：{root.campaign_state}",
         )
         host.shutdown()
 
@@ -25103,6 +26159,44 @@ async def check_campaign_state() -> None:
             f"取消进已取消：{root.campaign_state}",
         )
         host.shutdown()
+
+    # Textual 的循环用 eager task factory：战役可能在 `create_task` 那一行
+    # 同步跑完。已完成的任务不能留在会话上，否则下一次派发会被判成「已经
+    # 有一场在跑」而不肯启动。
+    with tempfile.TemporaryDirectory() as raw:
+        loop = asyncio.get_running_loop()
+        loop.set_task_factory(asyncio.eager_task_factory)
+        try:
+            manager = SessionManager(Path(raw) / "state.toml")
+            host = AgentHost(
+                manager, lambda session, ledger: None, EventBus(), Path(raw)
+            )
+            root = manager.new_session("根")
+
+            async def instant() -> str:
+                return "跑完了"
+
+            check(host.start_campaign(root, instant()), "同步跑完的战役起得来")
+            check(
+                not host.campaign_running(root.id),
+                "同步跑完的战役不留在会话上",
+            )
+
+            hold = asyncio.Event()
+
+            async def waiting() -> str:
+                await hold.wait()
+                return ""
+
+            check(
+                host.start_campaign(root, waiting()),
+                "上一场同步跑完后还能再起一场",
+            )
+            check(host.campaign_running(root.id), "第二场在跑")
+            host.cancel_campaign(root.id)
+            host.shutdown()
+        finally:
+            loop.set_task_factory(None)
 
     # 重启之后不装「还在跑」：调度器是内存对象，没有执行者（P-83）。
     manager = SessionManager(state_path=PROBE / "restart_campaign.toml")
@@ -25618,9 +26712,59 @@ async def check_subagent() -> None:
         len(tiny.messages) < 4,
         f"丢完之后子会话更短：{len(tiny.messages)}",
     )
+
+    # --- fork：约束与目标由任务书给，不整份复制父会话 ---
+    parent.task_state.constraints = ["父会话的约束"]
+    forced = Session(
+        id="ses_forced", title="子3", parent_id=parent.id, root_id=parent.id, depth=1
+    )
+    fork_messages(
+        parent, forced, 0, 1, 10**9, constraints=(), goal="这次任务要做的事"
+    )
+    check(forced.task_state.constraints == [], "显式给空约束时不继承父会话")
+    check(
+        forced.task_state.goal == "这次任务要做的事",
+        f"目标用任务书给的：{forced.task_state.goal}",
+    )
+    check(
+        parent.task_state.constraints == ["父会话的约束"],
+        "父会话的约束没有被改",
+    )
+
+    legacy = Session(
+        id="ses_legacy", title="子4", parent_id=parent.id, root_id=parent.id, depth=1
+    )
+    fork_messages(parent, legacy, 0, 1, 10**9)
+    check(
+        legacy.task_state.constraints == ["父会话的约束"],
+        "不传约束时保留旧行为",
+    )
+    check(legacy.task_state.goal == "子4", "不传目标时用子会话标题")
+
     notice = task_preamble(parent, 0, 4, dropped_tiny)
     check("不能再创建" in notice, "任务书里写明不能再派发")
     check("已作为上文复制过来" in notice, f"任务书说明历史是否复制：{notice}")
+
+    # 任务书把「步数是上限」与「验收条件满足就停」写给子 agent：倒计时本身
+    # 会被模型当成必须消耗的额度，所以停止条件要单独说清楚。
+    from vsagent.core.agent.execution.dispatcher import _task_book
+    from vsagent.core.agent.roles.profiles import profile as _profile
+
+    book = _task_book(
+        AgentTask(
+            task_id="t-book",
+            role="research",
+            objective="核一遍 HA2 的结构清单",
+            required_outputs=("Research Dossier",),
+            acceptance_criteria=[
+                {"kind": "artifact_exists", "target": "runs/ha2.md"}
+            ],
+        ),
+        _profile("research"),
+    )
+    check("剩余步数是上限" in book, f"任务书写明步数是上限：{book}")
+    check("验收条件满足" in book, "任务书把验收条件写成停止条件")
+    check("不需要调用工具时直接写结论" in book, "任务书允许直接停，不必为了调用而调用")
 
     # fresh（一条历史都不复制）时把工作区索引交过去：子会话没有别的途径知道
     # 父会话手上有哪些 handle，而它要接着用那些东西。
@@ -25653,6 +26797,79 @@ async def check_subagent() -> None:
         "按行丢，不切在半行上",
     )
     check("子0" in capped, "留下的是靠前的那些（按时间顺序读）")
+    indexed = _cap_report(heavy, index="runs/reports/ses_p/index.md")
+    check(
+        "runs/reports/ses_p/index.md" in indexed,
+        "截断时给出 read 能用的索引路径",
+    )
+
+    # P0：完整报告写到 runs/reports 下。上下文里只留 800 字预览，
+    # 父会话用 read 取全文；这条判据盯的是「文件里那一份没有被预算截掉」。
+    from vsagent.core.agent.execution import reports as reports_module
+    from vsagent.core.agent.execution.spawn import _report_markdown
+
+    report_parent = Session(id="ses_report_parent", title="父会话")
+    report_child = Session(
+        id="ses_report_child", title="子任务", status="done", agent_role="research"
+    )
+    long_answer = "结论内容" * 400
+    answer = Message(role="assistant", session_id=report_child.id)
+    answer.add_part(Part(type=PartType.TEXT, text=long_answer))
+    report_child.add_message(answer)
+    probe_reports = ROOT / ".probe" / "reports"
+    reports_module.report_root = lambda: probe_reports
+    answer.add_part(Part(type=PartType.SUMMARY, text="收尾总结：本轮停在步数上限。"))
+    rel = reports_module.save_report(
+        report_parent, report_child, _report_markdown(report_parent, report_child)
+    )
+    saved = probe_reports / report_parent.id / f"{report_child.id}.md"
+    check(rel == str(saved), f"全文路径是绝对路径：{rel}")
+    check(saved.exists(), "全文写到了磁盘")
+    body = saved.read_text(encoding="utf-8")
+    check(long_answer in body, f"全文没有被 800 字截断：{len(body)} 字")
+    check("## 结论" in body and "角色：research" in body, "文件里有结构化摘要")
+    check("## 收尾总结" in body and "停在步数上限" in body, "收尾总结单独成段")
+
+    # 索引按计划号分文件：同一父会话再跑另一场，不会把上一场的索引盖掉。
+    from vsagent.core.agent.execution import reports as report_files
+    first_index = report_files.save_index(report_parent, "甲", "task_a")
+    second_index = report_files.save_index(report_parent, "乙", "task_b")
+    check(first_index != second_index, "两场各有各的索引")
+    check(
+        report_files.index_path(report_parent, "task_a").read_text(encoding="utf-8") == "甲",
+        "第一场的索引还在",
+    )
+
+    # 真用 read 取一遍：父会话只有这个入口，路径写对才算交付。
+    from vsagent.core.agent.tools import ReadTool
+    read = await ReadTool(cwd=ROOT).run({"path": rel})
+    check(not read.failed and long_answer[:200] in read.output, "read 能按返回的路径取到全文")
+
+    # 超过 MAX_REPORTS 的子 agent 也要有文件：上下文里不列，磁盘上不能缺。
+    from vsagent.core.agent.execution import spawn as spawn_module
+
+    many_parent = Session(id="ses_many_parent", title="十个子会话")
+    many_children = [
+        Session(
+            id=f"ses_many_{index}",
+            title=f"子 {index}",
+            status="done",
+            agent_role="research",
+        )
+        for index in range(10)
+    ]
+    many_paths, _, many_index = spawn_module._write_reports(
+        many_parent, many_children, "task_many"
+    )
+    check(many_index.endswith("index-task_many.md"), f"索引路径来自写入结果：{many_index}")
+    check(len(many_paths) == 10, f"十个子会话都写了路径：{len(many_paths)}")
+    many_files = sorted((probe_reports / many_parent.id).glob("ses_*.md"))
+    check(len(many_files) == 10, f"第十个也有全文：{len(many_files)}")
+    many_index_text = Path(many_index).read_text(encoding="utf-8")
+    check(
+        all(path in many_index_text for path in many_paths.values()),
+        "索引里列全了十个路径",
+    )
 
     # --- 应用装配：根有编排工具，子没有；登记表共享；重启复位 ---
     state = ROOT / ".probe" / "state_subagent.toml"
@@ -25669,31 +26886,8 @@ async def check_subagent() -> None:
         row["function"]["name"] for row in app.host.loop_for(sub.id).tool_specs(sub)
     }
     check("dispatch_campaign" not in sub_specs, "子 agent 的清单里没有 dispatch_campaign")
-    check("agent_status" in root_specs, "根会话看得见 agent_status")
-    check("agent_status" not in sub_specs, "子 agent 不能查询别的 agent")
-
-    # --- 父会话能取回子 agent 的报告 ---
-    status_tool = AgentStatusTool()
-    report = await status_tool.execute({}, session=root_session, spawner=app.host)
-    check("子任务" in report.output, f"报告里有子 agent 的名字：{report.output}")
-    check("空闲" in report.output, f"报告里带状态：{report.output}")
-    blocked_report = ""
-    try:
-        await status_tool.execute({}, session=sub, spawner=app.host)
-    except ToolError as error:
-        blocked_report = str(error)
-    check("不能查询其他 agent" in blocked_report, f"子 agent 查询被拦：{blocked_report!r}")
-
-    produced = Message(role="assistant", session_id=sub.id)
-    produced.add_part(Part(type=PartType.FILE, file_path="runs/x/table.csv"))
-    sub.add_message(produced)
-    report_with_files = await status_tool.execute(
-        {"session_id": sub.id}, session=root_session, spawner=app.host
-    )
-    check(
-        "table.csv" in report_with_files.output,
-        f"报告里带产出文件：{report_with_files.output}",
-    )
+    check("agent_status" not in root_specs, "根会话不再有单独的查询工具")
+    check("agent_status" not in sub_specs, "子 agent 也没有这个工具")
 
     check(
         app.host.ledger_for(root_session) is app.host.ledger_for(sub),
@@ -25805,38 +26999,6 @@ async def check_subagent() -> None:
     host.cancel(third.id)
     await host.wait([third.id], 2)
     check(third.status == "cancelled", f"中断落 cancelled：{third.status}")
-
-    # agent_status 的 wait：超时先返回运行中，跑完之后再查是完成
-    wait_parent = manager.create_session("等待父")
-    wait_child = manager.create_session(
-        "等待子",
-        parent_id=wait_parent.id,
-        root_id=wait_parent.id,
-        depth=1,
-    )
-    gates[wait_child.id] = asyncio.Event()
-    check(host.prompt(wait_child.id, "慢慢跑"), "等待用的子 agent 开始跑")
-    wait_tool = AgentStatusTool()
-    timed = await wait_tool.execute(
-        {"session_id": wait_child.id, "wait": True, "timeout": 1},
-        session=wait_parent,
-        spawner=host,
-    )
-    check("运行中" in timed.output, f"超时之后如实报运行中：{timed.output}")
-    gates[wait_child.id].set()
-    await host.wait([wait_child.id], 2)
-    finished = await wait_tool.execute(
-        {"session_id": wait_child.id}, session=wait_parent, spawner=host
-    )
-    check("完成" in finished.output, f"跑完之后报完成：{finished.output}")
-
-    # 状态行第一句说的是「这是什么」，不是内部造的词：多角色执行。
-    wait_parent.campaign_state = "research"
-    labelled = await wait_tool.execute(
-        {"session_id": wait_child.id}, session=wait_parent, spawner=host
-    )
-    check("多角色执行：研究进行中" in labelled.output, f"状态行用通用说法：{labelled.output}")
-    check("战役" not in labelled.output, f"状态行不该出现内部叫法：{labelled.output}")
 
     host.shutdown()
     host_state.unlink(missing_ok=True)
@@ -26099,6 +27261,21 @@ async def check_subagent_ui() -> None:
             not app.session_manager.current.is_subagent,
             "返回不会把当前会话切到子 agent 上",
         )
+
+        # 连点返回栏：点击事件先投递、后处理，几条排队点击会落到同一块返回栏上。
+        # 每条都退一次的话会把父会话一起退掉，退到栈底那一层还会抛 ScreenStackError。
+        app.open_subagent(child.id)
+        await pilot.pause()
+        burst = app.screen.query_one("#subagent-banner", SubagentBanner)
+        for _ in range(3):
+            burst.post_message(events.Click(burst, 0, 0, 0, 0, 1, False, False, False))
+        await pilot.pause()
+        check(
+            isinstance(app.screen, ChatScreen)
+            and not isinstance(app.screen, SubagentChatScreen),
+            f"连点返回栏只退一层：{[type(screen).__name__ for screen in app.screen_stack]}",
+        )
+        check(len(app.screen_stack) > 1, "连点返回栏没有把父会话也退掉")
 
         # /delete：确认之后子 agent 消失并退回父会话
         app.open_subagent(child.id)
@@ -26537,6 +27714,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("ledger-digest", check_ledger_digest),
     ("env-block", check_env_block),
     ("focus", check_focus),
+    ("intent-block", check_intent_block),
     ("products", check_products),
     ("tool-context", check_tool_context),
     ("uniprot", check_uniprot_tools),
@@ -26596,6 +27774,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("listing", check_listing_tools),
     ("plan-deny", check_plan_deny),
     ("prompt", check_prompt),
+    ("route-config", check_route_config),
     ("memory", check_memory),
     ("memory-supersede", check_memory_supersede),
     ("memory-resident", check_memory_resident),
@@ -26618,7 +27797,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("evidence-dedupe", check_evidence_dedupe),
     ("tool-clear", check_tool_clear),
     ("contracts", check_contracts),
-    ("capabilities", check_capabilities),
+    ("catalog", check_catalog),
     ("validators", check_validators),
     ("profiles", check_profiles),
     ("reports", check_reports),
@@ -26634,7 +27813,11 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
     ("router", check_router),
     ("route", check_route),
     ("task-compiler", check_task_compiler),
+    ("templates-typed", check_templates_typed),
+    ("projection", check_projection_single_source),
     ("task-context", check_task_context),
+    ("context-resolver", check_context_resolver),
+    ("intent-validator", check_intent_validator),
     ("worker-guard", check_worker_guard),
     ("rules-split", check_rules_split),
     ("core-tools-profile", check_core_tools_profile),

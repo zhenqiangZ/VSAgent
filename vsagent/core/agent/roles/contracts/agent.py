@@ -57,6 +57,8 @@ class AgentTask:
     task_id: str
     role: str
     objective: str
+    # 父任务的目标。只作背景：子 agent 不该把它当成自己的交付物再完成一遍。
+    background: str = ""
     campaign_id: str = ""
     parent_task_id: str = ""
     input_refs: dict[str, Any] = field(default_factory=dict)
@@ -73,6 +75,9 @@ class AgentTask:
         self.task_id = text(self.task_id, "AgentTask.task_id")
         self.role = text(self.role, "AgentTask.role")
         self.objective = text(self.objective, "AgentTask.objective")
+        self.background = text(
+            self.background, "AgentTask.background", allow_empty=True
+        )
         self.campaign_id = text(self.campaign_id, "AgentTask.campaign_id", allow_empty=True)
         self.parent_task_id = text(
             self.parent_task_id, "AgentTask.parent_task_id", allow_empty=True
@@ -97,6 +102,7 @@ class AgentTask:
             "parent_task_id": self.parent_task_id,
             "role": self.role,
             "objective": self.objective,
+            "background": self.background,
             "input_refs": dict(self.input_refs),
             "constraints": list(self.constraints),
             "required_outputs": list(self.required_outputs),
@@ -117,6 +123,7 @@ class AgentTask:
                 "parent_task_id",
                 "role",
                 "objective",
+                "background",
                 "input_refs",
                 "constraints",
                 "required_outputs",
@@ -131,6 +138,7 @@ class AgentTask:
             task_id=data.get("task_id"),
             role=data.get("role"),
             objective=data.get("objective"),
+            background=data.get("background", ""),
             campaign_id=data.get("campaign_id", ""),
             parent_task_id=data.get("parent_task_id", ""),
             input_refs=data.get("input_refs") or {},

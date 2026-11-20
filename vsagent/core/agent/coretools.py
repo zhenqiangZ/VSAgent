@@ -18,7 +18,7 @@ from vsagent.core.agent.state.event_log import domain_tools as event_tools
 from vsagent.core.agent.state.history import SearchHistoryTool
 from vsagent.core.agent.state.hypothesis import HypothesisTool
 from vsagent.core.agent.state.memory import RecallTool, RememberTool
-from vsagent.core.agent.execution.spawn import AgentStatusTool, DispatchCampaignTool
+from vsagent.core.agent.execution.spawn import DispatchCampaignTool
 from vsagent.core.agent.state.task import TaskTool
 from .tools import BashTool, GrepTool, PatchTool, ReadTool, ReadTurnTool, Tool, WriteTool
 
@@ -33,8 +33,8 @@ def build_core_tools(
 ) -> list[Tool]:
     """按装配顺序返回全部常驻工具。
 
-    `allow_agents` 只决定编排那一对在不在：子 agent 的注册表里没有
-    `dispatch_campaign` 与 `agent_status`，模型连名字都看不到。
+    `allow_agents` 只决定派发工具在不在：子 agent 的注册表里没有
+    `dispatch_campaign`，模型连名字都看不到。
     其余工具两者的清单相同，差异由档位在装配处过滤。
     """
     tools: list[Tool] = [
@@ -56,5 +56,5 @@ def build_core_tools(
     tools.extend(event_tools(sessions))
     tools.extend([WriteRunTool(), OpenViewerTool()])
     if allow_agents:
-        tools.extend([AgentStatusTool(), DispatchCampaignTool()])
+        tools.append(DispatchCampaignTool())
     return tools

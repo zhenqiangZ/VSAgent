@@ -12,13 +12,19 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 """当前协议版本。
 
 2：`IntentSpec` 增加 `turn_mode`（Phase 3，轮次类型并进同一次解析）。
 3：`AgentReport` 增加 `evidence`（子会话交回的证据对象），`evidence_refs` 保留。
+4：`AgentReport` 增加 `evidence` 之外的结构化字段，`AgentTask` 增加权限。
+5：意图改成五维字段与两轴；任务子目标带 `agent` 与 `stage`；能力计划改成角色计划。
+6：`TaskSpec` 的交付物、确认点、证据要求从对象数组改成字符串数组，与 `AgentTask`
+   同名同类型。
+7：`AgentTask` 增加 `background`：父任务目标只作背景，不再混进本角色的任务目标。
 旧数据没有这个字段，读取时按空列表处理——升版本是为了让"读到更新版本的
-数据"能被拒绝，不是为了让旧数据读不进来。"""
+数据"能被拒绝，不是为了让旧数据读不进来。第 6 版例外：旧的 `task_spec` 形状
+对不上，`Session.from_dict` 会直接丢弃它，不写迁移分支。"""
 
 
 class ContractError(ValueError):

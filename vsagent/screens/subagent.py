@@ -56,8 +56,13 @@ ALLOWED_COMMANDS = frozenset(
 class SubagentBanner(Static):
     """顶部返回栏。整条可点，不必记住快捷键。"""
 
-    def on_click(self) -> None:
-        """点一下 banner 就返回。"""
+    def on_click(self, event: events.Click) -> None:
+        """点一下 banner 就返回。
+
+        与开始条一样要把事件截住：不截的话这一下还会往上传给父容器，
+        同一次点击可能在别处再被算一次。
+        """
+        event.stop()
         screen = self.screen
         if isinstance(screen, SubagentChatScreen):
             screen.action_back()
@@ -169,5 +174,13 @@ class SubagentChatScreen(ChatScreen):
         self.action_back()
 
     def action_back(self) -> None:
-        """返回上一层。栈底是父会话，所以回到原处。"""
+        """返回上一层。
+
+        点击是先投递、后处理的：连点几下返回栏时，后面几条落到已经退下来的
+        屏幕上，此时再退一次就会把父会话也一起退掉；退到栈底那一层，`pop_screen`
+        直接抛 `ScreenStackError`。所以只在自己仍是最上面一层、并且下面确实
+        还有一层时才动手，重复的那几条什么都不做。
+        """
+        if self.app.screen is not self or len(self.app.screen_stack) <= 1:
+            return
         self.app.pop_screen()

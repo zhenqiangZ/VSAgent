@@ -2,7 +2,7 @@
 
 现在有两条：
 
-- `capability_guard`：这一步的工具在不在这个角色的名单里；
+- `tool_guard`：这一步的工具在不在这个角色的名单里；
 - `task_precondition`：任务本身是不是处在能执行的状态。
 
 另外两条（输出合同、交付验收）需要先定义"每种交付物怎么验"，等这一层稳定了再加。
@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from vsagent.core.agent.roles.contracts import CapabilityPlan, TaskSpec
-from . import capability_guard, delivery, output_contract, task_precondition
+from vsagent.core.agent.roles.contracts import TaskSpec
+from . import delivery, output_contract, task_precondition, tool_guard
 from .base import DEFAULT_MODE, ENV, MODES, Finding, Verdict, mode_from_env
 
 __all__ = [
@@ -22,7 +22,7 @@ __all__ = [
     "MODES",
     "Finding",
     "Verdict",
-    "capability_guard",
+    "tool_guard",
     "check_tool",
     "check_delivery",
     "mode_from_env",
@@ -47,7 +47,7 @@ def check_tool(
     留着关键字只会让人以为它还在生效。
     """
     findings = [
-        *capability_guard.check(tool_name, allowed),
+        *tool_guard.check(tool_name, allowed),
         *task_precondition.check(tool_name, task),
     ]
     return Verdict(tuple(findings))

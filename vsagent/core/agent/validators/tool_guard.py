@@ -1,4 +1,4 @@
-"""能力守卫：这一步调用的工具，在不在这个会话的名单里。
+"""工具守卫：这一步调用的工具，在不在这个会话的名单里。
 
 它守的是「计划说只做结构，模型却去调用对接」这一类越界。判据只有一条：
 工具名必须在 `Session` 的允许清单里（名单来自 `agents.toml` 与基础档）。
@@ -13,7 +13,7 @@ from typing import Iterable
 
 from .base import Finding
 
-NAME = "capability_guard"
+NAME = "tool_guard"
 
 
 def check(tool_name: str, allowed: Iterable[str] | None = None) -> list[Finding]:

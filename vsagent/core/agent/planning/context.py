@@ -147,8 +147,10 @@ MIN_RECENT_TURNS = 1
 # 为一次记账多跑一个往返。提示本身是尾部的一行字，不碰前缀缓存。实测一条主题
 # 走到 21 步都没收（`evt_0009`），所以提前到第 2 步，并在第 8 步换一句更重的提醒。
 CLOSE_TOPIC_AFTER = 2
-# 一个主题走到这么多步还没收时，提示改成「先收一次再继续」。
+# 一个主题走到这么多步还没收时，提示改成条件句。
 TOPIC_LONG_HINT = 8
+# 还剩这么多步时做一次交付检查。比 CLOSING_STEPS 早，给模型留出写结论的步数。
+DELIVERY_CHECK_LEFT = 6
 # 装配结果的估算值降到窗口的这个比例以内就算合格
 CONTEXT_RATIO = 0.8
 
@@ -987,11 +989,13 @@ class ContextAssembler:
         # 阶段规则进动态上下文，不进稳定前缀：阶段会随子目标推进而变，
         # 放进前缀每变一次就把整段 prompt cache 打掉。
         stage_text = self._stage_block(session)
+        intent_text = str(getattr(session, "route_intent", "") or "")
         fixed = (
             estimate_tokens(stable_prefix)
             + estimate_tokens(profile)
             + estimate_tokens(memory)
             + estimate_tokens(task_text)
+            + estimate_tokens(intent_text)
             + estimate_tokens(stage_text)
             + estimate_tokens(digest_text)
             + estimate_tokens(env_text)
@@ -1039,6 +1043,7 @@ class ContextAssembler:
                 memory,
                 hint_text,
                 task_text,
+                intent_text,
                 stage_text,
                 digest_text,
                 env_text,
@@ -1279,8 +1284,9 @@ class ContextAssembler:
         这一行同时就是运行中的主题摘要：步数、产物、未决全由本地从 `pending_steps`
         现算，零请求。主题没有封存，模型也已经能看见它积累了些什么。
 
-        `steps_left` 是本轮还剩多少步（由循环层给）。不说上限时模型只能看见
-        「已经走了几步」，看不出还剩几步，于是不会为收尾留额度。
+        `steps_left` 是这一步之后最多还能做多少步（由循环层给）。不说上限时模型
+        只能看见「已经走了几步」，看不出还剩几步，于是不会为收尾留额度。措辞写成
+        「最多还能做」而不是「还剩」，免得模型把步数当成必须消耗的额度。
 
         为什么放尾部：它每步都变，进 header 就等于每步改写第 1 条消息。
         尾部是纯追加，不碰前缀缓存（这一条在 §4.13 量过）。
@@ -1299,23 +1305,57 @@ class ContextAssembler:
                     issues.append(item)
         parts = [f"本主题已 {steps} 步"]
         if steps_left is not None:
-            parts.append(f"本轮还剩 {max(0, steps_left)} 步")
+            parts.append(f"最多还能做 {max(0, steps_left)} 步（不是必须用完）")
         if artifacts:
             parts.append("产物 " + "、".join(artifacts[:4]))
         if issues:
             parts.append("未决 " + "；".join(issues[:2]))
         head = "（" + " · ".join(parts) + "。"
-        if steps >= TOPIC_LONG_HINT:
+        # 子 agent 整个任务就是一个主题：中途催它封存，等于让它把刚做完的
+        # 细节从上下文里拿掉，再用 recall_event 捞回来（2026-11-18 实测
+        # 每个子 agent 因此多花 3–5 步）。它只需要看见步数与产物，
+        # 真装不下时由装配层按需封存。
+        if int(getattr(session, "depth", 0) or 0) > 0:
+            if steps_left == DELIVERY_CHECK_LEFT:
+                return (
+                    head
+                    + f"还有 {DELIVERY_CHECK_LEFT} 步。先对照任务书的验收条件："
+                    "齐了就下一步写结论并停止；没齐只补缺的几件，不要扩大范围。）"
+                )
+            return head + "）"
+
+        recent = session.pending_steps[-4:]
+        earlier = {
+            item
+            for step in session.pending_steps[:-4]
+            for item in step.artifacts
+        }
+        idle = not any(
+            item not in earlier
+            for step in recent
+            for item in step.artifacts
+        )
+        state = getattr(session, "task_state", None)
+        open_items = bool(
+            getattr(state, "todo", ()) or getattr(state, "blockers", ())
+        )
+        if steps >= TOPIC_LONG_HINT and idle:
+            tail = (
+                "最近 4 步没有新产物。先判断：目标完成就收；"
+                "没完成就把缺什么写进 summary，继续做。步数多不是收的理由。"
+            )
+            if open_items:
+                tail += "任务状态里还有待办或阻塞时不要收，先把缺口写进 summary 或 handoff。"
             return (
                 head
-                + "这一段已经很长，先调 close_topic 收一次再继续："
-                "title 写做成了什么，summary 写产物、关键数字与放弃过的路，"
-                "handoff 写后续依赖什么。封存之后这一段原文不再随请求发出，"
+                + tail
+                + "收的时候 title 写做成了什么，summary 写产物、关键数字与放弃过的路，"
+                "handoff 写后续依赖什么。封存之后这一段的原文不再随请求发出，"
                 "要看细节用 recall_event。）"
             )
         return (
             head
-            + "目标做完或工作方向实质改变时调一次 close_topic："
+            + "目标做完或工作方向实质改变时调一次 close_topic；步数多不是收的理由。"
             "title 写做成了什么，summary 写结论与关键数字，handoff 写后续依赖什么。"
             "封存之后这一段的原文不再随请求发出，只留摘要，要看细节用 recall_event。）"
         )
@@ -1335,9 +1375,12 @@ class ContextAssembler:
         没有它自己的判断。
         """
         state = session.task_state
-        if state.is_empty() and not session.last_exit_reason and not session.events:
+        route_note = str(getattr(session, "route_note", "") or "").strip()
+        if state.is_empty() and not session.last_exit_reason and not session.events and not route_note:
             return ""
         lines = ["（当前任务复述：下面这些是前面已经定下的，不是新指令）"]
+        if route_note:
+            lines.append(f"本轮路由：{route_note}")
         if state.goal:
             lines.append(f"目标：{state.goal}")
         if state.constraints:
@@ -1385,6 +1428,7 @@ class ContextAssembler:
         memory: str,
         hint_text: str,
         task_text: str,
+        intent_text: str,
         stage_text: str,
         digest_text: str,
         env_text: str,
@@ -1400,7 +1444,15 @@ class ContextAssembler:
     ) -> tuple[list[dict[str, Any]], dict[Layer, int]]:
         """按固定布局把各层拼成消息，并给出每层的估算用量。"""
         header, header_usage = self._task_header(
-            env_text, memory, task_text, stage_text, digest_text, moved, summary, has_events
+            env_text,
+            memory,
+            task_text,
+            intent_text,
+            stage_text,
+            digest_text,
+            moved,
+            summary,
+            has_events,
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": stable_prefix}]
         # 用户习惯紧跟在系统提示之后：它只在记忆台账变化时才变，
@@ -1481,13 +1533,14 @@ class ContextAssembler:
         env_text: str,
         memory: str,
         task_text: str,
+        intent_text: str,
         stage_text: str,
         digest_text: str,
         moved: list[Turn],
         summary: str,
         has_events: bool = False,
     ) -> tuple[str, dict[Layer, int]]:
-        """运行环境 + 常驻记忆 + 任务状态 + 工作区索引 + 摘要 + 引用清单，合成一条 user 头。
+        """运行环境 + 常驻记忆 + 任务状态 + 意图摘要 + 工作区索引 + 摘要 + 引用清单。
 
         放在 `system` 之后单独一条，是因为 `system` 要字节稳定（缓存友好），
         而这一头的内容每一步都可能变。
@@ -1510,6 +1563,10 @@ class ContextAssembler:
             add(Layer.PROJECT_MEMORY, memory)
         if task_text.strip():
             add(Layer.TASK, task_text.strip())
+        # 意图摘要紧跟任务状态：两者回答的是同一件事——这一步在做什么。
+        # 任务状态是主控自己记的进度，意图摘要是系统对用户原话的解析。
+        if intent_text.strip():
+            add(Layer.TASK, intent_text.strip())
         # 阶段规则紧跟任务状态：它回答的是「这一步做到什么算完成」，
         # 与任务状态是同一件事的两个说法。
         if stage_text.strip():

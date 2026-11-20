@@ -31,8 +31,8 @@ def _settle_lost_campaign(session: Session) -> None:
     """上次退出时还在跑的多角色执行，落成失败并说明原因。
 
     调度器是内存对象（`host._campaigns`），重启之后没有执行者。留着
-    `delegating` / `research` / `integration`，`agent_status` 就会一直报一个
-    不会动的「研究进行中」，模型据此以为还在跑、不去重新派发（P-83）。
+    `delegating` / `research` / `integration`，界面会一直显示一个不会动的
+    「研究进行中」，模型据此以为还在跑、不去重新派发（P-83）。
 
     只处理这三个状态：`planning` 是「排过计划」，可能是只做了预演，留着不算错。
     """

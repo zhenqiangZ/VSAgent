@@ -592,7 +592,7 @@ class SessionLedger:
             if current is not None and str(current) in self._entries:
                 lines.append(_digest_line(self._entries[str(current)], "当前受体："))
             else:
-                lines.append("当前受体：未设定（产物还没有归属，先 switch_receptor）")
+                lines.append("当前受体：未设定")
 
             ligands = [
                 str(entry.handle) for entry in entries if entry.handle.kind == "ligandset"

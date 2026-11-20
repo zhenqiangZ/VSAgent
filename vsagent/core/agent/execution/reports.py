@@ -2,7 +2,7 @@
 
 **不调用模型。** 报告的内容来自三处可以机械读到的东西：
 
-- 最后一条回答的文字（拆成结论）；
+- 最后一条回答的文字（拆成结论）；非正常结束时优先取收尾总结，见 `answer_text`；
 - 工具调用留下的句柄（受体、配体集、产物）与链接（证据）；
 - 退出原因与失败的工具（局限）。
 
@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from vsagent.core.agent.roles.contracts import AgentReport
 from vsagent.core.models import PartType, Session, ToolStatus
 from vsagent.core.agent.roles.profiles import AgentProfile
+from vsagent.core.paths import project_root
 
 HANDLE_RE = re.compile(r"\b(receptor|ligandset|artifact)#(\d+)\b")
 URL_RE = re.compile(r"https?://[^\s，。；、）)]+")
@@ -29,6 +31,61 @@ MAX_CONCLUSIONS = 20
 MAX_REFS = 12
 MAX_EVIDENCE = 30
 DIGEST_LIMIT = 1200
+REPORT_DIRECTORY = "reports"
+"""完整报告放在 `runs/reports/` 下，派发结果只带回结论预览与绝对路径。
+
+父会话没有按 session_id 读别的会话的工具，能读的只有文件。报告被 800 字或
+1500 token 的预算截掉之后，磁盘上这份是唯一的全文入口。
+
+路径写成绝对路径：`read` 的相对路径按应用启动目录解释，源码运行与打包运行
+不是同一个根，拼相对路径在另一种启动方式下会指到不存在的文件。
+"""
+
+
+def report_root() -> Path:
+    """完整报告的根目录。判据把它换到 `.probe/`，不往真的 runs/ 里写。"""
+    return project_root() / "runs" / REPORT_DIRECTORY
+
+
+def report_path(parent: Session, child: Session) -> Path:
+    return report_root() / parent.id / f"{child.id}.md"
+
+
+def _index_name(key: str) -> str:
+    """一场战役一个索引文件：`index-<计划号>.md`，没有计划号时用 `index.md`。"""
+    safe = re.sub(r"[^0-9A-Za-z_.-]", "_", key.strip())[:48]
+    return f"index-{safe}.md" if safe else "index.md"
+
+
+def index_path(parent: Session, key: str = "") -> Path:
+    return report_root() / parent.id / _index_name(key)
+
+
+def index_abspath(parent: Session, key: str = "") -> str:
+    """索引的绝对路径。返回给模型之前都走这里，别在调用方各拼一遍。"""
+    return str(index_path(parent, key))
+
+
+def prepare_report_dir(parent: Session) -> Path:
+    """开跑之前先把目录建好：写不进去要在派发之前暴露，不能等跑完才报错。"""
+    directory = report_root() / parent.id
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def save_report(parent: Session, child: Session, text: str) -> str:
+    """覆盖写入一份完整报告，返回给模型看的绝对路径。"""
+    path = report_path(parent, child)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def save_index(parent: Session, text: str, key: str = "") -> str:
+    path = index_path(parent, key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
 
 
 @dataclass(frozen=True)
@@ -43,16 +100,58 @@ class Built:
         return not self.problems
 
 
-def _last_answer(session: Session) -> str:
+def answer_text(session: Session) -> str:
+    """子 agent 交回来的那一段话：正文优先，非正常结束时优先收尾总结。
+
+    非正常结束（步数用满、工具连续失败、被中断）时，正文可能只是最后
+    一两步的一句交代；真正的结论在收尾总结里。搜索增强还会压住正文，
+    等收尾总结发布之后才放出来，于是「最后一条部件」正好是那句空话
+    （2026-11-18 的 ses_0060，父会话只拿到一行文件路径）。
+    """
+    reason = str(getattr(session, "last_exit_reason", "") or "").strip()
     for message in reversed(session.messages):
         if message.role != "assistant":
             continue
-        text = "\n".join(
-            part.text for part in message.parts if part.type is PartType.TEXT and part.text
-        ).strip()
-        if text:
-            return text
+        texts = [
+            part.text.strip()
+            for part in message.parts
+            if part.type is PartType.TEXT and part.text.strip()
+        ]
+        summaries = [
+            part.text.strip()
+            for part in message.parts
+            if part.type is PartType.SUMMARY and part.text.strip()
+        ]
+        if reason and summaries:
+            return summaries[-1]
+        if texts:
+            return texts[-1]
+        if summaries:
+            return summaries[-1]
     return ""
+
+
+def answer_blocks(session: Session) -> tuple[str, str]:
+    """最后一条助手消息里的正文与收尾总结，各自按出现顺序拼起来。
+
+    磁盘上那份报告要的是全文：`answer_text` 只挑一段给预览，正文与总结
+    各留一份才不会丢——非正常结束时，真正的交代往往在总结里。
+    """
+    for message in reversed(session.messages):
+        if message.role != "assistant":
+            continue
+        texts = [
+            part.text.strip()
+            for part in message.parts
+            if part.type is PartType.TEXT and part.text.strip()
+        ]
+        summaries = [
+            part.text.strip()
+            for part in message.parts
+            if part.type is PartType.SUMMARY and part.text.strip()
+        ]
+        return "\n\n".join(texts), "\n\n".join(summaries)
+    return "", ""
 
 
 def _lines(text: str) -> list[str]:
@@ -158,7 +257,7 @@ def build(
     campaign_id: str = "",
 ) -> Built:
     """把一份跑完的子会话转成报告，并按角色说明书判一遍。"""
-    answer = _last_answer(session)
+    answer = answer_text(session)
     conclusions = [{"text": line} for line in _lines(answer)]
     refs, findings = _handles(session)
     urls = _urls(session)

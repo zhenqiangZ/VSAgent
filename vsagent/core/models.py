@@ -1025,6 +1025,19 @@ class Session:
     # 这里是**合同**（目标、交付物、验收条件），那里是**进度**。
     # 存字典而不是对象：模型的持久化层不依赖协议包，读的时候再按需还原。
     task_spec: dict[str, Any] | None = None
+    # 上一轮没有解析完的意图与要问用户的问题。下一轮解析时带回去，
+    # 验证通过或用户换话题后清空。跟着会话写进状态文件。
+    pending_intent: dict[str, Any] | None = None
+    # 本轮路由给模型的提示（任务关系、对话行为、要问的问题）。
+    # 只在内存里，每轮重写，不写盘；`ROUTE` Part 仍然只给界面看。
+    route_note: str = ""
+    # 本轮意图解析的摘要，进 TASK 层。与 `route_note` 分工：这一份是
+    # 解析出的目标、对象、角色、约束，那一份是要模型照做的短提示。
+    # 只在内存里，每轮重写，不写盘。
+    route_intent: str = ""
+    # 这一轮路由判定为不可执行时的原因。`dispatch_campaign` 用它拦一次，
+    # 避免模型在明确拒绝之后仍然派发。只在内存里。
+    route_blocked_reason: str = ""
     # ---- 子 agent ----
     # 父会话 id。根会话为空，这一条也是「是不是子 agent」的唯一判据。
     parent_id: str = ""
@@ -1194,6 +1207,7 @@ class Session:
             "task_state": self.task_state.to_dict(),
             # 空字典而不是 None：状态文件是 TOML，没有 null。读回来时 {} 还原成 None。
             "task_spec": dict(self.task_spec) if self.task_spec else {},
+            "pending_intent": dict(self.pending_intent) if self.pending_intent else {},
             "parent_id": self.parent_id,
             "root_id": self.root_id,
             "depth": self.depth,
@@ -1215,6 +1229,11 @@ class Session:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Session:
         """从字典还原 Session。"""
+        # 第 6 版把交付物/确认点/证据要求从对象数组改成字符串数组。旧任务的形状
+        # 对不上，按约定直接作废，不当成「当前任务」继续解释（不写迁移分支）。
+        raw_spec = data.get("task_spec")
+        if isinstance(raw_spec, dict) and int(raw_spec.get("schema_version") or 1) < 6:
+            raw_spec = None
         session = cls(
             id=data.get("id") or new_session_id(),
             title=data.get("title", "New Session"),
@@ -1229,10 +1248,12 @@ class Session:
             task_state=TaskState.from_dict(
                 data.get("task_state") if isinstance(data.get("task_state"), dict) else {}
             ),
-            task_spec=(
-                data.get("task_spec") if isinstance(data.get("task_spec"), dict) else None
-            )
-            or None,
+            task_spec=raw_spec if isinstance(raw_spec, dict) and raw_spec else None,
+            pending_intent=(
+                dict(data.get("pending_intent"))
+                if isinstance(data.get("pending_intent"), dict) and data.get("pending_intent")
+                else None
+            ),
             parent_id=str(data.get("parent_id") or ""),
             root_id=str(data.get("root_id") or ""),
             depth=int(data.get("depth") or 0),

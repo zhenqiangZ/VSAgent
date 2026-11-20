@@ -66,7 +66,15 @@ class Schedule:
     reports: dict[str, Built]
 
     def done(self) -> list[str]:
-        return [key for key, item in self.outcomes.items() if item.status == "done"]
+        """跑完的任务。`partial` 也算跑完：报告不全不是没结束。"""
+        return [
+            key
+            for key, item in self.outcomes.items()
+            if item.status in ("done", "partial")
+        ]
+
+    def partial(self) -> list[str]:
+        return [key for key, item in self.outcomes.items() if item.status == "partial"]
 
     def unfinished(self) -> list[str]:
         return [
@@ -124,6 +132,7 @@ class AgentScheduler:
         timeout: float | None = None,
         role_timeouts: Mapping[str, float] | None = None,
         on_report: Callable[[AgentTask, Built], None] | None = None,
+        on_dispatch: Callable[[AgentTask, Any], None] | None = None,
     ) -> Schedule:
         """跑到没有可派的为止。图不成立时抛 `SchedulerError`，一个都不派。
 
@@ -176,13 +185,17 @@ class AgentScheduler:
                     continue
                 started.add(task.task_id)
                 session = result.session
+                # 记下这一场真正派出的会话。同一任务号再次派发会开新的子会话，
+                # 收报告时按任务号找会把上一轮的旧会话一起收进来。
+                if on_dispatch is not None:
+                    on_dispatch(task, session)
                 if result.created or session.status == "running":
                     live[session.id] = (task, session)
                     seconds = budgets.get(task.role)
                     if seconds:
                         task_deadline[task.task_id] = time.monotonic() + seconds
                 else:
-                    # 之前派过而且已经跑完：直接收报告，不再等。
+                    # 之前派过的还停在待发：直接收它现在的报告，不再等。
                     self._settle(task, session, outcomes, reports, done, failed, on_report)
 
             if not live:
@@ -190,6 +203,9 @@ class AgentScheduler:
             if deadline is not None and time.monotonic() > deadline:
                 for session_id, (task, session) in list(live.items()):
                     live.pop(session_id, None)
+                    # 不再等它，就把它停掉：留着它在后台继续烧，父会话以为
+                    # 这一轮已经结束，产物却还在往同一份登记表里写。
+                    host.cancel(session.id)
                     failed.add(task.task_id)
                     outcomes[task.task_id] = Outcome(
                         task_id=task.task_id,

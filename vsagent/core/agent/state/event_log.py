@@ -691,6 +691,44 @@ def seal_range(
     )
 
 
+def absorb_tail(session: Session) -> Event | None:
+    """把轮末最后一段答复并进上一条事件。
+
+    轮末封存只切到消息边界。模型在最后一步调了 `close_topic` 时，切点已经
+    落在最后一条消息中间，收尾总结与正文都写在它后面：这一段既没有工具调用，
+    也没有新的用户消息，却会被主题视图画成又一条未封存的主题。
+    它属于刚刚封掉的主题，往后并进去，不再另起一条。
+    """
+    if not session.events:
+        return None
+    event = session.events[-1]
+    start = event.cut
+    end = (len(session.messages), 0)
+    if end <= start:
+        return None
+    found = False
+    for index in range(start[0], end[0]):
+        message = session.messages[index]
+        if message.role == "user":
+            return None
+        low = start[1] if index == start[0] else 0
+        for part in message.parts[low:]:
+            # 切点之后还有工具调用，说明这一段是下一步在做的事，不是答复。
+            if part.type is PartType.TOOL:
+                return None
+            if (
+                part.type in (PartType.TEXT, PartType.SUMMARY)
+                and (part.text or "").strip()
+            ):
+                found = True
+    if not found:
+        return None
+    event.tokens += _position_tokens(session, start, end)
+    event.cut_message, event.cut_part = end
+    session.touch()
+    return event
+
+
 def _render_step_raw(session: Session, step: Step, with_reasoning: bool = False) -> str:
     """一步的原文：那一次工具调用到底打印了什么。
 
@@ -799,7 +837,8 @@ class CloseTopicTool(Tool):
             "一个主题做完时调一次。**这一步结束时封存**，这一段的原文不再随请求发出，"
             "只留标题、结论与流水；要看细节用 recall_event。原文取不回来，依据只能写进结论。\n"
             "时机：当前目标已经达成，或者工作要换到一件不相干的事上。"
-            "最后一条消息里出现「本主题已 N 步」时，就是在提醒你看这件事。\n"
+            "步数多不代表必须收；只有目标完成或方向改变时才收。"
+            "还有未决事项或失败工具时，summary 要写明没做到的部分。\n"
             "它自己不算一步。同一个目标还没做完就别调——切成两半会让两个主题都读不通。"
         ),
         parameters={

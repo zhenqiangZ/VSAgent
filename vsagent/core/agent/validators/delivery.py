@@ -28,8 +28,8 @@ def check(
     if task is None:
         return []
     findings: list[Finding] = []
-    for row in task.required_outputs:
-        finding = verify(row["name"], ledger=ledger, workspace=workspace)
+    for name in task.required_outputs:
+        finding = verify(name, ledger=ledger, workspace=workspace)
         if finding is not None:
             findings.append(finding)
     return findings

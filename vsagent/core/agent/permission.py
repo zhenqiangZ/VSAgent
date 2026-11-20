@@ -39,7 +39,7 @@ DEFAULT_ASK = frozenset(
         "prepare_receptor",
         "prepare_ligands",
         # 切换当前受体改的是整个会话家族共享的状态，2026-11-12 的事故就是它。
-        # 交给 `structure_pocket` 执行不等于不用问：选哪套结构它说了算，
+        # 交给 `pocket` 执行不等于不用问：选哪套结构它说了算，
         # 但「把当前受体换掉」要用户点头（P-83）。
         "switch_receptor",
     }

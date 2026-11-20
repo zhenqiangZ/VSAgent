@@ -59,7 +59,6 @@ from vsagent.core.agent.roles.prompt import (  # noqa: E402
     is_key_line,
     stable_prefix,
 )
-from vsagent.core.agent.execution.spawn import AgentStatusTool
 from vsagent.core.agent.state.task import TaskTool
 from vsagent.core.agent.tools import (  # noqa: E402
     BashTool,
@@ -108,7 +107,6 @@ def tool_specs(store: MemoryStore | None = None) -> list[dict]:
         GrepTool(),
         ReadTurnTool(),
         TaskTool(),
-        AgentStatusTool(),
         *event_tools(),
     ]
     if store is not None:

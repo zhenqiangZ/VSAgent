@@ -6,13 +6,14 @@
 **能离线判的（结构不变量）**——给定一份任务规格，计划与任务是不是把它完整、
 准确地传了下去：
 
-- 约束保留：规格里的每条约束都进了每一份任务书；
-- 排除项保留：用户说不做的事，落在一个被拒绝的能力上，且不出现在选中的能力里。
-  这条只覆盖**能力级**排除（对接、筛选）。「不要引用预印本」这类来源质量要求
-  不是能力，判不了，由约束保留那条管；
+- 约束分派：任务规格里的原话不自动进任务书；父 agent 按角色写的限制，global 进
+  每一份，角色专属的只进那个角色，别的角色没有；
+- 排除项保留：用户说不做的事，归到一个被拒绝的角色上，且不出现在选中的角色里。
+  这条只覆盖**角色级**排除（对接、筛选）。「不要引用预印本」这类来源质量要求
+  不是角色，判不了，由约束保留那条管；
 - 子目标覆盖：每个子目标都有一个角色负责，没有子目标被悄悄丢掉；
-- 交付物落位：要求的产物恰好挂在一个终点上；多个终点时不硬分；
-- 依赖有效：每条边都指向真实任务、没有环、方向与能力的先后一致；
+- 交付物归属：每件交付物都挂给模板里声明它的角色；多个终点也照此认领；
+- 依赖有效：每条边都指向真实任务、没有环、方向与角色的先后一致；
 - 不重复派：同一个角色只出现一次；
 - 工具暴露：计划里每个被派出的角色都有一份非空的工具名单。
 
@@ -38,15 +39,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from vsagent.core.agent.planning.capability_router import DENIAL_RULES, CapabilityRouter
+from vsagent.core.agent.planning.agent_router import AgentRouter
+from vsagent.core.agent.roles.catalog import EXCLUSION_RULES
 from vsagent.core.agent.roles.contracts import TaskSpec
 from vsagent.core.agent.execution.coordinator import build_tasks
 from vsagent.core.agent.roles.profiles import profile
+from vsagent.core.agent.roles.templates import template_for
 
 
 @dataclass(frozen=True)
 class Case:
-    """一份标注好的任务规格。期望的能力不写在这里——它就是子目标本身。"""
+    """一份标注好的任务规格。期望的角色不写在这里——它就是子目标本身。"""
 
     name: str
     spec: TaskSpec
@@ -60,14 +63,14 @@ CASES: tuple[Case, ...] = (
             task_id="eval_structure",
             objective="取 4HJO 的实验结构，找出候选结合口袋",
             subgoals=[
-                {"goal": "取实验结构", "capability": "structure_discovery"},
-                {"goal": "找候选口袋", "capability": "pocket_discovery"},
+                {"goal": "取实验结构", "agent": "pocket"},
+                {"goal": "找候选口袋", "agent": "pocket"},
             ],
             constraints=("只看实验结构，不要用预测模型顶替",),
             exclusions=("不要做分子对接",),
-            required_outputs=[{"name": "PocketCatalog"}],
+            required_outputs=("PocketAtlas",),
         ),
-        why="两步有先后：口袋要从结构里找，不能并行。",
+        why="两步在同一个口袋角色里先后做，计划里只有一个节点。",
     ),
     Case(
         name="配体、准备与对接",
@@ -75,14 +78,15 @@ CASES: tuple[Case, ...] = (
             task_id="eval_ligand",
             objective="汇总 4HJO 的已知配体，准备好受体与配体，再跑一轮对接",
             subgoals=[
-                {"goal": "汇总已知配体与活性", "capability": "ligand_intelligence"},
-                {"goal": "准备受体与配体", "capability": "receptor_preparation"},
-                {"goal": "跑一轮对接", "capability": "docking_run"},
+                {"goal": "汇总已知配体与活性", "agent": "ligand"},
+                {"goal": "准备受体", "agent": "prepare"},
+                {"goal": "准备配体", "agent": "prepare"},
+                {"goal": "跑一轮对接", "agent": "docking"},
             ],
             constraints=("活性数据要带 pChEMBL", "候选不超过 200 个"),
-            required_outputs=[{"name": "PoseSet"}],
+            required_outputs=("CandidateSet",),
         ),
-        why="三段有先后：配体集与口袋定了才能准备，准备好了才能对接。",
+        why="准备与对接有先后；准备内部又分受体与配体两段。",
     ),
     Case(
         name="机制解释",
@@ -90,12 +94,12 @@ CASES: tuple[Case, ...] = (
             task_id="eval_mechanism",
             objective="解释这几个候选分子与口袋的结合机制",
             subgoals=[
-                {"goal": "分析关键残基与相互作用", "capability": "mechanism_analysis"},
+                {"goal": "分析关键残基与相互作用", "agent": "mechanism"},
             ],
             constraints=("区分实验证据与推断",),
-            required_outputs=[{"name": "MechanismNote"}],
+            required_outputs=("MechanismReport",),
         ),
-        why="单能力角色：计划里只有一个终点，交付物直接挂上去。",
+        why="单一角色：计划里只有一个终点，交付物直接挂上去。",
     ),
     Case(
         name="证据整理",
@@ -103,13 +107,13 @@ CASES: tuple[Case, ...] = (
             task_id="eval_literature",
             objective="查 4HJO 相关文献，整理可追溯的证据",
             subgoals=[
-                {"goal": "检索并整理文献证据", "capability": "literature_evidence"},
+                {"goal": "检索并整理文献证据", "agent": "research"},
             ],
             constraints=("每条结论都要有出处",),
             exclusions=("查文献就行，不要顺手做对接",),
-            required_outputs=[{"name": "EvidenceNote"}],
+            required_outputs=("ResearchDossier",),
         ),
-        why="跨阶段能力：它没有阶段规则，但仍要有角色与工具名单。",
+        why="跨阶段角色：它没有阶段规则，但仍要有角色与工具名单。",
     ),
 )
 
@@ -145,29 +149,42 @@ def _has_cycle(tasks: list) -> list[str]:
 def evaluate(case: Case) -> list[Result]:
     """跑一份规格，返回这一份的全部判据。"""
     spec = case.spec
-    routed = CapabilityRouter().route(spec)
+    routed = AgentRouter().route(spec)
     plan = routed.plan
     tasks, warnings = build_tasks(plan, spec)
     results: list[Result] = []
 
-    # 1. 约束保留：每份任务书都要带全部约束。少一条，子 agent 就可能做用户
-    #    明说过不要的事，而父会话以为它知道。
-    missing = {
-        task.role: [item for item in spec.constraints if item not in task.constraints]
-        for task in tasks
-    }
-    missing = {role: items for role, items in missing.items() if items}
-    results.append(
-        Result(
-            "约束保留",
-            not missing and bool(tasks),
-            "" if not missing else f"这些任务书缺约束：{missing}",
-        )
+    # 1. 约束分派：任务规格里的原话不会被自动拼进任务书（要父 agent 按角色重写）；
+    #    父 agent 写的 global 进每一份，角色专属只进那个角色。串味会让一句只针对
+    #    口袋的要求跟着所有角色跑，漏发会让子 agent 做用户明说过不要的事。
+    problems: list[str] = []
+    if not tasks:
+        problems.append("没有可派的任务")
+    fixed = {item for role in plan.selected_agents for item in template_for(role).constraints}
+    leaked = sorted(
+        {
+            f"{task.role}：{item}"
+            for task in tasks
+            for item in task.constraints
+            if item in set(spec.constraints) - fixed
+        }
     )
+    if leaked:
+        problems.append(f"任务规格里的原话被自动下发了：{leaked}")
+    if tasks:
+        probe = {"global": ["__全局探针__"], tasks[0].role: ["__角色探针__"]}
+        authored, _ = build_tasks(plan, spec, constraints=probe)
+        first = tasks[0].role
+        for task in authored:
+            if "__全局探针__" not in task.constraints:
+                problems.append(f"{task.role} 没收到 global 限制")
+            if ("__角色探针__" in task.constraints) != (task.role == first):
+                problems.append(f"{task.role} 收到了不属于它的角色限制")
+    results.append(Result("约束分派", not problems, "；".join(problems)))
 
-    # 2. 排除项保留：每条排除都要落到至少一个被拒绝的能力上。
-    denied = set(plan.denied_capabilities)
-    selected = set(plan.selected_capabilities)
+    # 2. 排除项保留：每条排除都要落到至少一个被拒绝的角色上。
+    denied = set(plan.denied_agents)
+    selected = set(plan.selected_agents)
     unlucky = [item for item in spec.exclusions if not _exclusion_landed(item, denied)]
     overlap = sorted(denied & selected)
     results.append(
@@ -176,15 +193,15 @@ def evaluate(case: Case) -> list[Result]:
             not unlucky and not overlap,
             ""
             if not unlucky and not overlap
-            else f"没落到任何被拒绝能力上的排除项 {unlucky}、既选又拒 {overlap}",
+            else f"没落到任何被拒绝角色上的排除项 {unlucky}、既选又拒 {overlap}",
         )
     )
 
-    # 3. 子目标覆盖：每个子目标的能力都要被选中；被排除的除外。
+    # 3. 子目标覆盖：每个子目标的角色都要被选中；被排除的除外。
     wanted = {
-        str(row.get("capability") or "")
+        str(row.get("agent") or "")
         for row in spec.subgoals
-        if str(row.get("capability") or "")
+        if str(row.get("agent") or "")
     }
     dropped = sorted(wanted - selected - denied)
     results.append(
@@ -195,21 +212,42 @@ def evaluate(case: Case) -> list[Result]:
         )
     )
 
-    # 4. 交付物落位：单终点挂一份；多终点不硬分（计划会给告警）。
-    outputs = {row["name"] for row in spec.required_outputs}
-    carriers = [task for task in tasks if set(task.required_outputs) & outputs]
+    # 4. 交付物归属：每件交付物挂给模板里声明它的角色；多终点也照此认领。
+    outputs = list(spec.required_outputs)
     sinks = [
-        task for task in tasks if not any(task.task_id in other.dependencies for other in tasks)
+        task
+        for task in tasks
+        if not any(task.task_id in other.dependencies for other in tasks)
     ]
-    if not outputs:
-        ok, detail = True, ""
-    elif len(sinks) == 1:
-        ok = len(carriers) == 1 and carriers[0].role == sinks[0].role
-        detail = "" if ok else f"交付物没挂在唯一终点上：{[(t.role, t.required_outputs) for t in tasks]}"
-    else:
-        ok = not carriers
-        detail = "" if ok else f"多终点时仍然分了交付物：{[(t.role, t.required_outputs) for t in carriers]}"
-    results.append(Result("交付物落位", ok, detail))
+    problems: list[str] = []
+    for name in outputs:
+        declared = [
+            task.role
+            for task in tasks
+            if name in template_for(task.role).required_outputs
+        ]
+        holders = [task.role for task in tasks if name in task.required_outputs]
+        if declared:
+            if sorted(holders) != sorted(declared):
+                problems.append(
+                    f"{name} 应当挂给 {'、'.join(declared)}，"
+                    f"现在挂给 {'、'.join(holders) or '无'}"
+                )
+            continue
+        if len(sinks) == 1:
+            if holders != [sinks[0].role]:
+                problems.append(
+                    f"{name} 没有角色声明，应当兜底挂给唯一终点 {sinks[0].role}，"
+                    f"现在挂给 {'、'.join(holders) or '无'}"
+                )
+            continue
+        if holders:
+            problems.append(
+                f"{name} 没有角色声明，多终点时不该硬挂：{'、'.join(holders)}"
+            )
+    results.append(
+        Result("交付物归属", not problems, "；".join(problems))
+    )
 
     # 5. 依赖有效：边指向真实任务、没有环。
     ids = {task.task_id for task in tasks}
@@ -263,12 +301,12 @@ def evaluate(case: Case) -> list[Result]:
 
 
 def _exclusion_landed(item: str, denied: set[str]) -> bool:
-    """这条排除项有没有落在一个被拒绝的能力上。
+    """这条排除项有没有落在一个被拒绝的角色上。
 
-    判据与路由用的是同一张表（`DENIAL_RULES`）：两边各写一份，改了一边另一边
+    判据与路由用的是同一张表（`EXCLUSION_RULES`）：两边各写一份，改了一边另一边
     就会静默失效——排除项看着还在，其实已经拦不住了。
     """
-    for words, names in DENIAL_RULES:
+    for words, names in EXCLUSION_RULES:
         if any(word in item for word in words) and set(names) & denied:
             return True
     return False
@@ -301,7 +339,7 @@ def main() -> int:
 
     print("\n不能离线判定的指标（这里不编数字）")
     for name, where in (
-        ("意图准确率", "tools/eval_intent_parser.py（真实模型跑 15 条标注样例）"),
+        ("意图准确率", "tools/eval_intent_parser.py（真实模型跑 18 条标注样例）"),
         ("用户意图保真", "人工：拿 TaskSpec 与原话逐条对，看有没有多写或少写"),
         ("证据覆盖率", "真实运行后读子会话报告：带 evidence_refs 的条数 / 总条数"),
         ("产物可追溯率", "真实运行后读登记表：报告里的 artifact_refs 能否取到"),

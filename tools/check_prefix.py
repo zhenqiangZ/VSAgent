@@ -4,8 +4,8 @@
 它出问题的四种样子，靠人眼读是看不出来的：
 
 1. **太长**：6604 token 那次占掉 18K 窗口的 36.7%，挤压的是最近几轮原文；
-2. **点名了看不见的工具**：写着「用 registry 取 handle」，而它属于 `listing` 族、
-   首步不可见——模型撞一次墙才知道要装族，一次撞墙就是一步；
+2. **点名了看不见的工具**：写着「用 registry 取 handle」，而它不在这个角色的
+   名单里——模型撞一次墙才知道这件事该换人，一次撞墙就是一步；
 3. **枚举漂移**：写着「全库只有三个动作收路径」，而实际是四个。枚举写进提示的那天
    就开始过期，过期之后模型会照着错的清单推理；
 4. **说法与工具对不上**：Plan 身份段说「这些都会被拒绝」，而实际被拒绝的工具里有一类
@@ -25,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from vsagent.core.agent.roles.capabilities import ROLES
+from vsagent.core.agent.roles.catalog import ROLES
 from vsagent.core.agent.domain.all_tools import all_names, domain_tools  # noqa: E402
 from vsagent.core.agent.domain.survey import SurveyStructuresTool  # noqa: E402
 from vsagent.core.agent.domain.export import OpenViewerTool, WriteRunTool  # noqa: E402
@@ -42,7 +42,6 @@ from vsagent.core.agent.roles.prompt import (  # noqa: E402
     rule_inventory,
     rules_directory,
     rules_home,
-    select_rules,
     stable_prefix,
     stage_rules,
 )
@@ -63,8 +62,11 @@ from vsagent.core.models import Session  # noqa: E402
 # 这几段每步都发，涨了会挤压最近几轮的原文，所以照旧卡住。
 PREFIX_BUDGET = 1900
 # 一份角色规则的预算。角色规则进稳定前缀，每多一份就在每一步重复计费；
-# 400 是实测值的上界（最长的一份 259），留了余量，但不允许它长成第二本手册。
+# 400 是其余角色的实测上界，留了余量，但不允许它们长成第二本手册。
+# 主控承接了原 `AGENTS.md` 的交付、禁止与检查清单，单独给 1,200 的额度；
+# 整段前缀仍有 `PREFIX_BUDGET` 兜底，主控不会把窗口吃满。
 ROLE_RULE_BUDGET = 400
+ROLE_RULE_BUDGETS: dict[str, int] = {"principal": 1_200}
 # 规则文件（`AGENTS.md`）不设上限：它是许可与判据的来源，少一条就可能让模型做一个
 # 本来被禁止的动作。这里只报它的体量，供改的人心里有数。
 # 这些句式一出现就说明有人又在提示里抄了一份会过期的清单。
@@ -103,14 +105,21 @@ PLAN_ACTIONS: dict[str, str] = {
 }
 
 
-def build(agent_name: str = "Build", depth: int = 0, rules_dir: Path | None = None) -> str:
+def build(
+    agent_name: str = "Build",
+    depth: int = 0,
+    rules_dir: Path | None = None,
+    role: str = "",
+) -> str:
     """按给定身份装一次前缀。工作目录用仓库根，规则也从这里取。
 
     `rules_dir` 给了就临时顶掉规则目录：量「不含规则文件」的固定部分用它。
     那个目录下不放 `AGENTS.md`，`project_rules` 读出空字符串，规则段整段不出现。
+    `role` 用来量某个专业角色拿到的前缀。
     """
     session = Session(id="ses_check_prefix", title="前缀判据", agent_name=agent_name)
     session.depth = depth
+    session.agent_role = role
     workspace = Workspace(session.id, root=ROOT)
     if rules_dir is None:
         return stable_prefix(workspace, session)
@@ -161,36 +170,25 @@ def main() -> int:
     total = estimate_tokens(prefix)
     fixed_tokens = estimate_tokens(fixed)
     rules_tokens = estimate_tokens(rules)
-    main_rules = select_rules(rules, user_facing=True)
-    sub_rules = select_rules(rules, user_facing=False)
     print(f"固定段 {fixed_tokens} token（预算 {PREFIX_BUDGET}）")
     print(
         f"项目规则 {rules_tokens} token / {len(rules.splitlines())} 行"
-        f"（不设上限，只报数：主 {estimate_tokens(main_rules)}、"
-        f"子 {estimate_tokens(sub_rules)}）"
+        "（不再注入，仅 /init 与人工查阅）"
     )
     print(f"整段前缀 {total} token")
     print(f"  Plan 身份 {estimate_tokens(plan_prefix) - total:+d} token"
-          f"，子 agent 前缀 {estimate_tokens(child_prefix) - total:+d} token（少了面向用户的规则）")
+          f"，子 agent 前缀 {estimate_tokens(child_prefix) - total:+d} token")
 
     if fixed_tokens > PREFIX_BUDGET:
         failures.append(f"固定段 {fixed_tokens} token，超过预算 {PREFIX_BUDGET}")
 
-    # 规则分两段：主 agent 少一节导航，子 agent 再少掉「怎么与用户交互」的四节。
-    #
-    # 这里**不设上限**：规则是许可与判据的来源，少一条就可能让模型做一个本来
-    # 被禁止的动作；体量只报数，由人决定要不要拆。判据只查两件事——切分真的
-    # 生效了，以及子 agent 手里确实没有那几节。
-    for marker in ("## 1.", "## 2.", "## 6.", "## 7.", "## 8."):
-        if marker not in main_rules:
-            failures.append(f"主 agent 的规则里缺了 {marker}：切分把它切掉了")
-    for marker in ("### 2.2", "## 3.", "## 4.", "## 5.", "## 1."):
-        if marker in sub_rules:
-            failures.append(f"子 agent 的规则里还有 {marker}：它不与用户对话")
-    if "## 9." in main_rules:
-        failures.append("主 agent 仍加载流程索引（第 9 节），那一节是导航")
-    if estimate_tokens(sub_rules) >= estimate_tokens(main_rules):
-        failures.append("子 agent 的规则没有比主 agent 少：切分没生效")
+    # `AGENTS.md` 不再进任何会话的前缀：主控行为以 `principal.md` 为准。
+    # 判据仍然读文件本身，报它的体量；只是不再允许它出现在前缀里。
+    title = "# VSAgent — Multi-Agent Operating Specification"
+    if rules and title in prefix:
+        failures.append("主 agent 的前缀里仍然有 AGENTS.md")
+    if rules and title in child_prefix:
+        failures.append("子 agent 的前缀里仍然有 AGENTS.md")
 
     # 前缀同一份输入必须产出同一份字节：差一个字节，整段 prompt cache 就废了。
     if prefix != build():
@@ -262,8 +260,9 @@ def main() -> int:
     # 总和会随着角色变多而涨，那时该拆的是内容，不是放宽这一条。
     for role in ROLES:
         tokens = estimate_tokens(agent_rules(base, role))
-        if tokens > ROLE_RULE_BUDGET:
-            failures.append(f"{role} 的角色规则 {tokens} token，超过 {ROLE_RULE_BUDGET}")
+        limit = ROLE_RULE_BUDGETS.get(role, ROLE_RULE_BUDGET)
+        if tokens > limit:
+            failures.append(f"{role} 的角色规则 {tokens} token，超过 {limit}")
 
     # 参考材料只列名字。被注入了就说明装配器读错了目录。
     reference_home = rules_home(base) / REFERENCE_RULE_DIR
@@ -272,12 +271,13 @@ def main() -> int:
         if body and body in prefix:
             failures.append(f"参考材料 {name} 被默认注入了前缀：它应当按需读取")
 
-    # 呈现与打分是这一轮新加的两段。缺了它们，模型不会主动取页面地址，也不会
-    # 把 DTA 当成对接之外的第二路。
-    if "没有地址就不要发这段描述" not in prefix:
-        failures.append("呈现纪律不在前缀里：结构描述会退回纯文字")
-    if "打分是两路" not in prefix or "微调" not in prefix:
-        failures.append("打分纪律不在前缀里：DTA 通道不会被想到")
+    # 呈现纪律只给主控与 visualization；评分纪律只给三个专业角色。
+    # 缺了它们，模型不会按角色请求视图，也不会把亲和力模型当成单独的一路。
+    if "页面地址必须来自工具返回" not in prefix:
+        failures.append("呈现纪律不在前缀里：页面地址会变成编造")
+    docking_prefix = build(role="docking")
+    if "评分模型" not in docking_prefix or "亲和力模型训练" not in docking_prefix:
+        failures.append("打分纪律不在专业角色前缀里：亲和力通道不会被想到")
     core_names = set(agents.core_tools("orchestrator", ROOT)) | set(
         agents.core_tools("worker", ROOT)
     )
@@ -318,7 +318,7 @@ def main() -> int:
     # 子 agent 不能派，也不该看见派发规则；反过来它必须知道自己是子 agent。
     if "该派子 agent" in child_prefix:
         failures.append("子 agent 的前缀里出现了派发规则")
-    if "你是从父会话分出的子 agent" not in child_prefix:
+    if "你是由 Principal 派发的专业 Worker Agent" not in child_prefix:
         failures.append("子 agent 的前缀里没有身份段")
 
     # Plan 只读：它必须说清「哪些会被拒绝」，而不是只提一个例子。

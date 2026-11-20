@@ -4,12 +4,14 @@
 补两句说明、给一个工具多开三个参数，每次只涨几十 token，谁也不会在评审里
 看出来。等到发现时，每一步都在多付几千。
 
-三档名单来自 `roles/agents.toml`（见 `roles/agents.py`）。判据只管四件事：
+档位名单来自 `roles/agents.toml`（见 `roles/agents.py`）。内置两档
+`orchestrator` 与 `worker`，其余名字由配置自己定义。判据只管五件事：
 
 1. 根会话档 `orchestrator` 在 8,000 之内；
 2. 子会话档 `worker` 在 5,300 之内；
-3. 名单里的每个名字都真的装得出来；
-4. 超预算时按体量排序指出该动谁，而不是只说一句「超了」。
+3. 自定义档按 5,300 判（它是基础档的收窄，不该比 `worker` 更宽）；
+4. 每一档里的名字都真的装得出来；
+5. 超预算时按体量排序指出该动谁，而不是只说一句「超了」。
 
 `full` 档不做额度判定：它是调试与回滚用的，等于全部工具。
 
@@ -32,8 +34,10 @@ from vsagent.core.agent.roles import agents  # noqa: E402
 from vsagent.core.agent.roles.prompt import estimate_tokens  # noqa: E402
 
 # 预算。主会话 8,000、子会话 5,300：都是「压到不能再压之后 + 余量」的数。
-# 超了就说明这一步的固定开销又涨了一截，先看是谁涨的。
+# 超了就说明这一步的固定开销又涨了一截，先看是谁涨的。自定义档没有单列预算，
+# 一律按子会话那一档判：它本来就是基础档的收窄。
 LIMITS: dict[str, int] = {"orchestrator": 8_000, "worker": 5_300}
+DEFAULT_LIMIT = LIMITS["worker"]
 
 
 def tool_tokens() -> dict[str, int]:
@@ -55,8 +59,11 @@ def main() -> int:
     tokens = tool_tokens()
     failed = False
 
-    for tier, limit in LIMITS.items():
-        names = [name for name in agents.core_tools(tier, ROOT) if name != "*"]
+    for tier, listed in agents.all_core(ROOT).items():
+        if tier == agents.WILDCARD_TIER:
+            continue
+        limit = LIMITS.get(tier, DEFAULT_LIMIT)
+        names = [name for name in listed if name != "*"]
         missing = [name for name in names if name not in tokens]
         if missing:
             failed = True
@@ -73,9 +80,9 @@ def main() -> int:
         if verbose:
             print(f"  {'、'.join(name for name, _ in kept)}")
 
-    full_names = agents.core_tools("full", ROOT)
+    full_names = agents.core_tools(agents.WILDCARD_TIER, ROOT)
     if full_names and full_names != ("*",):
-        print(f"full 档写了具体名字：{len(full_names)} 个（应为通配）")
+        print(f"{agents.WILDCARD_TIER} 档写了具体名字：{len(full_names)} 个（应为通配）")
         failed = True
     print(f"不分档（full）　{len(tokens):2d} 个　{sum(tokens.values()):5d} token")
 

@@ -13,14 +13,15 @@ python tools/replay_cost.py --json .probe/cost.json   # 逐步数据落盘
 
 **它不调模型、不联网**，只读 `state.toml`、`ledgers/`、`.vsmemory/` 与 trace。
 
-重放要和真实循环对齐三处，否则数字没有意义：
+重放要和真实循环对齐两处，否则数字没有意义：
 
 1. **按 `STEP_START` 切步**，不按工具调用切。一步可能没有工具（纯回答），
    也可能一次调三个；按工具切会把步数算多，和 trace 里的度量对不上。
-2. **补 `load_tools` 的副作用**。族表决定下一步发多少工具定义，不补的话
-   工具定义会一直停在核心那一份，凭空省下一大截。
-3. **去掉旧会话里的 `COMPACTION` 部件**。那是「历史超窗 → 摘要」那条路的产物，
+2. **去掉旧会话里的 `COMPACTION` 部件**。那是「历史超窗 → 摘要」那条路的产物，
    新设计只在首轮就溢出时兜底。留着等于拿旧包袱算新账。
+
+工具定义按会话角色取固定名单（`agents.toml`），不再模拟工具装载：同一个角色
+从头到尾是同一份清单，所以每一步直接用 `allowed_tools()` 的返回即可。
 
 **三处已知失真**（方向固定，量级小）：`TASK` 用最终的工作区索引（偏高）；
 证据层不模拟（偏低，它是循环层的运行时状态，不在消息里）；事件的标题与结论
@@ -52,9 +53,8 @@ from vsagent.core.agent.state.event_log import (  # noqa: E402
 from vsagent.core.agent.state.ledger import SessionLedger, default_snapshot_path
 from vsagent.core.agent.state.memory import MemoryStore, RecallTool, RememberTool
 from vsagent.core.agent.roles.prompt import stable_prefix
-from vsagent.core.agent.execution.spawn import AgentStatusTool
+from vsagent.core.agent.roles.agents import allowed_tools  # noqa: E402
 from vsagent.core.agent.state.task import TaskTool
-from vsagent.core.agent.toolset import LoadToolsTool, hidden_names, prune_families  # noqa: E402
 from vsagent.core.agent.tools import (  # noqa: E402
     BASH_TIMEOUT,
     BashTool,
@@ -95,8 +95,6 @@ def build_registry() -> ToolRegistry:
         registry.register(tool)
     for tool in event_tools():
         registry.register(tool)
-    registry.register(LoadToolsTool())
-    registry.register(AgentStatusTool())
     for tool in domain_tools():
         registry.register(tool)
     return registry
@@ -156,8 +154,6 @@ def replay(session: Session, window: int) -> list[dict[str, Any]]:
     session.summary_upto = 0
     session.summary = ""
     session.pending_steps = []
-    session.tool_families = []
-    session.family_phase = {}
 
     registry = build_registry()
     workspace = Workspace(session.id, root=PROJECT_ROOT)
@@ -175,19 +171,8 @@ def replay(session: Session, window: int) -> list[dict[str, Any]]:
     current_message = -1
 
     def finish(index: int) -> None:
-        """第 index 步（0 起）跑完了：装载族、记流水。
-
-        `load_tools` 的副作用必须在这里补——它改的是会话上的族表，
-        而族表决定了下一步发出去的工具定义有多少。
-        """
+        """第 index 步（0 起）跑完了：记流水。"""
         message_index, start, end, calls = steps[index]
-        for call in calls:
-            if call.tool_name != "load_tools":
-                continue
-            family = str(call.tool_input.get("family", "")).strip()
-            if family and family not in session.tool_families:
-                session.tool_families.append(family)
-                session.family_phase[family] = len(session.events) + 1
         if message_index != current_message:
             return
         record_step(
@@ -207,15 +192,9 @@ def replay(session: Session, window: int) -> list[dict[str, Any]]:
         # 换轮：先把上一轮封存（与循环层轮末那一处同义）。
         if message_index != current_message:
             if current_message >= 0:
-                event = seal_range(
+                seal_range(
                     session, kind="auto", upto=event_boundary(session, message_index)
                 )
-                if event is not None and event.steps:
-                    prune_families(
-                        session,
-                        {name for step in event.steps for name in step.tools},
-                        event.topic_index,
-                    )
             current_message = message_index
         elif open_tokens(session) > TOPIC_SOFT_LIMIT:
             seal_range(session, kind="auto", upto=event_boundary(session, message_index))
@@ -223,13 +202,11 @@ def replay(session: Session, window: int) -> list[dict[str, Any]]:
         view = truncate(session, message_index, start)
         view.events = session.events
         view.pending_steps = session.pending_steps
-        view.tool_families = list(session.tool_families)
-        view.family_topic = dict(session.family_topic)
 
         bundle = ContextAssembler(window).build(
             view,
             stable_prefix(workspace, view),
-            tools=registry.specs(exclude=hidden_names(view)),
+            tools=registry.specs(only=allowed_tools(view)),
             memory_text=memory.project_text(query=query),
             profile_text=memory.profile_text(),
             task_text="" if view.task_state.is_empty() else view.task_state.render(),
@@ -258,7 +235,7 @@ def replay(session: Session, window: int) -> list[dict[str, Any]]:
                 "total": bundle.metrics["total"],
                 "tools": bundle.metrics["tools"],
                 "events": len(session.events),
-                "families": list(session.tool_families),
+                "role": session.agent_role or "principal",
                 "usage": usage,
                 "old_reasoning": old_reasoning,
                 "new_reasoning": new_reasoning,

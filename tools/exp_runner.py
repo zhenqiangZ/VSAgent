@@ -304,7 +304,7 @@ def collect_usage(home: Path) -> dict[str, object]:
         "session_id": session.get("id"),
         "status": session.get("status"),
         "status_note": session.get("status_note"),
-        "tool_families": session.get("tool_families"),
+        "agent_role": session.get("agent_role"),
         "tokens": total,
         "cost": round(cost, 6),
         "messages": len(session.get("messages", [])),

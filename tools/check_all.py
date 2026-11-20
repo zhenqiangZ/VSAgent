@@ -3,12 +3,12 @@
 判据分成两组，各自守一件事：
 
 - `tests/test_agent.py`（内核）与 `tests/test_smoke.py`（界面）是主判据，项数最多；
-- `tools/check_*.py` 是窄判据：能力表与工具目录是否对得上、工具名有没有前缀冲突、
+- `tools/check_*.py` 是窄判据：角色目录与工具目录是否对得上、工具名有没有前缀冲突、
   色值与样式、仓库里有没有把密钥提交上去、生成的工具清单有没有落后于注册表。
 
 以前这些是「想起来才跑一个」，于是最常见的失败形态不是判据红了，而是**根本没跑**。
 这个脚本按固定顺序全跑一遍，任何一条非零退出就停在那儿并打印它的末尾几十行——
-后面的判据依赖前面的结论（能力表错了，前缀判据的报错会全是噪声）。
+后面的判据依赖前面的结论（角色目录错了，前缀判据的报错会全是噪声）。
 
     python tools/check_all.py
     python tools/check_all.py --only smoke
@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 JUDGES: tuple[tuple[str, str], ...] = (
     ("agent", "tests/test_agent.py"),
     ("smoke", "tests/test_smoke.py"),
-    ("capabilities", "tools/check_capabilities.py"),
+    ("agents", "tools/check_agents.py"),
     ("toolset", "tools/check_toolset.py"),
     ("descriptions", "tools/check_tool_descriptions.py"),
     ("toolsdoc", "tools/check_tools_doc.py"),

@@ -43,8 +43,8 @@ jobs:
       - run: python tools/check_repo.py
       # 独立脚本，不是 pytest：末尾打印「通过 N 项检查」，失败时抛 AssertionError。
       - run: python tests/test_agent.py
-      # 能力表与工具目录对账、常驻工具预算：读源码，不跑模型。
-      - run: python tools/check_capabilities.py
+      # 角色目录、模板与工具名单对账、逐角色额度：读源码，不跑模型。
+      - run: python tools/check_agents.py
       - run: python tools/check_toolset.py
       - run: python tools/check_tool_descriptions.py
       # 工具清单是生成物：与注册表逐字节比对，改了工具忘了重跑就红。

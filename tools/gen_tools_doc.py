@@ -28,7 +28,7 @@ CORE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("会话历史", ("read_turn", "search_history", "close_topic", "recall_event")),
     ("开工盘点", ("survey_structures",)),
     ("呈现与交付", ("write_run", "open_viewer")),
-    ("多 agent", ("agent_status", "dispatch_campaign")),
+    ("多 agent", ("dispatch_campaign",)),
 )
 
 MODULE_TITLES: dict[str, str] = {
@@ -61,7 +61,7 @@ READING = """## 0. 怎么读这份清单
 
 **清单由角色决定。** 每个角色能看见哪些工具，写在 `vsagent/core/agent/roles/agents.toml` 里：每个角色一条名单，会话开始时就定下来，中途不能自己装卸。常驻工具按三档装配（`orchestrator` / `worker` / `full`），领域工具逐条列出。改名单只改这个文件，不用动代码。
 
-**根会话只编排。** 有可执行计划时，根会话拿到的只有 `orchestrator` 档的常驻工具，领域结果靠 `agent_status` 从子会话取回。要算东西就派给对应角色，不要指望根会话自己调领域工具。
+**根会话只编排。** 有可执行计划时，根会话拿到的只有 `orchestrator` 档的常驻工具，领域结果随 `dispatch_campaign` 的返回带回。要算东西就派给对应角色，不要指望根会话自己调领域工具。
 
 **参数表的读法。** 「必填」指请求里必须带这个键，缺了工具直接报错；「选填」指可以不带，不带时按说明里的默认值处理。类型取自工具声明的 JSON Schema，`array` 表示字符串数组。
 
@@ -170,7 +170,7 @@ def render() -> tuple[str, int, int]:
     out.append(READING)
     out.append("---\n")
     out.append(f"## 1. 常驻工具（{len(core)} 个）\n")
-    out.append("常驻工具的顺序就是请求体里的顺序。子会话看不到 `agent_status` 与 `dispatch_campaign`。\n")
+    out.append("常驻工具的顺序就是请求体里的顺序。子会话看不到 `dispatch_campaign`。\n")
     for order, (title, names) in enumerate(CORE_GROUPS, start=1):
         out.append(f"### 1.{order} {title}\n")
         for name in names:

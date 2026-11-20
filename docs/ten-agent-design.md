@@ -11,11 +11,11 @@
 | 项 | 现值 | 取法 |
 | --- | --- | --- |
 | 领域工具 | 54 个，分 23 个模块 | `domain/all_tools.MODULES` |
-| 常驻核心工具 | 18 个 | `coretools.build_core_tools()` |
-| 常驻工具开销 | 主会话 7,108（上限 8,000），子会话 4,771（上限 5,300） | `tools/check_toolset.py` |
-| 角色 | 10 个：`principal` 加 9 个专业角色 | `roles/capabilities.ROLES` |
-| 能力 | 13 项，按职责分给 10 个角色 | `roles/capabilities.CAPABILITIES` |
-| 合同对象 | `IntentSpec`、`TaskSpec`、`CapabilityPlan`、`AgentTask`、`AgentReport` | `roles/contracts/` |
+| 常驻核心工具 | 17 个 | `coretools.build_core_tools()` |
+| 常驻工具开销 | 主会话 6,996（上限 8,000），子会话 4,869（上限 5,300） | `tools/check_toolset.py` |
+| 角色 | 10 个：`principal` 加 9 个专业角色 | `roles/catalog.ROLES` |
+| 操作 | 9 项，就是九个子 Agent 名 | `roles/catalog.AGENTS` |
+| 合同对象 | `IntentSpec`、`TaskSpec`、`AgentPlan`、`AgentTask`、`AgentReport` | `roles/contracts/` |
 | 科研对象 | 9 类：`target` `structure` `pocket` `ligand` `pose` `score` `evidence` `hypothesis` `report` | `research/research_objects.KINDS` |
 | 证据类别 | 7 类；另有 4 种论断性质 | `research/evidence_registry` |
 | 多角色执行状态 | 13 个，从「理解需求」到「交付」 | `execution/campaign_state.STATES` |
@@ -52,7 +52,7 @@ Research 的两条检索线、Pocket 的发现与画像，都在同一个会话�
 | --- | --- |
 | 理解需求 | 判断这次是调研、结构分析、配体发现、筛选还是机制解释 |
 | 定规格 | 写 `TaskSpec`：目标、范围、子目标、约束、排除项、验收条件、确认点 |
-| 排计划 | 写 `CapabilityPlan`：每个子目标交给哪个角色、谁等谁、哪些能并行 |
+| 排计划 | 写 `AgentPlan`：每个子目标交给哪个角色、谁等谁、哪些能并行 |
 | 派发 | `dispatch_campaign` 派 `AgentTask`，同一个任务号只派一次 |
 | 等待与验收 | 按依赖与并行调度，收集 `AgentReport`，核对验收条件 |
 | 汇总 | 合成交付；报告里标的局限与未答问题必须原样带到用户面前 |
@@ -186,7 +186,7 @@ flowchart TD
 
 把调研与发现阶段拿到的结构、口袋与配体集，变成能直接交给对接程序的输入。这一步是整条线上唯一会把结构改写成计算输入的动作，也是唯一需要逐次确认的动作。
 
-### 5.2 现有能力
+### 5.2 现有工作
 
 `prepare_receptor`：选链、去水、去杂原子、留共晶配体、按口袋或残基给盒子、出 PDBQT。
 
@@ -369,16 +369,29 @@ flowchart TD
 
 `kind` 的取值：`artifact_exists`、`handle_registered`、`evidence_ref`、`approval_recorded`、`review_required`。前四种能机器判定，第五种是显式的人工入口，不许拿它冒充已验收。
 
+约束有两个来源：
+
+| 来源 | 写在哪 | 发给谁 |
+| --- | --- | --- |
+| 角色固定约束 | `TEMPLATES[role].constraints` | 只发给这个角色 |
+| 派发时写的限制 | `dispatch_campaign` 的 `constraints`，键是角色名或 `global` | 角色名那一格只发给它，`global` 发给所有角色 |
+
+任务规格里解析出的约束（`spec.constraints`）与父会话任务状态里的条目都**不会自动下发**。它们是父 agent 写限制时的原材料：预览会把规格里的原话列出来提醒，父 agent 在确认派发时按每个角色这一段的任务重写一遍。`confirm=true` 时 `constraints` 必填，没有额外限制也要传 `{}`；键写了这次不派的角色、或写了不存在的角色，直接报错。
+
+前缀解析已经删除（2026-11-20）。以前按 `pocket：……` 切句子，不带前缀的广播给所有人，结果是父任务那一句「给出计划」跟着三个角色一起跑；前缀写错还会静默变全局。一句要求到底属于谁，只有派发那一刻看着子任务才判得准。子会话的任务状态只写自己那一份约束，不再复制父会话的整份清单。
+
+交付物也按模板认领：`required_outputs` 里的名字出现在哪个角色模板的 `required_outputs` 里，就挂给哪个角色；同一个名字被多个角色声明时各挂一份。没人认领时，计划只有一个终点就兜底挂给它；多个终点仍没人认领才告警，不硬分。
+
 ### 11.2 AgentReport 的字段
 
 `status` 取 `completed`／`partial`／`failed`／`cancelled`，`findings` 与 `conclusions` 标 `completed` 时不能空。各角色的必填项由 `profiles.REPORT_REQUIREMENTS` 定：
 
 | 角色 | 不能空 |
 | --- | --- |
-| `research`、`ligand` | `evidence_refs` |
-| `pocket` | `evidence_refs`、`artifact_refs` |
-| `prepare`、`docking` | `artifact_refs`、`limitations` |
-| `affinity`、`analysis` | `evidence_refs`、`limitations` |
+| `research` | `evidence_refs` |
+| `pocket`、`ligand` | `evidence_refs`、`artifact_refs` |
+| `prepare`、`docking`、`affinity` | `artifact_refs`、`limitations` |
+| `analysis` | `evidence_refs`、`artifact_refs` |
 | `mechanism` | `evidence_refs`、`unresolved_questions` |
 | `visualization` | `artifact_refs` |
 
@@ -442,7 +455,8 @@ flowchart LR
     PR --> AF[affinity]
   end
   subgraph 结论
-    AN[analysis] --> ME[mechanism]
+    AN[analysis]
+    ME[mechanism]
   end
   V[visualization]
   W[(共享工作区)]
@@ -450,6 +464,11 @@ flowchart LR
   P --> PR
   DK --> AN
   AF --> AN
+  P --> ME
+  G --> ME
+  DK --> ME
+  AN --> V
+  ME --> V
   R -.-> W
   G -.-> W
   P -.-> W
@@ -464,7 +483,19 @@ flowchart LR
 
 ### 13.1 前置依赖只写真正缺件的
 
-计划里的依赖按「下游没有产出这件东西的工具」来写，不按「流程上通常先做」。角色定下来之后是五条：准备依赖口袋与配体；对接依赖准备；亲和力依赖准备；候选评价依赖对接与亲和力；机制依赖口袋与配体。口袋内部的发现与画像不算跨角色依赖，在同一个会话里先后做。
+计划里的依赖按「下游没有产出这件东西的工具」来写，不按「流程上通常先做」。角色定下来之后是这些：
+
+1. 准备依赖口袋与配体；
+2. 对接依赖准备；
+3. 亲和力依赖准备；
+4. 候选评价依赖对接与亲和力；
+5. 机制依赖口袋、配体与位姿；
+6. 展示排在同计划其他角色之后；
+7. 没有指定可直接用于对接的口袋时先做调研。
+
+口袋内部的发现与画像不算跨角色依赖，在同一个会话里先后做。
+
+最后一条只管口袋：用户没有给出已定义、可直接用于对接的口袋时，先派调研查靶点身份、可用实验结构、共晶配体与已知活性配体，再定口袋。配体是用户自带的数据集，与检索关系不大，不因缺配体而触发这一步。这一条由主控在派发前判断，不写进角色前置表：`pocket` 自己的名单里就有取结构的工具，强制补一个调研节点在只做结构时是白跑。
 
 ### 13.2 并行
 
@@ -520,12 +551,12 @@ flowchart LR
 
 1. **工具清单重整**（§18）：删两个、合并七组、新增两个、说明按统一体例重写。
 2. **取消按族装载，改由配置文件固定每个角色的工具**（§17）。配置里的名字取 §18 的清单。
-3. **角色按十个 agent 重排**：改 `capabilities.py` 与 `profiles.py`。`target` 与 `literature` 合成 `research`，`structure_pocket` 与 `conformation` 合成 `pocket`；`screening` 的两段分成 `prepare` 与 `docking`，`scoring` 的两半分成 `affinity` 与 `analysis`；`hypothesis` 的两件工具并进 `mechanism`；新建 `visualization`。旧会话的状态文件里存着 `agent_role`，恢复时会走到 `profiles.profile()`；角色改名要留一张 `LEGACY_ROLES` 对照表给它查，否则恢复一个旧会话会当场崩溃。派发侧只认新角色名，旧名查得到、派不出去。
+3. **角色按十个 agent 重排**：改 `catalog.py` 与 `profiles.py`。`target` 与 `literature` 合成 `research`，`structure_pocket` 与 `conformation` 合成 `pocket`；`screening` 的两段分成 `prepare` 与 `docking`，`scoring` 的两半分成 `affinity` 与 `analysis`；`hypothesis` 的两件工具并进 `mechanism`；新建 `visualization`。旧会话不兼容：状态文件里的 `agent_role` 必须是当前名字，改名前的会话直接删掉，不留映射表。
 4. **`ligand` 扩权限与工具**：名单里加 `rank_library`、`pick_diverse`、`scaffold_analysis`、`matched_pairs`、`enumerate_analogs`、`record_assay`、`build_pharmacophore`、`align_ligands`，权限加 `analyze` 与 `write`。
 5. **`visualization` 角色与视图收权**：`open_viewer` 只留在主会话档与展示角色的名单里，改 `survey_structures` 的那句提示，补一组判据「非展示角色的子会话看不见 `open_viewer`」。
 6. **系统级评测**：真实模型上跑并行派发、失败恢复、证据追溯、产物一致性与整任务成功率，与单 Agent 基线对照。重构稿 Phase 12 留的正是这一项。
 
-判据入口：`tools/check_capabilities.py`（名单与配置对得上、逐角色额度）、`tools/check_tool_descriptions.py`（四段体例）、`tools/check_toolset.py`（两档基础档额度）、`tools/check_tools_doc.py`（工具清单与注册表一致）、`tools/check_all.py`。
+判据入口：`tools/check_agents.py`（名单与配置对得上、逐角色额度）、`tools/check_tool_descriptions.py`（四段体例）、`tools/check_toolset.py`（两档基础档额度）、`tools/check_tools_doc.py`（工具清单与注册表一致）、`tools/check_all.py`。
 
 六件里前五件已落地；第六件完成了离线结构判据、意图解析与一场两档对照，缺口（多任务成功率、故障注入、脚本化基线）见 §19。
 
@@ -535,7 +566,7 @@ flowchart LR
 
 ### 17.1 改到什么程度
 
-改造前注册表装 81 个工具（20 个常驻 + 61 个领域），每一步只发「核心 + 这一主题装过的族」。族这个名字同时出现在四处：装配分组、能力表、能力计划、提示里。模型要自己判断该装哪一族，判断错就多走几步；每装一次清单变化，前缀缓存整段失效；换主题还要按租约释放。
+改造前注册表装 81 个工具（20 个常驻 + 61 个领域），每一步只发「核心 + 这一主题装过的族」。族这个名字同时出现在四处：装配分组、角色目录、角色计划、提示里。模型要自己判断该装哪一族，判断错就多走几步；每装一次清单变化，前缀缓存整段失效；换主题还要按租约释放。
 
 改成：会话建立时工具清单定稿，运行当中不变。谁装什么只由配置决定，装配侧不再分组。
 
@@ -552,7 +583,7 @@ flowchart LR
 [core.orchestrator]
 tools = ["bash", "read", "write", "patch", "grep", "remember", "recall",
          "task", "hypothesis", "read_turn", "search_history", "close_topic",
-         "recall_event", "write_run", "registry", "open_viewer", "agent_status",
+         "recall_event", "write_run", "registry", "open_viewer",
          "dispatch_campaign"]
 
 [core.worker]
@@ -574,7 +605,7 @@ tools = ["open_viewer"]
 
 `core` 只能取 `orchestrator` / `worker` / `full`。`tools` 按工具名写，可以列常驻工具（`mechanism` 角色要 `hypothesis`，展示角色要 `open_viewer`），也可以列领域工具里的共享设施（`registry`、`add_evidence`、`workspace`），装配时用它补进这一档的名单。`"*"` 只允许写在 `[core.…]` 里。
 
-主会话按路由模式取档：有可执行计划时用 `orchestrator`，路由关掉（`VSA_ROUTE=off`）时用 `full`。这一段在今天靠 `Session.principal_only` 每轮动态计算，改成建会话时选一次，`principal_only` 与它配套的动态隐藏一起删。
+主会话按路由模式取档：有可执行计划时用 `orchestrator`，路由关掉（`.vsagent/route.toml` 里 `[route] mode = "off"`）时用 `full`。这一段在今天靠 `Session.principal_only` 每轮动态计算，改成建会话时选一次，`principal_only` 与它配套的动态隐藏一起删。
 
 ### 17.3 装配流程
 
@@ -597,15 +628,15 @@ flowchart LR
 
 ### 17.4 越权怎么拦
 
-`capability_guard` 按族判，族名没了就失去依据。改成按会话允许清单判：工具名不在 `Session.allowed_tools` 里就拒，文案写成「这个角色没有装配 `dock`；要它请改 `agents.toml`，或把这件事派给装了它的角色」。
+`tool_guard` 按族判，族名没了就失去依据。改成按会话允许清单判：工具名不在 `Session.allowed_tools` 里就拒，文案写成「这个角色没有装配 `dock`；要它请改 `agents.toml`，或把这件事派给装了它的角色」。
 
 这条同时覆盖模型硬调一个看不见的工具：清单外的名字在执行处被拒，不必依赖「看不见就不会调」。`AgentProfile.check_task` 保留动作类（读、分析、执行、写）的核对，删掉族的那一半。
 
 ### 17.5 计划与合同的变化
 
-`CapabilityPlan` 删 `tool_families` 与 `standalone_tools`：角色定了工具，计划不必再逐角色写一份。路由只产出角色、依赖、并行组。`SCHEMA_VERSION` 从 3 升到 4；`CapabilityPlan.from_dict` 的允许键里保留这两个名字但不再读取，因为计划会随会话存盘，恢复旧会话时不该因为多了两个键就解析失败。
+`AgentPlan` 删 `tool_families` 与 `standalone_tools`：角色定了工具，计划不必再逐角色写一份。路由只产出角色、依赖、并行组。`SCHEMA_VERSION` 从 3 升到 4；`AgentPlan.from_dict` 的允许键里保留这两个名字但不再读取，因为计划会随会话存盘，恢复旧会话时不该因为多了两个键就解析失败。
 
-`AgentTask` 不动。`capabilities.py` 保留角色、能力名、动作类、报告要求，删 `families` 与 `standalone_tools` 两个字段。能力名仍被路由模板引用。
+`AgentTask` 不动。`catalog.py` 保留角色、工作说明、动作类、报告要求，删 `families` 与 `standalone_tools` 两个字段。角色名仍被路由模板引用。
 
 ### 17.6 删掉的东西
 
@@ -616,11 +647,11 @@ flowchart LR
 - `all_tools.FAMILIES` 的族名，换成按模块顺序的一张清单与 `all_names()`；`family_of` 一并删掉，越权提示不再需要族名；
 - 会话上的三个字段，以及 `close_topic(next_tools=…)` 参数；
 - 提示里关于装族、主题租约、装一次缓存失效的那几段文字；
-- `check_capabilities.py` 里按族报账的部分，功能并进新的配置判据。
+- `check_agents.py` 里按族报账的部分，功能并进新的配置判据。
 
 ### 17.7 判据
 
-以下检查并进 `tools/check_capabilities.py`：
+以下检查并进 `tools/check_agents.py`：
 
 | 检查 | 不过时说明 |
 | --- | --- |
@@ -629,7 +660,7 @@ flowchart LR
 | 每个角色至少一个工具 | 空名单的角色派出去什么也做不了 |
 | 减掉 `tools.toml` 关掉的之后仍不为空 | 名单全被项目配置关掉，这个角色一步也走不了 |
 | 每个领域工具至少出现在一个角色名单里 | 漏掉的工具没有任何会话能调 |
-| 子会话名单里没有 `dispatch_campaign`、`agent_status` | 派发只能由主会话做 |
+| 子会话名单里没有 `dispatch_campaign` | 派发只能由主会话做 |
 | 角色名单里没有 `"*"` | 通配只留给核心档 |
 | 每个角色的定义开销 | 超过 10,000 提示，超过 12,000 判失败 |
 
@@ -642,7 +673,7 @@ flowchart LR
 1. 写配置与读取、校验；先把表算出来，装配仍然走原来的路。
 2. 装配与 `tool_specs` 切到名单，`load_tools` 留着但不再影响清单（这一步可以退回）。
 3. 删 `load_tools`、租约、三个会话字段、`close_topic` 的参数。
-4. 删 `CapabilityPlan` 两个字段、`capabilities` 两个字段，改路由与派发，升协议版本。
+4. 删 `AgentPlan` 两个字段、`catalog` 两个字段，改路由与派发，升协议版本。
 5. 改提示与判据脚本，跑全量。
 
 ### 17.9 重整前的账
@@ -827,7 +858,9 @@ flowchart LR
 
 工具的净减少是七个：九组合并省下九个名字，两个新增补回来两个。说明压缩省下的量比合并大，因为它作用在每一条、每一步上。
 
-按角色算一步的总额：清单里各件的定义按实测相加，常驻用 §18.6 的数（子会话 4,771、主会话 7,108，`tools/check_capabilities.py` 实测）。`survey_structures`、`hypothesis`、`open_viewer` 是常驻工具，单独计入点名它们的角色。
+> 2026-11-19 删除 `agent_status` 之后：常驻 17，总数 71，主会话 6,996，子会话 4,869。
+
+按角色算一步的总额：清单里各件的定义按实测相加，常驻用 §18.6 的数（子会话 4,771、主会话 7,108，`tools/check_agents.py` 实测）。`survey_structures`、`hypothesis`、`open_viewer` 是常驻工具，单独计入点名它们的角色。
 
 | agent | 清单件数 | 清单定义（实测） | 一步合计 |
 | --- | --- | --- | --- |

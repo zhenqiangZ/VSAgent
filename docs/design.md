@@ -1,7 +1,7 @@
 # 现行设计
 
 > 角色：现行设计（这个系统现在是什么样）
-> 状态：随代码更新，最后核对 2026-11-16
+> 状态：随代码更新，最后核对 2026-11-18
 > 配套：`history.md`（为什么这么定）、`review.md`（实测读数）、`reference.md`（判据与外部资料）、
 > `tools.md`（工具清单，由 `tools/gen_tools_doc.py` 生成）、
 > `ten-agent-design.md`（十个角色的职责与边界）、
@@ -25,8 +25,9 @@
 `update` 改不了它——否则模型可以绕过证据把一条假设标成 supported。未结的假设按粒度
 分组渲染进 `TASK` 层，`write_run` 把它们整份写进 `provenance.hypotheses`。
 
-判据来源与筛选流程的确认点在 `dist/AGENTS.md`，展开的操作细则在 `dist/rules/`：操作要点在
-`global/`、`agents/`、`stages/`，方法与阈值在 `references/`。
+判据来源与筛选流程的确认点在 `dist/rules/agents/principal.md`，展开的操作细则在 `dist/rules/`：
+操作要点在 `global/`、`agents/`、`stages/`，方法与阈值在 `references/`。`dist/AGENTS.md`
+不再进模型上下文，只留给 `/init` 与人工查阅。
 
 ---
 
@@ -60,9 +61,10 @@ graph TD
 ### 3.1 一轮的流程
 
 模型请求之前还有一段前置流程（`_prepare_route`，只在根会话跑）：取这一轮的用户原话 →
-意图解析 → 规格编译 → 能力路由 → 定下派哪几个角色、谁等谁。三档开关
-`off / shadow / enforce` 决定它做什么：`off` 什么都不做；`shadow` 与 `enforce`
-都写出计划与过程记录，不改工具清单——每个角色装哪些工具由 `agents.toml` 决定，
+上下文解析 → 意图解析 → 意图验证 → 任务关系 → 规格编译 → 角色路由 → 定下派哪几个角色、谁等谁。档位由 `.vsagent/route.toml`
+的 `[route] mode` 控制（`VSA_ROUTE` 只做临时覆盖），取 `off / shadow / enforce`：
+`off` 什么都不做；`shadow` 与 `enforce`
+都写出计划与过程记录，`shadow` 不拦截派发，`enforce` 先问或拒绝；两者都不改工具清单——每个角色装哪些工具由 `agents.toml` 决定，
 会话建立时就定稿。路由出错时 trace 照写，但**一个会话字段都不改**——宁可退回
 原来的路径，也不把一份半成品计划写进会话，下一轮再按它继续。
 
@@ -89,8 +91,8 @@ graph TD
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
 | `MAX_STEPS` | 24 | 一轮步数上限，`VSA_MAX_STEPS` 可改；写错按 24 处理 |
-| `CLOSING_STEPS` | 3 | 剩这么多步进入收束阶段，只放行收尾型工具 |
-| `TOPIC_STEP_LIMIT` | 20 | 一个主题走满这么多步且最近 4 步没有新产物，由内核封存并结束这一轮 |
+| `CLOSING_STEPS` | 3 | 剩这么多步进入收束阶段，只放行交付动作（按层级与角色算） |
+| `TOPIC_STEP_LIMIT` | 20 | 根会话的主题走满这么多步且最近 4 步没有新产物，由内核封存并结束这一轮；子 agent 不适用 |
 | `MAX_STOP_RETRIES` | 2 | STOP 钩子未通过时的重试次数 |
 | `MAX_RETRIES` | 2 | 模型请求的重试次数 |
 | `MAX_TOOL_RETRIES` | 1 | 工具调用的重试次数 |
@@ -104,10 +106,29 @@ graph TD
 重试用尽的文案写明「参数没有错，也不要用 bash 自己实现」——模型绕道自建客户端，实测一次
 误判烧掉 20 步。
 
-剩 `CLOSING_STEPS` 步时进入收束：`write_run` / `close_topic` / `task` / `read_turn` /
-`recall_event` 之外的调用直接返回「本轮步数快用完了」。这一阶段的整步失败不计进
-`MAX_FAILED_STREAK`——拒绝由内核自己发出，模型并没有卡住。尾部提示同时给出
-「本轮还剩 K 步」，模型看得见额度才会为收尾留步。
+剩 `CLOSING_STEPS` 步时进入收束，放行的是**交付动作**，不放行新计算与新取数。
+名单按层级与角色算：
+
+- 子 agent：`write` / `patch` / `read` / `grep` / `registry` / `workspace` /
+  `add_evidence` / `close_topic` / `task` / `recall_event`；`prepare`、`docking`、
+  `visualization` 另加 `write_run`。`bash` 与领域计算、取数工具一律拦下。
+- 根会话：`read` / `grep` / `write` / `patch` / `registry` / `read_turn` /
+  `search_history` / `recall_event` / `close_topic` / `task`。
+  `dispatch_campaign` 与 `bash` 拦下。
+
+名单分开的理由是 2026-11-18 的实测：旧名单只有 `write_run` / `close_topic` / `task` /
+`read_turn` / `recall_event` / `search_history`，而子 agent 最后三步要做的是登记证据、
+登记产物、核对文件，全部被拦；`write_run` 则是把受体与口袋写成运行目录的工具，
+三个子 agent 一次都没用过。拒绝时按层级给出不同的说明，不再统一指向 `write_run`。
+
+这一阶段的整步失败不计进 `MAX_FAILED_STREAK`——拒绝由内核自己发出，模型并没有卡住。
+尾部提示同时给出「最多还能做 K 步（不是必须用完）」；还剩 6 步时另给一次交付检查，
+让模型先对照任务书的验收条件，齐了就写结论并停止。
+
+子 agent 不显示「这一段已经很长，先调 close_topic」那一句，也不由内核按主题预算主动
+封存：它整个任务就是一个主题。实测中这句话让三个子 agent 在第 9–13 步提前封存，
+再花 3–5 步用 `recall_event` 或重读把细节捞回来，最后全部在 24 步用满。装不下时由
+装配层按需封存（`context.dropped` 那条路）。
 
 子 agent 另有两级时限（2026-11-13）：
 
@@ -143,7 +164,7 @@ graph TD
 | `event_argument` | 事件运行时 | 封存主题 |
 | `registry_argument` | 注册表（只读） | 查某个名字有没有装 |
 
-子 agent 的入口不走上面这些通道：`dispatch_campaign` 与 `agent_status` 从参数里拿 `session`
+子 agent 的入口不走上面这些通道：`dispatch_campaign` 从参数里拿 `session`
 与 `spawner`，由装配处直接提供。4b 的子代理上下文隔离只有设计。
 
 声明了某一类却收到 `None`，返回「内核装配问题」，措辞要让模型知道重试无用：这一路只可能是
@@ -206,10 +227,15 @@ graph TD
 `/agent` 已在 2026-11-13 删除，`host.spawn` 只由调度器调用。
 
 派出去的东西由四个模块分工：`dispatcher.py` 建会话并判重，`scheduler.py` 按依赖分层、
-只让失败卡住下游，`coordinator.py` 把能力计划翻成任务、把角色依赖换成任务号，
-`reports.py` 从子会话里机械抽取报告。子 agent 的报告走**拉**的路径：`agent_status` 在
-子会话有角色时补一段「合格 / 不合格（缺什么）+ 产物句柄 + 证据」，不主动往父会话的消息
-列表里推——推一条会在模型没要求的时候占用窗口。
+只让失败卡住下游，`coordinator.py` 把角色计划翻成任务、把角色依赖换成任务号，
+`reports.py` 从子会话里机械抽取报告。子 agent 的报告随**派发结果**一起回到父会话：
+`dispatch_campaign` 等全部子会话结束后，逐条列出「完成 / 失败 + 结论 + 合格或不合格
+（缺什么）+ 产物句柄 + 证据」。结论预览只留 800 字，整场结果压到 1500 token；每份
+报告的全文写到 `runs/reports/<父会话>/<子会话>.md`，正文与收尾总结各成一段；同目录的
+`index-<计划号>.md` 列出全部绝对路径，父会话用 `read` 取细节。索引按计划号分文件，
+同一父会话再跑另一场不会盖掉上一场。路径写绝对值：`read` 的相对路径按应用启动目录
+解释，源码运行与打包运行不是同一个根。用户中断或战役出错时同样把已有报告写下来，
+结果里附索引路径；目录在开跑前先建，写不进去在派发之前暴露。
 
 子会话的上下文隔离没有实现：`subagent_argument` 这个注入通道在代码里不存在。子 agent 的
 工具清单按角色配置裁剪；准备受体/配体与切换受体不再对子 agent 一律拒绝，而是按角色给
@@ -219,14 +245,14 @@ graph TD
 
 派发时的四条约定（2026-11-13）：
 
-- **`roles` 可以加**：计划里没有的角色按 `capabilities_for(role)` 补进这次派发，缺的前置
+- **`roles` 可以加**：计划里没有的角色按角色目录直接补进这次派发，缺的前置
   一起补；任务号仍是 `计划号:角色`。用于「跑到一半发现还要结构盘点」。
 - **`roles` 也可以减**：按子集派发时，预览会点名「计划里还有没派的角色：…」，
   `Campaign.pending` 进 `campaign.done` 事件并写进待办——不说的话，父会话会以为整场跑完了。
 - **自定义任务书只给一个角色**：`roles` 恰好一个时替换它的任务书，自动补的上游仍用模板；
   指定多个就报错。以前按「补完上游后的任务数」判，下游角色永远换不了任务书。
 - **自带输入不重复派**：`available_inputs` 里有 `pocket` / `ligand_set` / `structure` /
-  `receptor` 时，对应能力记进 `plan.provided_capabilities`，不再派角色，缺前置判据也认它。
+  `receptor` 时，对应角色记进 `plan.provided_agents`，不再派角色，缺前置判据也认它。
 
 ---
 
@@ -242,10 +268,10 @@ PREFIX → PROFILE_MEMORY → PROJECT_MEMORY → TASK → EVENT → RECENT → E
 
 | 层 | 内容 | 淘汰策略 |
 | --- | --- | --- |
-| `PREFIX` | 身份、工作纪律、平台、登记表说明、事件说明、`AGENTS.md` | pinned，字节稳定 |
+| `PREFIX` | 身份、工作纪律、平台、登记表说明、事件说明、全局规则、角色规则 | pinned，字节稳定 |
 | `PROFILE_MEMORY` | 用户的长期要求（习惯），`MemoryStore.profile_text()` | pinned，只在台账变化时变 |
 | `PROJECT_MEMORY` | 跨会话的项目事实与经验，`MemoryStore.project_text()` | 受 1000 token 限制，按核心 / 相关 / 最近三段填 |
-| `TASK` | 任务状态、工作区索引、运行环境、未结假设 | pinned |
+| `TASK` | 任务状态、意图摘要、工作区索引、运行环境、未结假设 | pinned |
 | `EVENT` | 已封存主题的流水（标题、逐步、结论、未决） | 超额度时从最旧的主题裁起 |
 | `RECENT` | 最近若干个完整交互组 | 整组进出，组内不切开 |
 | `EVIDENCE` | 本步相关证据，带引用 | 先给摘要，正文按预算展开 |
@@ -255,8 +281,12 @@ PREFIX → PROFILE_MEMORY → PROJECT_MEMORY → TASK → EVENT → RECENT → E
 习惯与项目情况分开装，是因为习惯只在用户改口时变，项目情况随最后一条用户消息变；
 合成一段的话，问题一换整段就变，装不下时还会把习惯与事实一起砍半。
 
+意图摘要是系统对用户原话的解析：目标、对象、角色、约束、禁止项、交付、验收与确认点。
+它由 `planning/intent_summary.py` 压到 500 个文字单位以内，放在 `TASK` 层，让主控在
+派发前能核对；与用户原话不符时，`principal.md` 要求先说明差异再问用户，不直接派发。
+
 输出布局：`system` 只放 `PREFIX`；紧跟着一条 user 消息放 `PROFILE_MEMORY`；再一条 user 头装
-运行环境、`PROJECT_MEMORY`、任务状态、工作区索引、摘要与引用清单；中间是 `RECENT`；
+运行环境、`PROJECT_MEMORY`、任务状态、意图摘要、工作区索引、摘要与引用清单；中间是 `RECENT`；
 最后一条 user 前面是 FOCUS 复述、来源提示与证据。易变内容一律不进 `system`——
 日期每天变一次，进去就每天击穿一次 prompt cache。
 
@@ -309,9 +339,10 @@ evidence_detail → history_summary → recent_tool_clear → event_step_detail
 
 封存时机：模型调 `close_topic`（步末执行）、轮末、新用户消息、当前主题原文超过
 `TOPIC_SOFT_LIMIT`（120K token）、溢出、`/compact`、中断、当前主题走到 `TOPIC_STEP_LIMIT`
-（20 步）且最近 4 步没有新产物。模型侧的触发条件是尾部那一行「本主题已 N 步 · 本轮还剩
-K 步 · 产物 … · 未决 …」，`CLOSE_TOPIC_AFTER` 为 2，第 8 步换成「先收一次再继续」，
-放尾部是为了不碰前缀缓存。
+（20 步）且最近 4 步没有新产物。模型侧的触发条件是尾部那一行「本主题已 N 步 · 最多还能做
+K 步 · 产物 … · 未决 …」，`CLOSE_TOPIC_AFTER` 为 2；第 8 步只在最近 4 步没有新产物时
+换成条件提示（目标完成就收，没完成就继续），步数多本身不构成收主题的理由。放尾部是为了
+不碰前缀缓存。
 
 `seal_topic(force=True)` 与 `force=False` 的差别是覆盖：轮末遇到纯聊天的一轮可以跳过，
 溢出与 `/compact` 必须封，否则那一段原文两边都不在。自动封存不推进 `compact_upto`，
@@ -357,23 +388,24 @@ K 步 · 产物 … · 未决 …」，`CLOSE_TOPIC_AFTER` 为 2，第 8 步换�
 全局不变式 → 角色规则 → 项目规则。排序是语义：假设规则紧跟身份（它定义产出长什么样），
 确认点放最后。
 
-规则按「变不变」分三档进不同层，只有前两档在前缀里：
+规则按「变不变」分层，只有前两档与项目规则在前缀里：
 
 | 档位 | 来源 | 何时加载 | 为什么在这一层 |
 | --- | --- | --- | --- |
 | 全局不变式 | `dist/rules/global/`（3 份） | 每一轮 | 所有角色都遵守，且整场会话不变 |
 | 角色规则 | `dist/rules/agents/<角色>.md`（10 份） | 每一轮，只取自己那份 | 按 `agent_role` 取，一次会话内不变 |
+| 项目规则 | `dist/AGENTS.md` | 不注入 | 只留给 `/init` 与人工查阅；主控行为以 `principal.md` 为准 |
 | 阶段规则 | `dist/rules/stages/`（5 份） | 任务层（动态） | 随子目标推进而变，放进前缀会每步击穿缓存 |
 | 参考材料 | `dist/rules/references/`（5 份） | 不注入，只列名字 | 需要时模型自己读 |
 
-阶段由任务规格里的子目标推导（`stages.stage_for`），不由模型自述决定；跨阶段的能力
-（`target_intelligence`、`literature_evidence`）不给阶段，不硬塞进相邻一步。
+阶段由任务规格里的子目标推导（`stages.stage_for`），不由模型自述决定；跨阶段的工作
+（`research` 的靶点与文献工作、`visualization` 的视图页）不给阶段，不硬塞进相邻一步。
 
-固定那几段预算 1900 token，实测 1821（`tools/check_prefix.py` 守着），整段前缀 6052 token。
-`dist/AGENTS.md` 占 3121 token / 214 行（主 agent 加载 2917、子 agent 加载 1023）且不设上限——
-它是许可与判据的来源，少一条就可能放行一个本来被禁止的动作。领域约束按角色拆到了
-`dist/rules/agents/`，这一份只留基础约束、四个确认点与角色索引。每一步最多加载的规则是
-1628 token（全局 + 一份角色 + 一份阶段）。平台那句由 `platform_note()` 按 `sys.platform` 现取。
+固定那几段预算 1900 token，实测 1634（`tools/check_prefix.py` 守着），整段前缀 3714 token。
+`dist/AGENTS.md` 不再注入，只留在磁盘上供 `/init` 与人工查阅；主控的交付、禁止与检查清单
+迁到了 `dist/rules/agents/principal.md`（1130 token）。领域约束按角色分到了
+`dist/rules/agents/`，全局不变式仍在 `dist/rules/global/`。每一步最多加载的规则是
+2395 token（全局 + 一份角色 + 一份阶段）。平台那句由 `platform_note()` 按 `sys.platform` 现取。
 
 易变信息走 `environment_block()`，由循环层放进 user 头：今天日期（只到天）、工作目录、状态目录。
 
@@ -418,7 +450,7 @@ agent 的引用必须存在（用户写入可以不存在，标 `unverified` 排
 
 ### 5.1 配置决定清单
 
-全仓 72 个工具：18 个常驻（文件、登记表、任务、假设、事件、记忆、
+全仓 71 个工具：17 个常驻（文件、登记表、任务、假设、事件、记忆、
 `write_run`、`open_viewer`、`dispatch_campaign` 等），54 个领域工具。每个角色装哪些
 写在 `vsagent/core/agent/roles/agents.toml`：三份配置按顺序读（包内、项目
 `.vsagent/agents.toml`、用户 `~/.vsagent/agents.toml`），同一个角色以靠后的整段为准。
@@ -427,9 +459,9 @@ agent 的引用必须存在（用户写入可以不存在，标 `unverified` 排
 注册表只装一份、含全部工具。哪一步发哪些名字由 `roles/agents.py` 算出来：
 根会话取 `core.orchestrator`（18 件），子会话取 `core.worker`（13 件）加本角色的
 工具。`Registry.specs(only=...)` 按这份名单过滤；模型真去调名单外的工具时，
-`capability_guard` 按同一份名单拒绝，文案指向 `agents.toml`。
+`tool_guard` 按同一份名单拒绝，文案指向 `agents.toml`。
 
-每个角色一步的清单开销由 `tools/check_capabilities.py` 量：超过 10,000 提示、
+每个角色一步的清单开销由 `tools/check_agents.py` 量：超过 10,000 提示、
 超过 12,000 判失败。基础档的额度由 `tools/check_toolset.py` 量（主 8,000、子 5,300）。
 
 ### 5.2 装配清单
@@ -446,7 +478,7 @@ agent 的引用必须存在（用户写入可以不存在，标 `unverified` 排
 | `core/agent/permission.py` | 权限判定（外部钩子在 `execution/hooks.py`） |
 | `core/agent/coretools.py` | 常驻核心工具的装配清单 |
 | `core/agent/provider.py` | 模型协议（OpenAI 兼容 SSE） |
-| `core/agent/validators/` | 四层运行时校验：能力守卫、任务前置、输出合同、交付验收 |
+| `core/agent/validators/` | 四层运行时校验：工具守卫、任务前置、输出合同、交付验收 |
 | `core/agent/domain/` | 54 个领域工具、23 个模块，外加 `http.py`（唯一网络出口）与库层模块 |
 | `core/agent/{planning,roles,execution,state,research}/` | 其余模块按用途分五组，见下一张表 |
 | `core/agent/search_reasoning/` | 检索触发的搜索增强：先验答案、证据适配与评估、选择性整合、交付前核对；由 `VSA_SAR` 接入主循环 |
@@ -465,9 +497,9 @@ agent 的引用必须存在（用户写入可以不存在，标 `unverified` 排
 
 | 组 | 模块 | 管什么 |
 | --- | --- | --- |
-| `planning/` | `intent.py`、`intent_parser.py`、`task_context.py`、`task_compiler.py`、`capability_router.py`、`route_adapter.py`、`stages.py`、`context.py` | 一句话怎么变成计划：意图规则、解析成 `IntentSpec`、编译成 `TaskSpec`、能力闭包与路由开关；`context.py` 是装配用的八层模型 |
-| `roles/` | `capabilities.py`、`profiles.py`、`agents.py`、`agents.toml`、`prompt.py`、`contracts/` | 角色本身：能力与权限、说明书与报告必填、每个角色的工具名单、系统提示与规则注入、五类协议 |
-| `execution/` | `coordinator.py`、`scheduler.py`、`dispatcher.py`、`dependency.py`、`spawn.py`、`host.py`、`campaign_state.py`、`reports.py`、`report.py`、`loop.py`、`hooks.py` | 跑起来的那一层：计划翻任务、建会话与判重、分层调度、子 agent 派发、会话宿主、状态机、报告抽取、唯一驱动与外部钩子 |
+| `planning/` | `intent.py`、`context_resolver.py`、`intent_parser.py`、`intent_validator.py`、`task_context.py`、`decision.py`、`notes.py`、`task_compiler.py`、`agent_router.py`、`route_adapter.py`、`stages.py`、`context.py` | 一句话怎么变成计划：意图规则、解析成 `IntentSpec`、编译成 `TaskSpec`、前置闭包与路由开关；`decision.py` 是意图、任务关系与最终计划合在一起的唯一对象，`notes.py` 是带机器码的提示；`context.py` 是装配用的八层模型 |
+| `roles/` | `catalog.py`、`templates.py`、`profiles.py`、`agents.py`、`agents.toml`、`prompt.py`、`contracts/` | 角色本身：工作与权限、角色模板（子目标／交付物／验收条件／确认点）、说明书与报告必填、每个角色的工具名单、系统提示与规则注入、五类协议 |
+| `execution/` | `projection.py`、`coordinator.py`、`scheduler.py`、`dispatcher.py`、`dependency.py`、`spawn.py`、`host.py`、`campaign_state.py`、`reports.py`、`report.py`、`loop.py`、`hooks.py` | 跑起来的那一层：唯一投影（`TaskSpec → AgentTask`）、计划调度、建会话与判重、分层调度、子 agent 派发、会话宿主、状态机、报告抽取、唯一驱动与外部钩子 |
 | `state/` | `event_log.py`、`ledger.py`、`memory.py`、`hypothesis.py`、`hypothesis_review.py`、`history.py`、`task.py`、`topics.py`、`trace.py` | 落在磁盘上的东西：主题与步的流水、handle 登记表、跨会话记忆、假设与假设评审、任务状态、主题视图、追踪 |
 | `research/` | `research_objects.py`、`research_workspace.py`、`workspace.py`、`evidence_registry.py` | 科研对象与工作区、证据分级 |
 
@@ -950,7 +982,8 @@ multipart 是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 
 
 四个确认点与开工盘点怎么讲、阈值多大、哪一步要用户点头，按角色与阶段拆在 `dist/rules/` 四档：
 `global/` 放不变式，`agents/` 放每个角色交什么，`stages/` 放每一步做到什么算完成，
-`references/` 放方法与阈值（不默认注入）。`AGENTS.md` 的 §9 索引指向具体文件。
+`references/` 放方法与阈值（不默认注入）。全局规则的索引指向具体文件；`AGENTS.md`
+只留给 `/init` 与人工查阅，不参与装配。
 
 ---
 
@@ -985,9 +1018,9 @@ CI 只有 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，两份�
 
 | 对象 | 回答的问题 | 什么时候产生 |
 | --- | --- | --- |
-| `IntentSpec` | 这一句话要什么：目标、约束、禁止项、要不要澄清 | 每一轮开头解析 |
+| `IntentSpec` | 这一句话要什么：目标、对象、操作、约束、期望交付；与当前任务什么关系 | 每一轮开头解析 |
 | `TaskSpec` | 这件事怎么算做完：子目标、交付物、验收条件 | 由意图编译，纯规则 |
-| `CapabilityPlan` | 要哪几个能力、谁等谁、哪些能并行 | 由任务规格路由 |
+| `AgentPlan` | 要哪几个角色、谁等谁、哪些能并行 | 由任务规格路由 |
 | `AgentTask` | 派给某个角色的一份活 | 协调器按计划生成 |
 | `AgentReport` | 它交回来什么：结论、产物、证据、局限 | 子会话结束时抽取 |
 
@@ -995,34 +1028,33 @@ CI 只有 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，两份�
 执行结果记在 `Schedule.outcomes`；`IntentSpec` 标了要澄清就必须写出问什么，反过来允许
 一句补充提问而不降级成「没解析出来」。
 
-### 12.2 十个角色与十三个能力
+### 12.2 十个角色与九项操作
 
-九个专业角色加一个 `principal`（根会话的身份）。能力到角色的映射写死在 `capabilities.py`，
-不从工具清单推导——工具名能穷举，哪个角色该拿哪些工具是领域判断。一个职责单元对应一个角色，
-角色内部不再分成两个运行实体。
+九个专业角色加一个 `principal`（根会话的身份）。每个角色的工作说明写在 `catalog.py`，
+只用于意图提示词与角色身份段，不参与路由。操作就是九个子 Agent 名；一个职责单元
+对应一个角色，角色内部不再分成两个运行实体。
 
-| 角色 | 能力 | 备注 |
+| 角色 | 负责的工作 | 备注 |
 | --- | --- | --- |
-| `research` | `target_intelligence`、`literature_evidence` | 一个角色做两件事，跨阶段 |
-| `pocket` | `structure_discovery`、`pocket_discovery`、`pocket_profiling` | 发现与画像在同一个会话里先后做 |
-| `ligand` | `ligand_intelligence` | 含化学空间与实验回填 |
-| `prepare` | `receptor_preparation` | 受体与配体两段准备 |
-| `docking` | `docking_run` | 对接与重对接验证 |
-| `affinity` | `affinity_prediction` | 单独一步，不并进评分 |
-| `analysis` | `scoring_evaluation` | 多路合成与效率体检 |
-| `mechanism` | `mechanism_analysis`、`hypothesis_validation` | 常驻 `hypothesis` 工具 |
-| `visualization` | `visualization` | 常驻 `open_viewer` 工具 |
+| `research` | 靶点身份、临床与文献证据 | 跨阶段，不加载阶段规则 |
+| `pocket` | 结构检索、口袋发现、口袋画像 | 三步在同一个会话里先后做 |
+| `ligand` | 已知配体、活性、骨架与化学空间 | 含化学空间与实验回填 |
+| `prepare` | 受体准备、配体准备 | 两段准备，各自有产物 |
+| `docking` | 对接与位姿检查 | 含重对接验证 |
+| `affinity` | 模型微调与亲和力预测 | 单独一步，不并进候选分析 |
+| `analysis` | 结果整合、候选评价与一致性检查 | 多路合成与效率体检 |
+| `mechanism` | 结合模式、关键残基、假设审查 | 常驻 `hypothesis` 工具 |
+| `visualization` | 把已登记对象做成视图页 | 常驻 `open_viewer` 工具 |
 
 科研对象那组工具跟着报告要求走，不跟着「谁做计算」走：凡报告要求 `evidence_refs` 的角色，
 名单里都有 `workspace`、`add_evidence`、`review_hypothesis`。
-旧会话里的角色名（`target`、`structure_pocket`、`conformation`、`literature`、`screening`、
-`scoring`、`hypothesis`）由 `LEGACY_ROLES` 换成新名，恢复旧会话时不会当场查不到。
+状态文件里的角色名必须是当前名字；改名前的旧会话不再恢复，兼容映射表已删除。
 
 ### 12.3 一句话到一次派发
 
 ```
-原话 → intent_parser → task_context（合并新旧约束）→ task_compiler → capability_router
-     → coordinator（能力 → 角色 → 任务号）→ dispatcher（建会话、判重）→ scheduler（按依赖分层）
+原话 → intent_parser → task_context（合并新旧约束）→ task_compiler → agent_router
+     → coordinator（角色 → 任务号）→ dispatcher（建会话、判重）→ scheduler（按依赖分层）
 ```
 
 三个必须记住的约定：
@@ -1033,15 +1065,16 @@ CI 只有 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，两份�
 
 两条同样必须记住的（2026-11-13）：
 
-- **计划要自己可执行**。路由把「没有输入就开不了跑」的前置补成节点
-  （`AUTO_PREREQUISITES`：受体准备 ← 口袋发现 + 配体情报；对接 ← 受体准备；
-  口袋画像 ← 口袋发现），用户已经给出对应输入时改记 `plan.provided_capabilities` 而不补。
+- **计划要自己可执行**。路由把「没有输入就开不了跑」的前置角色补成节点
+  （`AUTO_PREREQUISITES`：`prepare` ← `pocket` + `ligand`；`docking` ← `prepare`；
+  `affinity` ← `prepare`），用户已经给出对应输入时改记 `plan.provided_agents` 而不补。
   否则 2026-11-13 的 HA2 会话会重演：计划只有配体与对接，主 agent 想派结构角色被拒，
   而纯编排之后它自己也没有那些工具。
-- **派发可以改计划的两个方向**。`roles` 能减（上游自动补回，剩下的角色点名），
-  也能加（按能力表补进来）；自定义任务书只给被点名的那一个角色。
-  计划在一轮里是只读的，跨轮靠 `continue_task` 沿用，所以「中途发现要补一步」
-  只能走 `roles`。
+- **派发只能从计划里减角色**（2026-11-19 起）。`roles` 只能选子集，上游自动补回，
+  计划里剩下的角色要点名；计划外角色直接拒绝，要加角色先改任务规格、下一轮重新解析。
+  自定义任务书只给被点名的那一个角色。
+  计划在一轮里是只读的，跨轮靠 `continue` 沿用；中途发现要补一步，先让用户把
+  新子目标说清楚，下一轮重新解析后再派。
 
 ### 12.4 战役状态机
 
@@ -1061,11 +1094,11 @@ UNDERSTANDING → CLARIFICATION → SPECIFICATION → PLANNING → DELEGATING
 **重启之后不会一直「研究进行中」**：调度器是内存对象，进程退出就没有执行者了。
 `load_from_state` 把 `delegating` / `research` / `integration` 归一成 `failed`，并往待办里写
 「多角色执行随上次退出中断，需要重新派发」；`planning` 不动——只做过预演也会停在这一格。
-留着旧状态只会让 `agent_status` 报一个不会动的进度，模型据此不去重新派发。
+留着旧状态只会让界面报一个不会动的进度，模型据此不去重新派发。
 
 ### 12.5 验收与证据
 
-四层校验，越靠后越晚：能力守卫（这一步能不能用这个工具）→ 任务前置（输入齐不齐）→
+四层校验，越靠后越晚：工具守卫（这一步能不能用这个工具）→ 任务前置（输入齐不齐）→
 输出合同（交付物有没有对应的验证方式）→ 交付验收（轮末有没有少交）。被拦一律写成
 「工具失败」并把原因回灌给模型，不抛异常中断整轮。
 
@@ -1081,7 +1114,7 @@ UNDERSTANDING → CLARIFICATION → SPECIFICATION → PLANNING → DELEGATING
 
 ### 12.6 系统评测
 
-`tools/eval_system.py`：四份标注规格 × 八条结构不变量（约束保留、排除项保留、子目标覆盖、
+`tools/eval_system.py`：四份标注规格 × 八条结构不变量（约束分派、排除项保留、子目标覆盖、
 交付物落位、依赖无环、不重复派发、工具暴露、未决输入有交代），32/32。这八条能离线判。
 
 设计稿列的另外五项（意图准确率、用户意图保真、证据覆盖率、产物可追溯率、成本/延迟/token）

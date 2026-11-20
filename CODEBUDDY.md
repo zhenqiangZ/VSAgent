@@ -60,7 +60,7 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 那类数字随改动漂移；也不含 `web/` `viz/`）。
 
 CI 只有一个 `.github/workflows/ci.yml`：Linux 上两个 job——内核 job 依次跑
-`check_repo.py`（凭据扫描，不装依赖也能跑）、`test_agent.py`、`check_capabilities.py`、
+`check_repo.py`（凭据扫描，不装依赖也能跑）、`test_agent.py`、`check_agents.py`、
 `check_toolset.py`、`check_tool_descriptions.py`、`check_tools_doc.py`、`check_prefix.py`、`check_style.py`，界面 job 跑 `test_smoke.py`
 （它是超集，末尾会重跑 `test_agent.py` 的全部断言）。**两份依赖都装**（叠合与先验口袋
 那几条断言需要 gemmi，缺了会直接抛出 ToolError）。本地想一次跑完用 `tools/check_all.py`。
@@ -342,7 +342,7 @@ graph TD
   注册表只装一份、含全部工具，`Registry.specs(only=…)` 按名单过滤。
   模型看不见某个工具时最容易直接叫它的名字，所以 `loop.missing_tool_reason` 会说
   「这个角色没有装配 X，要它请改 agents.toml，或把这件事派给装了它的角色」。
-  名单与额度的判据在 `tools/check_capabilities.py`（逐角色 10,000 提示 / 12,000 判失败）
+  名单与额度的判据在 `tools/check_agents.py`（逐角色 10,000 提示 / 12,000 判失败）
   与 `tools/check_toolset.py`（两档基础档 8,000 / 5,300）。
 - `prompt.py` — `stable_prefix` 组装：身份 → **假设规则** → 工作方式 → shell → 登记表 →
   记忆 → 事件 →（派发）→ 项目规则。**前缀里不放时间不放进度**，否则每步都击穿 prompt cache。
@@ -822,7 +822,7 @@ widget 的 `DEFAULT_CSS` 用 `palette.css("""…""")` 包一层，Rich 标记用
 - **新增领域工具**：在模块里加 `domain_tools()` 返回值 → 需要的话在 `domain/__init__.py` 的
   `__all__` 补名字 → 在 `roles/agents.toml` 里把它加进要用的角色名单 →
   在 `debug_tools.py` 的 `CALLS` 补一行（顺序是依赖顺序）→ 过一遍 `domain/__init__.py`
-  的九条纪律。忘了写名单会被 `tools/check_capabilities.py` 抓出来：领域工具必须
+  的九条纪律。忘了写名单会被 `tools/check_agents.py` 抓出来：领域工具必须
   至少出现在一个角色名单里，否则没有任何会话能调它。
 - **依赖注入通道是声明式的**：工具靠 `Tool` 的类属性声明要什么，不要在 `run()` 里
   `assert ledger is not None` 然后自己抛出——内核统一返回「内核装配问题」。

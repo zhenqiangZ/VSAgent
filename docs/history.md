@@ -1,7 +1,7 @@
 # 计划与决策
 
 > 角色：计划与记录（每一项当时为什么这么定）
-> 状态：随工作推进更新，最后核对 2026-11-16
+> 状态：随工作推进更新，最后核对 2026-11-18
 > 配套：`design.md`（现在是什么样）、`review.md`（读数）、`reference.md`（判据）、
 > `ten-agent-design.md`（角色职责）
 
@@ -153,6 +153,24 @@
   多一份就会多一处与状态文件不一致的地方，能晚建就晚建。
 - **判据**：1000 个会话、5000 条主题时 `scope=all` 的 p95 低于 100 ms、状态文件保存低于
   200 ms；超过就升级。
+
+### 1.14 收束阶段按层级与角色放行（2026-11-18）
+
+- **约束**：一次真实战役（`ses_0058`）派了 research / pocket / ligand 三个子 agent，
+  四个会话全部 24 步用满。旧名单只放 `write_run` / `close_topic` / `task` / `read_turn` /
+  `recall_event` / `search_history`，而子 agent 最后三步要做的是 `add_evidence`、
+  `workspace`、`read`、`registry`，全部被拦；`write_run` 是把受体与口袋写成运行目录的工具，
+  三个子 agent 一次都没用过。收尾语还统一让它们「写进 write_run」。
+- **做法**：`WORKER_CLOSING` 与 `ROOT_CLOSING` 分开，`write_run` 只给 prepare / docking /
+  visualization；拒绝文案按层级给，不再指向 `write_run`。子 agent 不再显示「这一段已经很长，
+  先调 close_topic」，内核也不按主题预算主动封存它。非正常结束时，报告结论优先取收尾总结；
+  报告判据补一条：结论不能空，且非正常结束时至少有一条去掉路径与编号后仍有 30 字。
+- **依据**：三个子 agent 在第 9–13 步被主题提示催着封存，之后用 3–5 步 `recall_event`
+  或重读把细节捞回来，这是「半路停下」的主要来源。`ses_0060` 的总结完整、正文只有一行
+  文件路径，父会话拿到的却是正文；报告仍因引用非空判了合格。
+- **判据**：`closing-gate` 组——层级与角色的放行名单、与 `_EXECUTE_TOOLS` 不重叠；
+  子 agent 不按主题预算封存；非正常结束优先取总结；一句话路径判不合格。
+- **没做**：角色步数预算。这一轮先只改收束方式，步数仍统一 24，留给下一次按角色配置。
 
 ---
 
@@ -637,6 +655,7 @@ Linux 上两个 job：内核跑 `tests/test_agent.py`、`tools/check_prefix.py` 
 
 - **约束**：「战役」是内部对一次多角色执行的叫法，进了界面没人看得懂。
 - **做法**：`agent_status` 第一行写「多角色执行」；代码里的 `campaign_*` 标识不动。
+  （2026-11-19 这个工具已删除，见 11.13。）
 - **依据**：P-82。
 
 ### 11.12 代码分五组，判据一条命令
@@ -647,6 +666,40 @@ Linux 上两个 job：内核跑 `tests/test_agent.py`、`tools/check_prefix.py` 
   `research` 五组，根上只留跨组的基础设施；`tools/check_all.py` 按固定顺序跑九条判据。
 - **依据**：P-84。
 - **判据**：`tools/check_all.py`。
+
+### 11.13 派发改为阻塞，任务书分三层（2026-11-19）
+
+- **约束**：2026-11-19 的 HA2 会话里，意图只要求 1 个角色，主模型却用 `roles` 把 pocket、ligand
+  塞进计划；扩进来的角色没有交付物与验收条件，三份任务书都以父目标「制定一份计划」开头、
+  约束完全相同，三个子 agent 各做了一遍计划；父会话只能反复阻塞等待，子 agent 分别烧了
+  171k / 401k / 418k token。
+- **做法**：
+  1. `roles` 只能从计划里减，计划外角色直接拒绝；要加角色先改任务规格、下一轮重新解析。
+  2. 任务书分三层：本角色职责（`objective`）、父任务背景（`background`，明确不要重复完成）、
+     边界与交付；`task_state` 里没有前缀的约束不再下发。
+  3. `dispatch_campaign(confirm=true)` 阻塞到全部子 agent 结束，结果由工具返回带回；
+     用户中断时整场执行与子会话一起停。
+  4. 删除 `agent_status`：正常路径不再需要查询，中断后也没有遗留报告。
+  5. `partial` 同时计入「结束」，`campaign.done` 事件单列 `partial`，不再从两个列表里同时消失。
+- **依据**：`ses_0072` 的路由日志与三份任务书原文。
+- **判据**：`tests/test_agent.py --only campaign-dispatch`、`--only coordinator`、`--only scheduler`；
+  `tools/check_agents.py`、`tools/check_tools_doc.py`。
+
+### 11.14 子 agent 的限制改为派发时按角色写（2026-11-20）
+
+- **约束**：11.13 之后，限制还有两条「文本搬运」的路：`task_state.constraints` 里带前缀或写
+  「全局」的条目被原样挑出来下发；`spec.constraints` 按前缀切给角色，不带前缀的广播给所有人。
+  这两句都不是按这一段子任务写的；前缀写错还会静默变全局或丢掉。
+- **做法**：
+  1. `dispatch_campaign` 增加 `constraints`：键是角色名或 `global`，值是字符串数组；
+     `confirm=true` 必填，没有额外限制就传 `{}`；键写成这次不派或不存在的角色直接拒绝。
+  2. 删除前缀解析（`CONSTRAINT_PREFIX`、`split_constraints`、`_role_scoped`）；`project()`
+     只接收 `{角色: [正文]}`，再与角色说明书里的固定限制合并。
+  3. `spec.constraints` 不再自动下发；预览时把原话列出来，提醒父 agent 按角色重写。
+  4. `task` 工具不再承诺「角色名：要求」会自动分给角色。
+- **依据**：同一批任务书；「谁该遵守哪一句」在代码里猜不出来，只有派发那一刻看着子任务才判得准。
+- **判据**：`tests/test_agent.py --only coordinator`、`--only campaign-dispatch`、`--only task-state`；
+  `tools/eval_system.py` 的「约束分派」；`tools/check_tools_doc.py`。
 
 ---
 
@@ -669,7 +722,27 @@ Linux 上两个 job：内核跑 `tests/test_agent.py`、`tools/check_prefix.py` 
 
 ---
 
-## 十三、未完成
+## 十三、意图识别重构（2026-11-17）
+
+- **约束**：旧实现有 14 个意图类型，再经过一层能力名才落到角色；`IntentSpec` 只有一段
+  任务摘要，指代“它”“之前那个”“第二个口袋”时没有对象表；`turn_mode` 把任务关系与
+  对话行为混在一起，缺少比较、查进度与取消。
+- **做法**：意图类型直接改成九个子 Agent 名；`IntentSpec` 改成五个维度（目标、对象、
+  操作、约束、期望交付）加两条轴（任务关系、对话行为）；解析前加 `ContextResolver`，
+  提供任务、对象、产物与待澄清四段现场；解析后加 `IntentValidator`，输出
+  accept/clarify/update/reject；`Session` 增加 `pending_intent` 与 `route_note`；
+  `CapabilityPlan` 改成 `AgentPlan`，只记角色、依赖与确认点。
+- **依据**：能力层没有独立的决策价值，操作落到角色就够了；多轮科研任务最需要的是
+  对象连续性与任务连续性，完整聊天历史既贵又不准。
+- **不做**：不把 `operations` 放开成自由动词；不让模型直接生成 `TaskSpec`；不把完整
+  历史交给解析器；不把 `dependencies` 放进 `TaskSpec`。
+- **判据**：`tests/test_agent.py` 的 catalog、router、task-compiler、task-context、
+  context-resolver、intent-validator、route、intent-parser 各组；`tools/check_agents.py`
+  核对角色、模板、阶段与提示词覆盖；九条判据全部通过。
+- **数据**：备份 `~/.vsagent/state.toml` 后删除 15 个带 `capability` 子目标的旧会话，
+  剩余 37 个；不写字段映射。
+
+## 十四、未完成
 
 | 项 | 现状 | 下一步 |
 | --- | --- | --- |

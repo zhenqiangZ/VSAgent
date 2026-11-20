@@ -61,12 +61,10 @@ from vsagent.core.models import Session  # noqa: E402
 # 固定那几段的预算：身份、假设契约、路线判断、操作纪律、shell、登记表、记忆、事件。
 # 这几段每步都发，涨了会挤压最近几轮的原文，所以照旧卡住。
 PREFIX_BUDGET = 1900
-# 一份角色规则的预算。角色规则进稳定前缀，每多一份就在每一步重复计费；
-# 400 是其余角色的实测上界，留了余量，但不允许它们长成第二本手册。
-# 主控承接了原 `AGENTS.md` 的交付、禁止与检查清单，单独给 1,200 的额度；
-# 整段前缀仍有 `PREFIX_BUDGET` 兜底，主控不会把窗口吃满。
-ROLE_RULE_BUDGET = 400
-ROLE_RULE_BUDGETS: dict[str, int] = {"principal": 1_200}
+# 一份角色规则的预算。角色规则进稳定前缀，每多一份就在每一步重复计费。
+# 2026-11-20 起角色规则换成英文模板，实测 887–1,022 token；统一按 1,200 卡，
+# 仍能拦住继续膨胀的那一份。
+ROLE_RULE_BUDGET = 1_200
 # 规则文件（`AGENTS.md`）不设上限：它是许可与判据的来源，少一条就可能让模型做一个
 # 本来被禁止的动作。这里只报它的体量，供改的人心里有数。
 # 这些句式一出现就说明有人又在提示里抄了一份会过期的清单。
@@ -260,7 +258,7 @@ def main() -> int:
     # 总和会随着角色变多而涨，那时该拆的是内容，不是放宽这一条。
     for role in ROLES:
         tokens = estimate_tokens(agent_rules(base, role))
-        limit = ROLE_RULE_BUDGETS.get(role, ROLE_RULE_BUDGET)
+        limit = ROLE_RULE_BUDGET
         if tokens > limit:
             failures.append(f"{role} 的角色规则 {tokens} token，超过 {limit}")
 

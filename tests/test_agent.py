@@ -1190,9 +1190,9 @@ def check_rules_tier() -> None:
             head.startswith("# ") and TITLES[role].startswith(head[2:]),
             f"{role} 的规则标题与说明书一致：{head} / {TITLES[role]}",
         )
-        # 主控承接了原 AGENTS.md 的交付、禁止与检查清单，额度单独放宽；
-        # 其余角色仍然按 400 卡，避免角色规则长成第二本手册。
-        limit = 1_200 if role == "principal" else 400
+        # 角色规则 2026-11-20 换成英文模板，实测 887–1,022 token；统一按 1,200 卡，
+        # 主控那份也在这个额度内，避免角色规则继续长成第二本手册。
+        limit = 1_200
         check(
             estimate_tokens(text) <= limit,
             f"{role} 的规则不超过 {limit} token：{estimate_tokens(text)}",

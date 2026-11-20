@@ -1,4 +1,4 @@
-# Prepare Agent
+# 准备：受体与配体
 
 ## 1. Mission
 

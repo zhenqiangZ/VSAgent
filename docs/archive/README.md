@@ -19,6 +19,7 @@
 | `runtime-fixes-plan.md` | 2026-11-11 | 运行期问题的第一轮修复计划 | `../history.md` 一、七 |
 | `runtime-fixes-plan-2.md` | 2026-11-11 | 运行期问题的第二轮修复计划 | `../history.md` 一、七 |
 | `knowledge-center-plan.md` | 2026-11-08 | 网页端知识中心 M0–M6 的改造计划 | `../design.md` §6.7、§8.1 |
+| `intent-rework-plan.md` | 2026-11-19 | 意图走线重构的迁移计划：目标、边界、四个阶段与完成判据 | `../intent-flow.md` |
 
 归档里的相对链接（如 `pocket-issues.md` 指向 `retrieval-overreliance.md`）仍然有效，
 因为它们被一起移了进来。

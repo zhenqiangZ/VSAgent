@@ -628,7 +628,7 @@ graph TD
 真相在 `~/.vsagent/state.toml`（`session_manager.py:default_state_path()`），TOML + `STATE_VERSION=2`。
 同目录还有 `connection.toml`（模型接口，权限 0600）、`ledgers/`（按会话 id 隔离），traces 在 `logs/`，运行产物在仓库根的 `runs/`。
 
-写入是**原子替换**：同目录临时文件 → flush → `os.fsync` → `_replace_with_retry`（40 次 × 5ms 重试 `PermissionError`）。
+全部原子写入只有一份实现：`core/atomic.py` 的 `write_text` / `write_bytes`，同目录临时文件 → flush → `os.fsync` → `replace_with_retry`（40 次 × 5ms 重试 `PermissionError`）。新增写入点直接调用它，不要另抄一遍。
 读回来调 `sync_sequences` 把 ID 计数器推进到已加载 ID 之前。网页端**每个请求都重新从磁盘读**，
 所以网页看到的永远和 `state.toml` 一致——这是它跟 TUI 之间唯一的数据通路，没有 SSE、没有 websocket。
 

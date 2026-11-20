@@ -950,8 +950,8 @@ multipart 是简单请求，少了这一道，任何网页都能往 `127.0.0.1` 
 `STATE_VERSION = 2`。同目录还有 `connection.toml`（模型接口，权限 0600）、`ledgers/`
 （按会话 id 隔离）；trace 在 `logs/`，运行产物在仓库根的 `runs/`。
 
-写入是原子替换：同目录临时文件 → flush → `os.fsync` → `_replace_with_retry`（40 次 × 5 ms
-重试 `PermissionError`）。读回来调 `sync_sequences` 把 ID 计数器推进到已加载 ID 之前。
+全部原子写入只有一份实现：`core/atomic.py` 的 `write_text` / `write_bytes`，同目录临时文件 →
+flush → `os.fsync` → `replace_with_retry`（40 次 × 5 ms 重试 `PermissionError`）。读回来调 `sync_sequences` 把 ID 计数器推进到已加载 ID 之前。
 网页端每个请求都重新从磁盘读，这是它跟终端之间唯一的数据通路，没有 SSE、没有 websocket。
 
 会话标题的来源记在 `Session.title_source`：`default`（占位）、`placeholder`（首句截断）、

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import threading
 import time
@@ -10,11 +9,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+from vsagent.core import atomic
 from vsagent.core.paths import config_home
-
-# 换名在目标文件正被别的进程打开时会被系统拒绝，隔几毫秒重试。
-REPLACE_ATTEMPTS = 40
-REPLACE_RETRY_DELAY = 0.005
 
 KINDS: tuple[str, ...] = ("receptor", "ligandset", "artifact")
 """登记表里的三类条目。
@@ -832,19 +828,9 @@ class SessionLedger:
         if target is None:
             return None
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            staged = target.with_name(
-                f".{target.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+            atomic.write_text(
+                target, json.dumps(self.as_dict(), ensure_ascii=False, indent=2)
             )
-            try:
-                with staged.open("w", encoding="utf-8") as handle:
-                    json.dump(self.as_dict(), handle, ensure_ascii=False, indent=2)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                _replace_with_retry(staged, target)
-            except BaseException:
-                staged.unlink(missing_ok=True)
-                raise
         except OSError:
             return None
         return target
@@ -936,18 +922,6 @@ def _meta_contains(meta: dict[str, Any], wanted: dict[str, Any] | None) -> bool:
     if not wanted:
         return True
     return all(meta.get(key) == value for key, value in wanted.items())
-
-
-def _replace_with_retry(staged: Path, target: Path) -> None:
-    """把临时文件换名到目标位置，遇到占用就稍等再试。"""
-    for attempt in range(REPLACE_ATTEMPTS):
-        try:
-            os.replace(staged, target)
-            return
-        except PermissionError:
-            if attempt == REPLACE_ATTEMPTS - 1:
-                raise
-            time.sleep(REPLACE_RETRY_DELAY)
 
 
 def ledger_root() -> Path:

@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from vsagent.core import atomic
 from vsagent.core.paths import config_home
 
 from . import prompts
@@ -86,13 +87,9 @@ def save_answer(state: AnswerState, state_dir: Path | None, session_id: str) -> 
     先写临时文件再换名：写到一半被中断时，目录里不会留下半份 JSON。
     """
     target = answer_path(state_dir, session_id, state.answer_id)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(state.to_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    atomic.write_text(
+        target, json.dumps(state.to_dict(), ensure_ascii=False, indent=2)
     )
-    temporary.replace(target)
     return target
 
 

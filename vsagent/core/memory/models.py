@@ -41,10 +41,6 @@ PREFERENCE_LIMIT = 200
 # 而那时注入的一半内容与当前任务无关。
 MAX_PREFERENCES = 8
 
-# 换名在目标文件正被别的进程打开时会被系统拒绝，隔几毫秒重试。
-REPLACE_ATTEMPTS = 40
-REPLACE_RETRY_DELAY = 0.005
-
 # 条目引用的文件状态。与登记表用同一套说法，读的人不必分辨这是哪一处的状态。
 FILE_STATE_NOTES: dict[str, str] = {
     "ok": "文件在，内容与登记时一致",

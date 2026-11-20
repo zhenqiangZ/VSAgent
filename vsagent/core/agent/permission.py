@@ -5,13 +5,13 @@ import os
 import re
 import sys
 import tempfile
-import time
 import tomllib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
+from .. import atomic
 from ..file_log import record as log_read
 from ..paths import CONFIG_DIRECTORY
 from .tools import Tool
@@ -606,10 +606,5 @@ def save_disabled(root: Path, names: Iterable[str]) -> Path:
         "[tools]",
     ]
     lines.extend(f"{name} = false" for name in sorted(names))
-    staged = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
-    with staged.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join(lines) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(staged, path)
+    atomic.write_text(path, "\n".join(lines) + "\n", newline="\n")
     return path

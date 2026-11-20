@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from . import atomic
 from .paths import project_root
 
 __all__ = [
@@ -198,25 +199,12 @@ def write_web_page(*, source_id: str, content: str, meta: dict[str, Any]) -> Pat
 
 def atomic_write_text(path: Path, text: str) -> None:
     """同目录临时文件 → `fsync` → `os.replace`。中途失败不留半截目标文件。"""
-    atomic_write_bytes(Path(path), text.encode("utf-8"))
+    atomic.write_text(path, text)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """写入字节。**上传的 PDF 走这一条**——按文本写会把二进制毁掉。"""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle_fd, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(handle_fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
+    atomic.write_bytes(path, data)
 
 
 def copy_file_atomic(source: Path, target: Path) -> None:

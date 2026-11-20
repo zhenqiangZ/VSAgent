@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import atomic
 from .models import PartType, Session, ToolStatus
 
 LIVE_DIRECTORY = "live"
@@ -167,10 +168,9 @@ def write(state_path: Path, session: Session, *, running: bool) -> None:
     """
     payload = snapshot(session, running=running)
     target = path_for(state_path, session.id)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_name(f"{target.name}.tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(temp, target)
+    atomic.write_text(
+        target, json.dumps(payload, ensure_ascii=False), fsync=False
+    )
 
 
 def read(state_path: Path, session_id: str, *, now: float | None = None) -> dict[str, Any] | None:

@@ -1,23 +1,17 @@
 from __future__ import annotations
 
-import os
-import time
 import tomllib
 from pathlib import Path
 from typing import Any
 
 import tomli_w
 
+from . import atomic
 from .file_log import record as log_read
 from .models import Session, new_session_id, sync_sequences
 from .paths import config_home
 
 STATE_VERSION = 2
-
-# 换名在目标文件正被别的进程打开时会被系统拒绝，隔几毫秒重试。
-# 读的人打开文件的时间只有几毫秒，几次之内就能换过去。
-REPLACE_ATTEMPTS = 40
-REPLACE_RETRY_DELAY = 0.005
 
 # 侧栏宽度的取值区间。下限保证标题还能认出几个字，上限保证中间那一栏不会被挤没。
 RAIL_MIN, RAIL_MAX = 16, 60
@@ -218,17 +212,7 @@ class SessionManager:
         先缩到零字节再分段长回来，中间任何时刻去读都是半截内容。
         """
         target = Path(path) if path else self.state_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        staged = target.with_name(f".{target.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
-        try:
-            with staged.open("wb") as handle:
-                tomli_w.dump(self.to_state(), handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            _replace_with_retry(staged, target)
-        except BaseException:
-            staged.unlink(missing_ok=True)
-            raise
+        atomic.write_text(target, tomli_w.dumps(self.to_state()), newline="")
         return target
 
     def load_from_toml(self, path: str | Path | None = None) -> bool:
@@ -291,18 +275,3 @@ def default_state_path() -> Path:
     """返回默认状态文件路径。"""
     return config_home() / "state.toml"
 
-
-def _replace_with_retry(staged: Path, target: Path) -> None:
-    """把临时文件换名到目标位置，遇到占用就稍等再试。
-
-    换名在目标文件正被别的进程打开时会被系统拒绝，读的人打开文件的时间
-    只有几毫秒，隔几毫秒重试几次就能换过去。
-    """
-    for attempt in range(REPLACE_ATTEMPTS):
-        try:
-            os.replace(staged, target)
-            return
-        except PermissionError:
-            if attempt == REPLACE_ATTEMPTS - 1:
-                raise
-            time.sleep(REPLACE_RETRY_DELAY)

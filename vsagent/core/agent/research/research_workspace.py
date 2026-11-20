@@ -18,14 +18,13 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from vsagent.core import atomic
 from vsagent.core.paths import config_home
-from vsagent.core.agent.state.ledger import REPLACE_ATTEMPTS, REPLACE_RETRY_DELAY
 from vsagent.core.agent.research.research_objects import (
     KINDS,
     ObjectError,
@@ -102,22 +101,12 @@ class ResearchWorkspace:
                 "objects": [obj.to_dict() for obj in self._objects.values()],
             }
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_name(target.name + ".tmp")
-            tmp.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+            atomic.write_text(
+                target, json.dumps(payload, ensure_ascii=False, indent=1)
             )
-            for attempt in range(REPLACE_ATTEMPTS):
-                try:
-                    os.replace(tmp, target)
-                    return target
-                except PermissionError:
-                    if attempt == REPLACE_ATTEMPTS - 1:
-                        raise
-                    time.sleep(REPLACE_RETRY_DELAY)
         except OSError:
             return None
-        return None
+        return target
 
     # ------------------------------------------------------------------
     # 登记与查询

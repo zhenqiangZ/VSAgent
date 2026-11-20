@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 from ..file_log import record as log_read
+from .. import atomic
 from .lifecycle import MemoryLifecycle, _reject_handle
 from .models import (
     MAX_ENTRIES,
     MAX_PREFERENCES,
     MEMORY_TEXT_LIMIT,
-    REPLACE_ATTEMPTS,
-    REPLACE_RETRY_DELAY,
     SNAPSHOT_VERSION,
     MemoryEntry,
     MemoryError,
@@ -386,32 +384,7 @@ class MemoryStore(MemoryRetriever, MemoryLifecycle):
     def _atomic_write(self, target: Path, text: str) -> None:
         """原子换名写一个文本文件。
 
-        先写同目录下的临时文件，写完 fsync 再换名到目标位置。直接往目标
-        文件里写的话，读的人会看到写了一半的内容——而被截断在 JSON 边界上
-        的那份内容仍是合法 JSON，这让「写坏」比「写没」难查得多。
+        读的人会看到写了一半的内容——而被截断在 JSON 边界上的那份内容仍是
+        合法 JSON，这让「写坏」比「写没」难查得多。
         """
-        target.parent.mkdir(parents=True, exist_ok=True)
-        staged = target.with_name(
-            f".{target.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
-        )
-        try:
-            with staged.open("w", encoding="utf-8") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            _replace_with_retry(staged, target)
-        except BaseException:
-            staged.unlink(missing_ok=True)
-            raise
-
-
-def _replace_with_retry(staged: Path, target: Path) -> None:
-    """把临时文件换名到目标位置，遇到占用就稍等再试。"""
-    for attempt in range(REPLACE_ATTEMPTS):
-        try:
-            os.replace(staged, target)
-            return
-        except PermissionError:
-            if attempt == REPLACE_ATTEMPTS - 1:
-                raise
-            time.sleep(REPLACE_RETRY_DELAY)
+        atomic.write_text(target, text)

@@ -12,12 +12,11 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
+from vsagent.core import atomic
 from vsagent.core.agent.state.ledger import fingerprint_parts
 
 PARAMS_FILE = "params.json"
@@ -84,21 +83,11 @@ def read_json(path: Path) -> Any:
 
 
 def write_text_atomic(path: Path, text: str) -> None:
-    """同目录临时文件 → fsync → `os.replace`。中途失败不会留下半截目标文件。"""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle_fd, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(handle_fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
+    """同目录临时文件 → fsync → `os.replace`。中途失败不会留下半截目标文件。
+
+    `newline=""` 保留调用方给的换行：产物里的 CSV 与清单在各平台都写 `\n`。
+    """
+    atomic.write_text(path, text, newline="")
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:

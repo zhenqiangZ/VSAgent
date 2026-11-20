@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import os
-import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 import tomli_w
+
+from . import atomic
 
 CONNECTION_FILE = "connection.toml"
 CONNECTION_VERSION = 1
@@ -86,19 +86,8 @@ def save_connection(path: Path, connection: Connection) -> Path:
         payload["price_in"] = connection.price_in
     if connection.price_out is not None:
         payload["price_out"] = connection.price_out
-    staged = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
-    with staged.open("wb") as handle:
-        tomli_w.dump(payload, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        os.chmod(staged, 0o600)
-    except OSError:
-        # 有些文件系统（以及 Windows）不接受这个位，能用就行。
-        pass
-    os.replace(staged, path)
+    atomic.write_text(path, tomli_w.dumps(payload), newline="", mode=0o600)
     return path
-
 
 def _optional_int(value: object) -> int | None:
     """把 TOML 里的数转成正整数，空值或转不了时当作没写。"""

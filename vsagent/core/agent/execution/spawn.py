@@ -17,7 +17,11 @@ from typing import Any, Iterable
 
 from vsagent.core.models import Message, Part, PartType, Session
 from vsagent.core.agent.execution import campaign_state
+from vsagent.core.agent.execution.projection import RolePlan
+from vsagent.core.agent.roles import catalog
+from vsagent.core.agent.roles.contracts.task import ACCEPTANCE_KINDS
 from vsagent.core.agent.roles.prompt import estimate_tokens, translate_message
+from vsagent.core.agent.roles.templates import template_for
 from vsagent.core.agent.tools import Tool, ToolError, ToolResult, ToolSpec
 
 # 复制时跳过的 Part：它们是「上一轮怎么跑的」过程标记，不是对话内容。
@@ -181,6 +185,9 @@ class DispatchCampaignTool(Tool):
             "`constraints` 由你按每个角色这一段的任务写：键是角色名或 global，值是要求原文。"
             "它不从父会话自动抄；没写的角色只带角色说明书里的固定限制。"
             "confirm=true 时必填，没有额外限制就传 {}。\n"
+            "路由自动补出来的上游角色在任务规格里没有子目标；给它们写 `plans`"
+            "（每个角色一段 goals 与 acceptance_criteria），否则 confirm=true 会拒绝派发。"
+            "任务规格里已经有子目标的角色也可以补写，条目只增不减。\n"
             "不适用：一次调用就能做完的事、或下一步要用到你此刻的推理时，不要派"
             "（子 agent 看不到你的推理）。缺任务规格时先让用户把目标、对象与交付物说清楚。\n"
             "confirm=false 只返回计划预览（角色、谁等谁），不建会话、不跑计算；"
@@ -225,8 +232,41 @@ class DispatchCampaignTool(Tool):
                     "type": "string",
                     "description": (
                         "自定义任务书，只给 roles 指定的那一个角色用；"
-                        "不给则按子目标自动拼"
+                        "不给则按子目标自动拼。同一个角色不要再写 plans.goals"
                     ),
+                },
+                "plans": {
+                    "type": "object",
+                    "description": (
+                        "按角色补写的计划。键是这次要派的角色名；每格给 goals 与 "
+                        "acceptance_criteria 至少一项。它只影响这一次投影，不写回任务规格"
+                    ),
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "goals": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "acceptance_criteria": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": {
+                                            "type": "string",
+                                            "enum": list(ACCEPTANCE_KINDS),
+                                        },
+                                        "target": {"type": "string"},
+                                        "output": {"type": "string"},
+                                    },
+                                    "required": ["kind", "target"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
                 },
                 "timeout": {
                     "type": "number",
@@ -312,12 +352,23 @@ class DispatchCampaignTool(Tool):
                 "按角色写成一张表，键是角色名或 global，值是字符串数组；"
                 "这一场没有额外限制就传 {}。"
             )
+        plans = _role_plans(arguments.get("plans"), chosen)
+        single = list(roles) if roles is not None else list(routing.plan.selected_agents)
+        if custom and len(single) == 1:
+            target = single[0]
+            planned = plans.get(target) if plans else None
+            if planned is not None and planned.goals:
+                raise ToolError(
+                    f"task 与 plans[\"{target}\"].goals 只能留一个："
+                    "自定义任务书已经替代了这个角色的子目标"
+                )
         tasks, warnings = build_tasks(
             routing.plan,
             spec,
             roles=roles,
             task=custom,
             constraints=written,
+            role_plans=plans,
         )
         # 路由那边的告警也要带上：补派了哪些计划外角色、补了哪些前置，都在那里。
         warnings = list(routing.warnings) + list(warnings)
@@ -328,13 +379,24 @@ class DispatchCampaignTool(Tool):
         if custom:
             # 按**请求的**角色判，不按补完上游后的任务数：请求一个下游角色时，
             # 上游是按依赖补进来的，不该因此把这条路堵死（P-83）。
-            single = list(roles) if roles is not None else list(routing.plan.selected_agents)
             if len(single) != 1:
                 names = "、".join(single)
                 raise ToolError(
                     f"自定义任务书一次只给一个角色；现在指定了 {len(single)} 个"
                     f"（{names}）。用 roles 指定是哪一个，或去掉 task。"
                 )
+        covered = {str(row.get("agent") or "") for row in spec.subgoals}
+        covered.update(role for role, plan in (plans or {}).items() if plan.goals)
+        if custom and len(single) == 1:
+            covered.add(single[0])
+        missing_plan = [task.role for task in tasks if task.role not in covered]
+        if missing_plan and arguments.get("confirm"):
+            raise ToolError(
+                "这些角色没有子目标，不能直接派发："
+                + "、".join(missing_plan)
+                + "。路由补出来的上游角色要在 `plans` 里给每个角色写 goals"
+                "（可以再加 acceptance_criteria），再调用一次。"
+            )
         preview = _campaign_preview(routing.plan, tasks, warnings)
         if written is None and spec.constraints:
             # 预览时还没写限制：把任务规格里的原话摆出来，提醒它按角色重写。
@@ -404,6 +466,7 @@ class DispatchCampaignTool(Tool):
                 roles=roles,
                 task=custom,
                 constraints=written,
+                role_plans=plans,
                 on_dispatch=lambda task, child: dispatched.append(child.id),
             ),
             on_done=lambda campaign: _record_campaign(session, campaign),
@@ -604,6 +667,105 @@ def _requested_roles(arguments: dict[str, Any]) -> list[str] | None:
     return roles
 
 
+def _role_plans(raw: Any, chosen: Iterable[str]) -> dict[str, RolePlan] | None:
+    """把派发时补写的计划理成 {角色: RolePlan}。没写返回 None。
+
+    键只认这一场实际派发的角色。验收条件指向的交付物必须在这个角色的模板里；
+    角色只有一个交付物时可以省 `output`，多个就必须写明，不替它猜。
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ToolError(
+            'plans 要写成一张表，例如 {"prepare": {"goals": ["准备受体与配体"]}}'
+        )
+
+    names = list(chosen)
+    out: dict[str, RolePlan] = {}
+    for key, value in raw.items():
+        role = str(key).strip()
+        if not role:
+            raise ToolError("plans 的键要是角色名，不能是空串")
+        if role not in names:
+            if role in catalog.AGENTS:
+                raise ToolError(
+                    f"这次不派 {role}，写计划也没有人去执行。"
+                    f"这次派的是：{'、'.join(names)}"
+                )
+            raise ToolError(f"没有这个角色：{role}。可用：{'、'.join(catalog.AGENTS)}")
+        if not isinstance(value, dict):
+            raise ToolError(f"plans 里 {role} 的值要写成对象")
+        extra = set(value) - {"goals", "acceptance_criteria"}
+        if extra:
+            raise ToolError(
+                f"plans 里 {role} 有不认识的字段：{'、'.join(sorted(extra))}；"
+                "可用 goals、acceptance_criteria"
+            )
+        goals_raw = value.get("goals") or []
+        if isinstance(goals_raw, str):
+            goals_raw = [goals_raw]
+        if not isinstance(goals_raw, (list, tuple)) or any(
+            not isinstance(item, str) for item in goals_raw
+        ):
+            raise ToolError(f"plans 里 {role}.goals 要写成字符串数组")
+        goals = tuple(item.strip() for item in goals_raw if item.strip())
+
+        rows = value.get("acceptance_criteria") or []
+        if not isinstance(rows, (list, tuple)):
+            raise ToolError(f"plans 里 {role}.acceptance_criteria 要写成数组")
+        outputs = template_for(role).required_outputs
+        criteria: list[dict[str, str]] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise ToolError(
+                    f"plans 里 {role}.acceptance_criteria[{index}] 要写成对象"
+                )
+            extra = set(row) - {"kind", "target", "output"}
+            if extra:
+                raise ToolError(
+                    f"plans 里 {role}.acceptance_criteria[{index}] 有不认识的字段："
+                    f"{'、'.join(sorted(extra))}"
+                )
+            kind = str(row.get("kind") or "").strip()
+            if kind not in ACCEPTANCE_KINDS:
+                raise ToolError(
+                    f"plans 里 {role}.acceptance_criteria[{index}].kind 不认识：{kind!r}。"
+                    f"可用：{'、'.join(ACCEPTANCE_KINDS)}"
+                )
+            target = str(row.get("target") or "").strip()
+            if not target:
+                raise ToolError(
+                    f"plans 里 {role}.acceptance_criteria[{index}].target 不能为空"
+                )
+            output = str(row.get("output") or "").strip()
+            if output:
+                if output not in outputs:
+                    raise ToolError(
+                        f"plans 里 {role}.acceptance_criteria[{index}].output 不在"
+                        f"这个角色的交付物里：{output!r}。"
+                        f"可用：{'、'.join(outputs)}"
+                    )
+            elif len(outputs) == 1:
+                output = outputs[0]
+            else:
+                raise ToolError(
+                    f"plans 里 {role}.acceptance_criteria[{index}] 要写明 output，"
+                    f"这个角色有多个交付物：{'、'.join(outputs)}"
+                )
+            criteria.append(
+                {"kind": kind, "target": target, "output": output}
+            )
+        if not goals and not criteria:
+            raise ToolError(
+                f"plans 里 {role} 是空的：goals 与 acceptance_criteria 至少写一项"
+            )
+        out[role] = RolePlan(
+            goals=goals,
+            acceptance_criteria=tuple(criteria),
+        )
+    return out
+
+
 def _written_constraints(
     raw: Any, chosen: Iterable[str]
 ) -> dict[str, list[str]] | None:
@@ -681,7 +843,11 @@ def _campaign_preview(plan: Any, tasks: list[Any], warnings: Iterable[Any]) -> s
             role_label(roles.get(dep, dep)) for dep in task.dependencies
         )
         tail = f"；等 {waits}" if waits else ""
-        lines.append(f"- {role_label(task.role)}（{task.role}）：{goal}{tail}")
+        outputs = "、".join(task.required_outputs) or "无"
+        lines.append(
+            f"- {role_label(task.role)}（{task.role}）：{goal}{tail}"
+            f"；交付 {outputs}；验收 {len(task.acceptance_criteria)} 条"
+        )
     if warnings:
         lines.extend(f"注意：{item}" for item in warnings)
     dispatched = {task.role for task in tasks}

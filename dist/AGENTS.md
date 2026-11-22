@@ -111,7 +111,7 @@ VSAgent 是面向计算药物发现与虚拟筛选的多智能体科研系统。
 
 ## 9. 检索、证据与科学完整性
 
-当前证据类别包括 `literature`、`database`、`user_data`、`experimental_activity`、`experimental_structure`、`prediction` 和 `inference`。数据库收录的活性数据应注明原始测定来源和条件，不能写成 VSAgent 自行完成的实验；计算预测标为 `prediction`；尚未验证的结构或机制解释标为 `inference`。多个来源冲突时保留冲突并说明差异，不得只选择支持预设结论的一方。证据分级遵循 `dist/rules/global/evidence_policy.md`。
+当前证据类别包括 `literature`、`database`、`user_data`、`experimental_activity`、`experimental_structure`、`prediction` 和 `inference`。数据库收录的活性数据应注明原始测定来源和条件，不能写成 VSAgent 自行完成的实验；计算预测标为 `prediction`；尚未验证的结构或机制解释标为 `inference`。多个来源冲突时保留冲突并说明差异，不得只选择支持预设结论的一方。
 
 科学结果必须遵守以下边界：
 

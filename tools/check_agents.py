@@ -78,12 +78,8 @@ def _template_problems() -> list[str]:
         if role not in TEMPLATES:
             problems.append(f"{role} 没有模板")
             continue
-        template = template_for(role)
-        if not template.required_outputs:
+        if not template_for(role).required_outputs:
             problems.append(f"{role} 的模板没有交付物")
-        for step in template.subgoals:
-            if step.stage and step.stage not in catalog.STAGES:
-                problems.append(f"{role} 的模板阶段不认识：{step.stage}")
     extra = sorted(set(TEMPLATES) - set(catalog.AGENTS))
     if extra:
         problems.append(f"模板里有不存在的角色：{'、'.join(extra)}")

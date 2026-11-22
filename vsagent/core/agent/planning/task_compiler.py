@@ -1,18 +1,19 @@
 """Task Specification Compiler：把 `IntentSpec` 编译成 `TaskSpec`。
 
-**纯规则，不调用模型。** 理由不是“规则更聪明”，而是三条可验证的：
+子目标与验收条件由意图模型写；编译器只做四件事：
 
-1. 操作只有九个角色，模板数量可控。
-2. `TaskSpec` 的验收条件必须机器可查（交付校验按它判）。模板天然产出
-   `kind` + `target`，模型天然产出句子。
-3. 合同要稳定：同一份意图编译两次必须完全一致。
+1. 按操作取角色，去掉与禁止项冲突的那些；
+2. 从角色模板取交付物与确认点；
+3. 过滤、合并并去重模型写的子目标与验收条件；
+4. 检查每件交付物都有验收条件，缺口记一条警告。
+
+模板只保留不随用户改口变化的资产清单。模型漏写子目标时当场报错，不拿模板
+步骤兜底：任务书里的目标必须来自这一轮对用户要求的理解。
 
 未覆盖的操作**不静默降级**：记一条警告，让调用方与 trace 都看得见。
 
 排除项的处理有两条：原样继承；以及**删掉与它冲突的角色**——说了“不要对接”，
 计划里就不该有对接。
-
-模板本身在 `roles/templates.py`，这里只负责“意图 → 合同”的翻译。
 """
 
 from __future__ import annotations
@@ -96,9 +97,31 @@ class TaskCompiler:
                 )
             )
 
-        subgoals, outputs, checks, approvals = self._merge(covered)
+        subgoals, missing = self._subgoals(intent, covered, current)
+        if missing:
+            raise CompileError(
+                "这些操作没有子目标，先让意图模型补齐再编译："
+                + "、".join(missing)
+            )
         if not subgoals:
-            raise CompileError(f"这些操作没有可用模板：{'、'.join(covered) or '无'}")
+            raise CompileError(f"这些操作没有可执行子目标：{'、'.join(covered) or '无'}")
+
+        outputs, approvals = self._assets(covered)
+        checks, check_notes = self._checks(intent, outputs, current)
+        warnings.extend(check_notes)
+        missing_outputs = [
+            name
+            for name in outputs
+            if name not in {str(row.get("output") or "") for row in checks}
+        ]
+        if missing_outputs:
+            warnings.append(
+                Note(
+                    "acceptance_uncovered",
+                    "acceptance_criteria",
+                    f"这些交付物没有验收条件：{'、'.join(missing_outputs)}",
+                )
+            )
 
         objective = self._objective(intent, current)
         constraints = list(intent.constraints)
@@ -168,58 +191,102 @@ class TaskCompiler:
         return kept, dropped
 
     @staticmethod
-    def _merge(
+    def _subgoals(
+        intent: IntentSpec,
         roles: list[str],
-    ) -> tuple[
-        list[dict[str, object]],
-        list[str],
-        list[dict[str, object]],
-        list[str],
-    ]:
-        """合并模板：子目标按文本去重，交付物按名字去重，验收条件按 (kind,target) 去重。"""
-        subgoals: list[dict[str, object]] = []
-        outputs: list[str] = []
-        checks: list[dict[str, object]] = []
-        approvals: list[str] = []
-        seen_subgoals: set[str] = set()
-        seen_outputs: set[str] = set()
-        seen_checks: set[tuple[str, str]] = set()
-        seen_approvals: set[str] = set()
+        current: TaskSpec | None,
+    ) -> tuple[list[dict[str, object]], list[str]]:
+        """模型写的子目标。延续与恢复任务补上当前规格里的旧步骤。"""
+        merge = (
+            current is not None
+            and intent.task_relation in ("continue", "resume")
+        )
+        out: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
 
+        def add(row: dict[str, object]) -> None:
+            agent = str(row.get("agent") or "").strip()
+            goal = str(row.get("goal") or "").strip()
+            if agent not in roles or not goal:
+                return
+            key = (agent, goal)
+            if key in seen:
+                return
+            seen.add(key)
+            item: dict[str, object] = {"agent": agent, "goal": goal}
+            stage = str(row.get("stage") or "").strip()
+            if stage:
+                item["stage"] = stage
+            out.append(item)
+
+        if merge:
+            for row in current.subgoals:
+                add(row)
+        for row in intent.subgoals:
+            add(row)
+        covered = {str(row["agent"]) for row in out}
+        missing = [role for role in roles if role not in covered]
+        return out, missing
+
+    @staticmethod
+    def _assets(roles: list[str]) -> tuple[list[str], list[str]]:
+        """从模板取交付物与确认点。"""
+        outputs: list[str] = []
+        approvals: list[str] = []
         for role in roles:
             template = template_for(role)
-            for step in template.subgoals:
-                if step.goal in seen_subgoals:
-                    continue
-                row: dict[str, object] = {"goal": step.goal, "agent": role or "research"}
-                if step.stage:
-                    row["stage"] = step.stage
-                subgoals.append(row)
-                seen_subgoals.add(step.goal)
             for name in template.required_outputs:
-                if name not in seen_outputs:
+                if name not in outputs:
                     outputs.append(name)
-                    seen_outputs.add(name)
-            for criterion in template.acceptance_criteria:
-                key = (criterion.kind, criterion.target)
-                if key in seen_checks:
-                    continue
-                seen_checks.add(key)
-                checks.append(
-                    {
-                        "kind": criterion.kind,
-                        "target": criterion.target,
-                        "output": criterion.output,
-                    }
-                )
             for name in template.approval_points:
-                if name not in seen_approvals:
+                if name not in approvals:
                     approvals.append(name)
-                    seen_approvals.add(name)
-
         approvals.sort(
             key=lambda name: APPROVAL_ORDER.index(name)
             if name in APPROVAL_ORDER
             else 99
         )
-        return subgoals, outputs, checks, approvals
+        return outputs, approvals
+
+    @staticmethod
+    def _checks(
+        intent: IntentSpec,
+        outputs: list[str],
+        current: TaskSpec | None,
+    ) -> tuple[list[dict[str, object]], list[Note]]:
+        """模型写的验收条件。延续与恢复任务补上当前规格里的旧条件。"""
+        merge = (
+            current is not None
+            and intent.task_relation in ("continue", "resume")
+        )
+        out: list[dict[str, object]] = []
+        notes: list[Note] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(row: dict[str, object]) -> None:
+            kind = str(row.get("kind") or "").strip()
+            target = str(row.get("target") or "").strip()
+            output = str(row.get("output") or "").strip()
+            if not kind or not target:
+                return
+            if output not in outputs:
+                notes.append(
+                    Note(
+                        "acceptance_output_unknown",
+                        "acceptance_criteria",
+                        f"验收条件 {kind}：{target} 指向的交付物 {output or '（空）'} 不在本次清单里，已丢弃",
+                    )
+                )
+                return
+            key = (kind, target)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append({"kind": kind, "target": target, "output": output})
+
+        if merge:
+            for row in current.acceptance_criteria:
+                add(row)
+        for row in intent.acceptance_criteria:
+            add(row)
+        return out, notes

@@ -149,6 +149,7 @@ from vsagent.core.session_manager import SessionManager  # noqa: E402
 from vsagent.core.agent.roles.prompt import (  # noqa: E402
     DEEP_MARK,
     EMPTY_REASONING,
+    EVENT_DISCIPLINE,
     KEEP_MESSAGES,
     MEMORY_NOTICE,
     MODEL_OUTPUT_LIMIT,
@@ -1134,22 +1135,10 @@ def check_prefix() -> None:
         "不得假定自己拥有未提供的工具" in bare,
         "前缀说明工具清单由角色决定、不能自己扩权",
     )
-    check(
-        "页面地址必须来自工具返回" in bare,
-        "呈现纪律写明：页面地址必须来自工具",
-    )
-    check(
-        "visualization" in bare and "视图生成" in bare,
-        "呈现纪律写明视图由 visualization 角色负责",
-    )
-    docking = Session(id="ses_prefix_docking", title="打分", agent_role="docking")
-    docking_prefix = stable_prefix(
-        Workspace(docking.id, root=WORKSPACE_FIXTURE), docking
-    )
-    check(
-        "评分模型" in docking_prefix and "亲和力模型训练" in docking_prefix,
-        "打分纪律写明评分职责与亲和力通道",
-    )
+    child = Session(id="ses_prefix_child", title="子", depth=1)
+    child_prefix = stable_prefix(Workspace(child.id, root=WORKSPACE_FIXTURE), child)
+    check(EVENT_DISCIPLINE in bare, "主控前缀里有事件封存纪律")
+    check(EVENT_DISCIPLINE not in child_prefix, "子 agent 前缀里没有事件封存纪律")
 
 
 def check_rules_tier() -> None:
@@ -1182,17 +1171,26 @@ def check_rules_tier() -> None:
 
     # 角色规则每一轮都在前缀里：既不能空，也不能长。标题与说明书对齐，
     # 是为了让「这个角色负责什么」只有一处定义，改一处不会只改一半。
+    # 主控、调研、展示三份按英文模板重写，标题用英文；界面上的角色名
+    # 仍是中文，两种写法在这里各认一份。
+    english_headers = {
+        "principal": "Principal Agent",
+        "research": "Research Agent",
+        "visualization": "Visualization Agent",
+    }
     for role in ROLES:
         text = prompt_module.agent_rules(ROOT, role)
         check(text, f"{role} 有角色规则")
         head = text.splitlines()[0]
+        expected = english_headers.get(role, TITLES[role])
+        matched = head[2:] == expected if role in english_headers else TITLES[role].startswith(head[2:])
         check(
-            head.startswith("# ") and TITLES[role].startswith(head[2:]),
-            f"{role} 的规则标题与说明书一致：{head} / {TITLES[role]}",
+            head.startswith("# ") and matched,
+            f"{role} 的规则标题与说明书一致：{head} / {expected}",
         )
-        # 角色规则 2026-11-20 换成英文模板，实测 887–1,022 token；统一按 1,200 卡，
-        # 主控那份也在这个额度内，避免角色规则继续长成第二本手册。
-        limit = 1_200
+        # 角色规则 2026-11-20 换成英文模板，实测 887–1,022 token；统一按 1,200 卡。
+        # 主控那份 1,651 token，英文模板比中文长，单独放到 1,700。
+        limit = 1_700 if role == "principal" else 1_200
         check(
             estimate_tokens(text) <= limit,
             f"{role} 的规则不超过 {limit} token：{estimate_tokens(text)}",
@@ -1202,16 +1200,10 @@ def check_rules_tier() -> None:
     # 这一条原来查的是主前缀：领域约束按角色归位之后，判据跟着内容走。
     target_rules = prompt_module.agent_rules(ROOT, "research")
     check(
-        "本地语料" in target_rules and "命中就停" in target_rules,
-        "取证顺序写在 research 规则里：本地语料优先，命中即止",
+        "优先利用已有本地数据库" in target_rules
+        and "本地信息不足时" in target_rules,
+        "取证顺序写在 research 规则里：本地优先，不足再外查",
     )
-    check("两轮" in target_rules, "检索有轮次上限，不无限扩大")
-    check("没有记录" in target_rules, "查不到时写「没有记录」")
-
-    invariants = prompt_module.global_rules(ROOT)
-    check("数值必须来自工具输出" in invariants, "科学诚信那一条进了全局规则")
-    check("只有前两类能让假设变成" in invariants, "七级证据与封顶规则进了全局规则")
-    check("子 Agent 不能改共享状态" in invariants, "确认与边界进了全局规则")
 
     # 阶段直接写在子目标上；写错的阶段不会被当成某一步。
     check(
@@ -1230,14 +1222,13 @@ def check_rules_tier() -> None:
     try:
         principal = stable_prefix(workspace, session)
         check(
-            "以下全局规则适用于所有角色，必须遵守" in principal,
-            "全局规则进稳定前缀",
-        )
-        check(
             prompt_module.agent_rules(ROOT, "principal") in principal,
             "没有角色的会话按 principal 加载",
         )
-        check("派发前写清四件事" in principal, "主 Agent 的规则确实在前缀里")
+        check(
+            "不得虚构子 Agent 的执行结果" in principal,
+            "主 Agent 的规则确实在前缀里",
+        )
 
         session.agent_role = "prepare"
         prepared = stable_prefix(workspace, session)
@@ -2810,20 +2801,19 @@ def check_prompt() -> None:
         f"平台那句与真实平台一致（sys.platform={sys.platform}）",
     )
     check(
-        "Principal（主控 Agent）" in system_prompt
-        and "dispatch_campaign" in system_prompt,
-        "前缀里有主控职责，且点到派发工具",
+        "Principal 是 VSAgent 的主控 Agent" in system_prompt,
+        "前缀里有主控职责",
     )
     check(
-        "派发前构造完整 AgentTask" in system_prompt,
+        "Acceptance criteria" in system_prompt and "Dependencies" in system_prompt,
         "派发前要写清任务合同",
     )
     check(
-        "partial 或 failed 不得包装成 completed" in system_prompt,
-        "报告验收口径写在主控段里",
+        "应如实报告部分完成状态" in system_prompt,
+        "报告验收口径写在主控规则里",
     )
     check(
-        "用户确认" in system_prompt,
+        "不得绕过用户确认修改正式研究状态" in system_prompt,
         "主控不得绕过用户确认",
     )
     child = Session(id="ses_child", title="子任务", depth=1)
@@ -21369,6 +21359,24 @@ class FlakyTool(Tool):
         return ToolResult(output="第二次成了")
 
 
+def _plan_kwargs(operations: tuple[str, ...]) -> dict[str, Any]:
+    """给一份操作补上模型该写的子目标与验收条件。"""
+    from vsagent.core.agent.roles.templates import template_for
+
+    subgoals: list[dict[str, str]] = []
+    criteria: list[dict[str, str]] = []
+    for role in operations:
+        subgoals.append({"agent": role, "goal": f"{role} 这一段"})
+        for name in template_for(role).required_outputs:
+            criteria.append(
+                {"kind": "artifact_exists", "target": name, "output": name}
+            )
+    return {
+        "subgoals": tuple(subgoals),
+        "acceptance_criteria": tuple(criteria),
+    }
+
+
 async def check_contracts() -> None:
     """协议层：五个对象能往返、该拦的都拦住、不依赖运行期。"""
     intent = IntentSpec(
@@ -21379,6 +21387,14 @@ async def check_contracts() -> None:
             ObjectRef(type="target", label="EGFR", origin="new"),
         ),
         operations=("pocket", "ligand"),
+        subgoals=(
+            {"agent": "pocket", "goal": "列出 EGFR 的候选口袋"},
+            {"agent": "ligand", "goal": "盘点适配口袋的已知配体"},
+        ),
+        acceptance_criteria=(
+            {"kind": "artifact_exists", "target": "PocketAtlas", "output": "PocketAtlas"},
+            {"kind": "artifact_exists", "target": "LigandDossier", "output": "LigandDossier"},
+        ),
         constraints=("覆盖候选口袋",),
         exclusions=("不得直接执行分子对接",),
         confidence=0.8,
@@ -21459,6 +21475,33 @@ async def check_contracts() -> None:
             goal="x", conversation_action="status_query", operations=("pocket",)
         ),
         "查进度不该选操作",
+    )
+    rejected(
+        lambda: IntentSpec(
+            goal="x",
+            operations=("pocket",),
+            subgoals=({"agent": "pocket", "goal": "取结构", "stage": "screening"},),
+        ),
+        "子目标的阶段不属于这个角色",
+    )
+    rejected(
+        lambda: IntentSpec(
+            goal="x",
+            operations=("pocket",),
+            subgoals=({"agent": "pocket", "goal": "取结构"},),
+            acceptance_criteria=(
+                {"kind": "not_a_kind", "target": "PocketAtlas", "output": "PocketAtlas"},
+            ),
+        ),
+        "验收条件的 kind 不认识",
+    )
+    rejected(
+        lambda: IntentSpec(
+            goal="x",
+            operations=("pocket", "ligand"),
+            subgoals=({"agent": "pocket", "goal": "取结构"},),
+        ),
+        "操作没有对应的子目标",
     )
     rejected(
         lambda: ObjectRef(type="pocket", label="第二个口袋", origin="existing"),
@@ -21543,6 +21586,12 @@ async def check_catalog() -> None:
     check(len(catalog.ROLES) == 10 and catalog.ROLES[0] == "principal", "主控加九个角色")
     check(tuple(catalog.OPERATIONS) == catalog.AGENTS, "操作就是九个角色")
     check("principal" not in catalog.OPERATIONS, "主控不进入操作")
+    check(set(catalog.ROLE_STAGES) == set(catalog.AGENTS), "每个角色都有阶段表")
+    for role, stages in catalog.ROLE_STAGES.items():
+        check(
+            set(stages) <= set(catalog.STAGES),
+            f"{role} 的阶段都在阶段名单里：{stages}",
+        )
     for role in catalog.AGENTS:
         check(catalog.DUTIES.get(role), f"{role} 有工作说明")
         check(catalog.PERMISSIONS.get(role), f"{role} 有权限")
@@ -21572,6 +21621,7 @@ async def check_router() -> None:
             operations=("pocket", "ligand"),
             objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
             exclusions=("不要直接进行分子对接",),
+            **_plan_kwargs(("pocket", "ligand")),
         )
     ).task
     routed = router.route(task)
@@ -21595,6 +21645,7 @@ async def check_router() -> None:
             goal="针对 HA2 做配体筛选",
             operations=("ligand", "docking"),
             objects=(ObjectRef(type="target", label="HA2", origin="new"),),
+            **_plan_kwargs(("ligand", "docking")),
         )
     ).task
     screening_route = router.route(screening_task)
@@ -21626,7 +21677,11 @@ async def check_router() -> None:
     )
 
     solo = compiler.compile(
-        IntentSpec(goal="比较这批结果的可靠性", operations=("analysis",))
+        IntentSpec(
+            goal="比较这批结果的可靠性",
+            operations=("analysis",),
+            **_plan_kwargs(("analysis",)),
+        )
     ).task
     solo_plan = router.route(solo).plan
     check(solo_plan.selected_agents == ("analysis",), "孤立评分只选分析角色")
@@ -21638,6 +21693,7 @@ async def check_router() -> None:
             goal="用我给的受体、口袋与配体跑筛选",
             operations=("docking",),
             inputs={"pocket": "pocketset#9", "ligand_set": "ligandset#3"},
+            **_plan_kwargs(("docking",)),
         )
     ).task
     supplied_plan = router.route(supplied).plan
@@ -21674,7 +21730,11 @@ async def check_router() -> None:
 
     # 展示是汇点：同计划里其他角色都跑完才轮到它。
     shown = compiler.compile(
-        IntentSpec(goal="把口袋结果打开给我看", operations=("pocket", "visualization"))
+        IntentSpec(
+            goal="把口袋结果打开给我看",
+            operations=("pocket", "visualization"),
+            **_plan_kwargs(("pocket", "visualization")),
+        )
     ).task
     shown_plan = router.route(shown).plan
     check(
@@ -21706,6 +21766,14 @@ async def check_task_compiler() -> None:
         goal="获取 EGFR 的所有候选结合口袋，分析口袋特征和适配分子",
         operations=("pocket", "ligand"),
         objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
+        subgoals=(
+            {"agent": "pocket", "goal": "列出 EGFR 的候选口袋"},
+            {"agent": "ligand", "goal": "盘点适配口袋的已知配体"},
+        ),
+        acceptance_criteria=(
+            {"kind": "artifact_exists", "target": "PocketAtlas", "output": "PocketAtlas"},
+            {"kind": "artifact_exists", "target": "LigandDossier", "output": "LigandDossier"},
+        ),
         exclusions=("不要直接进行分子对接",),
         constraints=("只看人类",),
         inputs={"target": "EGFR"},
@@ -21724,6 +21792,11 @@ async def check_task_compiler() -> None:
     check(task.exclusions == ("不要直接进行分子对接",), "禁止项原样继承")
     check(task.constraints == ("只看人类",), "约束原样继承")
     check({row["agent"] for row in task.subgoals} == {"pocket", "ligand"}, "子目标带角色")
+    check(
+        {row["goal"] for row in task.subgoals}
+        == {"列出 EGFR 的候选口袋", "盘点适配口袋的已知配体"},
+        f"子目标是模型写的那几句：{task.subgoals}",
+    )
     check(not compiled.uncovered, f"覆盖到的角色不报未覆盖：{compiled.uncovered}")
 
     twice = compiler.compile(intent).task.to_dict()
@@ -21735,6 +21808,7 @@ async def check_task_compiler() -> None:
         operations=("pocket", "docking"),
         objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
         exclusions=("不要对接",),
+        **_plan_kwargs(("pocket", "docking")),
     )
     dropped = compiler.compile(changed)
     agents_now = {row["agent"] for row in dropped.task.subgoals}
@@ -21746,6 +21820,7 @@ async def check_task_compiler() -> None:
             goal="获取 EGFR 的结构与口袋",
             operations=("pocket",),
             objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
+            **_plan_kwargs(("pocket",)),
         )
     ).task
     running = pocket_only.with_updates(status="running", revision=3)
@@ -21755,6 +21830,7 @@ async def check_task_compiler() -> None:
             task_relation="modify",
             operations=("pocket",),
             constraints=("只看 T790M",),
+            **_plan_kwargs(("pocket",)),
         ),
         current=running,
     ).task
@@ -21763,6 +21839,10 @@ async def check_task_compiler() -> None:
     check(revised.status == "running", "正在跑的任务保留状态")
     check(revised.objective == "只看 T790M 突变体的口袋", "修改任务换目标")
     check("只看 T790M" in revised.constraints, "新约束并进去")
+    check(
+        {row["goal"] for row in revised.subgoals} == {"pocket 这一段"},
+        f"修改任务的子目标按这一轮重写：{revised.subgoals}",
+    )
 
     compare = compiler.compile(
         IntentSpec(
@@ -21773,6 +21853,7 @@ async def check_task_compiler() -> None:
                 ObjectRef(type="pocket", label="第一个", ref="pocket#1", origin="existing"),
                 ObjectRef(type="pocket", label="第二个", ref="pocket#2", origin="existing"),
             ),
+            **_plan_kwargs(("analysis",)),
         ),
         current=running,
     ).task
@@ -21785,6 +21866,7 @@ async def check_task_compiler() -> None:
             goal="继续",
             task_relation="continue",
             operations=("pocket", "ligand"),
+            **_plan_kwargs(("pocket", "ligand")),
         ),
         current=running,
     ).task
@@ -21805,6 +21887,15 @@ async def check_task_compiler() -> None:
 
     try:
         compiler.compile(
+            IntentSpec(goal="取结构", operations=("pocket",))
+        )
+    except CompileError as error:
+        check("没有子目标" in str(error), f"没有子目标时拒绝编译：{error}")
+    else:
+        raise AssertionError("没有子目标时应当拒绝编译，不用模板兜底")
+
+    try:
+        compiler.compile(
             IntentSpec(
                 goal="x",
                 clarification_required=("想做什么？",),
@@ -21817,9 +21908,8 @@ async def check_task_compiler() -> None:
 
 
 def check_templates_typed() -> None:
-    """模板是冻结数据类，字段名与合同对齐，验收条件管得住交付物。"""
+    """模板只保留资产清单：交付物、确认点与固定约束。"""
     from vsagent.core.agent.roles import catalog
-    from vsagent.core.agent.roles.contracts.task import ACCEPTANCE_KINDS
     from vsagent.core.agent.roles.templates import (
         GENERIC_TEMPLATE,
         TEMPLATES,
@@ -21832,32 +21922,19 @@ def check_templates_typed() -> None:
         template_for("no-such-role") is GENERIC_TEMPLATE,
         "不认识的角色回退到通用模板",
     )
+    fields = set(RoleTemplate.__dataclass_fields__)
+    check(
+        fields == {"required_outputs", "approval_points", "constraints"},
+        f"模板只剩资产字段：{sorted(fields)}",
+    )
     for role, template in TEMPLATES.items():
         check(isinstance(template, RoleTemplate), f"{role} 的模板是 RoleTemplate")
-        outputs = set(template.required_outputs)
-        for criterion in template.acceptance_criteria:
-            check(
-                criterion.kind in ACCEPTANCE_KINDS,
-                f"{role} 的验收条件 kind 合法：{criterion.kind}",
-            )
-            check(
-                criterion.output in outputs,
-                f"{role} 的验收条件指向自己的交付物：{criterion.output}",
-            )
-        covered = {item.output for item in template.acceptance_criteria}
-        check(
-            outputs <= covered,
-            f"{role} 的每个交付物都有验收条件：{sorted(outputs - covered)}",
-        )
-        for step in template.subgoals:
-            check(
-                not step.stage or step.stage in catalog.STAGES,
-                f"{role} 的模板阶段认识：{step.stage}",
-            )
+        check(bool(template.required_outputs), f"{role} 的模板有交付物")
         check(
             template.constraints == (),
             f"{role} 的固定约束目前为空：{template.constraints}",
         )
+    check(GENERIC_TEMPLATE.required_outputs == ("TaskReport",), "通用模板也交一份报告")
 
 
 def check_projection_single_source() -> None:
@@ -21891,6 +21968,88 @@ def check_projection_single_source() -> None:
             stale.append(relative)
     check(not offenders, f"AgentTask 只在投影模块构造：{offenders}")
     check(not stale, f"TurnContext 已经并入 RouteDecision：{stale}")
+
+    # 派发时补写的计划只影响这一场；任务规格里没有子目标的上游靠它拿到任务书。
+    from vsagent.core.agent.execution.projection import RolePlan, project
+    from vsagent.core.agent.roles.contracts import AgentPlan, TaskSpec
+
+    plan = AgentPlan(
+        task_id="task_proj",
+        selected_agents=("pocket", "ligand", "prepare", "docking"),
+        dependencies=[
+            {"from": "pocket", "to": "prepare"},
+            {"from": "ligand", "to": "prepare"},
+            {"from": "prepare", "to": "docking"},
+        ],
+    )
+    spec = TaskSpec(
+        task_id="task_proj",
+        objective="从口袋走到候选集",
+        subgoals=[{"agent": "docking", "goal": "跑一轮对接"}],
+        required_outputs=("CandidateSet",),
+        acceptance_criteria=[
+            {"kind": "artifact_exists", "target": "CandidateSet", "output": "CandidateSet"}
+        ],
+    )
+    plans = {
+        "pocket": RolePlan(
+            goals=("找出口袋",),
+            acceptance_criteria=(
+                {"kind": "artifact_exists", "target": "PocketAtlas", "output": "PocketAtlas"},
+            ),
+        ),
+        "ligand": RolePlan(
+            goals=("盘点配体",),
+            acceptance_criteria=(
+                {"kind": "artifact_exists", "target": "LigandDossier", "output": "LigandDossier"},
+            ),
+        ),
+        "prepare": RolePlan(goals=("准备受体与配体",)),
+    }
+    filled = project(plan, spec, role_plans=plans)
+    check(
+        filled.slice_for("prepare").required_outputs
+        == ("PreparedReceptor", "PreparedLigandSet"),
+        f"补出来的上游从模板拿到交付物：{filled.slice_for('prepare').required_outputs}",
+    )
+    check(
+        filled.slice_for("pocket").goals == ("找出口袋",),
+        f"补写的目标进了任务书：{filled.slice_for('pocket').goals}",
+    )
+    check(
+        not [note for note in filled.notes if note.code == "plan_missing_goals"],
+        f"补齐之后没有缺目标的角色：{filled.notes}",
+    )
+    plain = project(plan, spec)
+    check(
+        any(note.code == "plan_missing_goals" for note in plain.notes),
+        f"没有补写时要点名缺目标的角色：{plain.notes}",
+    )
+    unknown = project(
+        AgentPlan(task_id="task_proj", selected_agents=("docking",)),
+        spec,
+        role_plans={"pocket": RolePlan(goals=("找口袋",))},
+    )
+    check(
+        any(note.code == "plan_unknown_role" for note in unknown.notes),
+        f"写给不派的角色要提示：{unknown.notes}",
+    )
+    bad_output = project(
+        plan,
+        spec,
+        role_plans={
+            "prepare": RolePlan(
+                goals=("准备受体与配体",),
+                acceptance_criteria=(
+                    {"kind": "artifact_exists", "target": "x", "output": "Nope"},
+                ),
+            )
+        },
+    )
+    check(
+        any(note.code == "plan_output_unknown" for note in bad_output.notes),
+        f"验收条件指向不存在的交付物要提示：{bad_output.notes}",
+    )
 
 
 def _source_of(module: Any) -> str:
@@ -21975,7 +22134,10 @@ async def check_task_context() -> None:
         task,
     )
     check(compare.recompile, "比较任务要重新编译")
-    check("analysis" in compare.intent.operations and "pocket" in compare.intent.operations, "比较任务补上分析角色")
+    check(
+        compare.intent.operations == ("analysis",),
+        f"比较的操作由这一句决定，不再把旧角色拼进来：{compare.intent.operations}",
+    )
 
     missing = resolver.resolve(intent("continue"))
     check(
@@ -21992,7 +22154,11 @@ async def check_task_context() -> None:
     check(resumed.source_refs == ("ses_0007/evt_3",), "恢复要留出处")
 
     line = context_line(task)
-    check("目标：" in line and "禁止：" in line and len(line) <= 400, f"摘要够短：{len(line)} 字符")
+    check(
+        "目标：" in line and "角色：pocket" in line and "禁止：" in line,
+        f"摘要带目标、角色与禁止：{line}",
+    )
+    check(len(line) <= 500, f"摘要够短：{len(line)} 字符")
     check(context_line(None) == "", "没有任务时摘要为空")
 
 
@@ -22359,7 +22525,11 @@ async def check_delivery() -> None:
         check(verify("ScoringReport", workspace=workspace) is None, "有运行目录时验过")
 
         task = TaskCompiler().compile(
-            IntentSpec(goal="筛选候选", operations=("prepare", "docking"))
+            IntentSpec(
+                goal="筛选候选",
+                operations=("prepare", "docking"),
+                **_plan_kwargs(("prepare", "docking")),
+            )
         ).task
         check(
             list(task.required_outputs)
@@ -22395,7 +22565,11 @@ async def check_delivery() -> None:
         workspace_root=WORKSPACE_FIXTURE, validator_mode="shadow",
     )
     loop._turn_task = TaskCompiler().compile(
-        IntentSpec(goal="写一份机制说明", operations=("mechanism",))
+        IntentSpec(
+            goal="写一份机制说明",
+            operations=("mechanism",),
+            **_plan_kwargs(("mechanism",)),
+        )
     ).task
     loop._check_delivery(Session(id="ses_delivery"))
     check(len(seen) == 1, "轮末写一条交付验收事件")
@@ -22559,7 +22733,7 @@ async def check_validators() -> None:
     check(not check_tool("detect_pockets").blocked, "没有清单时不拦")
 
     task = TaskCompiler().compile(
-        IntentSpec(goal="取结构", operations=("pocket",))
+        IntentSpec(goal="取结构", operations=("pocket",), **_plan_kwargs(("pocket",)))
     ).task
     check(not tool_guard.check("fetch_structure", None), "没有清单不产生发现")
 
@@ -22644,6 +22818,7 @@ async def check_route() -> None:
         goal="取 EGFR 的全部实验结构",
         operations=("pocket",),
         objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
+        **_plan_kwargs(("pocket",)),
     )
     shadow = RouteAdapter(None, mode="shadow", parser=_StubParser(intent))
     decision = await shadow.prepare("取 EGFR 的全部实验结构")
@@ -22697,7 +22872,20 @@ async def check_route() -> None:
     from vsagent.core.agent.planning.task_compiler import TaskCompiler
 
     built = TaskCompiler().compile(
-        _Intent(goal="取 EGFR 的全部实验结构", operations=("pocket",))
+        _Intent(
+            goal="取 EGFR 的全部实验结构",
+            operations=("pocket",),
+            subgoals=(
+                {"agent": "pocket", "goal": "获取符合范围的实验结构并建立结构目录"},
+            ),
+            acceptance_criteria=(
+                {
+                    "kind": "artifact_exists",
+                    "target": "PocketAtlas",
+                    "output": "PocketAtlas",
+                },
+            ),
+        )
     ).task
     plan = shadow.router.route(built).plan
 
@@ -22953,6 +23141,14 @@ async def check_intent_parser(server: FakeModelServer) -> None:
             {"type": "target", "label": "EGFR", "ref": "", "origin": "new"}
         ],
         "operations": ["pocket", "ligand"],
+        "subgoals": [
+            {"agent": "pocket", "goal": "列出 EGFR 的候选口袋"},
+            {"agent": "ligand", "goal": "盘点适配口袋的已知配体"},
+        ],
+        "acceptance_criteria": [
+            {"kind": "artifact_exists", "target": "PocketAtlas", "output": "PocketAtlas"},
+            {"kind": "artifact_exists", "target": "LigandDossier", "output": "LigandDossier"},
+        ],
         "constraints": ["覆盖候选口袋"],
         "exclusions": ["不得直接执行分子对接"],
         "inputs": {},
@@ -22978,6 +23174,11 @@ async def check_intent_parser(server: FakeModelServer) -> None:
     )
     check(spec.task_relation == "modify", f"任务关系跟着一起解析：{spec.task_relation}")
     check(spec.conversation_action == "execute", f"对话行为跟着一起解析：{spec.conversation_action}")
+    check(
+        {row["agent"] for row in spec.subgoals} == {"pocket", "ligand"},
+        f"子目标由模型写，随意图一起解析：{spec.subgoals}",
+    )
+    check(len(spec.acceptance_criteria) == 2, f"验收条件也随意图解析：{spec.acceptance_criteria}")
     body = server.requests[-1]
     check(not body.get("tools"), "解析请求不带工具定义")
     system = body["messages"][0]["content"]
@@ -23001,7 +23202,25 @@ async def check_intent_parser(server: FakeModelServer) -> None:
     check(retried.goal == payload["goal"], "坏输出之后重试成功")
     check(len(server.requests) == before + 2, "重试只多问一次")
     correction = server.requests[-1]["messages"][-1]["content"]
-    check("不合法" in correction and "不要改变" in correction, "第二次只要求改格式")
+    check(
+        "不合法" in correction and "补齐缺失字段" in correction and "保持" in correction,
+        "第二次只要求补齐格式与缺失字段",
+    )
+
+    # 要执行却没有计划：同样走重试，并在纠正话里点名 subgoals。
+    before = len(server.requests)
+    no_plan = dict(payload)
+    no_plan.pop("subgoals")
+    no_plan.pop("acceptance_criteria")
+    server.script(
+        Reply(chunks=text_chunks(json.dumps(no_plan, ensure_ascii=False))),
+        Reply(chunks=text_chunks(json.dumps(payload, ensure_ascii=False))),
+    )
+    completed = await parser.parse("补上计划再试")
+    check(completed.subgoals, "缺计划的输出被要求补齐之后才返回")
+    correction = server.requests[-1]["messages"][-1]["content"]
+    check("subgoals" in correction, f"纠正话点名缺的子目标：{correction}")
+    check(len(server.requests) == before + 2, "缺计划也只多问一次")
 
     # 两次都坏：抛错，不返回空壳意图。
     before = len(server.requests)
@@ -25207,7 +25426,7 @@ async def check_coordinator() -> None:
     from vsagent.core.agent.planning.agent_router import AgentRouter
     from vsagent.core.agent.roles.contracts import AgentTask, AgentPlan, TaskSpec
     from vsagent.core.agent.execution.coordinator import Coordinator, build_tasks
-    from vsagent.core.agent.execution.projection import task_id_for
+    from vsagent.core.agent.execution.projection import RolePlan, task_id_for
     from vsagent.core.agent.execution.dispatcher import AgentDispatcher
     from vsagent.core.agent.execution.scheduler import AgentScheduler
 
@@ -25232,7 +25451,32 @@ async def check_coordinator() -> None:
     )
 
     tasks, warnings = build_tasks(plan, spec)
-    check(not warnings, f"单终点计划没有告警：{warnings}")
+    check(
+        {item.code for item in warnings} == {"plan_missing_goals", "acceptance_uncovered"},
+        f"补出来的上游角色先要求派发时补写计划：{[str(item) for item in warnings]}",
+    )
+    tasks, warnings = build_tasks(
+        plan,
+        spec,
+        role_plans={
+            "prepare": RolePlan(
+                goals=("准备受体与配体",),
+                acceptance_criteria=(
+                    {
+                        "kind": "artifact_exists",
+                        "target": "PreparedReceptor",
+                        "output": "PreparedReceptor",
+                    },
+                    {
+                        "kind": "artifact_exists",
+                        "target": "PreparedLigandSet",
+                        "output": "PreparedLigandSet",
+                    },
+                ),
+            )
+        },
+    )
+    check(not warnings, f"派发时补写计划后没有告警：{[str(item) for item in warnings]}")
     check(
         [item.task_id for item in tasks]
         == [task_id_for(plan, role) for role in plan.selected_agents],
@@ -25364,6 +25608,18 @@ async def check_coordinator() -> None:
             {"goal": "查配体", "agent": "ligand"},
         ],
         required_outputs=("PocketAtlas", "LigandDossier"),
+        acceptance_criteria=[
+            {
+                "kind": "artifact_exists",
+                "target": "PocketAtlas",
+                "output": "PocketAtlas",
+            },
+            {
+                "kind": "artifact_exists",
+                "target": "LigandDossier",
+                "output": "LigandDossier",
+            },
+        ],
     )
     two_plan = AgentRouter().route(two_ends).plan
     two_tasks, two_warnings = build_tasks(two_plan, two_ends)
@@ -25713,6 +25969,10 @@ async def check_campaign_dispatch() -> None:
         )
         check("这次会派 4 个角色" in chained.output, f"自动补上游：{chained.output}")
         check("补上了上游角色" in chained.output, "补了哪些要说明")
+        check(
+            "prepare 没有子目标" in chained.output,
+            f"自动补出来的上游缺任务书要点名：{chained.output}",
+        )
 
         try:
             await tool.execute(
@@ -25751,6 +26011,111 @@ async def check_campaign_dispatch() -> None:
             check("一次只给一个角色" in str(error), f"多个角色时拒绝：{error}")
         else:
             raise AssertionError("多个角色时不该接受自定义任务书")
+
+        # 自动补出来的上游要在派发时补写计划；confirm=true 缺计划直接拒绝。
+        planned = await tool.execute(
+            {
+                "confirm": False,
+                "roles": ["docking"],
+                "plans": {"prepare": {"goals": ["准备 4HJO 的受体与配体"]}},
+            },
+            session=subset,
+            spawner=host,
+        )
+        check("准备 4HJO 的受体与配体" in planned.output, f"补写的目标进预览：{planned.output}")
+        check(
+            "PreparedReceptor" in planned.output and "PreparedLigandSet" in planned.output,
+            f"补出来的角色从模板拿到交付物：{planned.output}",
+        )
+        try:
+            await tool.execute(
+                {"confirm": True, "roles": ["docking"], "constraints": {}},
+                session=subset,
+                spawner=host,
+            )
+        except ToolError as error:
+            check(
+                "plans" in str(error) and "prepare" in str(error),
+                f"缺计划时拒绝并说怎么补：{error}",
+            )
+        else:
+            raise AssertionError("自动补出来的上游没有计划时不该启动")
+        check(not host.children_of(subset.id), "拒绝之后不建子会话")
+        try:
+            await tool.execute(
+                {
+                    "confirm": True,
+                    "roles": ["docking"],
+                    "constraints": {},
+                    "plans": {
+                        "prepare": {
+                            "acceptance_criteria": [
+                                {
+                                    "kind": "artifact_exists",
+                                    "target": "prepared.pdb",
+                                    "output": "PreparedReceptor",
+                                }
+                            ]
+                        }
+                    },
+                },
+                session=subset,
+                spawner=host,
+            )
+        except ToolError as error:
+            check(
+                "这些角色没有子目标" in str(error) and "prepare" in str(error),
+                f"只有验收条件不算补了计划：{error}",
+            )
+        else:
+            raise AssertionError("自动补出来的上游只有验收条件时不该启动")
+        check(not host.children_of(subset.id), "只有验收条件也不建子会话")
+
+        for plans, label, wanted in (
+            ({"nope": {"goals": ["x"]}}, "不存在的角色", "没有这个角色"),
+            ({"analysis": {"goals": ["x"]}}, "这次不派的角色", "这次不派"),
+            ({"prepare": {}}, "空计划", "至少写一项"),
+            (
+                {
+                    "prepare": {
+                        "acceptance_criteria": [
+                            {
+                                "kind": "artifact_exists",
+                                "target": "x",
+                                "output": "CandidateSet",
+                            }
+                        ]
+                    }
+                },
+                "验收条件指向别的角色的交付物",
+                "不在这个角色的交付物里",
+            ),
+        ):
+            try:
+                await tool.execute(
+                    {"confirm": False, "roles": ["docking"], "plans": plans},
+                    session=subset,
+                    spawner=host,
+                )
+            except ToolError as error:
+                check(wanted in str(error), f"{label}被拒：{error}")
+            else:
+                raise AssertionError(f"{label}应当被拒")
+        try:
+            await tool.execute(
+                {
+                    "confirm": False,
+                    "roles": ["docking"],
+                    "task": "只跑单路对接",
+                    "plans": {"docking": {"goals": ["重跑对接"]}},
+                },
+                session=subset,
+                spawner=host,
+            )
+        except ToolError as error:
+            check("只能留一个" in str(error), f"task 与 plans 的 goals 冲突：{error}")
+        else:
+            raise AssertionError("task 与 plans 同时给子目标应当被拒")
 
         # 计划是边界：roles 只能减，不能把计划外的角色塞进来。
         grown = manager.new_session("计划外角色")

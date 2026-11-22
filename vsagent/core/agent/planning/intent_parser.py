@@ -21,8 +21,9 @@ import json
 from typing import Any
 
 from vsagent.core.agent.provider import ChatProvider, ProviderEventType
-from vsagent.core.agent.roles.catalog import AGENTS, DUTIES, NOTES, TITLES, WHEN
+from vsagent.core.agent.roles.catalog import AGENTS, DUTIES, NOTES, ROLE_STAGES, TITLES, WHEN
 from vsagent.core.agent.roles.contracts import ContractError, IntentSpec
+from vsagent.core.agent.roles.templates import template_for
 
 MAX_ATTEMPTS = 2
 """解析最多问两次。第二次只用于“格式不对”，不允许改变内容。"""
@@ -40,6 +41,14 @@ HEAD = """你是科研意图解析器。读用户这一句话，输出一个 JSO
 - constraints：用户明确提出的要求，逐条照抄原意。
 - exclusions：用户明确禁止的事，逐条照抄。**这一项不许合并、不许改写。**
 - expected_outputs：用户希望拿到什么。
+- subgoals：任务分工。每项写 agent、goal，可选 stage。
+  · agent 只能取 operations 里的角色名。
+  · goal 是一句可执行的子目标；stage 只能取角色目录里该角色列出的阶段。
+  · new、modify、compare 且 operations 非空时，每个操作角色都要有子目标。
+- acceptance_criteria：每条写 kind、target、output。
+  · kind 只能是 artifact_exists、handle_registered、evidence_ref、approval_recorded、review_required。
+  · target 是检查对象；output 是这条检查对应的交付物，必须在该角色的交付物清单里。
+  · new、modify、compare 且 operations 非空时至少写一条，每个交付物都要被检查。
 
 两条轴：
 - task_relation：new、continue、modify、compare、resume、none。
@@ -69,6 +78,7 @@ HEAD = """你是科研意图解析器。读用户这一句话，输出一个 JSO
 TAIL = """四条硬规则：
 1. operations 只能填九个角色名，不要输出 principal，也不要输出不存在的名字。
 2. 要执行任务时，new、modify、compare 至少要选一个操作；只补约束的 continue 可以不选。
+   有操作时就要写子目标与验收条件；continue、resume 新增的角色也要写子目标。
    解析不出来就留空，并在 clarification_required 写一个最关键的问题。
 3. 不要补全用户没说的结构编号、口袋编号、突变体、物种或筛选库。
 4. 用户明确禁止某类动作时，operations 里不要出现对应的角色；
@@ -77,7 +87,9 @@ TAIL = """四条硬规则：
 常见组合：
 - 用户没有确定具体蛋白， 例如没有给出 uniprot id 或者 pdb id，只能使用 research 进行一轮系统的调研，ligand 和 pocket 需要得到具体蛋白信息才可调用。
 - 用户说“虚拟筛选”或“筛选一批分子”：选 ligand、docking；结构和口袋没定时加 pocket。
-  prepare 由系统按前置自动补，不必手选。
+  下游要跑时，把 prepare 一并写进 operations 与 subgoals：它没有模板子目标，
+  系统不会替你补一段任务书。
+- 子目标写这一段要达成什么，不抄用户原话；验收条件的 target 写清检查什么。
 - 用户说“比较”：task_relation 用 compare，operations 里要有 analysis，objects 指向两组已有对象。
 - 用户要机制解释：选 mechanism；已有对接结果时可以同时选 analysis。
 - 用户问靶点本身、问临床或文献证据：选 research。
@@ -103,10 +115,13 @@ def role_catalog() -> str:
         duties = "、".join(DUTIES[role]) or "无"
         when = WHEN[role] or "用户明确要这一类工作时。"
         note = NOTES.get(role) or "无额外边界。"
+        outputs = "、".join(template_for(role).required_outputs) or "无"
+        stages = "、".join(ROLE_STAGES.get(role, ())) or "无"
         lines.append(
             f"- {role}（{title}）：{duties}。\n"
             f"  什么时候选：{when}\n"
-            f"  边界：{note}"
+            f"  边界：{note}\n"
+            f"  交付物：{outputs}；可用阶段：{stages}"
         )
     return "\n".join(lines)
 
@@ -143,6 +158,27 @@ def extract_json(text: str) -> dict[str, Any]:
     return data
 
 
+EXECUTING_RELATIONS: frozenset[str] = frozenset({"new", "modify", "compare"})
+
+
+def _plan_problem(spec: IntentSpec) -> str:
+    """检查模型有没有写全计划。空串表示通过。
+
+    `IntentSpec` 只在子目标非空时核对覆盖；这里补上「一个都没写」这一种：
+    要执行却没有任何子目标，编译阶段只能靠模板兜底，那正是这次要拆掉的部分。
+    """
+    if not spec.operations:
+        return ""
+    if spec.task_relation in EXECUTING_RELATIONS:
+        if not spec.subgoals:
+            return "要执行任务却没有 subgoals：每个操作角色都要有一段可执行的子目标"
+        if not spec.acceptance_criteria:
+            return "要执行任务却没有 acceptance_criteria：交付物至少要有验收条件"
+    elif spec.task_relation in ("continue", "resume") and not spec.subgoals:
+        return "新增了操作却没有 subgoals：给新角色补一段可执行的子目标"
+    return ""
+
+
 class IntentParser:
     """一次解析 = 一到两次模型调用，不参与工具循环。"""
 
@@ -168,6 +204,9 @@ class IntentParser:
             self.last_raw = raw
             try:
                 spec = IntentSpec.from_dict(extract_json(raw))
+                problem = _plan_problem(spec)
+                if problem:
+                    raise ContractError(problem)
                 if not spec.intent_id:
                     digest = hashlib.sha1(f"{message}\n{raw}".encode("utf-8")).hexdigest()
                     spec = IntentSpec.from_dict({**spec.to_dict(), "intent_id": f"intent_{digest[:10]}"})
@@ -179,8 +218,9 @@ class IntentParser:
                     {
                         "role": "user",
                         "content": (
-                            f"这份输出不合法：{problem}。只按报错修正格式与字段名，"
-                            "不要改变已经解析出的内容，也不要补充用户没说过的东西。"
+                            f"这份输出不合法：{problem}。补齐缺失字段，"
+                            "保持已经正确的目标、对象与操作不变；"
+                            "不要补充用户没有说过的事实。"
                         ),
                     }
                 )

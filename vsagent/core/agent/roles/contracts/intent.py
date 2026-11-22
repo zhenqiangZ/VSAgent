@@ -26,7 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from vsagent.core.agent.roles.catalog import AGENTS
+from vsagent.core.agent.roles.catalog import AGENTS, ROLE_STAGES
+from vsagent.core.agent.roles.contracts.task import ACCEPTANCE_KINDS
 from vsagent.core.agent.roles.contracts.base import (
     SCHEMA_VERSION,
     ContractError,
@@ -84,6 +85,65 @@ OPERATIONS: tuple[str, ...] = AGENTS
 """操作的取值就是九个子 Agent。"""
 
 
+def _plan_rows(value: Any, field: str, keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    """子目标与验收条件共用的行校验：只收认识的键，并去掉首尾空白。"""
+    rows = records(value, field)
+    for index, row in enumerate(rows):
+        reject_unknown(row, keys, name=f"{field}[{index}]")
+    return rows
+
+
+def _subgoals(value: Any) -> tuple[dict[str, Any], ...]:
+    """模型写的执行步骤。角色必须认识，阶段必须是该角色允许的阶段。"""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, row in enumerate(
+        _plan_rows(value, "IntentSpec.subgoals", ("agent", "goal", "stage"))
+    ):
+        agent = choice(row.get("agent"), AGENTS, f"IntentSpec.subgoals[{index}].agent")
+        goal = text(row.get("goal"), f"IntentSpec.subgoals[{index}].goal")
+        stage = row.get("stage")
+        if stage is None or (isinstance(stage, str) and not stage.strip()):
+            stage = ""
+        else:
+            stage = text(stage, f"IntentSpec.subgoals[{index}].stage")
+            allowed = ROLE_STAGES.get(agent, ())
+            if stage not in allowed:
+                raise ContractError(
+                    f"IntentSpec.subgoals[{index}].stage={stage!r} 对 {agent} 不可用。"
+                    f"可用：{'、'.join(allowed) or '不挂阶段'}"
+                )
+        key = (agent, goal)
+        if key in seen:
+            continue
+        seen.add(key)
+        item: dict[str, Any] = {"agent": agent, "goal": goal}
+        if stage:
+            item["stage"] = stage
+        out.append(item)
+    return tuple(out)
+
+
+def _criteria(value: Any) -> tuple[dict[str, Any], ...]:
+    """模型写的验收条件。每一条都要指明它管哪件交付物。"""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, row in enumerate(
+        _plan_rows(value, "IntentSpec.acceptance_criteria", ("kind", "target", "output"))
+    ):
+        kind = choice(
+            row.get("kind"), ACCEPTANCE_KINDS, f"IntentSpec.acceptance_criteria[{index}].kind"
+        )
+        target = text(row.get("target"), f"IntentSpec.acceptance_criteria[{index}].target")
+        output = text(row.get("output"), f"IntentSpec.acceptance_criteria[{index}].output")
+        key = (kind, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"kind": kind, "target": target, "output": output})
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class ObjectRef:
     """用户说到的一个科研对象。"""
@@ -135,6 +195,8 @@ class IntentSpec:
     conversation_action: str = "execute"
     objects: tuple[ObjectRef, ...] = ()
     operations: tuple[str, ...] = ()
+    subgoals: tuple[dict[str, Any], ...] = ()
+    acceptance_criteria: tuple[dict[str, Any], ...] = ()
     constraints: tuple[str, ...] = ()
     exclusions: tuple[str, ...] = ()
     inputs: dict[str, Any] = field(default_factory=dict)
@@ -179,12 +241,31 @@ class IntentSpec:
             if item not in objects:
                 objects.append(item)
 
+        subgoals = _subgoals(self.subgoals)
+        criteria = _criteria(self.acceptance_criteria)
+        if subgoals and any(row["agent"] not in kinds for row in subgoals):
+            extra = sorted({row["agent"] for row in subgoals} - set(kinds))
+            raise ContractError(
+                "子目标的角色必须同时出现在 operations 里："
+                f"多出来的是 {'、'.join(extra)}"
+            )
+        if relation in ("new", "modify", "compare") and subgoals:
+            covered = {row["agent"] for row in subgoals}
+            missing = [name for name in kinds if name not in covered]
+            if missing:
+                raise ContractError(
+                    "这些操作没有对应的子目标："
+                    f"{'、'.join(missing)}。每个操作至少写一条子目标"
+                )
+
         questions = texts(self.clarification_required, "IntentSpec.clarification_required")
 
         if action in NON_EXECUTING_ACTIONS and kinds:
             raise ContractError(
                 f"{action} 这一轮不选操作，operations 应当为空，收到 {'、'.join(kinds)}"
             )
+        if action in NON_EXECUTING_ACTIONS and (subgoals or criteria):
+            raise ContractError(f"{action} 这一轮不写子目标或验收条件")
         if action == "chat" and relation != "none":
             raise ContractError("闲聊的 task_relation 应当是 none")
         if action == "execute" and relation == "none":
@@ -205,6 +286,8 @@ class IntentSpec:
         object.__setattr__(self, "conversation_action", action)
         object.__setattr__(self, "objects", tuple(objects))
         object.__setattr__(self, "operations", tuple(kinds))
+        object.__setattr__(self, "subgoals", subgoals)
+        object.__setattr__(self, "acceptance_criteria", criteria)
         object.__setattr__(
             self, "constraints", texts(self.constraints, "IntentSpec.constraints")
         )
@@ -255,6 +338,8 @@ class IntentSpec:
             "goal": self.goal,
             "objects": [item.to_dict() for item in self.objects],
             "operations": list(self.operations),
+            "subgoals": [dict(row) for row in self.subgoals],
+            "acceptance_criteria": [dict(row) for row in self.acceptance_criteria],
             "constraints": list(self.constraints),
             "exclusions": list(self.exclusions),
             "inputs": dict(self.inputs),
@@ -278,6 +363,8 @@ class IntentSpec:
                 "goal",
                 "objects",
                 "operations",
+                "subgoals",
+                "acceptance_criteria",
                 "constraints",
                 "exclusions",
                 "inputs",
@@ -299,6 +386,8 @@ class IntentSpec:
                 ObjectRef.from_dict(row) for row in records(data.get("objects"), "IntentSpec.objects")
             ),
             operations=tuple(data.get("operations") or ()),
+            subgoals=tuple(data.get("subgoals") or ()),
+            acceptance_criteria=tuple(data.get("acceptance_criteria") or ()),
             constraints=tuple(data.get("constraints") or ()),
             exclusions=tuple(data.get("exclusions") or ()),
             inputs=data.get("inputs") or {},

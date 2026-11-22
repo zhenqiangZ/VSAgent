@@ -701,6 +701,16 @@
         return el("div", "part part-note", `重试 ${part.text}`);
       case "compaction":
         return el("div", "part part-note", `上下文已压缩 ${part.text}`);
+      case "sar": {
+        // 先验答案带展开正文，折起来与过程行同列；其余过程行仍是一行说明。
+        if (!part.detail) {
+          return el("div", "part part-note", `· ${part.text || "检索增强"}`);
+        }
+        const details = el("details", "part part-sar");
+        details.appendChild(el("summary", "", part.text || "先验答案"));
+        details.appendChild(el("div", "sar-body", part.detail));
+        return details;
+      }
       default:
         return el("div", "part part-note", part.text || part.type);
     }

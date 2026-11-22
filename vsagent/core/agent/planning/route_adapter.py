@@ -41,6 +41,23 @@ WARNING_LIMIT = 4
 TEXT_LIMIT = 2_000
 
 
+def _merge_rows(
+    first: tuple[dict[str, Any], ...],
+    second: tuple[dict[str, Any], ...],
+    keys: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    """按几个字段去重，保留第一次出现的行。"""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    for row in (*first, *second):
+        key = tuple(str(row.get(name) or "") for name in keys)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(row))
+    return tuple(out)
+
+
 def _clip(text: str, limit: int) -> str:
     """压成一行再截断：折叠块的正文按行排，换行会把一条要求拆成两行。"""
     flat = " ".join(str(text).split())
@@ -191,6 +208,14 @@ class RouteAdapter:
                 task_relation=relation,
                 conversation_action="execute",
                 operations=operations,
+                subgoals=_merge_rows(
+                    base.subgoals, intent.subgoals, ("agent", "goal")
+                ),
+                acceptance_criteria=_merge_rows(
+                    base.acceptance_criteria,
+                    intent.acceptance_criteria,
+                    ("kind", "target"),
+                ),
                 objects=objects,
                 goal=goal,
                 inputs={**base.inputs, **intent.inputs},

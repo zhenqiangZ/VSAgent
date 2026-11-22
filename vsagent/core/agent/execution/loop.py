@@ -229,6 +229,18 @@ def sar_mode_from_env(
     fallback = default if default in SAR_MODES else "off"
     raw = source.get(SAR_ENV, "").strip().lower()
     return raw if raw in SAR_MODES else fallback
+
+
+def defers_search_reasoning(session: Session, mode: str) -> bool:
+    """research 子会话把搜索增强分成轮首与轮末两段。
+
+    轮首写下先验答案，检索阶段只收结果，轮末再统一评估与整合。逐步评估
+    会在每次检索之后插一次模型请求，研究角色一轮要查十几次，这些请求夹在
+    检索之间只会打断它继续找；轮末一起看，去重与冲突也只算一遍。
+    """
+    return mode != "off" and session.agent_role == "research"
+
+
 # 每次重发之前等多久
 RETRY_DELAYS = (1.0, 3.0)
 # Stop 钩子拦下来时写进会话的那句话
@@ -396,6 +408,8 @@ class AgentLoop:
         # 这一轮的答案状态。`None` 表示这一轮没有进入 SAR（DIRECT 或开关关闭）。
         self.answer_state: AnswerState | None = None
         self._sar_active = False
+        # research 子会话轮首写先验，检索阶段只收集，轮末再评估整合。
+        self._research_batch = False
         # 模型最后一步的正文先留在这里，核对完成后再一次性发布。
         # 只有 SAR 生效的轮次才用得到；其余轮次正文照常边生成边发。
         self._held_parts: list[tuple[Message, Part]] = []
@@ -540,6 +554,7 @@ class AgentLoop:
         # 答案状态按轮清空：上一轮的说法与证据不进入这一轮。
         self.answer_state = None
         self._sar_active = False
+        self._research_batch = defers_search_reasoning(session, self.sar_mode)
         self._held_parts = []
         self._sar_parts = {}
         self._sar_suppressed = []
@@ -582,6 +597,8 @@ class AgentLoop:
         # 或解析失败时保持 False，否则新加的这一层会把旧路径一起锁死。
         await self._prepare_route(session, message)
         try:
+            if self._research_batch:
+                await self._begin_research_turn(session, message)
             message, step, elapsed_ms, exit_reason = await self._run_steps(
                 session, message, workspace
             )
@@ -1002,8 +1019,19 @@ class AgentLoop:
                 self._add_usage(message, event.usage)
         return "".join(chunks).strip()
 
-    def _sar_failed(self, session: Session, message: Message, error: Exception) -> None:
-        """SAR 某一步走不通：保存失败状态，放开原始结果，退回原路径。"""
+    def _sar_failed(
+        self,
+        session: Session,
+        message: Message,
+        error: Exception,
+        *,
+        part_type: PartType = PartType.ERROR,
+    ) -> None:
+        """SAR 某一步走不通：保存失败状态，放开原始结果，退回原路径。
+
+        轮首失败传 `SAR`：这一行不是模型请求出错，写成 `ERROR` 会让循环
+        把它当成「模型报错停下」，整轮按异常结束处理。
+        """
         state = self.answer_state
         if state is not None:
             state.status = "failed"
@@ -1021,7 +1049,10 @@ class AgentLoop:
         )
         self._publish(
             message,
-            Part(type=PartType.ERROR, text=f"检索增强没有走通，这一轮按原路径回答：{error}"),
+            Part(
+                type=part_type,
+                text=f"检索增强没有走通，这一轮按原路径回答：{error}",
+            ),
         )
 
     def _sar_line(
@@ -1138,7 +1169,135 @@ class AgentLoop:
             f"{len(state.knowledge_gaps)} 个知识缺口",
             claims=len(state.initial_claims),
             gaps=len(state.knowledge_gaps),
+            detail=self._prior_detail(state),
         )
+        return True
+
+    def _turn_tool_parts(self, session: Session, message: Message) -> list[Part]:
+        """这一轮已经完成的工具结果，从最后一条用户消息之后算起。
+
+        research 可能在轮末换过一条助手消息（Stop 钩子拦住后另起一条），
+        只看最后一条会漏掉前面几步的检索。
+        """
+        start = 0
+        for index in range(len(session.messages) - 1, -1, -1):
+            if session.messages[index].role == "user":
+                start = index + 1
+                break
+        parts: list[Part] = []
+        for item in session.messages[start:]:
+            if item.role != "assistant":
+                continue
+            parts.extend(
+                part
+                for part in item.parts
+                if part.type is PartType.TOOL
+                and part.tool_status is ToolStatus.COMPLETED
+            )
+        return parts
+
+    async def _begin_research_turn(
+        self, session: Session, message: Message
+    ) -> bool:
+        """research 轮首写下先验答案，作为本轮回答的基线。
+
+        检索还没开始，输入只有问题、任务、记忆与上一轮答复。先验与本轮
+        证据无关，后面的评估只看它需要补什么。
+        """
+        question = self._last_user_text(session)
+        if not question.strip():
+            return False
+        try:
+            state = await capture_prior(
+                question,
+                self._sar_ask(message),
+                task_text=self._task_text(session),
+                recent=self._prior_answer_text(session, message),
+                memory=self._memory_text(session),
+            )
+        except SearchReasoningError as error:
+            self._sar_failed(session, message, error, part_type=PartType.SAR)
+            return False
+        except Exception as error:
+            self._sar_failed(session, message, error, part_type=PartType.SAR)
+            return False
+        self.answer_state = state
+        self._sar_active = True
+        self.bus.publish(
+            sar_events.ANSWER_INITIALIZED, sar_events.initialized(state, session.id)
+        )
+        save_answer(state, self.state_dir, session.id)
+        self._sar_line(
+            message,
+            "baseline",
+            f"先验答案 · {len(state.initial_claims)} 条说法，"
+            f"{len(state.knowledge_gaps)} 个知识缺口",
+            claims=len(state.initial_claims),
+            gaps=len(state.knowledge_gaps),
+            detail=self._prior_detail(state),
+        )
+        return True
+
+    async def _finish_research_batch(
+        self, session: Session, message: Message
+    ) -> bool:
+        """轮末把整轮检索结果并进先验答案，评估一次。
+
+        检索过程中不评估；这里统一去重、评估并同步证据层，整合与核对
+        由收尾继续跑。
+        """
+        state = self.answer_state
+        if state is None:
+            return False
+        tools = self._turn_tool_parts(session, message)
+        initial = items_from(tools)
+        if not initial:
+            return True
+        trigger = next((part for part in tools if is_trigger_tool(part.tool_name)), None)
+        tool_name = (trigger.tool_name if trigger is not None else "") or "检索汇总"
+        self.bus.publish(
+            sar_events.RETRIEVAL_OBSERVED,
+            sar_events.observed(session.id, tool_name, 0, len(initial), len(initial)),
+        )
+        self._sar_line(
+            message,
+            "retrieval",
+            f"检索 · 本轮 {len(tools)} 次调用，{len(initial)} 条候选，轮末统一整理",
+            tool=tool_name,
+            count=len(initial),
+        )
+        added = merge(initial, state)
+        state.status = "searching"
+        self.bus.publish(
+            sar_events.EVIDENCE_COLLECTED,
+            sar_events.collected(state, session.id, added, len(state.evidence_pool)),
+        )
+        try:
+            counts = await assess(
+                state, question=state.question, ask=self._sar_ask(message), refine=True
+            )
+        except SearchReasoningError as error:
+            self._sar_failed(session, message, error)
+            return False
+        except Exception as error:
+            self._sar_failed(session, message, error)
+            return False
+        self.bus.publish(
+            sar_events.EVIDENCE_ASSESSED, sar_events.assessed(state, session.id, counts)
+        )
+        self._sync_sar_evidence()
+        selected = len(select_for_context(state))
+        self._sar_line(
+            message,
+            "evidence",
+            f"证据 · {len(state.evidence_pool)} 条候选，{selected} 条进入上下文"
+            f"（支持 {counts.get('supporting', 0)}、补充 {counts.get('supplementary', 0)}、"
+            f"冲突 {counts.get('contradictory', 0)}）",
+            total=len(state.evidence_pool),
+            selected=selected,
+            relations=dict(counts),
+        )
+        save_answer(state, self.state_dir, session.id)
         return True
 
     def _suppress_retrieval(self, message: Message, step: int) -> None:
@@ -1219,7 +1378,7 @@ class AgentLoop:
         self, session: Session, message: Message, calls: list[Part], step: int
     ) -> None:
         """检索结果回写之后：第一次触发先写先验答案，然后整理证据。"""
-        if self.sar_mode == "off":
+        if self.sar_mode == "off" or self._research_batch:
             return
         state = self.answer_state
         if state is None:
@@ -1327,13 +1486,28 @@ class AgentLoop:
             )
             self.evidence.add(f"sar:{item.id}", summary, item.content[:600])
 
+    @staticmethod
+    def _prior_detail(state: AnswerState) -> str:
+        """先验答案展开后的正文：答复、说法与知识缺口。界面默认收起这一块。"""
+        lines = [state.initial_answer]
+        if state.initial_claims:
+            lines.extend(["", "说法："])
+            lines.extend(
+                f"- {claim.id}（{claim.category}）：{claim.content}"
+                for claim in state.initial_claims
+            )
+        if state.knowledge_gaps:
+            lines.extend(["", "知识缺口：" + "；".join(state.knowledge_gaps)])
+        return "\n".join(lines)
+
     def _answer_text(self) -> str:
         """把答案状态的摘要渲染成 TASK 层的一段。没有状态时是空串。"""
         state = self.answer_state
         if not self._sar_active or state is None:
             return ""
         snap = state.snapshot(answer_limit=400, claim_limit=6, gap_limit=5)
-        lines = ["本轮回答基线（第一次检索结果返回前建立，供对照）"]
+        origin = "轮首建立" if self._research_batch else "第一次检索结果返回前建立"
+        lines = [f"本轮回答基线（{origin}，供对照）"]
         lines.append(f"先验答案：{snap['initial_answer']}")
         if snap["claims"]:
             lines.append("说法：")
@@ -1360,16 +1534,35 @@ class AgentLoop:
         `shadow` 照常跑整合与核对，但最终正文仍是模型自己写的那一份；
         `enforce` 用整合并核对过的正文替换草稿。异常结束的轮次不整合。
         """
-        state = self.answer_state
-        if not self._sar_active or state is None:
+        if self.sar_mode == "off":
             return
         if exit_reason:
-            state.status = "failed"
-            save_answer(state, self.state_dir, session.id)
-            # 交代已经由收尾总结给了。这里再把压着的草稿放出去，用户看到的
-            # 最后一段会是一句「本轮写入：…」的半截话，总结被挤到它前面。
-            self._drop_held()
-            self._release_suppressed()
+            state = self.answer_state
+            if state is not None:
+                state.status = "failed"
+                save_answer(state, self.state_dir, session.id)
+            if self._sar_active or self._research_batch:
+                # 交代已经由收尾总结给了。这里再把压着的草稿放出去，用户看到的
+                # 最后一段会是一句「本轮写入：…」的半截话，总结被挤到它前面。
+                self._drop_held()
+                self._release_suppressed()
+            return
+
+        if self._research_batch:
+            if self.answer_state is None:
+                # 轮首先验没有建立：这一轮按原路径回答，不在轮末补建。
+                self._flush_held()
+                self._release_suppressed()
+                return
+            if not await self._finish_research_batch(session, message):
+                # 证据评估没有走通：草稿照原样交给用户。
+                self._flush_held()
+                self._release_suppressed()
+                return
+
+        state = self.answer_state
+        if not self._sar_active or state is None:
+            self._flush_held()
             return
 
         draft = "".join(
@@ -1414,25 +1607,26 @@ class AgentLoop:
 
         ask = self._sar_ask(message)
         try:
-            # 收尾时允许模型复核规则判不准的证据；这一步只做一次。
-            counts = await assess(
-                state, question=state.question, ask=ask, refine=True
-            )
-            self.bus.publish(
-                sar_events.EVIDENCE_ASSESSED,
-                sar_events.assessed(state, session.id, counts),
-            )
-            selected = len(select_for_context(state))
-            self._sar_line(
-                message,
-                "evidence",
-                f"证据 · {len(state.evidence_pool)} 条候选，{selected} 条进入上下文"
-                f"（支持 {counts.get('supporting', 0)}、补充 {counts.get('supplementary', 0)}、"
-                f"冲突 {counts.get('contradictory', 0)}）",
-                total=len(state.evidence_pool),
-                selected=selected,
-                relations=dict(counts),
-            )
+            if not self._research_batch:
+                # 收尾时允许模型复核规则判不准的证据；这一步只做一次。
+                counts = await assess(
+                    state, question=state.question, ask=ask, refine=True
+                )
+                self.bus.publish(
+                    sar_events.EVIDENCE_ASSESSED,
+                    sar_events.assessed(state, session.id, counts),
+                )
+                selected = len(select_for_context(state))
+                self._sar_line(
+                    message,
+                    "evidence",
+                    f"证据 · {len(state.evidence_pool)} 条候选，{selected} 条进入上下文"
+                    f"（支持 {counts.get('supporting', 0)}、补充 {counts.get('supplementary', 0)}、"
+                    f"冲突 {counts.get('contradictory', 0)}）",
+                    total=len(state.evidence_pool),
+                    selected=selected,
+                    relations=dict(counts),
+                )
             actions, _notes = await integrate(state, ask, limits=limits)
             self.bus.publish(
                 sar_events.CLAIM_UPDATED, sar_events.updated(state, session.id, actions)
@@ -2617,10 +2811,19 @@ class AgentLoop:
         """把增量接到当前这一类 Part 上，最后一个是别的类型时另起一个。
 
         SAR 生效的轮次，`TEXT` 先不发布：模型最后一步的正文只是草稿，要等
-        整合与核对完成之后一次性交给用户。`REASONING` 照常流式发布——
-        用户仍能看见正在做什么，只是最终答复不会先出一版再被改写。
+        整合与核对完成之后一次性交给用户。research 的先验在轮首建立，
+        `enforce` 用整合正文替换草稿；`shadow` 到收尾时把草稿原样放出，
+        观察整合结果与草稿的差别。
+        `REASONING` 照常流式发布——用户仍能看见正在做什么，只是最终答复
+        不会先出一版再被改写。
         """
-        hold = self._sar_active and part_type is PartType.TEXT
+        hold = (
+            part_type is PartType.TEXT
+            and (
+                self._sar_active
+                or (self._research_batch and self.sar_mode == "enforce")
+            )
+        )
         last = message.parts[-1] if message.parts else None
         if last is not None and last.type is part_type:
             last.text += text

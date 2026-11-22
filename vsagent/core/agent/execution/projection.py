@@ -15,8 +15,9 @@
 （`{"pocket": [...], "global": [...]}`）。不再从父会话的任务状态或任务规格里
 按前缀切句子——「这条要求该给谁」只有派发的那一刻、看着子任务才判得准。
 
-中间结构 `RoleSlice` 不落盘、不下发：它是投影的中间结果，真正的运输合同仍是
-`AgentTask`。
+`RolePlan` 是派发时给任务规格里没有的角色补写的一段计划。它不写回任务规格，
+只影响这一次投影：路由自动补出来的上游角色靠它拿到目标与验收条件，
+也靠模板补上交付物。
 """
 
 from __future__ import annotations
@@ -31,6 +32,14 @@ from vsagent.core.agent.roles.templates import template_for
 
 # 写给所有角色的那一格。派发工具也收「全局」，归一化之后用这个键。
 GLOBAL_CONSTRAINT = "global"
+
+
+@dataclass(frozen=True)
+class RolePlan:
+    """派发时补写的一段计划，只给任务规格里没有子目标的角色用。"""
+
+    goals: tuple[str, ...] = ()
+    acceptance_criteria: tuple[dict[str, Any], ...] = ()
 
 
 def task_id_for(plan: AgentPlan, role: str) -> str:
@@ -81,9 +90,16 @@ def role_constraints(
 
 
 def _claim_outputs(
-    spec: TaskSpec | None, chosen: list[str], sinks: list[str]
+    spec: TaskSpec | None,
+    chosen: list[str],
+    sinks: list[str],
+    baseline: set[str],
 ) -> tuple[dict[str, tuple[str, ...]], list[Note]]:
-    """按角色模板的交付物认领，返回（每个角色一份, 提示）。"""
+    """按角色模板的交付物认领，返回（每个角色一份, 提示）。
+
+    `baseline` 是任务规格里已经有子目标的角色。不在其中的角色是路由补出来的
+    上游，任务规格没有为它们列交付物，从模板补上，否则子任务书里没有交付目标。
+    """
     if spec is None:
         return {}, []
     owners: dict[str, list[str]] = {}
@@ -115,15 +131,17 @@ def _claim_outputs(
                 f"（{'、'.join(sinks)}），这次不下发",
             )
         )
+    for role in chosen:
+        if role in baseline:
+            continue
+        for name in template_for(role).required_outputs:
+            if name not in claimed[role]:
+                claimed[role].append(name)
     return {role: tuple(names) for role, names in claimed.items()}, notes
 
 
-def _goals_for(spec: TaskSpec | None, role: str) -> list[str]:
-    """这个角色负责的子目标。按 `agent` 字段对，不按文字猜。
-
-    一个都找不到时（路由补出来的前置节点在任务规格里没有对应子目标），用模板里的
-    步骤兜底：子 agent 拿到的任务书里必须有一句能说明“这一段要做什么”。
-    """
+def _goals_for(spec: TaskSpec | None, role: str, plan: RolePlan | None) -> list[str]:
+    """这个角色负责的子目标。任务规格里的在前，派发补写的在后。"""
     out: list[str] = []
     if spec is not None:
         for row in spec.subgoals:
@@ -132,16 +150,60 @@ def _goals_for(spec: TaskSpec | None, role: str) -> list[str]:
             goal = str(row.get("goal") or "").strip()
             if goal and goal not in out:
                 out.append(goal)
-    return out or _template_goals(role)
-
-
-def _template_goals(role: str) -> list[str]:
-    """模板里给这个角色的步骤目标。"""
-    out: list[str] = []
-    for step in template_for(role).subgoals:
-        if step.goal and step.goal not in out:
-            out.append(step.goal)
+    if plan is not None:
+        for goal in plan.goals:
+            text = str(goal).strip()
+            if text and text not in out:
+                out.append(text)
     return out
+
+
+def _criteria_for(
+    spec: TaskSpec | None,
+    role: str,
+    outputs: tuple[str, ...],
+    plan: RolePlan | None,
+) -> tuple[tuple[dict[str, Any], ...], list[Note]]:
+    """属于这个角色交付物的验收条件。派发补写的条件只增不减。"""
+    notes: list[Note] = []
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(row: dict[str, Any]) -> None:
+        output = str(row.get("output") or "").strip()
+        if not output and len(outputs) == 1:
+            output = outputs[0]
+        if not output or output not in outputs:
+            notes.append(
+                Note(
+                    "plan_output_unknown",
+                    "plans",
+                    f"{role} 的验收条件指向 {output or '（空）'}，"
+                    f"不在它的交付物里：{'、'.join(outputs) or '无'}",
+                )
+            )
+            return
+        key = (str(row.get("kind") or ""), str(row.get("target") or ""))
+        if not key[0] or not key[1] or key in seen:
+            return
+        seen.add(key)
+        out.append(
+            {
+                "kind": key[0],
+                "target": key[1],
+                "output": output,
+            }
+        )
+
+    if spec is not None:
+        for row in spec.acceptance_criteria:
+            output = str(row.get("output") or "").strip()
+            if output in outputs:
+                add(row)
+    if plan is not None:
+        for row in plan.acceptance_criteria:
+            add(row)
+    return tuple(out), notes
 
 
 def select_roles(plan: AgentPlan, roles: Iterable[str]) -> list[str]:
@@ -227,6 +289,7 @@ def project(
     roles: Iterable[str] | None = None,
     task: str = "",
     constraints: Mapping[str, Iterable[str]] | None = None,
+    role_plans: Mapping[str, RolePlan] | None = None,
 ) -> Projection:
     """把计划投影成每个角色的切片。不派发，纯计算。
 
@@ -237,6 +300,10 @@ def project(
     `constraints` 是父 agent 在派发时按角色写的那一份：键是角色名或 `global`。
     没写的角色只带说明书里的固定限制。`spec.constraints` 不参与：那是父会话里
     用户的原话，不是这一段子任务的交付要求。
+
+    `role_plans` 是派发时补写的目标与验收条件，按角色分。它只影响这一次投影：
+    任务规格里没有子目标的角色（路由补出来的上游）靠它拿到任务书，交付物从
+    模板补。补写的条目与任务规格里的按 `(agent, goal)`、`(kind, target)` 去重。
     """
     if not plan.selected_agents:
         return Projection(
@@ -266,6 +333,16 @@ def project(
         )
 
     notes: list[Note] = []
+    plans = dict(role_plans or {})
+    for name in sorted(set(plans) - set(chosen)):
+        # 与限制写错角色同样处理：这一次不派它，计划不会悄悄留到下一场。
+        notes.append(
+            Note(
+                "plan_unknown_role",
+                "plans",
+                f"计划写给了这次不派的角色 {name}，没有下发",
+            )
+        )
     if roles and set(chosen) - set(requested):
         notes.append(
             Note(
@@ -279,7 +356,11 @@ def project(
         str(row["from"]) for row in plan.dependencies if str(row["to"]) in chosen
     }
     sinks = [role for role in chosen if role not in upstream]
-    outputs, output_notes = _claim_outputs(spec, chosen, sinks)
+    baseline = {
+        str(row.get("agent") or "")
+        for row in (spec.subgoals if spec is not None else ())
+    }
+    outputs, output_notes = _claim_outputs(spec, chosen, sinks, baseline)
     notes.extend(output_notes)
 
     written = constraints or {}
@@ -302,19 +383,34 @@ def project(
 
     slices: list[RoleSlice] = []
     for role in chosen:
-        goals = _goals_for(spec, role)
+        role_plan = plans.get(role)
+        goals = _goals_for(spec, role, role_plan)
+        if spec is not None and not goals:
+            notes.append(
+                Note(
+                    "plan_missing_goals",
+                    "plans",
+                    f"{role} 没有子目标；派发时用 plans[\"{role}\"].goals 补写，"
+                    "或者在任务规格里加一条子目标",
+                )
+            )
         duty = "；".join(goals) or f"完成 {role} 这一段（任务 {plan.task_id}）"
         # 本角色的目标只写它这一段要做什么。父目标进 `background`，
         # 不放在第一行——否则子 agent 会把父任务当成自己的交付物再做一遍。
         objective = duty
         background = spec.objective if spec is not None else ""
         outputs_for_role = outputs.get(role, ())
-        criteria: tuple[dict[str, Any], ...] = ()
-        if spec is not None and outputs_for_role:
-            criteria = tuple(
-                dict(row)
-                for row in spec.acceptance_criteria
-                if str(row.get("output") or "") in outputs_for_role
+        criteria, criterion_notes = _criteria_for(
+            spec, role, outputs_for_role, role_plan
+        )
+        notes.extend(criterion_notes)
+        if outputs_for_role and not criteria:
+            notes.append(
+                Note(
+                    "acceptance_uncovered",
+                    "acceptance_criteria",
+                    f"{role} 的交付物没有验收条件：{'、'.join(outputs_for_role)}",
+                )
             )
         slices.append(
             RoleSlice(

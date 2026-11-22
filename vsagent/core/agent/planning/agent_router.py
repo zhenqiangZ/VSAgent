@@ -118,11 +118,7 @@ def validate_prerequisites() -> list[str]:
         if role not in TEMPLATES:
             problems.append(f"{role} 没有编译模板")
             continue
-        template = template_for(role)
-        for step in template.subgoals:
-            if step.stage and step.stage not in catalog.STAGES:
-                problems.append(f"{role} 的模板阶段不认识：{step.stage}")
-        if not template.required_outputs:
+        if not template_for(role).required_outputs:
             problems.append(f"{role} 的模板没有交付物")
     for role in catalog.ROLE_PROVIDED_INPUTS:
         if role not in known:

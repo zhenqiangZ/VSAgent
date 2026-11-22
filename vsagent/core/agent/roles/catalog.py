@@ -42,6 +42,19 @@ STAGES: tuple[str, ...] = (
 )
 """五个科研阶段。子目标可以带一个阶段名，供阶段规则使用。"""
 
+ROLE_STAGES: dict[str, tuple[str, ...]] = {
+    "research": (),
+    "pocket": ("structure_discovery", "pocket_analysis"),
+    "ligand": ("ligand_analysis",),
+    "prepare": ("screening",),
+    "docking": ("screening",),
+    "affinity": ("evaluation",),
+    "analysis": ("evaluation",),
+    "mechanism": ("evaluation",),
+    "visualization": (),
+}
+"""每个角色允许挂的阶段。模型写子目标时按这张表选，空元组表示不挂阶段。"""
+
 TITLES: dict[str, str] = {
     "principal": "主控：拆解目标、派发与汇总",
     "research": "调研：靶点、受体与配体情报",
@@ -226,4 +239,13 @@ def validate() -> list[str]:
             problems.append(f"自带输入表里有不存在的角色：{role}")
         if not keys:
             problems.append(f"{role} 的自带输入是空的")
+    for role in AGENTS:
+        if role not in ROLE_STAGES:
+            problems.append(f"{role} 没有阶段条目：不挂阶段也要写一行")
+            continue
+        for stage in ROLE_STAGES[role]:
+            if stage not in STAGES:
+                problems.append(f"{role} 的阶段不认识：{stage}")
+    for role in sorted(set(ROLE_STAGES) - set(AGENTS)):
+        problems.append(f"阶段表里有不存在的角色：{role}")
     return problems

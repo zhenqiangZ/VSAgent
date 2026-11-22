@@ -544,6 +544,23 @@ button { transition: border-color 0.15s ease, color 0.15s ease, background 0.15s
   word-break: break-word;
 }
 
+/* 先验答案：标题是检索增强的阶段行，正文展开后是完整答复与说法。 */
+.part-sar {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--reason-bg);
+  padding: var(--space-2) var(--space-4);
+}
+
+.part-sar summary { cursor: pointer; color: var(--muted); font-size: var(--fs-small); }
+.part-sar .sar-body {
+  margin-top: var(--space-3);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .part-tool, .part-patch {
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);

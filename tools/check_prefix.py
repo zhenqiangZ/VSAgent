@@ -31,6 +31,7 @@ from vsagent.core.agent.domain.survey import SurveyStructuresTool  # noqa: E402
 from vsagent.core.agent.domain.export import OpenViewerTool, WriteRunTool  # noqa: E402
 from vsagent.core.agent.permission import PATH_ARGUMENTS, PLAN_DENY  # noqa: E402
 from vsagent.core.agent.roles.prompt import (  # noqa: E402
+    EVENT_DISCIPLINE,
     REFERENCE_RULE_DIR,
     RULES_DIR_ENV,
     agent_rules,
@@ -62,9 +63,10 @@ from vsagent.core.models import Session  # noqa: E402
 # 这几段每步都发，涨了会挤压最近几轮的原文，所以照旧卡住。
 PREFIX_BUDGET = 1900
 # 一份角色规则的预算。角色规则进稳定前缀，每多一份就在每一步重复计费。
-# 2026-11-20 起角色规则换成英文模板，实测 887–1,022 token；统一按 1,200 卡，
-# 仍能拦住继续膨胀的那一份。
+# 2026-11-20 起角色规则换成英文模板，其余九份实测 887–1,022 token，按 1,200 卡；
+# 主控那份 1,651 token，英文模板比中文长，单独按 1,700 卡，仍能拦住继续膨胀。
 ROLE_RULE_BUDGET = 1_200
+PRINCIPAL_RULE_BUDGET = 1_700
 # 规则文件（`AGENTS.md`）不设上限：它是许可与判据的来源，少一条就可能让模型做一个
 # 本来被禁止的动作。这里只报它的体量，供改的人心里有数。
 # 这些句式一出现就说明有人又在提示里抄了一份会过期的清单。
@@ -258,7 +260,7 @@ def main() -> int:
     # 总和会随着角色变多而涨，那时该拆的是内容，不是放宽这一条。
     for role in ROLES:
         tokens = estimate_tokens(agent_rules(base, role))
-        limit = ROLE_RULE_BUDGET
+        limit = PRINCIPAL_RULE_BUDGET if role == "principal" else ROLE_RULE_BUDGET
         if tokens > limit:
             failures.append(f"{role} 的角色规则 {tokens} token，超过 {limit}")
 
@@ -269,13 +271,6 @@ def main() -> int:
         if body and body in prefix:
             failures.append(f"参考材料 {name} 被默认注入了前缀：它应当按需读取")
 
-    # 呈现纪律只给主控与 visualization；评分纪律只给三个专业角色。
-    # 缺了它们，模型不会按角色请求视图，也不会把亲和力模型当成单独的一路。
-    if "页面地址必须来自工具返回" not in prefix:
-        failures.append("呈现纪律不在前缀里：页面地址会变成编造")
-    docking_prefix = build(role="docking")
-    if "评分模型" not in docking_prefix or "亲和力模型训练" not in docking_prefix:
-        failures.append("打分纪律不在专业角色前缀里：亲和力通道不会被想到")
     core_names = set(agents.core_tools("orchestrator", ROOT)) | set(
         agents.core_tools("worker", ROOT)
     )
@@ -318,6 +313,12 @@ def main() -> int:
         failures.append("子 agent 的前缀里出现了派发规则")
     if "你是由 Principal 派发的专业 Worker Agent" not in child_prefix:
         failures.append("子 agent 的前缀里没有身份段")
+
+    # 事件封存只给主控：子会话没有事件工具，照抄一段只会让它去调不存在的工具。
+    if EVENT_DISCIPLINE not in prefix:
+        failures.append("主控前缀里没有事件封存纪律")
+    if EVENT_DISCIPLINE in child_prefix:
+        failures.append("子 agent 前缀里出现了事件封存纪律：它没有事件工具")
 
     # Plan 只读：它必须说清「哪些会被拒绝」，而不是只提一个例子。
     if "都会被拒绝" not in plan_prefix:

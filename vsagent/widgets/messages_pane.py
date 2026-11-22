@@ -676,6 +676,49 @@ class SarPartView(SimplePartView):
         self.update(self.render_part_text(part))
 
 
+def _sar_detail(part: Part) -> str:
+    """SAR 过程行附带的展开正文；没有时是空串。"""
+    meta = part.tool_meta if isinstance(part.tool_meta, dict) else {}
+    return str(meta.get("detail") or "")
+
+
+class SarPriorView(FoldBlock):
+    """先验答案：检索结果进入之前模型写下的那一份，默认收起。
+
+    标题行保留阶段行原有的计数，正文展开后是完整答复、说法与知识缺口。
+    它和过程行分开渲染：过程行是一眼扫描用的，答案需要读，默认摊开会
+    把后面的证据与整合行挤出视口。
+    """
+
+    DEFAULT_CSS = palette.css("""
+    SarPriorView {
+        height: auto;
+        margin: 0 0 1 4;
+        border-left: thick $vsa-line-soft;
+    }
+    SarPriorView .fold-header { color: $vsa-text-3; }
+    SarPriorView .fold-body { color: $vsa-text-2; }
+    """)
+
+    def __init__(self, part: Part) -> None:
+        super().__init__(title=part.text, classes="part part-sar")
+        self.part_id = part.id
+        body = _sar_detail(part)
+        self._start_window(body)
+        self.write_text(body)
+
+    def sync(self, part: Part) -> None:
+        """标题与正文都按最新数据重画；标题变了才改表头那一行。"""
+        changed = part.text != self._title
+        self._title = part.text
+        body = _sar_detail(part)
+        self._start_window(body)
+        self.write_text(body)
+        if changed:
+            for header in self.query(".fold-header"):
+                header.update(self._header_text())
+
+
 class PatchPartView(SimplePartView):
     """补丁 Part，点击后打开全屏 Diff。"""
 
@@ -2020,7 +2063,7 @@ class MessagesPane(ScrollableContainer):
         if part.type is PartType.ROUTE:
             return RoutePartView(part)
         if part.type is PartType.SAR:
-            return SarPartView(part)
+            return SarPriorView(part) if _sar_detail(part) else SarPartView(part)
         return SimplePartView(part)
 
     def _build_and_register(

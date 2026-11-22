@@ -14,7 +14,8 @@
 - `continue` 沿用任务号；新约束、新排除项、新输入并进去。出现新角色时版本加一，
   并重新编译；只改约束时版本也加一，但不重写子目标。
 - `modify` 换目标或对象，版本加一；已有产物保留。
-- `compare` 沿用任务号，版本加一，补上 `analysis`，输入指向两组已有对象。
+- `compare` 沿用任务号，版本加一；操作与子目标由这一句的解析结果给出，
+  必须包含 `analysis`，输入指向两组已有对象。
 
 合并一律**只增不减**：旧约束不会被这一句覆盖掉。
 """
@@ -32,7 +33,7 @@ NON_EXECUTING_ACTIONS: frozenset[str] = frozenset(
 )
 """这些行为不编译任务。"""
 
-CONTEXT_LIMIT = 400
+CONTEXT_LIMIT = 500
 """喂回解析器的当前任务摘要上限（字符）。"""
 
 
@@ -141,11 +142,12 @@ class TaskContextResolver:
             )
 
         if relation == "compare":
-            operations = self._ordered([*self._agents(task), *intent.operations, "analysis"])
+            # 比较要用到哪几个角色由这一句决定；把当前任务的旧角色再拼进来，
+            # 模型没为它们写子目标，编译时会因为覆盖不全而失败。
             return RouteDecision(
                 relation=relation,
                 action=action,
-                intent=replace(intent, operations=operations),
+                intent=intent,
                 task=task,
                 source_refs=source_refs,
             )
@@ -216,7 +218,7 @@ class TaskContextResolver:
 
 
 def context_line(task: TaskSpec | None) -> str:
-    """给解析器看的当前任务摘要：目标、要求、禁止、状态，最多 400 字符。
+    """给解析器看的当前任务摘要：目标、角色、要求、禁止、状态，最多 500 字符。
 
     只带这几项，不带进度与历史。对象表由 `context_resolver` 另外拼。
     """
@@ -224,6 +226,13 @@ def context_line(task: TaskSpec | None) -> str:
         return ""
     parts = [f"任务：{task.task_id}（第 {task.revision} 版）"]
     parts.append(f"目标：{task.objective}")
+    roles = [
+        str(row.get("agent") or "").strip()
+        for row in task.subgoals
+        if str(row.get("agent") or "").strip()
+    ]
+    if roles:
+        parts.append("角色：" + "、".join(dict.fromkeys(roles)))
     if task.constraints:
         parts.append("要求：" + "；".join(task.constraints[:5]))
     if task.exclusions:

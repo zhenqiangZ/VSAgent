@@ -51,6 +51,8 @@ PLAN.md
 
 # 本机运行状态与编辑器配置
 .vsagent/
+# Qoder 的本机权限设置，随个人会话变化
+.qoder/settings.local.json
 # 改名前那份项目侧配置（tools.toml / permissions.toml / hooks.toml）。
 # 启动时会被 `paths.migrate_legacy_config()` 改名成 `.vsagent/`；
 # 这里留着只是不让它在搬迁之前把 `git status` 弄脏。

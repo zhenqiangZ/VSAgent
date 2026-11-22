@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
-from vsagent.core.agent.execution.projection import Projection, project
+from vsagent.core.agent.execution.projection import Projection, RolePlan, project
 from vsagent.core.agent.execution.scheduler import AgentScheduler, Schedule
 from vsagent.core.agent.planning.notes import Note
 from vsagent.core.agent.roles.contracts import AgentPlan, AgentTask, TaskSpec
@@ -94,6 +94,7 @@ def build_tasks(
     roles: Iterable[str] | None = None,
     task: str = "",
     constraints: Mapping[str, Iterable[str]] | None = None,
+    role_plans: Mapping[str, RolePlan] | None = None,
 ) -> tuple[list[AgentTask], list[Note]]:
     """把计划翻成任务列表，返回（任务, 提示）。不派发，纯翻译。
 
@@ -106,6 +107,7 @@ def build_tasks(
         roles=roles,
         task=task,
         constraints=constraints,
+        role_plans=role_plans,
     )
     return projection.tasks(), list(projection.notes)
 
@@ -124,6 +126,7 @@ class Coordinator:
         roles: Iterable[str] | None = None,
         task: str = "",
         constraints: Mapping[str, Iterable[str]] | None = None,
+        role_plans: Mapping[str, RolePlan] | None = None,
     ) -> tuple[list[AgentTask], list[Note]]:
         return build_tasks(
             plan,
@@ -131,6 +134,7 @@ class Coordinator:
             roles=roles,
             task=task,
             constraints=constraints,
+            role_plans=role_plans,
         )
 
     def project(
@@ -141,6 +145,7 @@ class Coordinator:
         roles: Iterable[str] | None = None,
         task: str = "",
         constraints: Mapping[str, Iterable[str]] | None = None,
+        role_plans: Mapping[str, RolePlan] | None = None,
     ) -> Projection:
         return project(
             plan,
@@ -148,6 +153,7 @@ class Coordinator:
             roles=roles,
             task=task,
             constraints=constraints,
+            role_plans=role_plans,
         )
 
     async def run(
@@ -161,6 +167,7 @@ class Coordinator:
         roles: Iterable[str] | None = None,
         task: str = "",
         constraints: Mapping[str, Iterable[str]] | None = None,
+        role_plans: Mapping[str, RolePlan] | None = None,
         on_dispatch: Callable[[AgentTask, Any], None] | None = None,
     ) -> Campaign:
         """翻译、调度、收拢。计划不成立时由调度器抛 `SchedulerError`，这里不吞。"""
@@ -170,6 +177,7 @@ class Coordinator:
             roles=roles,
             task=task,
             constraints=constraints,
+            role_plans=role_plans,
         )
         tasks = projection.tasks()
         warnings = list(projection.notes)

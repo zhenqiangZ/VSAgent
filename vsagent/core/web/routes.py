@@ -202,6 +202,8 @@ def part_json(part) -> dict:
         "toolStatus": part.tool_status.value if part.tool_status else "",
         "toolInput": part.tool_input,
         "toolOutput": part.tool_output,
+        # SAR 过程行可能带一段展开正文（先验答案）。其余类型的这一段是空串。
+        "detail": str((part.tool_meta or {}).get("detail") or ""),
         "filePath": part.file_path,
         "agentName": part.agent_name,
         "permission": part.permission,

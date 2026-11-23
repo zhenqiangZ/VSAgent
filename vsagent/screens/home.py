@@ -23,6 +23,7 @@ from ..widgets.editor_pane import COMMAND_TOKEN, FILE_TOKEN, ComposerInput, sear
 from ..widgets.file_autocomplete import AutocompletePopup, FileAutocomplete
 from ..widgets.session_list import NewTaskRow, SessionRow
 from ..widgets.top_bar import TopBar, TopLink
+from .forward_guard import ForwardGuard
 
 # 字标逐行写、最后补齐到同一宽度再拼起来。**不能省掉补齐**：`#home-logo` 是
 # `text-align: center`，每行各自居中，长短不一的几行会互相错开一格，整块看着是歪的。
@@ -143,7 +144,7 @@ class QuickTask(Static):
         self.post_message(self.Picked(self.key))
 
 
-class HomeScreen(Screen):
+class HomeScreen(ForwardGuard, Screen):
     """启动界面：标题、输入框、状态模型行、快捷键提示与底部状态栏。"""
 
     # 与 `ChatScreen` 同一条根因：`Screen.focused`（`screen.py:229`）与

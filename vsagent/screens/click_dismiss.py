@@ -17,6 +17,8 @@ from textual.errors import NoWidget
 from textual.screen import ModalScreen
 from textual.widget import Widget
 
+from .forward_guard import ForwardGuard
+
 ResultT = TypeVar("ResultT")
 
 # 弹窗本体统一挂的类。点击落在带这个类的组件之内时说明点的是弹窗内容，
@@ -24,7 +26,7 @@ ResultT = TypeVar("ResultT")
 BODY_CLASS = "modal-body"
 
 
-class ClickDismissModal(ModalScreen[ResultT], Generic[ResultT]):
+class ClickDismissModal(ForwardGuard, ModalScreen[ResultT], Generic[ResultT]):
     """点击弹窗之外的空白处即可关闭的模态弹窗。"""
 
     # 点击空白处时返回的结果，默认是与「按取消键」一致的空值。带返回值的

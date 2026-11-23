@@ -33,6 +33,7 @@ from ..widgets.status_bar import (
 from ..widgets.topic_card import ArtifactChip
 from ..widgets.topic_list import TopicList, TopicRow
 from .context_usage import ContextUsageScreen
+from .forward_guard import ForwardGuard
 
 # 中间那一栏至少要留这么多列。拖动分栏界线时宽度夹在这里，终端变窄时按同一档重算。
 MIN_MAIN_WIDTH = 40
@@ -266,7 +267,7 @@ class SidePanel(Vertical):
         self.query_one(selector, Static).update(text)
 
 
-class ChatScreen(Screen):
+class ChatScreen(ForwardGuard, Screen):
     """聊天主界面，消息区在上、编辑器在下、状态栏在最底。
 
     没有单独的标题栏：会话名、目录、分支、用量与侧栏开关全部放在底部那一行。

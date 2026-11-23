@@ -29,8 +29,9 @@ from textual import events  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.css.stylesheet import Stylesheet  # noqa: E402
 from textual.scrollbar import ScrollTo  # noqa: E402
+from textual.screen import Screen  # noqa: E402
 from textual.widget import Widget  # noqa: E402
-from textual.widgets import Input, ListView  # noqa: E402
+from textual.widgets import Input, ListView, Static  # noqa: E402
 
 from vsagent.app import VSAgentApp  # noqa: E402
 from vsagent.core.agent.state.memory import MemoryStore
@@ -72,6 +73,7 @@ from vsagent.core.session_manager import (  # noqa: E402
 from vsagent.screens.chat import ChatScreen, SideOptionList, SidePanel  # noqa: E402
 from vsagent.screens.connection_form import ConnectionFormScreen  # noqa: E402
 from vsagent.screens.context_usage import ContextUsageScreen  # noqa: E402
+from vsagent.screens.forward_guard import ForwardGuard  # noqa: E402
 from vsagent.screens.help import HelpScreen  # noqa: E402
 from vsagent.screens.home import (  # noqa: E402
     QUICK_TEMPLATES,
@@ -1273,6 +1275,73 @@ async def run_modal_click_checks() -> None:
     path.unlink(missing_ok=True)
 
 
+async def run_forward_guard_checks() -> None:
+    """组件摘掉之后的一帧内按下鼠标：命中旧地图时不能崩。
+
+    Textual 的摘除是异步的，真正把 `parent` 置空与合成器地图重排不在同一帧。
+    消息区在流式输出时不停补挂和裁剪，这一帧里按下鼠标，旧地图给出的组件已经
+    不在树上；`ForwardGuard` 要拦住这种事件，正常按下仍照常处理。
+    """
+
+    class Guarded(ForwardGuard, Screen):
+        def compose(self) -> ComposeResult:
+            yield Static("一行正文", id="guard-target")
+
+    class Demo(App):
+        def on_mount(self) -> None:
+            self.push_screen(Guarded())
+
+    app = Demo()
+    async with app.run_test(size=(40, 12)) as pilot:
+        for _ in range(40):
+            if isinstance(app.screen, Guarded):
+                break
+            await pilot.pause(0.05)
+        screen = app.screen
+        target = screen.query_one("#guard-target", Static)
+        region = target.region
+
+        def press() -> events.MouseDown:
+            return events.MouseDown(
+                target,
+                region.x + 1,
+                region.y,
+                0,
+                0,
+                1,
+                False,
+                False,
+                False,
+                screen_x=region.x + 1,
+                screen_y=region.y,
+            )
+
+        screen._forward_event(press())
+        check(screen._select_state is not None, "普通按下照常开始选区")
+        screen.clear_selection()
+
+        await target.remove()
+        check(target.parent is None, "摘掉之后组件已经不在父节点上")
+        check(
+            target in screen._compositor.visible_widgets,
+            "摘掉之后合成器地图还留着旧命中",
+        )
+        try:
+            screen._forward_event(press())
+        except AttributeError as error:
+            check(False, f"旧命中上的按下不该抛错：{error}")
+        else:
+            check(True, "旧命中上的按下被跳过")
+
+        await pilot.pause()
+        check(
+            target not in screen._compositor.visible_widgets,
+            "重排之后旧命中从地图上消失",
+        )
+        screen._forward_event(press())
+        check(True, "重排之后的按下照常走完")
+
+
 async def run_chat_rail_checks() -> None:
     """聊天左栏：只列最近八条会话，每条两行卡片，会话区与主题区之间不再有分隔条。"""
     path = ROOT / ".probe" / "chat_rail_state.toml"
@@ -1337,6 +1406,7 @@ async def run() -> None:
         await run_splitter_checks()
         await run_chat_rail_checks()
         await run_modal_click_checks()
+        await run_forward_guard_checks()
         await run_home_recent_checks()
         await run_home_quick_checks()
         await run_home_top_bar_checks()

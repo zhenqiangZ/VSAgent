@@ -498,7 +498,10 @@ class AgentLoop:
         """
         self.config = config
         self.context_window = config.context_window
-        self.provider = OpenAICompatProvider(self.config, self.provider.timeout)
+        # 会话 ID 跟着重建的 provider 走，换模型不能换成另一段对话
+        self.provider = OpenAICompatProvider(
+            self.config, self.provider.timeout, session_id=self.provider.session_id
+        )
         return self.config
 
     def compact_session(self, session: Session) -> int:

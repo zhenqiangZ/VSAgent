@@ -296,7 +296,7 @@ class VSAgentApp(App[None]):
             self._tool_registry = registry
         return AgentLoop(
             self.event_bus,
-            OpenAICompatProvider(config),
+            OpenAICompatProvider(config, session_id=session.id),
             registry,
             config,
             context_window=config.context_window,
@@ -315,7 +315,10 @@ class VSAgentApp(App[None]):
             route_adapter=(
                 None
                 if session.is_subagent
-                else RouteAdapter(OpenAICompatProvider(config), mode=route_mode(self.root))
+                else RouteAdapter(
+                    OpenAICompatProvider(config, session_id=session.id),
+                    mode=route_mode(self.root),
+                )
             ),
             validator_mode=validators_mode_from_env(),
             max_steps=max_steps_from_env(),

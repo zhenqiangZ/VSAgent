@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterator, Protocol
 
 import httpx
 
+from ... import __version__
+
 DEFAULT_TIMEOUT = 120.0
+
+APP_USER_AGENT = f"VSAgent/{__version__}"
 
 PRICE_UNKNOWN = -1.0
 DEFAULT_CONTEXT_WINDOW = 128_000
@@ -365,9 +370,16 @@ class OpenAICompatProvider:
     中途解析必然得到半个对象。用量同样攒到流结束再发，让它在事件序列里排在最后。
     """
 
-    def __init__(self, config: ProviderConfig, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        config: ProviderConfig,
+        timeout: float = DEFAULT_TIMEOUT,
+        session_id: str = "",
+    ) -> None:
         self.config = config
         self.timeout = timeout
+        # OpenCode 网关按会话路由并复用 prompt 缓存，同一段对话必须始终带同一个值
+        self.session_id = session_id or f"ses_{uuid.uuid4().hex}"
 
     async def stream(
         self,
@@ -390,7 +402,11 @@ class OpenAICompatProvider:
             payload["temperature"] = self.config.temperature
         if self.config.max_tokens is not None:
             payload["max_tokens"] = self.config.max_tokens
-        headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "User-Agent": APP_USER_AGENT,
+            "x-opencode-session": self.session_id,
+        }
         url = f"{self.config.base_url.rstrip('/')}/chat/completions"
         collected: dict[int, dict[str, str]] = {}
         pending_usage: list[ProviderEvent] = []

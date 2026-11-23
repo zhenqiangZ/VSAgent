@@ -182,7 +182,8 @@ python tests/verify_modal_transparency.py  # 模态居中/半透明，聊天透�
 ## 配置
 
 `.env` 在仓库根（已 gitignore，没有 example 文件）。`env.py:load_env()` 用 `override=False`
-——已存在的真实环境变量永远压过文件里的值。
+——已存在的真实环境变量永远压过文件里的值。打包产物留在仓库里时（`dist/VSAgent`）读仓库根
+这一份，被挪出仓库后读 exe 旁边那一份；`vsagent.spec` 打包时会把仓库根 `.env` 复制过去。
 
 **模型接口不走 `.env`**：地址、密钥与模型名由应用内的 `/model` 命令填写，写入与
 `state.toml` 同目录的 `connection.toml`（`core/connection.py`，权限 0600，原子替换）。

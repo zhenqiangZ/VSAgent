@@ -139,3 +139,10 @@ if _rules_source.resolve() != _rules_target.resolve():
     shutil.copytree(
         _rules_source / "rules", _rules_target / "rules", dirs_exist_ok=True
     )
+
+# `.env` 只维护仓库根的一份：带一份到产物目录，exe 离开仓库之后才有配置可读。
+# 冻结版在仓库里启动读仓库根那一份（见 `env.env_file()`），所以这里复制出去不会
+# 影响在仓库里的运行；省略这一步时，把 exe 单独拷走的部署只能靠环境变量。
+_env_source = root / ".env"
+if _env_source.is_file():
+    shutil.copy2(_env_source, _rules_target / ".env")

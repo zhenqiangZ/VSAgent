@@ -36,7 +36,7 @@ Python 3.12。没有 pyproject / setup.py / pytest / ruff / mypy / Makefile，�
 
 ## 配置
 
-- 没有必填环境变量，应用可直接启动。`.env` 在仓库根、已 gitignore、没有示例文件；`vsagent/env.py:load_env()` 用 `override=False`，真实环境变量优先。
+- 没有必填环境变量，应用可直接启动。`.env` 在仓库根、已 gitignore、没有示例文件；`vsagent/env.py:load_env()` 用 `override=False`，真实环境变量优先。打包产物留在仓库里时（`dist/VSAgent`）读仓库根这一份，被挪出仓库后读 exe 旁边那一份，`vsagent.spec` 打包时会把仓库根 `.env` 复制过去。
 - 模型接口不读 `.env`：应用内 `/model` 写入 `~/.vsagent/connection.toml`（权限 0600）。
 - 可选依赖：`requirements-chem.txt`（缺失时准备受体、准备配体等少数工具返回安装指令）；`requirements-embed.txt` 加显式下载 `python -m vsagent.core.embed download`（约 255MB，不自动下载）；亲和力打分用 `models/DTA/.venv`（Python 3.10，独立环境，不并进主仓 `.venv`）。
 - 外部程序用 `VSA_VINA_BIN`、`VSA_AUTOGRID_BIN`、`VSA_DTA_*` 指定；缺失时对应工具返回安装指引。网页端口用 `VSA_WEB_PORT`。

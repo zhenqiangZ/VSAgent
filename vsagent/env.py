@@ -7,9 +7,18 @@ from dotenv import load_dotenv
 
 
 def env_file() -> Path:
-    """`.env` 的位置：打包之后与可执行文件同目录，否则项目根目录。"""
+    """`.env` 的位置。
+
+    源码运行读仓库根。打包产物还在源码仓库里（`dist/VSAgent` 这类布局）时同样读
+    仓库根，与源码运行共用一份配置；按 `vsagent.spec` 认仓库根，部署到别处的 exe
+    读旁边那一份，不随启动目录变化。
+    """
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / ".env"
+        beside = Path(sys.executable).parent
+        for candidate in (beside, *beside.parents):
+            if (candidate / "vsagent.spec").is_file():
+                return candidate / ".env"
+        return beside / ".env"
     return Path(__file__).resolve().parents[1] / ".env"
 
 

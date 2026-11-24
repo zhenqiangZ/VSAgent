@@ -314,6 +314,12 @@ class Tool(ABC):
     # 在哪」，工作区回答「我们在研究什么」。一个结构对象可以引用 `receptor#1`
     # 这个 handle，反过来不成立。混成一个口子，工具就得自己判断手里是哪一个。
     workspace_argument: ClassVar[str] = ""
+    # 收本轮意图运行时的参数名。只有 route_intent 声明。
+    #
+    # 它与会话、登记表都不同：是循环层在每轮开头现建的一份小对象，持有这一句
+    # 用户输入、当前任务与「把决策写回会话」的回调。工具只调它的 `wire`，
+    # 不认循环层类型，这一层因此不必导入 execution 包。
+    route_argument: ClassVar[str] = ""
     # 收工具登记表本身的参数名。
     #
     # 别的工具拿登记表是为了写条目；它拿的是**注册表**，只为读一件事：哪些工具
@@ -337,6 +343,7 @@ class Tool(ABC):
         event_runtime: Any = None,
         registry: Any = None,
         workspace: Any = None,
+        route: Any = None,
         on_arguments: Callable[[dict[str, Any]], None] | None = None,
     ) -> ToolResult:
         """内核唯一的调用入口：注入 context、任务状态、证据收集器与结构服务之后再走 `run`。
@@ -366,6 +373,7 @@ class Tool(ABC):
             (self.event_argument, event_runtime, "事件运行时"),
             (self.registry_argument, registry, "工具注册表"),
             (self.workspace_argument, workspace, "科研工作区"),
+            (self.route_argument, route, "本轮意图运行时"),
         ):
             if not name:
                 continue

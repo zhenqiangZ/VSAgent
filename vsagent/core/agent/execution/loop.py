@@ -149,6 +149,16 @@ def closing_hint(session: Session) -> str:
 
 # Stop 钩子最多让一轮多走这么多次，单独计数，不吃 MAX_STEPS 的额度
 MAX_STOP_RETRIES = 2
+# 第一步没调 route_intent 时，最多提醒这么多次。提醒不占工作步。
+#
+# 只提醒一次：第二次还不调，说明这一轮它只打算直接回答；继续逼它填表，
+# 会把一句闲聊拖成两三次模型请求。
+ROUTE_NUDGES = 1
+# 等意图那一步的固定提示。工具清单里只有 route_intent 时，这句话解释为什么。
+ROUTE_FIRST_INSTRUCTION = (
+    "本轮还没形成结构化意图。这一步先调用 route_intent，把用户这一句的目标、"
+    "对象、操作与两条轴填清楚；不要直接调用领域工具，也不要先做别的。"
+)
 # 可以重试的错误最多重发这么多次
 MAX_RETRIES = 2
 # 工具执行遇到可重试故障时最多再试这么多次。
@@ -401,6 +411,12 @@ class AgentLoop:
         self.workspace = workspace
         # 路由适配器：意图 → 任务 → 能力计划。None 表示不接（子 agent 与测试）。
         self.route_adapter = route_adapter
+        # 这一轮是否还在等主控调用 route_intent：为真时第一步只发这一个工具。
+        self._route_pending = False
+        # 这一轮的意图运行时（`route_tool.RouteRuntime`），执行工具时注入。
+        self._route_runtime: Any = None
+        # 第一步漏调 route_intent 的次数，用于提醒与收口。
+        self._route_nudges = 0
         # 校验器模式：off / shadow / enforce。由应用层按环境变量取值。
         self.validator_mode = validator_mode
         # 搜索增强推理：off / shadow / enforce。默认按环境变量取。
@@ -823,21 +839,17 @@ class AgentLoop:
         return paths
 
     async def _prepare_route(self, session: Session, message: Message) -> None:
-        """在模型请求之前做一次意图解析与路由。
+        """每轮开头建立意图运行时；决策要等主控第一步调用 `route_intent` 之后。
 
-        三种模式见 `route_adapter.py`。这里只负责五件事：算一次关键词提示
-        （`intent.detect`，与路由无关）、把结果写进 trace、在消息开头留一块可折叠的
-        过程记录（`PartType.ROUTE`）、把任务规格记到会话上（shadow 也记，否则下一轮
-        没有上下文）、把这一轮标记成「主 agent 只编排」。
+        这里只做四件事：算一次关键词提示（`intent.detect`，与路由无关）、
+        清掉上一轮的三段路由字段、读出当前任务规格，以及为第一步准备运行时。
+        真实决策由 `_apply_route_decision` 写回。
 
-        **工具清单不随计划变**：角色在 `agents.toml` 里定死了自己那一份，派发时由
-        `coordinator` 交给子会话。装到根会话上等于让主 agent 自己去做领域动作，
-        那正是这一层要避免的。
+        **第一步只发意图工具**：`_route_pending` 为真时，`_run_steps` 把工具清单
+        收成 `route_intent` 一个。装到根会话上的其余工具不会在这一步出现，
+        模型没有机会跳过意图直接做领域动作。
 
-        过程记录先于模型请求写：用户看到「这一轮按什么理解」与「这一轮要交什么」
-        不用等答复出来；解析失败也留一块，写明这一轮退回原路径的原因。
-
-        任何异常都不往外抛：路由是新加的一层，不能成为新的故障点。
+        路由关闭、子会话、空输入都不建立运行时，行为与加入这一层之前一致。
         """
         text = self._last_user_text(session)
         # 这三个字段只在内存里，每轮重写。`route_note` 是给模型的短提示，
@@ -846,12 +858,17 @@ class AgentLoop:
         session.route_note = ""
         session.route_intent = ""
         session.route_blocked_reason = ""
+        self._route_pending = False
+        self._route_runtime = None
+        self._route_nudges = 0
         if text.strip():
             # 关键词提示与路由无关：路由关掉、或者是子会话，上下文里那一行照样要给。
             self._turn_hint = intent.detect(text)
         if self.route_adapter is None or session.depth > 0:
             return
         if not text.strip():
+            return
+        if getattr(self.route_adapter, "mode", "shadow") == "off":
             return
         current = None
         if session.task_spec:
@@ -862,20 +879,42 @@ class AgentLoop:
                     "route.error",
                     {"session_id": session.id, "error": f"读不出当前任务规格：{error}"},
                 )
-        try:
-            decision = await self.route_adapter.prepare(
-                text,
-                current=current,
-                session=session,
-                ledger=self.ledger,
-                workspace=self.workspace,
-            )
-        except Exception as error:
-            self.bus.publish("route.error", {"session_id": session.id, "error": str(error)})
-            return
+        from vsagent.core.agent.planning.route_tool import RouteRuntime
+
+        self._route_pending = True
+        session.route_note = (
+            "这一轮先在第一步调用 route_intent，给出结构化意图；"
+            "系统据此编译任务、路由角色，之后按计划派发。"
+        )
+        self._route_runtime = RouteRuntime(
+            adapter=self.route_adapter,
+            session=session,
+            message=message,
+            text=text,
+            current=current,
+            ledger=self.ledger,
+            workspace=self.workspace,
+            apply=lambda decision: self._apply_route_decision(
+                session, message, decision, current
+            ),
+        )
+
+    def _apply_route_decision(
+        self,
+        session: Session,
+        message: Message,
+        decision: Any,
+        current: TaskSpec | None,
+    ) -> str:
+        """把一次意图决策写回会话，返回这一轮给模型的短提示。
+
+        出错时什么都不改：宁可这一轮退回普通对话，也不要把一份半成品计划
+        写进会话状态。只有明确拒绝时额外记一条派发禁令。
+        """
+        self._route_pending = False
         if decision.mode == "off":
             # 关掉时不写 trace：免得每一轮多一条什么也没发生的记录，把日志冲淡。
-            return
+            return ""
         # 这一块是给人看的过程记录：两种界面都按折叠块画，模型上下文里没有它。
         hint_line = intent.summary(self._turn_hint) if self._turn_hint is not None else ""
         self._publish(
@@ -912,7 +951,7 @@ class AgentLoop:
                 session.route_note = (
                     f"这一轮路由明确拒绝：{decision.error}。不要派发，先向用户说明原因。"
                 )
-            return
+            return session.route_note
         if decision.clarification:
             if getattr(self.route_adapter, "mode", "shadow") == "enforce":
                 session.pending_intent = {
@@ -926,13 +965,13 @@ class AgentLoop:
                     + "；".join(decision.clarification)
                     + "。不要派发。"
                 )
-            return
+            return session.route_note
         if decision.action == "status_query":
             session.route_note = "本轮只回答当前进度，不要重新编译任务，也不要派发新的角色。"
-            return
+            return session.route_note
         if decision.action == "ask_result":
             session.route_note = "本轮只解释已有结果与产物，不要重新计算，也不要派发新的角色。"
-            return
+            return session.route_note
         if decision.action == "cancel":
             if getattr(self.route_adapter, "mode", "shadow") == "enforce":
                 if self.spawner is not None and hasattr(self.spawner, "cancel_campaign"):
@@ -948,10 +987,10 @@ class AgentLoop:
                 session.route_note
                 or "本轮用户要求终止任务。说明已经停止的部分；不要再派发。"
             )
-            return
+            return session.route_note
         if decision.action == "chat" or decision.relation == "none":
             session.route_note = "本轮是闲聊或概念问答，不要建任务，也不要派发。"
-            return
+            return session.route_note
         if decision.task is not None:
             previous = session.task_spec or {}
             session.task_spec = decision.task.to_dict()
@@ -974,6 +1013,7 @@ class AgentLoop:
             "compare": "本轮是比较任务：只比较已有对象或结果，不要重跑上游。",
             "resume": "本轮恢复旧任务；沿用原任务号与已有产物。",
         }.get(decision.relation, "")
+        return session.route_note
 
     def _note_task_change(self, session: Session, previous: dict, task: Any) -> None:
         """任务规格变了，把战役状态推到「定规格」。
@@ -1768,11 +1808,12 @@ class AgentLoop:
                 task = None
         from vsagent.core.agent.roles.agents import allowed_tools
 
-        return check_tool(
-            name,
-            allowed=allowed_tools(session, self.workspace_root),
-            task=task,
-        )
+        allowed = allowed_tools(session, self.workspace_root)
+        # 意图工具不进角色名单：它是内核在第一步单独放出来的准备动作，
+        # 校验器在等意图这一步临时承认它，其余时候按名单拦。
+        if allowed is not None and self._route_pending and name == "route_intent":
+            allowed = (*allowed, "route_intent")
+        return check_tool(name, allowed=allowed, task=task)
 
     def _intent_text(self, session: Session) -> str:
         """按最后一条用户消息给一行「可能在问哪几类来源」。
@@ -1877,8 +1918,17 @@ class AgentLoop:
         """
         from vsagent.core.agent.roles.agents import allowed_tools
 
-        only = allowed_tools(session, self.workspace_root)
-        return self.registry.specs(only=only)
+        # 意图工具只在第一步单独出现，不进常规清单：留在里面会诱使模型在工作
+        # 中途重解析意图，把已经编译好的任务改掉。
+        allowed = allowed_tools(session, self.workspace_root)
+        only = None if allowed is None else set(allowed)
+        return self.registry.specs(only=only, exclude={"route_intent"})
+
+    def _step_tools(self, session: Session, final_step: bool) -> list[dict[str, Any]]:
+        """这一步发出去的工具定义；等意图时第三步也照发。"""
+        if self._route_pending:
+            return self.registry.specs(only=("route_intent",))
+        return [] if final_step else self.tool_specs(session)
 
     def _assemble(
         self,
@@ -1887,6 +1937,7 @@ class AgentLoop:
         with_tools: bool = True,
         steps_left: int | None = None,
         hint_text: str = "",
+        tools_override: list[dict[str, Any]] | None = None,
     ) -> ContextBundle:
         """按分层装配这一步发给模型的消息。
 
@@ -1898,11 +1949,19 @@ class AgentLoop:
         留额度；只说「已经走了几步」时，它会一路做到底。
 
         证据层现取一份：工具是上一步跑的，这一步装配时才看得见它们留下了什么。
+
+        `tools_override` 是这一步真正要发的那一份（等意图时只有 `route_intent`）。
+        预算必须按同一份算，否则额度里扣着一批没发出去的工具定义。
         """
+        tools = (
+            tools_override
+            if tools_override is not None
+            else (self.tool_specs(session) if with_tools else [])
+        )
         return ContextAssembler(self.context_window).build(
             session,
             prefix,
-            tools=self.tool_specs(session) if with_tools else [],
+            tools=tools,
             memory_text=self._memory_text(session),
             profile_text=self._profile_text(),
             hint_text=hint_text,
@@ -1952,7 +2011,9 @@ class AgentLoop:
             step_hint = (
                 f"{hint_text}\n\n{FINAL_STEP_INSTRUCTION}" if final_step else hint_text
             )
-            tools = [] if final_step else self.tool_specs(session)
+            if self._route_pending:
+                step_hint = f"{step_hint}\n\n{ROUTE_FIRST_INSTRUCTION}".strip()
+            tools = self._step_tools(session, final_step)
             self._publish(message, Part(type=PartType.STEP_START, text=f"{step} · {self.config.model}"))
             prefix = stable_prefix(workspace, session)
             try:
@@ -1962,6 +2023,7 @@ class AgentLoop:
                     with_tools=not final_step,
                     steps_left=steps_left,
                     hint_text=step_hint,
+                    tools_override=tools,
                 )
             except ContextAssemblyError as error:
                 # 装不下就明说，不静默截断：模型在缺了材料的情况下继续往下做，
@@ -1990,6 +2052,7 @@ class AgentLoop:
                         with_tools=not final_step,
                         steps_left=steps_left,
                         hint_text=step_hint,
+                        tools_override=tools,
                     )
                 elif await self._summarize(session, message, context.dropped_upto):
                     context = self._assemble(
@@ -1998,6 +2061,7 @@ class AgentLoop:
                         with_tools=not final_step,
                         steps_left=steps_left,
                         hint_text=step_hint,
+                        tools_override=tools,
                     )
             elif context.dropped_upto > 0:
                 # 判据是「上下文里有没有已经不在的内容」，不是「这一步新丢了没有」：
@@ -2010,6 +2074,7 @@ class AgentLoop:
                         with_tools=not final_step,
                         steps_left=steps_left,
                         hint_text=step_hint,
+                        tools_override=tools,
                     )
             self._trace_context(session, context)
             before = dict(message.tokens)
@@ -2034,6 +2099,17 @@ class AgentLoop:
                 if self._has_error_part(message):
                     exit_reason = EXIT_ERROR
                     break
+                if self._route_pending and self._route_nudges < ROUTE_NUDGES:
+                    # 它这一句直接回答了、没碰意图工具：提醒一次再问。
+                    self._route_nudges += 1
+                    self._flush_held()
+                    message = self._start_continuation(session)
+                    continue
+                if self._route_pending:
+                    # 提醒过仍不调：这一轮按普通对话收束，不要再逼它填表。
+                    self._route_pending = False
+                    self._route_runtime = None
+                    session.route_note = "本轮没有形成结构化意图；不要派发，直接回答用户。"
                 report = await self._run_hooks(STOP, "", {})
                 if not report.blocked:
                     break
@@ -2045,7 +2121,11 @@ class AgentLoop:
                 self._flush_held()
                 message = self._start_continuation(session)
                 continue
-            tool_steps += 1
+            # 意图那一步是内核要求的准备动作，不是一次工作步：不计进
+            # MAX_STEPS，否则每轮都白白少一步。
+            route_only = all(part.tool_name == "route_intent" for part in calls)
+            if not route_only:
+                tool_steps += 1
             if not await self._run_tools(session, message, calls):
                 exit_reason = EXIT_CANCELLED
                 break
@@ -2607,6 +2687,20 @@ class AgentLoop:
 
         PreToolUse 钩子排在判定之前：它是机械拦截，用户点允许也过不去。
         """
+        if self._route_pending and part.tool_name != "route_intent":
+            self._fail_tool(
+                message,
+                part,
+                "本轮还没形成结构化意图：先调用 route_intent，再按它编译出来的计划做。",
+            )
+            return
+        if part.tool_name == "route_intent" and not self._route_pending:
+            self._fail_tool(
+                message,
+                part,
+                "这一轮不需要再解析意图：按已有任务继续，或者直接回答用户。",
+            )
+            return
         tool = self.registry.get(part.tool_name)
         if tool is None:
             self._fail_tool(
@@ -2615,7 +2709,12 @@ class AgentLoop:
                 missing_tool_reason(self.registry, part.tool_name, session),
             )
             return
-        if self._closing and not explicit and tool.spec.name not in closing_tools(session):
+        if (
+            self._closing
+            and not explicit
+            and tool.spec.name not in closing_tools(session)
+            and not (self._route_pending and tool.spec.name == "route_intent")
+        ):
             # 收束阶段：不再开新工作，只允许登记、写交付物、核对、收主题与记状态。
             # 与走到 0 步直接断开相比，这一步把「还剩几步」交给模型自己安排。
             self._fail_tool(message, part, closing_hint(session))
@@ -2695,6 +2794,7 @@ class AgentLoop:
                     event_runtime=self._event_runtime(session),
                     registry=self.registry,
                     workspace=self.workspace,
+                    route=self._route_runtime,
                     on_arguments=record_arguments,
                 )
                 break

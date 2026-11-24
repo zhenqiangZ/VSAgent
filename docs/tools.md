@@ -4,7 +4,7 @@
 
 本文列出 VSAgent 当前装配的全部工具，按「常驻」与「领域」两层分开写。每一条给出用途、参数与关键限制。
 
-数据来源是 `vsagent/core/agent/coretools.py` 的 `build_core_tools()` 与 `vsagent/core/agent/domain/all_tools.py` 的 `domain_tools()`，共 **71 个**：常驻 17 个，领域 54 个（23 个模块）。模型实际能看见哪些，由 `roles/agents.toml` 里的角色名单决定。
+数据来源是 `vsagent/core/agent/coretools.py` 的 `build_core_tools()` 与 `vsagent/core/agent/domain/all_tools.py` 的 `domain_tools()`，共 **72 个**：常驻 18 个，领域 54 个（23 个模块）。模型实际能看见哪些，由 `roles/agents.toml` 里的角色名单决定。
 
 ---
 
@@ -24,7 +24,7 @@
 
 ---
 
-## 1. 常驻工具（17 个）
+## 1. 常驻工具（18 个）
 
 常驻工具的顺序就是请求体里的顺序。子会话看不到 `dispatch_campaign`。
 
@@ -1335,7 +1335,7 @@ PubChem 全库里有没有和这个结构相近的已知化合物？
 | `pharmacophore` | 1 | `build_pharmacophore` |
 | `research` | 3 | `workspace`、`add_evidence`、`review_hypothesis` |
 
-常驻 17 个，领域 54 个，合计 71 个。
+常驻 18 个，领域 54 个，合计 72 个。
 
 ### 3.2 按任务找工具
 

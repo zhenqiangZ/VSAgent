@@ -68,7 +68,7 @@ Research 的两条检索线、Pocket 的发现与画像，都在同一个会话�
 
 ### 1.4 现有的接入点
 
-`execution/loop.py` 是执行循环，`execution/host.py` 管会话，`execution/dispatcher.py` 做派发，`execution/scheduler.py` 管依赖与并行，`planning/intent_parser.py` 与 `planning/task_compiler.py` 把需求编译成规格。这些模块由主控调用，没有一个搬进主控。
+`execution/loop.py` 是执行循环，`execution/host.py` 管会话，`execution/dispatcher.py` 做派发，`execution/scheduler.py` 管依赖与并行，`planning/route_tool.py` 与 `planning/task_compiler.py` 把需求编译成规格；前者是主控每轮第一步调用的结构化意图工具。这些模块由主控调用，没有一个搬进主控。
 
 ## 2 Research：靶点、受体与配体调研
 

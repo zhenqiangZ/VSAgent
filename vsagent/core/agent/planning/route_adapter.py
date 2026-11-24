@@ -1,21 +1,22 @@
-"""Route Adapter：把意图、任务与角色计划接到循环层上。
+"""Route Adapter：把主控给的结构化意图接到任务与角色计划上。
+
+意图不再由独立的解析调用产出，而是主会话每轮第一步调用 `route_intent` 工具
+给出（见 `route_tool.py`）。这一层只做意图之后的纯规则计算：
+
+    上下文解析 → 意图验证 → 任务关系 → 任务编译 → 角色路由
 
 三种模式，由 `.vsagent/route.toml` 的 `[route] mode` 控制（环境变量
 `VSA_ROUTE` 只做临时覆盖）：
 
-- `off`　　：一概不做，与加入路由之前完全一致；
-- `shadow` ：照常解析、验证、编译与路由，写出计划与过程记录，不改变任务状态；
+- `off`　　：一概不做；`wire` 直接返回空决策，也不会给出意图工具；
+- `shadow` ：照常验证、编译与路由，写出计划与过程记录；
 - `enforce`：验证通过才编译与派发；需要澄清时先问；明确拒绝时不执行。
-
-一条完整路径：
-
-    上下文解析 → 意图解析 → 意图验证 → 任务关系 → 任务编译 → 角色路由
 
 四条边界：
 
-- **失败不改行为**：解析失败、路由抛错，都只是记一条 `route.error`。
+- **失败不改行为**：编译失败、路由抛错都写进决策，由循环层决定不改变状态。
 - **子 agent 不路由**：它的任务书由父会话给，自己没有“用户意图”可解析。
-- **计划写进会话状态**：解析成功就落成 `task_spec`，下一轮靠它判延续、修改与比较。
+- **计划写进会话状态**：决策成立就落成 `task_spec`，下一轮靠它判延续、修改与比较。
 - **动作先于任务**：查进度、问结果、取消、闲聊不编译任务。
 """
 
@@ -27,7 +28,6 @@ from typing import Any
 from vsagent.core.agent.planning.agent_router import AgentRouter, RouterError
 from vsagent.core.agent.planning.context_resolver import ContextBundle, ContextResolver
 from vsagent.core.agent.planning.decision import RouteDecision
-from vsagent.core.agent.planning.intent_parser import IntentParser
 from vsagent.core.agent.planning.intent_summary import ACTION_WORDS, RELATION_WORDS
 from vsagent.core.agent.planning.intent_validator import IntentValidator, Verdict
 from vsagent.core.agent.planning.notes import Note
@@ -65,54 +65,37 @@ def _clip(text: str, limit: int) -> str:
 
 
 class RouteAdapter:
-    """一次路由 = 一次上下文解析 + 一次模型调用 + 纯规则计算。"""
+    """一次接线 = 一次上下文解析 + 纯规则计算。"""
 
-    def __init__(
-        self,
-        provider: Any,
-        *,
-        mode: str = DEFAULT_MODE,
-        parser: IntentParser | None = None,
-    ) -> None:
+    def __init__(self, *, mode: str = DEFAULT_MODE) -> None:
         self.mode = mode if mode in MODES else DEFAULT_MODE
-        self.parser = parser or IntentParser(provider)
         self.context = ContextResolver()
         self.validator = IntentValidator()
         self.compiler = TaskCompiler()
         self.router = AgentRouter()
         self.resolver = TaskContextResolver()
 
-    async def prepare(
+    async def wire(
         self,
-        text: str,
+        intent: IntentSpec,
         *,
+        text: str = "",
         current: TaskSpec | None = None,
         session: Any = None,
         ledger: Any = None,
         workspace: Any = None,
     ) -> RouteDecision:
+        """接收主控给出的意图，验证、编译并路由。不调用模型。"""
         if self.mode == "off":
             return RouteDecision(mode=self.mode)
-        if not (text or "").strip():
-            return RouteDecision(mode=self.mode, error="没有可解析的用户输入")
 
         bundle: ContextBundle = self.context.resolve(
             session=session,
-            text=text,
+            text=text or intent.goal,
             current=current,
             ledger=ledger,
             workspace=workspace,
         )
-        try:
-            intent = await self.parser.parse(text, context=bundle.text)
-        except Exception as error:
-            message = str(error) or type(error).__name__
-            return RouteDecision(
-                mode=self.mode,
-                warnings=(Note("parse_failed", "text", message),),
-                error=message,
-            )
-
         intent = self._merge_pending(intent, session)
         verdict = self.validator.validate(intent, bundle, current=current)
         # Reason 里本来就有机器码，转成提示时保留下来；以前只抄了 message。

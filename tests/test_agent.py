@@ -262,7 +262,6 @@ from vsagent.core.agent.roles.contracts import (  # noqa: E402
     TaskSpec,
 )
 from vsagent.core.agent.coretools import build_core_tools  # noqa: E402
-from vsagent.core.agent.planning.intent_parser import IntentParseError, IntentParser
 from vsagent.core.agent.planning.task_compiler import CompileError, TaskCompiler
 from vsagent.core.agent.planning.agent_router import (  # noqa: E402
     AgentRouter,
@@ -22300,21 +22299,6 @@ async def check_intent_validator() -> None:
     )
 
 
-class _StubParser:
-    """替身解析器：不调模型，直接回一份意图或抛错。"""
-
-    def __init__(self, spec: Any = None, error: Exception | None = None) -> None:
-        self.spec = spec
-        self.error = error
-        self.calls: list[tuple[str, str]] = []
-
-    async def parse(self, text: str, *, context: str = "") -> Any:
-        self.calls.append((text, context))
-        if self.error is not None:
-            raise self.error
-        return self.spec
-
-
 async def check_profiles() -> None:
     """角色说明书：能力从注册表来、报告要求能判、坏说明书会被拦住。"""
     from vsagent.core.agent.roles import catalog
@@ -22803,45 +22787,117 @@ async def check_validators() -> None:
 
 
 async def check_route() -> None:
-    """路由适配器的三种模式，以及循环层怎么用它的结果。"""
-    from vsagent.core.agent.planning.route_adapter import RouteAdapter, RouteDecision
+    """路由适配器的三种模式、意图工具的 Schema，以及循环层怎么用它的结果。"""
+    from vsagent.core.agent.planning.route_adapter import RouteAdapter
 
-    # 1. off：解析器一次都不该被调用。
-    stub = _StubParser(error=AssertionError("off 模式不该解析"))
-    off = RouteAdapter(None, mode="off", parser=stub)
-    quiet = await off.prepare("帮我取 EGFR 的结构")
-    check(quiet.mode == "off" and quiet.intent is None, "off 模式什么都不做")
-    check(not stub.calls, "off 模式不调用解析器")
+    # 1. off：不碰上下文，直接给空决策。
+    quiet = await RouteAdapter(mode="off").wire(
+        IntentSpec(goal="帮我取 EGFR 的结构", operations=("pocket",))
+    )
+    check(
+        quiet.mode == "off" and quiet.intent is None and quiet.task is None,
+        "off 模式什么都不做",
+    )
 
-    # 2. shadow：解析、编译、路由都跑，结果只回给调用方。
+    # 2. shadow：验证、编译、路由都跑，结果只回给调用方。
     intent = IntentSpec(
         goal="取 EGFR 的全部实验结构",
         operations=("pocket",),
         objects=(ObjectRef(type="target", label="EGFR", origin="new"),),
         **_plan_kwargs(("pocket",)),
     )
-    shadow = RouteAdapter(None, mode="shadow", parser=_StubParser(intent))
-    decision = await shadow.prepare("取 EGFR 的全部实验结构")
+    decision = await RouteAdapter(mode="shadow").wire(
+        intent, text="取 EGFR 的全部实验结构"
+    )
     check(decision.usable and decision.task is not None, "shadow 也产出任务规格")
     check(decision.plan is not None and decision.plan.selected_agents == ("pocket",), "shadow 也产出计划")
     check(decision.plan is not None, "计划带着角色")
     check(decision.task.status == "ready", "编译出来的任务是 ready")
 
-    # 3. 解析失败：这一轮照旧，不抛。
-    broken = RouteAdapter(
-        None, mode="shadow", parser=_StubParser(error=RuntimeError("解析挂了"))
-    )
-    failed = await broken.prepare("随便")
-    check(failed.error and failed.task is None, "解析失败只记录，不产出任务")
-
-    # 4. 还没解析完就编译：拒绝，但不抛。
-    unclear = IntentSpec(
-        goal="EGFR", clarification_required=("想做什么？",)
-    )
-    rejected = await RouteAdapter(None, mode="shadow", parser=_StubParser(unclear)).prepare("EGFR")
+    # 3. 还没解析完就编译：先问，不产出任务。
+    unclear = IntentSpec(goal="EGFR", clarification_required=("想做什么？",))
+    rejected = await RouteAdapter(mode="shadow").wire(unclear, text="EGFR")
     check(rejected.clarification and rejected.task is None, f"未解析完时先问：{rejected.clarification}")
 
-    # 4.1 回答上一轮澄清：把待澄清意图补回来，再按执行处理。
+    # 4. 工具的 Schema 与 IntentSpec 对得上：字段名只多不少，未知键会被挡住。
+    from vsagent.core.agent.planning.route_tool import RouteIntentTool
+
+    tool = RouteIntentTool()
+    properties = set(tool.spec.parameters["properties"])
+    allowed = {
+        "goal", "objects", "operations", "constraints", "exclusions",
+        "expected_outputs", "subgoals", "acceptance_criteria", "inputs",
+        "missing_information", "clarification_required", "confidence",
+        "uncertainties", "task_relation", "conversation_action",
+    }
+    check(properties == allowed, f"工具字段与意图字段一一对应：{properties ^ allowed}")
+    check(
+        tool.spec.parameters.get("additionalProperties") is False,
+        "工具参数不允许额外字段",
+    )
+    check("route_intent" in tool.spec.description, "工具说明写清自己的名字")
+    check(
+        "clarification_required" in tool.spec.description,
+        "工具说明保留「缺什么」与「问什么」的分界",
+    )
+
+    # 4.1 运行时一次只收一份意图：成功之后关掉，重复调用只给一句失败。
+    from vsagent.core.agent.planning.decision import RouteDecision
+    from vsagent.core.agent.planning.route_tool import RouteRuntime
+
+    class _WireStub:
+        def __init__(self) -> None:
+            self.intents: list[Any] = []
+
+        async def wire(self, given: Any, **kwargs: Any) -> RouteDecision:
+            self.intents.append(given)
+            return RouteDecision(
+                mode="enforce", relation="new", action="execute", intent=given
+            )
+
+    adapter = _WireStub()
+    runtime = RouteRuntime(
+        adapter=adapter,
+        session=None,
+        message=None,
+        text="取 EGFR 的全部实验结构",
+        current=None,
+        ledger=None,
+        workspace=None,
+        apply=lambda decision: "按计划执行。",
+    )
+    payload = {
+        "goal": "取 EGFR 的全部实验结构",
+        "task_relation": "new",
+        "conversation_action": "execute",
+        "operations": ["pocket"],
+    }
+    first = await tool.execute(payload, route=runtime)
+    check(not first.failed and "按计划执行" in first.output, f"运行时返回本轮提示：{first.output}")
+    check(
+        len(adapter.intents) == 1 and adapter.intents[0].intent_id.startswith("intent_"),
+        "运行时给意图补上编号",
+    )
+    check(not runtime.active, "决策成立后运行时关闭")
+    again = await tool.execute(payload, route=runtime)
+    check(again.failed and "不要重复调用" in again.output, f"重复调用被挡：{again.output}")
+
+    # 字段不合法：同一轮里还能重填，运行时保持有效。
+    retry_runtime = RouteRuntime(
+        adapter=adapter,
+        session=None,
+        message=None,
+        text="取 EGFR 的全部实验结构",
+        current=None,
+        ledger=None,
+        workspace=None,
+        apply=lambda decision: "",
+    )
+    bad = await tool.execute({"goal": "EGFR", "task_relation": "new", "conversation_action": "execute", "operations": ["nope"]}, route=retry_runtime)
+    check(bad.failed and "意图字段不合法" in bad.output, f"坏取值当场退回：{bad.output}")
+    check(retry_runtime.active, "坏意图不关闭运行时，下一步还能重填")
+
+    # 4.2 回答上一轮澄清：把待澄清意图补回来，再按执行处理。
     pending_intent = IntentSpec(
         goal="比较两个口袋",
         task_relation="compare",
@@ -22887,13 +22943,14 @@ async def check_route() -> None:
             ),
         )
     ).task
-    plan = shadow.router.route(built).plan
+    plan = AgentRouter().route(built).plan
 
     class _Adapter:
         def __init__(self, decision: Any) -> None:
             self.decision = decision
+            self.mode = decision.mode
 
-        async def prepare(self, text: str, *, current: Any = None, **kwargs: Any) -> Any:
+        async def wire(self, intent: Any, **kwargs: Any) -> Any:
             return self.decision
 
     class _NoProvider:
@@ -22923,7 +22980,9 @@ async def check_route() -> None:
             )
         )
     )
-    await loop._prepare_route(enforce_session, enforce_message)
+    loop._apply_route_decision(
+        enforce_session, enforce_message, loop.route_adapter.decision, None
+    )
     check(
         enforce_session.task_spec is not None
         and enforce_session.task_spec.get("task_id") == built.task_id,
@@ -23006,7 +23065,10 @@ async def check_route() -> None:
     hint_loop = make_loop(
         _Adapter(RouteDecision(mode="shadow", relation="new", action="execute", intent=intent, task=built, plan=plan))
     )
-    await hint_loop._prepare_route(hint_session, hint_message)
+    hint_loop._turn_hint = intent_rules.detect("上次那个 EGFR 的口袋查到哪了")
+    hint_loop._apply_route_decision(
+        hint_session, hint_message, hint_loop.route_adapter.decision, None
+    )
     hint_block = next(
         part.text for part in hint_message.parts if part.type is PartType.ROUTE
     )
@@ -23047,9 +23109,12 @@ async def check_route() -> None:
     other_message = reply_message(enforce_session)
     enforce_session.campaign_state = "research"
     other = TaskSpec(task_id="task_other", objective="另一件事")
-    await make_loop(
+    other_loop = make_loop(
         _Adapter(RouteDecision(mode="shadow", relation="new", action="execute", intent=intent, task=other))
-    )._prepare_route(enforce_session, other_message)
+    )
+    other_loop._apply_route_decision(
+        enforce_session, other_message, other_loop.route_adapter.decision, None
+    )
     check(
         enforce_session.campaign_state == "specification",
         f"换了任务号回到定规格：{enforce_session.campaign_state}",
@@ -23069,14 +23134,17 @@ async def check_route() -> None:
     shadow_session = Session(id="ses_route_shadow")
     ask(shadow_session, "取 EGFR 的全部实验结构")
     shadow_message = reply_message(shadow_session)
-    await make_loop(
+    shadow_loop = make_loop(
         _Adapter(
             RouteDecision(
                 mode="shadow", relation="new", action="execute",
                 intent=intent, task=built, plan=plan
             )
         )
-    )._prepare_route(shadow_session, shadow_message)
+    )
+    shadow_loop._apply_route_decision(
+        shadow_session, shadow_message, shadow_loop.route_adapter.decision, None
+    )
     check(shadow_session.task_spec is not None, "shadow 也记任务规格（否则下一轮没有上下文）")
     check(
         shadow_session.route_intent.startswith("（本轮理解，仅参考"),
@@ -23095,9 +23163,10 @@ async def check_route() -> None:
     error_session = Session(id="ses_route_error")
     ask(error_session, "取 EGFR 的全部实验结构")
     error_message = reply_message(error_session)
-    await make_loop(
-        _Adapter(RouteDecision(mode="enforce", error="路由挂了"))
-    )._prepare_route(error_session, error_message)
+    error_loop = make_loop(_Adapter(RouteDecision(mode="enforce", error="路由挂了")))
+    error_loop._apply_route_decision(
+        error_session, error_message, error_loop.route_adapter.decision, None
+    )
     check(error_session.task_spec is None, "路由出错时不写任务规格")
     error_routes = [part.text for part in error_message.parts if part.type is PartType.ROUTE]
     check(
@@ -23129,112 +23198,125 @@ async def check_route() -> None:
     )
 
 
-async def check_intent_parser(server: FakeModelServer) -> None:
-    """意图解析：短提示、无工具、多意图、排除项原样保留、坏输出只重试一次。"""
+async def check_route_intent(server: FakeModelServer) -> None:
+    """每轮第一步只发 route_intent；调用后任务写回，漏调只提醒一次。"""
+    from vsagent.core.agent.planning.route_adapter import RouteAdapter
+    from vsagent.core.agent.planning.route_tool import RouteIntentTool
+
     config = ProviderConfig(base_url=server.base_url, api_key="secret", model="fake-model")
-    parser = IntentParser(OpenAICompatProvider(config))
+    registry = ToolRegistry()
+    registry.register(RouteIntentTool())
+    loop = AgentLoop(
+        EventBus(),
+        OpenAICompatProvider(config),
+        registry,
+        config,
+        workspace_root=WORKSPACE_FIXTURE,
+        route_adapter=RouteAdapter(mode="enforce"),
+        policy=PermissionPolicy(default_ask=frozenset()),
+    )
     payload = {
-        "task_relation": "modify",
+        "task_relation": "new",
         "conversation_action": "execute",
-        "goal": "调查 EGFR 的候选口袋并分析适配配体",
+        "goal": "获取 EGFR 的全部实验结构",
         "objects": [
             {"type": "target", "label": "EGFR", "ref": "", "origin": "new"}
         ],
-        "operations": ["pocket", "ligand"],
-        "subgoals": [
-            {"agent": "pocket", "goal": "列出 EGFR 的候选口袋"},
-            {"agent": "ligand", "goal": "盘点适配口袋的已知配体"},
-        ],
+        "operations": ["pocket"],
+        "subgoals": [{"agent": "pocket", "goal": "获取符合范围的实验结构并建立结构目录"}],
         "acceptance_criteria": [
-            {"kind": "artifact_exists", "target": "PocketAtlas", "output": "PocketAtlas"},
-            {"kind": "artifact_exists", "target": "LigandDossier", "output": "LigandDossier"},
+            {"kind": "artifact_exists", "target": "PocketAtlas", "output": "PocketAtlas"}
         ],
-        "constraints": ["覆盖候选口袋"],
-        "exclusions": ["不得直接执行分子对接"],
+        "constraints": ["只要实验结构"],
+        "exclusions": ["不得使用预测结构"],
         "inputs": {},
         "expected_outputs": ["PocketAtlas"],
-        "missing_information": ["具体结构与口袋尚未指定"],
+        "missing_information": ["具体结构编号尚未指定"],
         "clarification_required": [],
         "confidence": 0.8,
         "uncertainties": [],
-        "source_message_ids": [],
     }
 
-    before = len(server.requests)
-    server.script(Reply(chunks=text_chunks(json.dumps(payload, ensure_ascii=False))))
-    spec = await parser.parse("获取 EGFR 的所有候选结合口袋，分析口袋特征，不要对接")
-    check(len(server.requests) == before + 1, "一次合法输出只要一次调用")
-    check(
-        spec.operations == ("pocket", "ligand"),
-        f"多个操作都保留：{spec.operations}",
-    )
-    check(
-        spec.exclusions == ("不得直接执行分子对接",),
-        f"排除项原样保留：{spec.exclusions}",
-    )
-    check(spec.task_relation == "modify", f"任务关系跟着一起解析：{spec.task_relation}")
-    check(spec.conversation_action == "execute", f"对话行为跟着一起解析：{spec.conversation_action}")
-    check(
-        {row["agent"] for row in spec.subgoals} == {"pocket", "ligand"},
-        f"子目标由模型写，随意图一起解析：{spec.subgoals}",
-    )
-    check(len(spec.acceptance_criteria) == 2, f"验收条件也随意图解析：{spec.acceptance_criteria}")
-    body = server.requests[-1]
-    check(not body.get("tools"), "解析请求不带工具定义")
-    system = body["messages"][0]["content"]
-    check("AGENTS.md" not in system, "解析提示不加载项目规则")
-    check(len(system) < 5000, f"解析提示够短：{len(system)} 字符")
-
-    # 围栏包着的 JSON 也认。
+    session = Session(id="ses_route_tool")
+    ask(session, "获取 EGFR 的全部实验结构，不要预测结构")
+    server.clear()
     server.script(
-        Reply(chunks=text_chunks("```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"))
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[
+                        tool_call_delta(
+                            0,
+                            call_id="c1",
+                            name="route_intent",
+                            arguments=json.dumps(payload, ensure_ascii=False),
+                        )
+                    ]
+                ),
+                usage_chunk(2, 2),
+            ]
+        ),
+        Reply(chunks=[*text_chunks("已安排。", size=2), usage_chunk(1, 1)]),
     )
-    fenced = await parser.parse("再来一句")
-    check(fenced.goal == payload["goal"], "解析 ```json 围栏")
-
-    # 第一次坏、第二次好：只让它改格式。
-    before = len(server.requests)
-    server.script(
-        Reply(chunks=text_chunks("{这不是 JSON")),
-        Reply(chunks=text_chunks(json.dumps(payload, ensure_ascii=False))),
-    )
-    retried = await parser.parse("再试一次")
-    check(retried.goal == payload["goal"], "坏输出之后重试成功")
-    check(len(server.requests) == before + 2, "重试只多问一次")
-    correction = server.requests[-1]["messages"][-1]["content"]
+    message = await loop.stream_reply(session, "")
+    check(len(server.requests) == 2, f"意图一次、答复一次：{len(server.requests)}")
+    first_tools = [
+        row["function"]["name"] for row in server.requests[0].get("tools") or []
+    ]
+    check(first_tools == ["route_intent"], f"第一步只发意图工具：{first_tools}")
+    second_tools = [
+        row["function"]["name"] for row in server.requests[1].get("tools") or []
+    ]
+    check("route_intent" not in second_tools, f"意图完成后收回工具：{second_tools}")
+    check(session.task_spec is not None, "任务规格写回会话")
     check(
-        "不合法" in correction and "补齐缺失字段" in correction and "保持" in correction,
-        "第二次只要求补齐格式与缺失字段",
+        str((session.task_spec or {}).get("task_id", "")).startswith("task_"),
+        f"任务号由编译产生：{(session.task_spec or {}).get('task_id')}",
     )
+    check("操作：pocket" in session.route_intent, f"意图摘要进 TASK 层：{session.route_intent[:80]}")
+    tools = [part for part in message.parts if part.type is PartType.TOOL]
+    check(
+        tools and tools[0].tool_status is ToolStatus.COMPLETED,
+        f"意图工具正常完成：{tools[0].tool_status if tools else '无'}",
+    )
+    check("已解析" in (tools[0].tool_output or ""), f"工具结果写给模型看：{tools[0].tool_output}")
+    routes = [part for part in message.parts if part.type is PartType.ROUTE]
+    check(
+        routes and "意图与任务" in routes[0].text,
+        "过程记录照常写一块",
+    )
+    check("不得使用预测结构" in routes[0].text, "禁止项进了过程记录")
 
-    # 要执行却没有计划：同样走重试，并在纠正话里点名 subgoals。
-    before = len(server.requests)
-    no_plan = dict(payload)
-    no_plan.pop("subgoals")
-    no_plan.pop("acceptance_criteria")
+    # 第一步直接作答：提醒一次；第二次调了意图工具就照常继续。
+    nudge = Session(id="ses_route_nudge")
+    ask(nudge, "获取 EGFR 的全部实验结构")
+    server.clear()
     server.script(
-        Reply(chunks=text_chunks(json.dumps(no_plan, ensure_ascii=False))),
-        Reply(chunks=text_chunks(json.dumps(payload, ensure_ascii=False))),
+        Reply(chunks=[*text_chunks("先想想。", size=2), usage_chunk(1, 1)]),
+        Reply(
+            chunks=[
+                delta_chunk(
+                    tool_calls=[
+                        tool_call_delta(
+                            0,
+                            call_id="c2",
+                            name="route_intent",
+                            arguments=json.dumps(payload, ensure_ascii=False),
+                        )
+                    ]
+                ),
+                usage_chunk(2, 2),
+            ]
+        ),
+        Reply(chunks=[*text_chunks("已安排。", size=2), usage_chunk(1, 1)]),
     )
-    completed = await parser.parse("补上计划再试")
-    check(completed.subgoals, "缺计划的输出被要求补齐之后才返回")
-    correction = server.requests[-1]["messages"][-1]["content"]
-    check("subgoals" in correction, f"纠正话点名缺的子目标：{correction}")
-    check(len(server.requests) == before + 2, "缺计划也只多问一次")
-
-    # 两次都坏：抛错，不返回空壳意图。
-    before = len(server.requests)
-    server.script(
-        Reply(chunks=text_chunks("{坏")),
-        Reply(chunks=text_chunks("{还坏")),
-    )
-    try:
-        await parser.parse("第三次")
-    except IntentParseError as error:
-        check(error.attempts == 2, "解析失败记录了尝试次数")
-    else:
-        raise AssertionError("两次都坏时应当抛 IntentParseError")
-    check(len(server.requests) == before + 2, "失败也只问两次，不无限重试")
+    await loop.stream_reply(nudge, "")
+    check(len(server.requests) == 3, f"漏调只多提醒一次：{len(server.requests)}")
+    first_tools = [
+        row["function"]["name"] for row in server.requests[0].get("tools") or []
+    ]
+    check(first_tools == ["route_intent"], f"提醒那一步仍只发意图工具：{first_tools}")
+    check(nudge.task_spec is not None, "补调意图之后任务照样编译")
 
 
 async def check_worker_guard() -> None:
@@ -23307,7 +23389,7 @@ async def check_core_tools_profile() -> None:
         for tool in tools
     }
     check(len(names) == len(set(names)), "常驻工具没有重名")
-    check(len(names) == 17, f"常驻工具按清单装配：{len(names)} 个")
+    check(len(names) == 18, f"常驻工具按清单装配：{len(names)} 个")
     check(names[0] == "bash", "装配顺序从 bash 开始（顺序就是请求体里的顺序）")
     check(names[-1] == "dispatch_campaign", "派发那一组排在最后")
 
@@ -28201,7 +28283,7 @@ GROUPS: tuple[tuple[str, Callable[[], Any]], ...] = (
 # 需要假模型服务的组。只有命中其中之一才起服务，否则不占端口、也不等它。
 SERVER_GROUPS: tuple[tuple[str, Callable[[Any], Any]], ...] = (
     ("provider", check_provider),
-    ("intent-parser", check_intent_parser),
+    ("route-intent", check_route_intent),
     ("loop", check_loop),
     ("permission-in-loop", check_permission_in_loop),
     ("hooks-in-loop", check_hooks_in_loop),

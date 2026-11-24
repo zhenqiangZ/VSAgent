@@ -26,8 +26,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from vsagent.core.agent.planning.intent_parser import IntentParseError, IntentParser
-from vsagent.core.agent.provider import OpenAICompatProvider, ProviderConfig  # noqa: E402
+from vsagent.core.agent.planning.route_tool import RouteIntentTool  # noqa: E402
+from vsagent.core.agent.provider import (  # noqa: E402
+    OpenAICompatProvider,
+    ProviderConfig,
+    ProviderEventType,
+)
+from vsagent.core.agent.roles.contracts import ContractError, IntentSpec  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -138,13 +143,28 @@ def config() -> ProviderConfig:
     )
 
 
+async def parse(provider: OpenAICompatProvider, text: str, context: str) -> IntentSpec:
+    """走与主控相同的路径：不带文字答案，只接受一次 route_intent 调用。"""
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": "你是科研意图解析器。读用户这一句，调用 route_intent 给出结构化意图。"}
+    ]
+    if context:
+        messages.append({"role": "system", "content": f"这一轮的现场：\n{context}"})
+    messages.append({"role": "user", "content": text})
+    tools = [RouteIntentTool().spec.to_openai()]
+    async for event in provider.stream(messages, tools):
+        if event.type is ProviderEventType.TOOL_CALL and event.tool_name == "route_intent":
+            return IntentSpec.from_dict(event.tool_args)
+    raise RuntimeError("模型没有调用 route_intent")
+
+
 async def run(cases: list[Case], verbose: bool) -> int:
-    parser = IntentParser(OpenAICompatProvider(config()))
+    provider = OpenAICompatProvider(config())
     passed = 0
     for index, case in enumerate(cases, start=1):
         try:
-            spec = await parser.parse(case.text, context=case.context)
-        except IntentParseError as error:
+            spec = await parse(provider, case.text, case.context)
+        except (ContractError, RuntimeError) as error:
             print(f"[{index}] 解析失败：{error}")
             continue
         problems: list[str] = []

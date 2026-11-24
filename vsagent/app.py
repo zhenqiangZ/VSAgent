@@ -315,10 +315,7 @@ class VSAgentApp(App[None]):
             route_adapter=(
                 None
                 if session.is_subagent
-                else RouteAdapter(
-                    OpenAICompatProvider(config, session_id=session.id),
-                    mode=route_mode(self.root),
-                )
+                else RouteAdapter(mode=route_mode(self.root))
             ),
             validator_mode=validators_mode_from_env(),
             max_steps=max_steps_from_env(),

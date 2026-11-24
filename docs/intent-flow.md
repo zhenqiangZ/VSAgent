@@ -8,9 +8,8 @@
 
 ```text
 用户这一句
-  → Context Resolver
-      当前任务 + 科研对象表 + 产物表 + 待澄清问题
-  → Intent Parser
+  → Principal 第一步调用 route_intent
+      Context Resolver：当前任务 + 科研对象表 + 产物表 + 待澄清问题
       五个维度 + 两条轴 + 结构化对象引用
   → Intent Validator
       accept / clarify / update / reject
@@ -28,7 +27,8 @@
 | 环节 | 文件 |
 |---|---|
 | 上下文解析 | `planning/context_resolver.py` |
-| 意图解析 | `planning/intent_parser.py` |
+| 意图工具 | `planning/route_tool.py` |
+| 意图提示词 | `planning/intent_prompt.py` |
 | 意图验证 | `planning/intent_validator.py` |
 | 任务关系 | `planning/task_context.py` |
 | 任务编译 | `planning/task_compiler.py` |
@@ -37,22 +37,13 @@
 
 ## 二、意图识别看到什么
 
-只有三样：
+意图由主控在每轮第一步调用 `route_intent` 完成，所以它看到的是本轮装配给主控的
+上下文：用户这一句、当前任务、对象与产物表、待澄清问题，以及主控本来就有的历史
+与规则。`ContextResolver` 仍拼一份现场摘要供验证器使用；工具参数只要求五个维度
+与两条轴，不要求模型复述整段历史。
 
-1. 用户这一句话里的正文（`PartType.TEXT`）。
-2. 一份有上限的现场摘要：当前任务、科研对象、已有产物、上一轮待澄清问题。
-3. 固定的解析提示词。
-
-看不到的东西：
-
-- 完整聊天历史。
-- `AGENTS.md` 与角色规则。
-- 项目记忆。
-- 工作区全文。
-- 工具清单。
-
-现场摘要由 `ContextResolver` 拼出，四段各有上限，总长度控制在一千五百字以内。
-对象表只给引用与一句摘要，不给文件正文。
+模型给出的是结构化参数，不是自由文本。写了不认识的字段或取值时，参数检查与
+`IntentSpec` 会当场退回，下一步在同一轮里重填。
 
 ## 三、五个维度
 

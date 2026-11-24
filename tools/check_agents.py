@@ -30,7 +30,7 @@ from vsagent.core.agent.coretools import build_core_tools  # noqa: E402
 from vsagent.core.agent.domain.all_tools import all_names, domain_tools  # noqa: E402
 from vsagent.core.agent.permission import load_disabled  # noqa: E402
 from vsagent.core.agent.planning.agent_router import validate_prerequisites  # noqa: E402
-from vsagent.core.agent.planning.intent_parser import PROMPT  # noqa: E402
+from vsagent.core.agent.planning.intent_prompt import INTENT_PROMPT  # noqa: E402
 from vsagent.core.agent.roles import agents, catalog  # noqa: E402
 from vsagent.core.agent.roles.prompt import estimate_tokens  # noqa: E402
 from vsagent.core.agent.roles.templates import TEMPLATES, template_for  # noqa: E402
@@ -60,15 +60,15 @@ def _costs() -> dict[str, int]:
 def _prompt_problems() -> list[str]:
     problems: list[str] = []
     for role in catalog.AGENTS:
-        if role not in PROMPT:
+        if role not in INTENT_PROMPT:
             problems.append(f"意图提示词里没有角色：{role}")
         for duty in catalog.DUTIES[role]:
-            if duty not in PROMPT:
+            if duty not in INTENT_PROMPT:
                 problems.append(f"意图提示词里没有写 {role} 的工作：{duty}")
-    if "capability" in PROMPT.lower():
+    if "capability" in INTENT_PROMPT.lower():
         problems.append("意图提示词里仍出现 capability 这个旧概念")
-    if len(PROMPT) > 5_000:
-        problems.append(f"意图提示词 {len(PROMPT)} 字符，超过 5000")
+    if len(INTENT_PROMPT) > 5_000:
+        problems.append(f"意图提示词 {len(INTENT_PROMPT)} 字符，超过 5000")
     return problems
 
 

@@ -497,7 +497,7 @@ agent 的引用必须存在（用户写入可以不存在，标 `unverified` 排
 
 | 组 | 模块 | 管什么 |
 | --- | --- | --- |
-| `planning/` | `intent.py`、`context_resolver.py`、`intent_parser.py`、`intent_validator.py`、`task_context.py`、`decision.py`、`notes.py`、`task_compiler.py`、`agent_router.py`、`route_adapter.py`、`stages.py`、`context.py` | 一句话怎么变成计划：意图规则、解析成 `IntentSpec`、编译成 `TaskSpec`、前置闭包与路由开关；`decision.py` 是意图、任务关系与最终计划合在一起的唯一对象，`notes.py` 是带机器码的提示；`context.py` 是装配用的八层模型 |
+| `planning/` | `intent.py`、`intent_prompt.py`、`route_tool.py`、`context_resolver.py`、`intent_validator.py`、`task_context.py`、`decision.py`、`notes.py`、`task_compiler.py`、`agent_router.py`、`route_adapter.py`、`stages.py`、`context.py` | 一句话怎么变成计划：主控第一步用 `route_intent` 给出 `IntentSpec`，再编译成 `TaskSpec`、路由角色；`decision.py` 是意图、任务关系与最终计划合在一起的唯一对象，`notes.py` 是带机器码的提示；`context.py` 是装配用的八层模型 |
 | `roles/` | `catalog.py`、`templates.py`、`profiles.py`、`agents.py`、`agents.toml`、`prompt.py`、`contracts/` | 角色本身：工作与权限、角色模板（子目标／交付物／验收条件／确认点）、说明书与报告必填、每个角色的工具名单、系统提示与规则注入、五类协议 |
 | `execution/` | `projection.py`、`coordinator.py`、`scheduler.py`、`dispatcher.py`、`dependency.py`、`spawn.py`、`host.py`、`campaign_state.py`、`reports.py`、`report.py`、`loop.py`、`hooks.py` | 跑起来的那一层：唯一投影（`TaskSpec → AgentTask`）、计划调度、建会话与判重、分层调度、子 agent 派发、会话宿主、状态机、报告抽取、唯一驱动与外部钩子 |
 | `state/` | `event_log.py`、`ledger.py`、`memory.py`、`hypothesis.py`、`hypothesis_review.py`、`history.py`、`task.py`、`topics.py`、`trace.py` | 落在磁盘上的东西：主题与步的流水、handle 登记表、跨会话记忆、假设与假设评审、任务状态、主题视图、追踪 |
@@ -1053,7 +1053,7 @@ CI 只有 `.github/workflows/ci.yml`：Linux 上跑两个判据脚本，两份�
 ### 12.3 一句话到一次派发
 
 ```
-原话 → intent_parser → task_context（合并新旧约束）→ task_compiler → agent_router
+原话 → 主控第一步 route_intent → task_context（合并新旧约束）→ task_compiler → agent_router
      → coordinator（角色 → 任务号）→ dispatcher（建会话、判重）→ scheduler（按依赖分层）
 ```
 

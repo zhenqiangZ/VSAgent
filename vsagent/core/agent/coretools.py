@@ -19,6 +19,7 @@ from vsagent.core.agent.state.history import SearchHistoryTool
 from vsagent.core.agent.state.hypothesis import HypothesisTool
 from vsagent.core.agent.state.memory import RecallTool, RememberTool
 from vsagent.core.agent.execution.spawn import DispatchCampaignTool
+from vsagent.core.agent.planning.route_tool import RouteIntentTool
 from vsagent.core.agent.state.task import TaskTool
 from .tools import BashTool, GrepTool, PatchTool, ReadTool, ReadTurnTool, Tool, WriteTool
 
@@ -56,5 +57,7 @@ def build_core_tools(
     tools.extend(event_tools(sessions))
     tools.extend([WriteRunTool(), OpenViewerTool()])
     if allow_agents:
+        # 每轮第一步的意图工具：只在根会话的注册表里，且只在路由开启时出现。
+        tools.append(RouteIntentTool())
         tools.append(DispatchCampaignTool())
     return tools

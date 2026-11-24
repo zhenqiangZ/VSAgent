@@ -201,7 +201,7 @@ ROLE_PROVIDED_INPUTS: dict[str, tuple[str, ...]] = {
 }
 """用户自带哪些输入时，对应角色整段不必再跑。
 
-键名与 `intent_parser.PROMPT` 里的 `inputs` 说明一致。
+键名与 `intent_prompt.INTENT_PROMPT` 里的 `inputs` 说明一致。
 `prepare` 不设自带输入：原始配体集不等于已准备产物。
 """
 

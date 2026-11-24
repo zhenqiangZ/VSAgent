@@ -1897,7 +1897,7 @@ a.artifact-item:hover { border-color: var(--accent); }
 
 .home-composer { max-width: 800px; margin: 0 auto var(--space-6); }
 
-/* ---------- 任务输入框（工作空间与会话页共用） ---------- */
+/* ---------- 任务输入框（工作空间） ---------- */
 
 .composer {
   display: flex;
@@ -1961,14 +1961,6 @@ a.artifact-item:hover { border-color: var(--accent); }
 .composer-send:disabled { cursor: not-allowed; opacity: 0.45; filter: none; }
 
 .composer-error { font-size: var(--fs-small); color: var(--hot); white-space: pre-wrap; }
-
-.chat-composer {
-  border-top: 1px solid var(--line);
-  background: var(--surface);
-  padding: var(--space-4) var(--space-6) var(--space-5);
-}
-.chat-composer .composer { margin: 0 auto; }
-.chat-composer .composer-note { font-size: var(--fs-small); }
 
 .home-panel {
   max-width: 960px;

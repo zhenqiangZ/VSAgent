@@ -1783,14 +1783,11 @@ async function checkComposer(page, sessionId, consoleErrors) {
   await page.waitForTimeout(200);
   consoleErrors.splice(errorsBefore, consoleErrors.length - errorsBefore);
 
-  // 会话页底部是同一个组件，换的只是它认的会话编号。
+  // 会话页只回看，不提供续接提问：输入框只在工作空间出现。
   await openView(page, `#/history/${sessionId}`, 60000);
-  await page.waitForSelector("#chat-composer .composer-input", { timeout: 30000 });
-  check(
-    "会话页底部也有输入框",
-    await page.locator("#chat-composer .composer-send").isVisible(),
-    "输入框与发送按钮都在"
-  );
+  await page.waitForSelector("#conversation", { timeout: 30000 });
+  const boxes = await page.locator("#chat-composer").count();
+  check("会话页没有输入框", boxes === 0, `找到 ${boxes} 个`);
 }
 
 async function checkArtifactPaneWidths(page, sessionId) {

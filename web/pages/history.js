@@ -29,7 +29,6 @@
           <nav id="topic-rail" aria-label="主题导航"></nav>
           <div class="conversation-column">
             <div id="conversation"></div>
-            <div id="chat-composer" class="chat-composer is-hidden"></div>
           </div>
           <aside id="artifact-pane" aria-label="任务产物"></aside>
         </div>
@@ -139,8 +138,6 @@
   const ARTIFACT_STEPS = [0, 240, 300, 380];
   let artifactWidth = 0;
   let focusMode = false;
-  // 底部输入框。整页只建一次，换会话时只换它认的会话编号。
-  let chatComposer = null;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -1569,8 +1566,6 @@
     const wasRunning = Boolean(live && live.running);
     const wasCount = live ? live.eventCount : 0;
     live = next;
-    // 这一轮没结束就不让再交一件：服务端也会回 409，按钮上先说清楚更省一次往返。
-    if (chatComposer) chatComposer.setBusy(Boolean(live && live.running));
 
     if (live && live.running) {
       if (wasRunning && wasCount !== live.eventCount) {
@@ -2483,9 +2478,6 @@
     startLive();
     loadOpenState();
     renderList();
-    chatComposer.setSession(sessionId);
-    chatComposer.setBusy(false);
-    root.querySelector("#chat-composer").classList.remove("is-hidden");
 
     root.querySelector("#session-head").classList.add("is-hidden");
     root.querySelector("#analysis-pane").classList.add("is-hidden");
@@ -2600,18 +2592,6 @@
     };
     document.addEventListener("keydown", onKeydown);
     applyChrome();
-
-    chatComposer = window.vsComposer.createComposer({
-      placeholder: "接着这个任务说一句……",
-      minHeight: 64,
-      onSubmitted: async () => {
-        // 新的一轮已经开始，状态文件里的消息还没到齐：先重取列表与这一段，
-        // 再让两秒一次的实时轮询把运行中的主题接上来。
-        await loadSessions();
-        await refreshSession();
-      },
-    });
-    container.querySelector("#chat-composer").appendChild(chatComposer.element);
 
     await loadSessions();
     if (param) {

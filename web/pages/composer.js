@@ -1,4 +1,4 @@
-// 任务输入框：工作空间与历史页共用同一份。
+// 任务输入框：工作空间使用，历史页只回看。
 //
 // 提交走 `POST /api/tasks`，真正的执行发生在终端进程里——网页只把文字交过去。
 // 需要确认的工具仍然在终端弹窗，所以这里不假装自己是一个完整的对话界面：
@@ -44,8 +44,6 @@
     let sessionId = options.sessionId || "";
     let busy = false;
     let sending = false;
-    // 会话页底部的输入框不必占 120px：那里是接着说话，不是开一件新任务。
-    const minHeight = options.minHeight || MIN_HEIGHT;
 
     if (options.quick) {
       const quick = el("div", "composer-quick");
@@ -85,7 +83,7 @@
 
     function grow() {
       area.style.height = "auto";
-      const wanted = Math.max(minHeight, Math.min(MAX_HEIGHT, area.scrollHeight));
+      const wanted = Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, area.scrollHeight));
       area.style.height = `${wanted}px`;
     }
 
